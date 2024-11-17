@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8"]
+requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "boltz"
+version = "0.1.0"
 requires-python = ">=3.9"
-dynamic = ["version"]
 description = "Boltz-1"
 readme = "README.md"
 dependencies = [
