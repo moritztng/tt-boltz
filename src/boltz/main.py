@@ -19,8 +19,8 @@ from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.model import Boltz1
 
-CCD_URL = "https://www.dropbox.com/scl/fi/h4mjhcbhzzkkj4piu1k6x/ccd.pkl?rlkey=p43trjrs9ots4qk84ygk24seu&st=bymcsoqe&dl=1"
-MODEL_URL = "https://www.dropbox.com/scl/fi/8qo9aryyttzp97z74dchn/boltz1.ckpt?rlkey=jvxl2jsn0kajnyfmesbj4lb89&st=dipi1sbw&dl=1"
+CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
+MODEL_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1.ckpt"
 
 
 @dataclass
