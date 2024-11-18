@@ -61,22 +61,22 @@ def download(cache: Path) -> None:
         The cache directory.
 
     """
-    # Warn user, just in case
-    click.echo(
-        f"Downloading data and model to {cache}. "
-        "You may change this by setting the --cache flag."
-    )
-
-    # Download CCD, while capturing the output
+    # Download CCD
     ccd = cache / "ccd.pkl"
     if not ccd.exists():
-        click.echo(f"Downloading CCD to {ccd}.")
+        click.echo(
+            f"Downloading the CCD dictionary to {ccd}. You may "
+            "change the cache directory with the --cache flag."
+        )
         urllib.request.urlretrieve(CCD_URL, str(ccd))  # noqa: S310
 
     # Download model
     model = cache / "boltz1.ckpt"
     if not model.exists():
-        click.echo(f"Downloading model to {model}")
+        click.echo(
+            f"Downloading the model weights to {model}. You may "
+            "change the cache directory with the --cache flag."
+        )
         urllib.request.urlretrieve(MODEL_URL, str(model))  # noqa: S310
 
 
@@ -140,7 +140,13 @@ def check_inputs(
     # Remove them from the input data
     if existing and not override:
         data = [d for d in data if d.stem not in existing]
-        msg = "Found existing predictions, skipping and running only the missing ones."
+        num_skipped = len(existing) - len(data)
+        msg = (
+            f"Found some existing predictions ({num_skipped}), "
+            f"skipping and running only the missing ones, "
+            "if any. If you wish to override these existing "
+            "predictions, please set the --override flag."
+        )
         click.echo(msg)
     elif existing and override:
         msg = "Found existing predictions, will override."
@@ -367,8 +373,16 @@ def predict(
     if checkpoint is None:
         checkpoint = cache / "boltz1.ckpt"
 
-    # Check if data is a directory
+    # Validate inputs
     data = check_inputs(data, out_dir, override)
+    if not data:
+        click.echo("No predictions to run, exiting.")
+        return
+
+    msg = f"Running predictions for {len(data)} structures."
+    click.echo(msg)
+
+    # Process inputs
     processed = process_inputs(data, out_dir, ccd)
 
     # Create data module
