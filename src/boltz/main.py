@@ -111,8 +111,25 @@ def check_inputs(
 
     # Check if data is a directory
     if data.is_dir():
-        data = list(data.glob("*"))
-        data = [d for d in data if d.suffix in [".fasta", ".yaml"]]
+        data: list[Path] = list(data.glob("*"))
+
+        # Filter out non .fasta or .yaml files, raise
+        # an error on directory and other file types
+        filtered_data = []
+        for d in data:
+            if d.suffix in (".yaml", ".fasta"):
+                filtered_data.append(d)
+            elif d.is_dir():
+                msg = f"Found directory {d} instead of .fasta or .yaml."
+                raise RuntimeError(msg)
+            else:
+                msg = (
+                    f"Unable to parse filetype {d.suffix}, "
+                    "please provide a .fasta or .yaml file."
+                )
+                raise RuntimeError(msg)
+
+        data = filtered_data
     else:
         data = [data]
 
@@ -132,7 +149,7 @@ def check_inputs(
     return data
 
 
-def process_inputs(
+def process_inputs(  # noqa: C901
     data: list[Path],
     out_dir: Path,
     ccd: dict[str, Mol],
@@ -177,8 +194,14 @@ def process_inputs(
             target = parse_fasta(path, ccd)
         elif path.suffix == ".yaml":
             target = parse_yaml(path, ccd)
+        elif path.is_dir():
+            msg = f"Found directory {path} instead of .fasta or .yaml, skipping."
+            raise RuntimeError(msg)
         else:
-            msg = f"Unable to parse filetype {path.suffix}"
+            msg = (
+                f"Unable to parse filetype {path.suffix}, "
+                "please provide a .fasta or .yaml file."
+            )
             raise RuntimeError(msg)
 
         # Keep record
