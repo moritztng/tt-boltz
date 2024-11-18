@@ -177,6 +177,9 @@ def process_inputs(
             target = parse_fasta(path, ccd)
         elif path.suffix == ".yaml":
             target = parse_yaml(path, ccd)
+        else:
+            msg = f"Unable to parse filetype {path.suffix}"
+            raise RuntimeError(msg)
 
         # Keep record
         records.append(target.record)
