@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
 
+import click
 import numpy as np
 from rdkit import rdBase
 from rdkit.Chem import AllChem
@@ -536,6 +537,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         # Ensure all the items share the same msa
         msa = -1
         if entity_type == "protein":
+            # Check if MSA is present
             if ("msa" not in items[0][entity_type]) or (
                 items[0][entity_type]["msa"] is None
             ):
@@ -544,10 +546,24 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 single sequence mode, please explicitely pass an empty string.
                 """
                 raise ValueError(msg)
+
+            # Get the msa
             msa = items[0][entity_type]["msa"]
+
+            # Check if all MSAs are the same within the same entity
             if not all(item[entity_type]["msa"] == msa for item in items):
                 msg = "All proteins with the same sequence must share the same MSA!"
                 raise ValueError(msg)
+
+            # Set the MSA, warn if passed in single-sequence mode
+            if items[0][entity_type]["msa"] == "":
+                msa = -1
+                msg = (
+                    "Found explicit empty MSA for some proteins, will run "
+                    "these in single sequence mode. Keep in mind that the "
+                    "model predictions will be suboptimal without an MSA."
+                )
+                click.echo(msg)
 
         # Parse a polymer
         if entity_type in {"protein", "dna", "rna"}:
