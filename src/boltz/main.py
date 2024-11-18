@@ -117,7 +117,7 @@ def check_inputs(
         # an error on directory and other file types
         filtered_data = []
         for d in data:
-            if d.suffix in (".yaml", ".fasta"):
+            if d.suffix in (".fa", ".fas", ".fasta", ".yml", ".yaml"):
                 filtered_data.append(d)
             elif d.is_dir():
                 msg = f"Found directory {d} instead of .fasta or .yaml."
@@ -190,9 +190,9 @@ def process_inputs(  # noqa: C901
     records: list[Record] = []
     for path in tqdm(data):
         # Parse data
-        if path.suffix == ".fasta":
+        if path.suffix in (".fa", ".fas", ".fasta"):
             target = parse_fasta(path, ccd)
-        elif path.suffix == ".yaml":
+        elif path.suffix in (".yml", ".yaml"):
             target = parse_yaml(path, ccd)
         elif path.is_dir():
             msg = f"Found directory {path} instead of .fasta or .yaml, skipping."
