@@ -603,7 +603,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
 
         # Parse a non-polymer
-        elif entity_type == "ligand" and "ccd" in items[0][entity_type]:
+        elif (entity_type == "ligand") and "ccd" in (items[0][entity_type]):
             seq = items[0][entity_type]["ccd"]
             if isinstance(seq, str):
                 seq = [seq]
@@ -628,7 +628,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 residues=residues,
                 type=const.chain_type_ids["NONPOLYMER"],
             )
-        elif entity_type == "ligand" and "smiles" in items[0][entity_type]:
+        elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
             mol = AllChem.MolFromSmiles(seq)
             mol = AllChem.AddHs(mol)
