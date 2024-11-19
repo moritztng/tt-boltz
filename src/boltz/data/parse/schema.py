@@ -329,7 +329,7 @@ def parse_ccd_residue(
 def parse_polymer(
     sequence: list[str],
     entity: str,
-    entity_type: str,
+    chain_type: str,
     components: dict[str, Mol],
 ) -> Optional[ParsedChain]:
     """Process a sequence into a chain object.
@@ -360,34 +360,35 @@ def parse_polymer(
         If the alignment fails.
 
     """
+    ref_res = set(const.tokens)
     unk_chirality = const.chirality_type_ids[const.unk_chirality_type]
-
-    # Check what type of sequence this is
-    if entity_type == "rna":
-        chain_type = const.chain_type_ids["RNA"]
-        token_map = const.rna_letter_to_token
-    elif entity_type == "dna":
-        chain_type = const.chain_type_ids["DNA"]
-        token_map = const.dna_letter_to_token
-    elif entity_type == "protein":
-        chain_type = const.chain_type_ids["PROTEIN"]
-        token_map = const.prot_letter_to_token
-    else:
-        msg = f"Unknown polymer type: {entity_type}"
-        raise ValueError(msg)
 
     # Get coordinates and masks
     parsed = []
-    for res_idx, res_code in enumerate(sequence):
+    for res_idx, res_name in enumerate(sequence):
+        # Check if modified residue
+        # Map MSE to MET
+        res_corrected = res_name if res_name != "MSE" else "MET"
+
+        # Handle non-standard residues
+        if res_corrected not in ref_res:
+            ref_mol = components[res_corrected]
+            residue = parse_ccd_residue(
+                name=res_corrected,
+                ref_mol=ref_mol,
+                res_idx=res_idx,
+            )
+            parsed.append(residue)
+            continue
+
         # Load ref residue
-        res_name = token_map[res_code]
-        ref_mol = components[res_name]
+        ref_mol = components[res_corrected]
         ref_mol = AllChem.RemoveHs(ref_mol, sanitize=False)
         ref_conformer = get_conformer(ref_mol)
 
         # Only use reference atoms set in constants
         ref_name_to_atom = {a.GetProp("name"): a for a in ref_mol.GetAtoms()}
-        ref_atoms = [ref_name_to_atom[a] for a in const.ref_atoms[res_name]]
+        ref_atoms = [ref_name_to_atom[a] for a in const.ref_atoms[res_corrected]]
 
         # Iterate, always in the same order
         atoms: list[ParsedAtom] = []
@@ -420,12 +421,12 @@ def parse_polymer(
                 )
             )
 
-        atom_center = const.res_to_center_atom_id[res_name]
-        atom_disto = const.res_to_disto_atom_id[res_name]
+        atom_center = const.res_to_center_atom_id[res_corrected]
+        atom_disto = const.res_to_disto_atom_id[res_corrected]
         parsed.append(
             ParsedResidue(
-                name=res_name,
-                type=const.token_ids[res_name],
+                name=res_corrected,
+                type=const.token_ids[res_corrected],
                 atoms=atoms,
                 bonds=[],
                 idx=res_idx,
@@ -529,7 +530,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     # Go through entities and parse them
     chains: dict[str, ParsedChain] = {}
     chain_to_msa: dict[str, str] = {}
-    chain_to_moltype: dict[str, int] = {}
     for entity_id, items in enumerate(items_to_group.values()):
         # Get entity type and sequence
         entity_type = next(iter(items[0].keys())).lower()
@@ -569,18 +569,36 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
         # Parse a polymer
         if entity_type in {"protein", "dna", "rna"}:
+            # Get token map
+            if entity_type == "rna":
+                token_map = const.rna_letter_to_token
+            elif entity_type == "dna":
+                token_map = const.dna_letter_to_token
+            elif entity_type == "protein":
+                token_map = const.prot_letter_to_token
+            else:
+                msg = f"Unknown polymer type: {entity_type}"
+                raise ValueError(msg)
+
+            # Get polymer info
+            chain_type = const.chain_type_ids[entity_type.upper()]
+            unk_token = const.unk_token[entity_type.upper()]
+
+            # Convert sequence to tokens
             seq = list(items[0][entity_type]["sequence"])
+            seq = [token_map.get(c, unk_token) for c in seq]
+
             # Apply modifications
-            for modification in items[0][entity_type].get("modifications", []):
-                code = modification["ccd"]
-                idx = modification["position"] - 1  # 1-indexed
+            for mod in items[0][entity_type].get("modifications", []):
+                code = mod["ccd"]
+                idx = mod["position"] - 1  # 1-indexed
                 seq[idx] = code
 
             # Parse a polymer
             parsed_chain = parse_polymer(
                 sequence=seq,
                 entity=entity_id,
-                entity_type=entity_type,
+                chain_type=chain_type,
                 components=ccd,
             )
 
@@ -640,11 +658,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             msg = f"Invalid entity type: {entity_type}"
             raise ValueError(msg)
 
-        # Convert entity_type to mol_type_id
-        mol_type_id = entity_type.upper()
-        mol_type_id = mol_type_id.replace("LIGAND", "NONPOLYMER")
-        mol_type_id = const.chain_type_ids[mol_type_id]
-
+        # Add as many chains as provided ids
         for item in items:
             ids = item[entity_type]["id"]
             if isinstance(ids, str):
@@ -652,7 +666,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             for chain_name in ids:
                 chains[chain_name] = parsed_chain
                 chain_to_msa[chain_name] = msa
-                chain_to_moltype[chain_name] = mol_type_id
 
     # If no chains parsed fail
     if not chains:
@@ -790,7 +803,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         chain_info = ChainInfo(
             chain_id=chain_id,
             chain_name=chain["name"],
-            mol_type=chain_to_moltype[chain["name"]],
+            mol_type=chain["type"],
             cluster_id=-1,
             msa_id=chain_to_msa[chain["name"]],
             num_residues=int(chain["res_num"]),
