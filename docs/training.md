@@ -34,7 +34,7 @@ data:
 
 ## Run the training script
 
-Before running the full training, we recommend using the debug flag. This turns off DDP (sets single device) and set `num_workers` to 0 so everything is in a single process, as well as disabling wandb:
+Before running the full training, we recommend using the debug flag. This turns off DDP (sets single device) and sets `num_workers` to 0 so everything is in a single process, as well as disabling wandb:
 
     python scripts/train/train.py scripts/train/configs/structure.yaml debug=1
 
