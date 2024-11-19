@@ -799,11 +799,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     # Create metadata
     struct_info = StructureInfo(num_chains=len(chains))
     chain_infos = []
-    for chain_id, chain in enumerate(chains):
+    for chain in chains:
         chain_info = ChainInfo(
-            chain_id=chain_id,
+            chain_id=int(chain["asym_id"]),
             chain_name=chain["name"],
-            mol_type=chain["type"],
+            mol_type=int(chain["mol_type"]),
             cluster_id=-1,
             msa_id=chain_to_msa[chain["name"]],
             num_residues=int(chain["res_num"]),
