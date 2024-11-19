@@ -539,11 +539,13 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         if entity_type == "protein":
             # Check if MSA is present
             if ("msa" not in items[0][entity_type]) or (
-                items[0][entity_type]["msa"] is None
+                (items[0][entity_type]["msa"] is None)
+                or (items[0][entity_type]["msa"] == "")
             ):
                 msg = """
-                Proteins must have an MSA. If you wish to run the model in
-                single sequence mode, please explicitely pass an empty string.
+                Proteins must have an MSA. If you wish to force
+                the model to run in single sequence mode, please
+                use the special keyword 'empty' for this msa.
                 """
                 raise ValueError(msg)
 
@@ -556,7 +558,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
 
             # Set the MSA, warn if passed in single-sequence mode
-            if items[0][entity_type]["msa"] == "":
+            if items[0][entity_type]["msa"] == "empty":
                 msa = -1
                 msg = (
                     "Found explicit empty MSA for some proteins, will run "
