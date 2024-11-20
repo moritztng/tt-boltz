@@ -191,6 +191,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     out_dir: Path,
     ccd_path: Path,
     max_msa_seqs: int = 4096,
+    use_msa_server: bool = False,
 ) -> None:
     """Process the input data and output directory.
 
@@ -204,6 +205,8 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
         The path to the CCD dictionary.
     max_msa_seqs : int, optional
         Max number of MSA seuqneces, by default 4096.
+    use_msa_server : bool, optional
+        Whether to use the MMSeqs2 server for MSA generation, by default False.
 
     Returns
     -------
@@ -262,6 +265,10 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 chain.msa_id = -1
 
         # Generate MSA
+        if to_generate and not use_msa_server:
+            msg = "Missing MSA's in input and --use_msa_server flag not set."
+            raise RuntimeError(msg)
+
         if to_generate:
             msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
             click.echo(msg)
@@ -378,6 +385,11 @@ def cli() -> None:
     is_flag=True,
     help="Whether to override existing found predictions. Default is False.",
 )
+@click.option(
+    "--use_msa_server",
+    is_flag=True,
+    help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
+)
 def predict(
     data: str,
     out_dir: str,
@@ -391,6 +403,7 @@ def predict(
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
     override: bool = False,
+    use_msa_server: bool = False,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -426,7 +439,12 @@ def predict(
 
     # Process inputs
     ccd_path = cache / "ccd.pkl"
-    process_inputs(data, out_dir, ccd_path)
+    process_inputs(
+        data=data,
+        out_dir=out_dir,
+        ccd_path=ccd_path,
+        use_msa_server=use_msa_server,
+    )
 
     # Load processed data
     processed_dir = out_dir / "processed"
