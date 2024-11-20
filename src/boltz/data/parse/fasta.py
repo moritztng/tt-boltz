@@ -71,6 +71,8 @@ def parse_fasta(path: Path, ccd: Mapping[str, Mol]) -> Target:  # noqa: C901
                 entity_type.lower() == "protein"
             ), "MSA_ID is only allowed for proteins"
             msa_id = header[2]
+        else:
+            msa_id = None
 
         entity_type = entity_type.upper()
         seq = str(seq_record.seq)
