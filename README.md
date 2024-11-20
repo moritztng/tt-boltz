@@ -52,12 +52,13 @@ We welcome external contributions and are eager to engage with the community. Co
 
 ## Coming very soon
 
+- [x] Auto-generated MSAs using MMseqs2
+- [x] More examples
+- [ ] Support for custom paired MSA
+- [ ] Confidence model checkpoint
 - [ ] Pocket conditioning support
-- [ ] More examples
 - [ ] Full data processing pipeline
 - [ ] Colab notebook for inference
-- [ ] Confidence model checkpoint
-- [ ] Support for custom paired MSA
 - [ ] Kernel integration
 
 ## License
