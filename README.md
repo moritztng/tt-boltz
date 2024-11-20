@@ -71,11 +71,16 @@ Our model and code are released under MIT License, and can be freely used for bo
 If you use this code or the models in your research, please cite the following papers:
 
 ```bibtex
-@article{mirdita2022colabfold,
-  title={Boltz-1: Democratizing Biomolecular Interaction Modeling},
-  author={Wohlwend, Jeremy and Corso, Gabriele and Passaro, Saro and Reveiz, Mateo and Leidal, Ken and Swiderski, Wojtek and Portnoi, Tally and Chinn, Itamar and Siltera, Jacob and Jaakkola, Tommi and Barzilay, Regina},
-  journal={},
-  year={2024},
+@article {Wohlwend2024.11.19.624167,
+	author = {Wohlwend, Jeremy and Corso, Gabriele and Passaro, Saro and Reveiz, Mateo and Leidal, Ken and Swiderski, Wojtek and Portnoi, Tally and Chinn, Itamar and Silterra, Jacob and Jaakkola, Tommi and Barzilay, Regina},
+	title = {Boltz-1: Democratizing Biomolecular Interaction Modeling},
+	elocation-id = {2024.11.19.624167},
+	year = {2024},
+	doi = {10.1101/2024.11.19.624167},
+	publisher = {Cold Spring Harbor Laboratory},
+	URL = {https://www.biorxiv.org/content/early/2024/11/20/2024.11.19.624167},
+	eprint = {https://www.biorxiv.org/content/early/2024/11/20/2024.11.19.624167.full.pdf},
+	journal = {bioRxiv}
 }
 ```
 
