@@ -63,3 +63,30 @@ We welcome external contributions and are eager to engage with the community. Co
 ## License
 
 Our model and code are released under MIT License, and can be freely used for both academic and commercial purposes.
+
+
+## Cite
+
+If you use this code or the models in your research, please cite the following papers:
+
+```bibtex
+@article{mirdita2022colabfold,
+  title={Boltz-1: Democratizing Biomolecular Interaction Modeling},
+  author={Wohlwend, Jeremy and Corso, Gabriele and Passaro, Saro and Reveiz, Mateo and Leidal, Ken and Swiderski, Wojtek and Portnoi, Tally and Chinn, Itamar and Siltera, Jacob and Jaakkola, Tommi and Barzilay, Regina},
+  journal={},
+  year={2024},
+}
+```
+
+```bibtex
+@article{mirdita2022colabfold,
+  title={ColabFold: making protein folding accessible to all},
+  author={Mirdita, Milot and Sch{\"u}tze, Konstantin and Moriwaki, Yoshitaka and Heo, Lim and Ovchinnikov, Sergey and Steinegger, Martin},
+  journal={Nature methods},
+  volume={19},
+  number={6},
+  pages={679--682},
+  year={2022},
+  publisher={Nature Publishing Group US New York}
+}
+```
