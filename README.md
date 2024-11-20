@@ -5,7 +5,7 @@ Democratizing Biomolecular Interaction Modeling
 
 ![](docs/boltz1_pred_figure.png)
 
-Boltz-1 is an open-source model which predicts the 3D structure of proteins, rna, dna and small molecules; it handles modified residues, covalent ligands and glycans, as well as condition the generation on pocket residues. 
+Boltz-1 is an open-source model which predicts the 3D structure of proteins, RNA, DNA and small molecules; it handles modified residues, covalent ligands and glycans, as well as condition the generation on pocket residues. 
 
 For more information about the model, see our [technical report](https://gcorso.github.io/assets/boltz1.pdf).
 
@@ -68,7 +68,7 @@ Our model and code are released under MIT License, and can be freely used for bo
 
 ## Cite
 
-If you use this code or the models in your research, please cite the following papers:
+If you use this code or the models in your research, please cite the following paper:
 
 ```bibtex
 @article {Wohlwend2024.11.19.624167,
@@ -83,6 +83,8 @@ If you use this code or the models in your research, please cite the following p
 	journal = {bioRxiv}
 }
 ```
+
+In addition if you use the automatic MSA generation, please cite:
 
 ```bibtex
 @article{mirdita2022colabfold,
