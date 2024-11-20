@@ -764,9 +764,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "bond" in constraint:
-            c1, r1, a1 = atom_idx_map[tuple(constraint["bond"]["atom1"])]
-            c2, r2, a2 = atom_idx_map[tuple(constraint["bond"]["atom2"])]
-            connections.append((c1, c2, r1 - 1, r2 - 1, a1, a2))  # 1-indexed
+            c1, r1, a1 = tuple(constraint["bond"]["atom1"])
+            c2, r2, a2 = tuple(constraint["bond"]["atom2"])
+            c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
+            c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
+            connections.append((c1, c2, r1, r2, a1, a2))
 
         elif "pocket" in constraint:
             binder = constraint["pocket"]["binder"]
