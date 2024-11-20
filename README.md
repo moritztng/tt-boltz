@@ -71,7 +71,7 @@ Our model and code are released under MIT License, and can be freely used for bo
 If you use this code or the models in your research, please cite the following paper:
 
 ```bibtex
-@article {Wohlwend2024.11.19.624167,
+@article{Wohlwend2024.11.19.624167,
   author = {Wohlwend, Jeremy and Corso, Gabriele and Passaro, Saro and Reveiz, Mateo and Leidal, Ken and Swiderski, Wojtek and Portnoi, Tally and Chinn, Itamar and Silterra, Jacob and Jaakkola, Tommi and Barzilay, Regina},
   title = {Boltz-1: Democratizing Biomolecular Interaction Modeling},
   elocation-id = {2024.11.19.624167},
