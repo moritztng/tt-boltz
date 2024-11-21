@@ -260,8 +260,9 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
             # Add to generate list, assigning entity id
             if (chain.mol_type == prot_id) and (chain.msa_id == 0):
                 entity_id = chain.entity_id
-                to_generate[entity_id] = target.sequences[entity_id]
-                chain.msa_id = msa_dir / f"{target_id}_{entity_id}.a3m"
+                msa_id = f"{target_id}_{entity_id}"
+                to_generate[msa_id] = target.sequences[entity_id]
+                chain.msa_id = msa_dir / f"{msa_id}.a3m"
 
             # We do not support msa generation for non-protein chains
             elif chain.msa_id == 0:
