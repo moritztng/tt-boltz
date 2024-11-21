@@ -225,8 +225,8 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     out_dir.mkdir(parents=True, exist_ok=True)
     msa_dir.mkdir(parents=True, exist_ok=True)
     structure_dir.mkdir(parents=True, exist_ok=True)
-    predictions_dir.mkdir(parents=True, exist_ok=True)
     processed_msa_dir.mkdir(parents=True, exist_ok=True)
+    predictions_dir.mkdir(parents=True, exist_ok=True)
 
     # Load CCD
     with ccd_path.open("rb") as file:
@@ -250,6 +250,9 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
             )
             raise RuntimeError(msg)
 
+        # Get target id
+        target_id = target.record.id
+
         # Get all MSA ids and decide whether to generate MSA
         to_generate = {}
         prot_id = const.chain_type_ids["PROTEIN"]
@@ -258,7 +261,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
             if (chain.mol_type == prot_id) and (chain.msa_id == 0):
                 entity_id = chain.entity_id
                 to_generate[entity_id] = target.sequences[entity_id]
-                chain.msa_id = msa_dir / f"{entity_id}.a3m"
+                chain.msa_id = msa_dir / f"{target_id}_{entity_id}.a3m"
 
             # We do not support msa generation for non-protein chains
             elif chain.msa_id == 0:
@@ -285,8 +288,8 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 raise FileNotFoundError(msg)
 
             # Dump processed MSA
-            processed = processed_msa_dir / f"{msa_idx}.npz"
-            msa_id_map[msa_id] = msa_idx
+            processed = processed_msa_dir / f"{target_id}_{msa_idx}.npz"
+            msa_id_map[msa_id] = f"{target_id}_{msa_idx}"
             if not processed.exists():
                 msa: MSA = parse_a3m(
                     msa_path,
