@@ -399,7 +399,7 @@ def cli() -> None:
 @click.option(
     "--msa_server_url",
     type=str,
-    help="The url to the MSA server. Used only if --use_msa_server is set.",
+    help="MSA server url. Used only if --use_msa_server is set. ",
     default="https://api.colabfold.com",
 )
 @click.option(
