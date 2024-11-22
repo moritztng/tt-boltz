@@ -121,7 +121,10 @@ The following options are available for the `predict` command:
 | `--output_format`           | `[pdb,mmcif]`   | `mmcif`            | The output format to use for the predictions.                                   |
 | `--num_workers INTEGER`     | `INTEGER`       | `2`                | The number of dataloader workers to use for prediction.                         |
 | `--override`                | `FLAG`          | `False`            | Whether to override existing predictions if found.                              |
-| `--use_msa_server`                | `FLAG`          | `False`            | Whether to use the msa server to generate msa's.
+| `--use_msa_server`                | `FLAG`          | `False`            | Whether to use the msa server to generate msa's.                           |
+| `--msa_server_url`                | str          | `https://api.colabfold.com`            |  MSA server url. Used only if --use_msa_server is set.                           |
+| `--msa_pairing_strategy`                | str          | `greedy`            | Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'                           |
+
 
 ## Output
 

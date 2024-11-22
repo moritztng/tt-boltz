@@ -158,7 +158,7 @@ def check_inputs(
     return data
 
 
-def compute_msa(data: dict[str, str], msa_dir: Path) -> list[Path]:
+def compute_msa(data: dict[str, str], msa_dir: Path, msa_server_url:str, msa_pairing_strategy:str) -> list[Path]:
     """Compute the MSA for the input data.
 
     Parameters
@@ -175,7 +175,7 @@ def compute_msa(data: dict[str, str], msa_dir: Path) -> list[Path]:
 
     """
     # Run MMSeqs2
-    msa = run_mmseqs2(list(data.values()), msa_dir, use_pairing=len(data) > 1)
+    msa = run_mmseqs2(list(data.values()), msa_dir, use_pairing=len(data) > 1, host_url=msa_server_url, pairing_strategy=msa_pairing_strategy)
 
     # Dump to A3M
     for idx, key in enumerate(data):
@@ -190,6 +190,8 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     data: list[Path],
     out_dir: Path,
     ccd_path: Path,
+    msa_server_url: str,
+    msa_pairing_strategy: str,
     max_msa_seqs: int = 4096,
     use_msa_server: bool = False,
 ) -> None:
@@ -276,7 +278,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
         if to_generate:
             msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
             click.echo(msg)
-            compute_msa(to_generate, msa_dir)
+            compute_msa(to_generate, msa_dir, msa_server_url=msa_server_url, msa_pairing_strategy=msa_pairing_strategy)
 
         # Parse MSA data
         msas = {c.msa_id for c in target.record.chains if c.msa_id != -1}
@@ -394,6 +396,18 @@ def cli() -> None:
     is_flag=True,
     help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
 )
+@click.option(
+    "--msa_server_url",
+    type=str,
+    help="MSA server url. Used only if --use_msa_server is set. ",
+    default="https://api.colabfold.com",
+)
+@click.option(
+    "--msa_pairing_strategy",
+    type=str,
+    help="Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'",
+    default="greedy",
+)
 def predict(
     data: str,
     out_dir: str,
@@ -408,6 +422,8 @@ def predict(
     num_workers: int = 2,
     override: bool = False,
     use_msa_server: bool = False,
+    msa_server_url: str = "https://api.colabfold.com",
+    msa_pairing_strategy: str = "greedy",
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -448,6 +464,8 @@ def predict(
         out_dir=out_dir,
         ccd_path=ccd_path,
         use_msa_server=use_msa_server,
+        msa_server_url=msa_server_url,
+        msa_pairing_strategy=msa_pairing_strategy,
     )
 
     # Load processed data
