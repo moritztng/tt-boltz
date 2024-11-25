@@ -6,7 +6,7 @@ from typing import Literal, Optional
 
 import click
 import torch
-from pytorch_lightning import Trainer
+from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
 from tqdm import tqdm
@@ -251,7 +251,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     ccd_path : Path
         The path to the CCD dictionary.
     max_msa_seqs : int, optional
-        Max number of MSA seuqneces, by default 4096.
+        Max number of MSA sequences, by default 4096.
     use_msa_server : bool, optional
         Whether to use the MMSeqs2 server for MSA generation, by default False.
 
@@ -462,6 +462,12 @@ def cli() -> None:
     help="Whether to override existing found predictions. Default is False.",
 )
 @click.option(
+    "--seed",
+    type=int,
+    help="Seed to use for random number generator. Default is None (no seeding).",
+    default=None,
+)
+@click.option(
     "--use_msa_server",
     is_flag=True,
     help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
@@ -493,6 +499,7 @@ def predict(
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
     override: bool = False,
+    seed: Optional[int] = None,
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
@@ -508,6 +515,10 @@ def predict(
 
     # Ignore matmul precision warning
     torch.set_float32_matmul_precision("highest")
+
+    # Set seed if desired
+    if seed is not None:
+        seed_everything(seed)
 
     # Set cache path
     cache = Path(cache).expanduser()
