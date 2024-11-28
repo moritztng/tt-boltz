@@ -16,7 +16,7 @@ dependencies = [
     "rdkit>=2024.3.2",
     "dm-tree==0.1.8",
     "requests==2.32.3",
-    "pandas==2.2.3",
+    "pandas>=2.2.2",
     "types-requests",
     "einops==0.8.0",
     "einx==0.3.0",

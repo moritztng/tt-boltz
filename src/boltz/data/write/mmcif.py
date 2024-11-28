@@ -1,5 +1,6 @@
 import io
-from typing import Iterator, Optional
+from collections.abc import Iterator
+from typing import Optional
 
 import ihm
 import modelcif
@@ -13,7 +14,7 @@ from boltz.data.types import Structure
 from boltz.data.write.utils import generate_tags
 
 
-def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: C901
+def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: C901, PLR0915, PLR0912
     """Write a structure into an MMCIF file.
 
     Parameters
@@ -150,12 +151,12 @@ def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # n
                             type_symbol=element,
                             seq_id=residue_index,
                             atom_id=name,
-                            x=pos[0],
-                            y=pos[1],
-                            z=pos[2],
+                            x=f"{pos[0]:.5f}",
+                            y=f"{pos[1]:.5f}",
+                            z=f"{pos[2]:.5f}",
                             het=het,
-                            biso=1.00,
-                            occupancy=1.00,
+                            biso=1,
+                            occupancy=1,
                         )
 
         def add_plddt(self, plddts):
