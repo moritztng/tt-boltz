@@ -1,5 +1,6 @@
 import pickle
 import urllib.request
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -15,6 +16,7 @@ from boltz.data import const
 from boltz.data.module.inference import BoltzInferenceDataModule
 from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
+from boltz.data.parse.csv import parse_csv
 from boltz.data.parse.fasta import parse_fasta
 from boltz.data.parse.yaml import parse_yaml
 from boltz.data.types import MSA, Manifest, Record
@@ -158,7 +160,12 @@ def check_inputs(
     return data
 
 
-def compute_msa(data: dict[str, str], msa_dir: Path, msa_server_url:str, msa_pairing_strategy:str) -> list[Path]:
+def compute_msa(
+    data: dict[str, str],
+    msa_dir: Path,
+    msa_server_url: str,
+    msa_pairing_strategy: str,
+) -> list[Path]:
     """Compute the MSA for the input data.
 
     Parameters
@@ -174,15 +181,50 @@ def compute_msa(data: dict[str, str], msa_dir: Path, msa_server_url:str, msa_pai
         The list of MSA files.
 
     """
-    # Run MMSeqs2
-    msa = run_mmseqs2(list(data.values()), msa_dir, use_pairing=len(data) > 1, host_url=msa_server_url, pairing_strategy=msa_pairing_strategy)
+    if len(data) > 1:
+        paired_msas = run_mmseqs2(
+            list(data.values()),
+            msa_dir / "tmp",
+            use_env=True,
+            use_pairing=True,
+            host_url=msa_server_url,
+            pairing_strategy=msa_pairing_strategy,
+        )
 
-    # Dump to A3M
-    for idx, key in enumerate(data):
-        entity_msa = msa[idx]
-        msa_path = msa_dir / f"{key}.a3m"
+    unpaired_msa = run_mmseqs2(
+        list(data.values()),
+        msa_dir / "tmp",
+        use_env=True,
+        use_pairing=False,
+        host_url=msa_server_url,
+        pairing_strategy=msa_pairing_strategy,
+    )
+
+    for idx, name in enumerate(data):
+        # Get paired sequences
+        paired = paired_msas[idx].strip().splitlines()
+        paired = paired[1::2]  # ignore headers
+        paired = paired[: const.max_paired_seqs]
+
+        # Set key per row and remove empty sequences
+        keys = [idx for idx, s in enumerate(paired) if s != "-" * len(s)]
+        paired = [s for s in paired if s != "-" * len(s)]
+
+        # Combine paired-unpaired sequences
+        unpaired = unpaired_msa[idx].strip().splitlines()
+        unpaired = unpaired[1::2]
+        unpaired = unpaired[: (const.max_msa_seqs - len(paired))]
+
+        # Combine
+        seqs = paired + unpaired
+        keys = keys + [-1] * len(unpaired)
+
+        # Dump MSA
+        csv_str = ["key,sequence"] + [f"{key},{seq}" for key, seq in zip(keys, seqs)]
+
+        msa_path = msa_dir / f"{name}.csv"
         with msa_path.open("w") as f:
-            f.write(entity_msa)
+            f.write("\n".join(csv_str))
 
 
 @rank_zero_only
@@ -264,7 +306,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 entity_id = chain.entity_id
                 msa_id = f"{target_id}_{entity_id}"
                 to_generate[msa_id] = target.sequences[entity_id]
-                chain.msa_id = msa_dir / f"{msa_id}.a3m"
+                chain.msa_id = msa_dir / f"{msa_id}.csv"
 
             # We do not support msa generation for non-protein chains
             elif chain.msa_id == 0:
@@ -278,7 +320,12 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
         if to_generate:
             msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
             click.echo(msg)
-            compute_msa(to_generate, msa_dir, msa_server_url=msa_server_url, msa_pairing_strategy=msa_pairing_strategy)
+            compute_msa(
+                to_generate,
+                msa_dir,
+                msa_server_url=msa_server_url,
+                msa_pairing_strategy=msa_pairing_strategy,
+            )
 
         # Parse MSA data
         msas = {c.msa_id for c in target.record.chains if c.msa_id != -1}
@@ -294,11 +341,19 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
             processed = processed_msa_dir / f"{target_id}_{msa_idx}.npz"
             msa_id_map[msa_id] = f"{target_id}_{msa_idx}"
             if not processed.exists():
-                msa: MSA = parse_a3m(
-                    msa_path,
-                    taxonomy=None,
-                    max_seqs=max_msa_seqs,
-                )
+                # Parse A3M
+                if msa_path.suffix == ".a3m":
+                    msa: MSA = parse_a3m(
+                        msa_path,
+                        taxonomy=None,
+                        max_seqs=max_msa_seqs,
+                    )
+                elif msa_path.suffix == ".csv":
+                    msa: MSA = parse_csv(msa_path)
+                else:
+                    msg = f"MSA file {msa_path} not supported, only a3m or csv."
+                    raise RuntimeError(msg)
+
                 msa.dump(processed)
 
         # Modify records to point to processed MSA
@@ -433,6 +488,10 @@ def predict(
 
     # Set no grad
     torch.set_grad_enabled(False)
+
+    # Ignore matmul precision warning
+    # warnings.filterwarnings("ignore", "*To properly utilize them, you should set*")
+    torch.set_float32_matmul_precision("highest")
 
     # Set cache path
     cache = Path(cache).expanduser()
