@@ -1,6 +1,5 @@
 import pickle
 import urllib.request
-import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -490,7 +489,6 @@ def predict(
     torch.set_grad_enabled(False)
 
     # Ignore matmul precision warning
-    # warnings.filterwarnings("ignore", "*To properly utilize them, you should set*")
     torch.set_float32_matmul_precision("highest")
 
     # Set cache path
@@ -511,6 +509,19 @@ def predict(
     if not data:
         click.echo("No predictions to run, exiting.")
         return
+
+    # Set up trainer
+    strategy = "auto"
+    if (isinstance(devices, int) and devices > 1) or (
+        isinstance(devices, list) and len(devices) > 1
+    ):
+        strategy = DDPStrategy()
+        if len(data) < devices:
+            msg = (
+                "Number of requested devices is greater "
+                "than the number of predictions."
+            )
+            raise ValueError(msg)
 
     msg = f"Running predictions for {len(data)} structure"
     msg += "s" if len(data) > 1 else ""
@@ -567,13 +578,6 @@ def predict(
         output_dir=out_dir / "predictions",
         output_format=output_format,
     )
-
-    # Set up trainer
-    strategy = "auto"
-    if (isinstance(devices, int) and devices > 1) or (
-        isinstance(devices, list) and len(devices) > 1
-    ):
-        strategy = DDPStrategy()
 
     trainer = Trainer(
         default_root_dir=out_dir,
