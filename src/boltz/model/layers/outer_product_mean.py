@@ -85,6 +85,7 @@ class OuterProductMean(nn.Module):
                     z_out = z_out + z.to(m) @ sliced_weight_proj_o.T
             return z_out
         else:
+            mask = mask[:, :, None, :] * mask[:, :, :, None]
             num_mask = mask.sum(1).clamp(min=1)
             z = torch.einsum("bsic,bsjd->bijcd", a.float(), b.float())
             z = z.reshape(*z.shape[:3], -1)
