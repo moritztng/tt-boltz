@@ -54,8 +54,9 @@ We welcome external contributions and are eager to engage with the community. Co
 
 - [x] Auto-generated MSAs using MMseqs2
 - [x] More examples
-- [ ] Support for custom paired MSA
-- [ ] Confidence model checkpoint
+- [x] Support for custom paired MSA
+- [x] Confidence model checkpoint
+- [x] Chunking for lower memory usage
 - [ ] Pocket conditioning support
 - [ ] Full data processing pipeline
 - [ ] Colab notebook for inference

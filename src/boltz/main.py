@@ -191,6 +191,8 @@ def compute_msa(
             host_url=msa_server_url,
             pairing_strategy=msa_pairing_strategy,
         )
+    else:
+        paired_msas = [""] * len(data)
 
     unpaired_msa = run_mmseqs2(
         list(data.values()),
