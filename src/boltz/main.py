@@ -23,7 +23,9 @@ from boltz.data.write.writer import BoltzWriter
 from boltz.model.model import Boltz1
 
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
-MODEL_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1.ckpt"
+MODEL_URL = (
+    "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt"
+)
 
 
 @dataclass
@@ -75,7 +77,7 @@ def download(cache: Path) -> None:
         urllib.request.urlretrieve(CCD_URL, str(ccd))  # noqa: S310
 
     # Download model
-    model = cache / "boltz1.ckpt"
+    model = cache / "boltz1_conf.ckpt"
     if not model.exists():
         click.echo(
             f"Downloading the model weights to {model}. You may "
@@ -429,22 +431,16 @@ def cli() -> None:
     default=1,
 )
 @click.option(
-    "--write_confidence_summary",
-    type=bool,
-    help="Whether to dump the confidence metrics summary and plddt into a json file. Default is True.",
-    default=True,
-)
-@click.option(
     "--write_full_pae",
     type=bool,
+    is_flag=True,
     help="Whether to dump the pae into a npz file. Default is True.",
-    default=True,
 )
 @click.option(
     "--write_full_pde",
     type=bool,
+    is_flag=True,
     help="Whether to dump the pde into a npz file. Default is False.",
-    default=False,
 )
 @click.option(
     "--output_format",
@@ -490,8 +486,7 @@ def predict(
     recycling_steps: int = 3,
     sampling_steps: int = 200,
     diffusion_samples: int = 1,
-    write_confidence_summary: bool = True,
-    write_full_pae: bool = True,
+    write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
@@ -577,13 +572,13 @@ def predict(
 
     # Load model
     if checkpoint is None:
-        checkpoint = cache / "boltz1.ckpt"
+        checkpoint = cache / "boltz1_conf.ckpt"
 
     predict_args = {
         "recycling_steps": recycling_steps,
         "sampling_steps": sampling_steps,
         "diffusion_samples": diffusion_samples,
-        "write_confidence_summary": write_confidence_summary,
+        "write_confidence_summary": True,
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
     }
