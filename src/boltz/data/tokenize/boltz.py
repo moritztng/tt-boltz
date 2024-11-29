@@ -36,7 +36,7 @@ class BoltzTokenizer(Tokenizer):
 
         Parameters
         ----------
-        data : Inpput
+        data : Input
             The input data.
 
         Returns
