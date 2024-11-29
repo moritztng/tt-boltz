@@ -2,9 +2,9 @@
 
 Once you have installed `boltz`, you can start making predictions by simply running:
 
-`boltz predict <INPUT_PATH>`
+`boltz predict <INPUT_PATH> --use_msa_server`
 
-where `<INPUT_PATH>` is a path to the input file or a directory. The input file can either be in fasta (enough for most use cases) or YAML  format (for more complex inputs). If you specify a directory, `boltz` will run predictions on each `.yaml` or `.fasta` file in the directory.
+where `<INPUT_PATH>` is a path to the input file or a directory. The input file can either be in fasta (enough for most use cases) or YAML  format (for more complex inputs). If you specify a directory, `boltz` will run predictions on each `.yaml` or `.fasta` file in the directory. Passing the `--use_msa_server` flag will auto-generate the MSA using the mmseqs2 server, otherwise you can provide a precomputed MSA. 
 
 Before diving into more details about the input formats, here are the key differences in what they each support:
 
@@ -106,25 +106,31 @@ N[C@@H](Cc1ccc(O)cc1)C(=O)O
 
 The following options are available for the `predict` command:
 
-    boltz predict [OPTIONS] input_path
+    boltz predict input_path [OPTIONS]
 
-| **Option**                  | **Type**        | **Default**        | **Description**                                                                 |
-|-----------------------------|-----------------|--------------------|---------------------------------------------------------------------------------|
-| `--out_dir PATH`            | `PATH`          | `./`             | The path where to save the predictions.                                         |
-| `--cache PATH`              | `PATH`          | `~/.boltz`         | The directory where to download the data and model.                             |
-| `--checkpoint PATH`         | `PATH`          | None      | An optional checkpoint. Uses the provided Boltz-1 model by default.             |
-| `--devices INTEGER`         | `INTEGER`       | `1`                | The number of devices to use for prediction.                                    |
-| `--accelerator`             | `[gpu,cpu,tpu]` | `gpu`              | The accelerator to use for prediction.                                          |
-| `--recycling_steps INTEGER` | `INTEGER`       | `3`                | The number of recycling steps to use for prediction.                            |
-| `--sampling_steps INTEGER`  | `INTEGER`       | `200`              | The number of sampling steps to use for prediction.                             |
-| `--diffusion_samples INTEGER` | `INTEGER`       | `1`                | The number of diffusion samples to use for prediction.                          |
-| `--output_format`           | `[pdb,mmcif]`   | `mmcif`            | The output format to use for the predictions.                                   |
-| `--num_workers INTEGER`     | `INTEGER`       | `2`                | The number of dataloader workers to use for prediction.                         |
-| `--override`                | `FLAG`          | `False`            | Whether to override existing predictions if found.                              |
-| `--use_msa_server`                | `FLAG`          | `False`            | Whether to use the msa server to generate msa's.                           |
-| `--msa_server_url`                | str          | `https://api.colabfold.com`            |  MSA server url. Used only if --use_msa_server is set.                           |
-| `--msa_pairing_strategy`                | str          | `greedy`            | Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'                           |
+As an example to predict a structure using 10 recycling steps and 25 samples (the default parameters for AlphaFold3) use (note however that the prediction will take significantly longer):
 
+    boltz predict input_path --recycling_steps 10 --diffusion_samples 25
+
+
+| **Option**                    | **Type**        | **Default**        | **Description**                                                                                    |
+|-------------------------------|-----------------|--------------------|----------------------------------------------------------------------------------------------------|
+| `--out_dir PATH`              | `PATH`          | `./`             | The path where to save the predictions.                                                            |
+| `--cache PATH`                | `PATH`          | `~/.boltz`         | The directory where to download the data and model.                                                |
+| `--checkpoint PATH`           | `PATH`          | None      | An optional checkpoint. Uses the provided Boltz-1 model by default.                                |
+| `--devices INTEGER`           | `INTEGER`       | `1`                | The number of devices to use for prediction.                                                       |
+| `--accelerator`               | `[gpu,cpu,tpu]` | `gpu`              | The accelerator to use for prediction.                                                             |
+| `--recycling_steps INTEGER`   | `INTEGER`       | `3`                | The number of recycling steps to use for prediction.                                               |
+| `--sampling_steps INTEGER`    | `INTEGER`       | `200`              | The number of sampling steps to use for prediction.                                                |
+| `--diffusion_samples INTEGER` | `INTEGER`       | `1`                | The number of diffusion samples to use for prediction.                                             |
+| `--output_format`             | `[pdb,mmcif]`   | `mmcif`            | The output format to use for the predictions.                                                      |
+| `--num_workers INTEGER`       | `INTEGER`       | `2`                | The number of dataloader workers to use for prediction.                                            |
+| `--override`                  | `FLAG`          | `False`            | Whether to override existing predictions if found.                                                 |
+| `--use_msa_server`            | `FLAG`          | `False`            | Whether to use the msa server to generate msa's.                                                   |
+| `--msa_server_url`            | str          | `https://api.colabfold.com`            | MSA server url. Used only if --use_msa_server is set.                                              |
+| `--msa_pairing_strategy`      | str          | `greedy`            | Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete' |
+| `--write_full_pae`            | `FLAG`          | `False`            | Whether to save the full PAE matrix as a file.                                                     |
+| `--write_full_pde`            | `FLAG`          | `False`            | Whether to save the full PDE matrix as a file.                                                     |
 
 ## Output
 
@@ -134,11 +140,16 @@ out_dir/
 ├── lightning_logs/                                            # Logs generated during training or evaluation
 ├── predictions/                                               # Contains the model's predictions
     ├── [input_file1]/
-        ├── [input_file1]_model_0.cif                          # The predicted structure in CIF format
+        ├── [input_file1]_model_0.cif                          # The predicted structure in CIF format, with the inclusion of per token pLDDT scores
+        ├── confidence_[input_file1]_model_0.json              # The confidence scores (confidence_score, ptm, iptm, ligand_iptm, protein_iptm, complex_plddt, complex_iplddt, chains_ptm, pair_chains_iptm)
+        ├── pae_[input_file1]_model_0.npz                      # The predicted PAE score for every pair of tokens
+        ├── pde_[input_file1]_model_0.npz                      # The predicted PDE score for every pair of tokens
+        ├── plddt_[input_file1]_model_0.npz                    # The predicted pLDDT score for every token
         ...
         └── [input_file1]_model_[diffusion_samples-1].cif      # The predicted structure in CIF format
+        ...
     └── [input_file2]/
         ...
 └── processed/                                                 # Processed data used during execution 
 ```
-The `predictions` folder contains a unique folder for each input file. The input folders contain diffusion_samples predictions saved in the output_format. The `processed` folder contains the processed input files that are used by the model during inference.
+The `predictions` folder contains a unique folder for each input file. The input folders contain `diffusion_samples` predictions saved in the output_format ordered by confidence score as well as additional files containing the predictions of the confidence model. The `processed` folder contains the processed input files that are used by the model during inference.

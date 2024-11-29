@@ -29,7 +29,7 @@ cd boltz; pip install -e .
 You can run inference using Boltz-1 with:
 
 ```
-boltz predict input_path
+boltz predict input_path --use_msa_server
 ```
 
 Boltz currently accepts three input formats:
