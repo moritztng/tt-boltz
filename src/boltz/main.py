@@ -357,7 +357,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                         max_seqs=max_msa_seqs,
                     )
                 elif msa_path.suffix == ".csv":
-                    msa: MSA = parse_csv(msa_path)
+                    msa: MSA = parse_csv(msa_path, max_seqs=max_msa_seqs)
                 else:
                     msg = f"MSA file {msa_path} not supported, only a3m or csv."
                     raise RuntimeError(msg)
