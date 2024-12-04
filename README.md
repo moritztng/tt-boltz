@@ -13,7 +13,7 @@ For more information about the model, see our [technical report](https://doi.org
 Install boltz with PyPI (recommended):
 
 ```
-pip install boltz
+pip install boltz -U
 ```
 
 or directly from GitHub for daily updates:
