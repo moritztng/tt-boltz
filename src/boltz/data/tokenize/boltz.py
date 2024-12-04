@@ -36,7 +36,7 @@ class BoltzTokenizer(Tokenizer):
 
         Parameters
         ----------
-        data : Inpput
+        data : Input
             The input data.
 
         Returns
@@ -177,9 +177,6 @@ class BoltzTokenizer(Tokenizer):
             )
             token_bonds.append(token_bond)
 
-        # Consider adding missing bond for modified residues to standard?
-        # I'm not sure it's necessary because the bond is probably always
-        # the same and the model can use the residue indices to infer it
         token_data = np.array(token_data, dtype=Token)
         token_bonds = np.array(token_bonds, dtype=TokenBond)
         tokenized = Tokenized(

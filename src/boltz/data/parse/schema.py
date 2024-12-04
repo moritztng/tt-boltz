@@ -4,7 +4,7 @@ from typing import Optional
 
 import click
 import numpy as np
-from rdkit import rdBase
+from rdkit import rdBase, Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdchem import Conformer, Mol
 
@@ -130,6 +130,14 @@ def compute_3d_conformer(mol: Mol, version: str = "v3") -> bool:
 
     try:
         conf_id = AllChem.EmbedMolecule(mol, options)
+
+        if conf_id == -1:
+            print(f"WARNING: RDKit ETKDGv3 failed to generate a conformer for molecule "
+                  f"{Chem.MolToSmiles(AllChem.RemoveHs(mol))}, so the program will start with random coordinates. "
+                  f"Note that the performance of the model under this behaviour was not tested.")
+            options.useRandomCoords = True
+            conf_id = AllChem.EmbedMolecule(mol, options)
+
         AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
 
     except RuntimeError:

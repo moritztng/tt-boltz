@@ -1127,7 +1127,8 @@ class Boltz1(LightningModule):
             pred_dict["coords"] = out["sample_atom_coords"]
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
-                    4 * out["complex_plddt"] + out["iptm"]
+                    4 * out["complex_plddt"] +
+                    (out["iptm"] if not torch.allclose(out["iptm"], torch.zeros_like(out["iptm"])) else out["ptm"])
                 ) / 5
                 for key in [
                     "ptm",
