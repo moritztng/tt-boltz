@@ -224,7 +224,7 @@ class MSAModule(nn.Module):
         """
         # Set chunk sizes
         if not self.training:
-            if z.shape[1] > 512:
+            if z.shape[1] > const.chunk_size_threshold:
                 chunk_heads_pwa = True
                 chunk_size_transition_z = 64
                 chunk_size_transition_msa = 32
@@ -520,7 +520,7 @@ class PairformerModule(nn.Module):
 
         """
         if not self.training:
-            if z.shape[1] > 512:
+            if z.shape[1] > const.chunk_size_threshold:
                 chunk_size_tri_attn = 128
             else:
                 chunk_size_tri_attn = 512
