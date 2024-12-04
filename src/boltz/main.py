@@ -163,29 +163,31 @@ def check_inputs(
 
 def compute_msa(
     data: dict[str, str],
+    target_id: str,
     msa_dir: Path,
     msa_server_url: str,
     msa_pairing_strategy: str,
-) -> list[Path]:
+) -> None:
     """Compute the MSA for the input data.
 
     Parameters
     ----------
     data : dict[str, str]
         The input protein sequences.
+    target_id : str
+        The target id.
     msa_dir : Path
-        The msa temp directory.
-
-    Returns
-    -------
-    list[Path]
-        The list of MSA files.
+        The msa directory.
+    msa_server_url : str
+        The MSA server URL.
+    msa_pairing_strategy : str
+        The MSA pairing strategy.
 
     """
     if len(data) > 1:
         paired_msas = run_mmseqs2(
             list(data.values()),
-            msa_dir / "tmp",
+            msa_dir / f"{target_id}_paired_tmp",
             use_env=True,
             use_pairing=True,
             host_url=msa_server_url,
@@ -196,7 +198,7 @@ def compute_msa(
 
     unpaired_msa = run_mmseqs2(
         list(data.values()),
-        msa_dir / "tmp",
+        msa_dir / f"{target_id}_unpaired_tmp",
         use_env=True,
         use_pairing=False,
         host_url=msa_server_url,
@@ -217,6 +219,8 @@ def compute_msa(
         unpaired = unpaired_msa[idx].strip().splitlines()
         unpaired = unpaired[1::2]
         unpaired = unpaired[: (const.max_msa_seqs - len(paired))]
+        if paired:
+            unpaired = unpaired[1:]  # ignore query is already present
 
         # Combine
         seqs = paired + unpaired
@@ -324,14 +328,15 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
             msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
             click.echo(msg)
             compute_msa(
-                to_generate,
-                msa_dir,
+                data=to_generate,
+                target_id=target_id,
+                msa_dir=msa_dir,
                 msa_server_url=msa_server_url,
                 msa_pairing_strategy=msa_pairing_strategy,
             )
 
         # Parse MSA data
-        msas = {c.msa_id for c in target.record.chains if c.msa_id != -1}
+        msas = sorted({c.msa_id for c in target.record.chains if c.msa_id != -1})
         msa_id_map = {}
         for msa_idx, msa_id in enumerate(msas):
             # Check that raw MSA exists
