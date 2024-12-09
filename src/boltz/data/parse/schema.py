@@ -786,18 +786,37 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "bond" in constraint:
+            if "atom1" not in constraint["bond"] or "atom2" not in constraint["bond"]:
+                msg = f"Bond constraint was not properly specified"
+                raise ValueError(msg)
+
             c1, r1, a1 = tuple(constraint["bond"]["atom1"])
             c2, r2, a2 = tuple(constraint["bond"]["atom2"])
             c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
             c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
             connections.append((c1, c2, r1, r2, a1, a2))
         elif "pocket" in constraint:
+            if "binder" not in constraint["pocket"] or "contacts" not in constraint["pocket"]:
+                msg = f"Pocket constraint was not properly specified"
+                raise ValueError(msg)
+
             binder = constraint["pocket"]["binder"]
             contacts = constraint["pocket"]["contacts"]
-            pocket_binders.append(chain_to_idx[binder])
-            pocket_residues.extend([
-                (chain_to_idx[chain_name],residue_index) for chain_name,residue_index in contacts
-            ])
+
+            if len(pocket_binders) > 0:
+                if pocket_binders[-1] != chain_to_idx[binder]:
+                    msg = f"Only one pocket binders is supported!"
+                    raise ValueError(msg)
+                else:
+                    pocket_residues[-1].extend([
+                        (chain_to_idx[chain_name], residue_index - 1) for chain_name, residue_index in contacts
+                    ])
+
+            else:
+                pocket_binders.append(chain_to_idx[binder])
+                pocket_residues.extend(
+                    [(chain_to_idx[chain_name],residue_index-1) for chain_name,residue_index in contacts]
+                )
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)

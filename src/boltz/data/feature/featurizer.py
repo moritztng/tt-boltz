@@ -450,6 +450,8 @@ def process_token_features(
                 pocket_feature[idx] = const.pocket_contact_info["BINDER"]
             elif (token["asym_id"], token["res_idx"]) in pocket_residues:
                 pocket_feature[idx] = const.pocket_contact_info["POCKET"]
+            else:
+                pocket_feature[idx] = const.pocket_contact_info["UNSELECTED"]
     elif (
         binder_pocket_conditioned_prop > 0.0
         and random.random() < binder_pocket_conditioned_prop
