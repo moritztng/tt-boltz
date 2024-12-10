@@ -57,7 +57,7 @@ We welcome external contributions and are eager to engage with the community. Co
 - [x] Support for custom paired MSA
 - [x] Confidence model checkpoint
 - [x] Chunking for lower memory usage
-- [ ] Pocket conditioning support
+- [x] Pocket conditioning support
 - [ ] Full data processing pipeline
 - [ ] Colab notebook for inference
 - [ ] Kernel integration
