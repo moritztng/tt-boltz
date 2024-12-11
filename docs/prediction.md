@@ -117,24 +117,25 @@ As an example to predict a structure using 10 recycling steps and 25 samples (th
     boltz predict input_path --recycling_steps 10 --diffusion_samples 25
 
 
-| **Option**                    | **Type**        | **Default**        | **Description**                                                                                    |
-|-------------------------------|-----------------|--------------------|----------------------------------------------------------------------------------------------------|
-| `--out_dir PATH`              | `PATH`          | `./`             | The path where to save the predictions.                                                            |
-| `--cache PATH`                | `PATH`          | `~/.boltz`         | The directory where to download the data and model.                                                |
-| `--checkpoint PATH`           | `PATH`          | None      | An optional checkpoint. Uses the provided Boltz-1 model by default.                                |
-| `--devices INTEGER`           | `INTEGER`       | `1`                | The number of devices to use for prediction.                                                       |
-| `--accelerator`               | `[gpu,cpu,tpu]` | `gpu`              | The accelerator to use for prediction.                                                             |
-| `--recycling_steps INTEGER`   | `INTEGER`       | `3`                | The number of recycling steps to use for prediction.                                               |
-| `--sampling_steps INTEGER`    | `INTEGER`       | `200`              | The number of sampling steps to use for prediction.                                                |
-| `--diffusion_samples INTEGER` | `INTEGER`       | `1`                | The number of diffusion samples to use for prediction.                                             |
-| `--output_format`             | `[pdb,mmcif]`   | `mmcif`            | The output format to use for the predictions.                                                      |
-| `--num_workers INTEGER`       | `INTEGER`       | `2`                | The number of dataloader workers to use for prediction.                                            |
-| `--override`                  | `FLAG`          | `False`            | Whether to override existing predictions if found.                                                 |
-| `--use_msa_server`            | `FLAG`          | `False`            | Whether to use the msa server to generate msa's.                                                   |
-| `--msa_server_url`            | str          | `https://api.colabfold.com`            | MSA server url. Used only if --use_msa_server is set.                                              |
-| `--msa_pairing_strategy`      | str          | `greedy`            | Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete' |
-| `--write_full_pae`            | `FLAG`          | `False`            | Whether to save the full PAE matrix as a file.                                                     |
-| `--write_full_pde`            | `FLAG`          | `False`            | Whether to save the full PDE matrix as a file.                                                     |
+| **Option**              | **Type**        | **Default**                 | **Description**                                                                                                                                                                      |
+|-------------------------|-----------------|-----------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--out_dir`             | `PATH`          | `./`                        | The path where to save the predictions.                                                                                                                                              |
+| `--cache`               | `PATH`          | `~/.boltz`                  | The directory where to download the data and model.                                                                                                                                  |
+| `--checkpoint`          | `PATH`          | None                        | An optional checkpoint. Uses the provided Boltz-1 model by default.                                                                                                                  |
+| `--devices`             | `INTEGER`       | `1`                         | The number of devices to use for prediction.                                                                                                                                         |
+| `--accelerator`         | `[gpu,cpu,tpu]` | `gpu`                       | The accelerator to use for prediction.                                                                                                                                               |
+| `--recycling_steps`     | `INTEGER`       | `3`                         | The number of recycling steps to use for prediction.                                                                                                                                 |
+| `--sampling_steps`      | `INTEGER`       | `200`                       | The number of sampling steps to use for prediction.                                                                                                                                  |
+| `--diffusion_samples`   | `INTEGER`       | `1`                         | The number of diffusion samples to use for prediction.                                                                                                                               |
+| `--step_scale`          | `FLOAT`         | `1.638`                     | The step size is related to the temperature at which the diffusion process samples the distribution. The lower the higher the diversity among samples (recommended between 1 and 2). |
+| `--output_format`       | `[pdb,mmcif]`   | `mmcif`                     | The output format to use for the predictions.                                                                                                                                        |
+| `--num_workers`  | `INTEGER`       | `2`                         | The number of dataloader workers to use for prediction.                                                                                                                              |
+| `--override`            | `FLAG`          | `False`                     | Whether to override existing predictions if found.                                                                                                                                   |
+| `--use_msa_server`      | `FLAG`          | `False`                     | Whether to use the msa server to generate msa's.                                                                                                                                     |
+| `--msa_server_url`      | str             | `https://api.colabfold.com` | MSA server url. Used only if --use_msa_server is set.                                                                                                                                |
+| `--msa_pairing_strategy` | str             | `greedy`                    | Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'                                                                                   |
+| `--write_full_pae`      | `FLAG`          | `False`                     | Whether to save the full PAE matrix as a file.                                                                                                                                       |
+| `--write_full_pde`      | `FLAG`          | `False`                     | Whether to save the full PDE matrix as a file.                                                                                                                                       |
 
 ## Output
 

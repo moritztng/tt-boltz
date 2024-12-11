@@ -438,6 +438,13 @@ def cli() -> None:
     default=1,
 )
 @click.option(
+    "--step_scale",
+    type=float,
+    help="The step size is related to the temperature at which the diffusion process samples the distribution."
+         "The lower the higher the diversity among samples (recommended between 1 and 2). Default is 1.638.",
+    default=1.638,
+)
+@click.option(
     "--write_full_pae",
     type=bool,
     is_flag=True,
@@ -499,6 +506,7 @@ def predict(
     recycling_steps: int = 3,
     sampling_steps: int = 200,
     diffusion_samples: int = 1,
+    step_scale: float = 1.638,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -600,12 +608,14 @@ def predict(
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
     }
+    diffusion_params = BoltzDiffusionParams()
+    diffusion_params.step_scale = step_scale
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=True,
         predict_args=predict_args,
         map_location="cpu",
-        diffusion_process_args=asdict(BoltzDiffusionParams()),
+        diffusion_process_args=asdict(diffusion_params),
         ema=False,
     )
     model_module.eval()
