@@ -2,9 +2,40 @@
 
 ## Download the pre-processed data
 
-Instructions on how to download the processed dataset for training are coming soon, we are currently uploading the data to sharable storage and will update this page when ready.
+To run training, you will need to download a a few pre-processed datasets. Note that you will need ~250G of storage for all the data. If instead you want to re-run the preprocessing pipeline or processed your own raw data for training, please see the [instructions](#processing-raw-data) at the bottom of this page.
 
-If you wish to re-run the preprocessing pipeline, or processed your own raw data for training / fine-tuning, see the instructions at the bottom of this page.
+- The pre-processed RCSB (i.e PDB) structures:
+```bash
+wget https://boltz1.s3.us-east-2.amazonaws.com/rcsb_processed_targets.tar
+tar -xf rcsb_processed_targets.tar
+rm rcsb_processed_targets.tar
+```
+
+- The pre-processed RCSB (i.e PDB) MSA's:
+```bash
+wget https://boltz1.s3.us-east-2.amazonaws.com/rcsb_processed_msa.tar
+tar -xf rcsb_processed_msa.tar
+rm rcsb_processed_msa.tar
+```
+
+- The pre-processed OpenFold structures:
+```bash
+wget https://boltz1.s3.us-east-2.amazonaws.com/openfold_processed_targets.tar
+tar -xf openfold_processed_targets.tar
+rm openfold_processed_targets.tar
+```
+
+- The pre-processed OpenFold MSA's:
+```bash
+wget https://boltz1.s3.us-east-2.amazonaws.com/openfold_processed_msa.tar
+tar -xf openfold_processed_msa.tar
+rm openfold_processed_msa.tar
+```
+
+- The pre-computed symmetry files for ligands:
+```bash
+wget https://boltz1.s3.us-east-2.amazonaws.com/symmetries.pkl
+```
 
 ## Modify the configuration file
 
@@ -51,7 +82,7 @@ We also provide a different configuration file to train the confidence model:
 
 ## Processing raw data
 
-There are several steps to perform when processing raw data for boltz training.
+We have already pre-processed the training data for the PDB and the OpenFold self-distillation set. However, if you'd like to replicate the processing pipeline or processed your own data for training, you can follow the instructions below.
 
 
 #### Step 1: Go to the processing folder
@@ -76,16 +107,19 @@ You must also install two external libraries: `mmseqs` and `redis`. Instructions
 #### Step 3: Preprocess the CCD dictionary
 
 
-We have already done this for you, the relevant file is here. Unless you wish to do it again yourself, you can skip to the next step!
+We have already done this for you, the relevant file is here:
+```bash
+wget https://boltz1.s3.us-east-2.amazonaws.com/ccd.pkl
+```
 
-If you do want to do this your self, you can do so with the following commands:
+Unless you wish to do it again yourself, you can skip to the next step! If you do want to recreate the file, you can do so with the following commands:
 
 ```bash
 wget https://files.wwpdb.org/pub/pdb/data/monomers/components.cif
 python ccd.py --components components.cif --ouptut ccd.pkl
 ```
 
-> Note: runs in parallel by default with as many threads as cpu cores on your machine, can be changed with `--num_processed`
+> Note: runs in parallel by default with as many threads as cpu cores on your machine, can be changed with `--num_processes`
 
 #### Step 4: Create sequence clusters
 
@@ -97,10 +131,7 @@ wget https://files.rcsb.org/pub/pdb/derived_data/pdb_seqres.txt.gz
 gunzip -d pdb_seqres.txt.gz
 ```
 
-For the OpenFold data, we provide this for you here:
-```
-Link to come
-``` 
+> Note: for the OpenFold data, since the sequences were chosen for diversity, we do not apply any clustering.
 
 When this is done, you can run the clustering script, which assigns proteins to 40% similarity clusters and rna/dna to a cluster for each unique sequence. For ligands, each CCD code is also assigned to its own cluster.
 
@@ -116,13 +147,20 @@ We have already computed MSA's for all sequences in the PDB at the time of train
 
 The raw MSA's for the PDB can be found here:
 ```
-Link to come
+wget https://boltz1.s3.us-east-2.amazonaws.com/rcsb_raw_msa.tar
+tar -xf rcsb_raw_msa.tar
+rm rcsb_raw_msa.tar
 ```
+> Note: this file is 130G large, and will take another 130G to extract before you can delete the original tar archive, we make sure you have enough storage on your machine.
 
 You can also download the raw OpenFold MSA's here:
 ```
-Link to come
+wget https://boltz1.s3.us-east-2.amazonaws.com/openfold_raw_msa.tar
+tar -xf openfold_raw_msa.tar
+rm openfold_raw_msa.tar
 ```
+
+> Note: this file is 88G large, and will take another 88G to extract before you can delete the original tar archive, we make sure you have enough storage on your machine.
 
 If you wish to use your own MSA's, just ensure that their file name is the hash of the query sequence, according to the following function:
 ```python
@@ -135,9 +173,7 @@ def hash_sequence(seq: str) -> str:
 
 #### Step 6: Process MSA's
 
-During MSA processing, we annotate sequences using their taxonomy ID, which is important for MSA pairing during training.
-
-This happens only on MSA sequences with headers that start with the following:
+During MSA processing, among other things, we annotate sequences using their taxonomy ID, which is important for MSA pairing during training. This happens only on MSA sequences with headers that start with the following:
 
 ```
 >UniRef100_UNIREFID
@@ -146,10 +182,10 @@ This happens only on MSA sequences with headers that start with the following:
 
 This format is the way that MSA's are provided by colabfold. If you use a different MSA pipeline, make sure your Uniref MSA's follow the above format.
 
-Next you should download our provided taxonomy database and place it in this folder:
+Next you should download our provided taxonomy database and place it in the current folder:
 
 ```bash
-Link to come
+wget https://boltz1.s3.us-east-2.amazonaws.com/taxonomy.rdb
 ```
 
 You can now process the raw MSAs. First launch a redis server. We use redis to share the large taxonomy dictionary across workers, so MSA processing can happen in parallel without blowing up the RAM usage.
@@ -164,7 +200,7 @@ In a separate shell, run the processing script:
 python msa.py --msadir YOUR_MSA_DIR --outdir YOUR_OUTPUT_DIR --redis-port 7777
 ```
 
-> Important: the script looks for `.a3m` files in the directory, make sure to match this extension and file format.
+> Important: the script looks for `.a3m` or `.a3m.gz` files in the directory, make sure to match this extension and file format.
 
 #### Step 7: Process structures
 
@@ -175,7 +211,7 @@ https://www.rcsb.org/docs/programmatic-access/file-download-services
 
 
 ```bash
-wget Link to come
+wget https://boltz1.s3.us-east-2.amazonaws.com/ccd.rdb
 redis-server --dbfilename ccd.rdb --redis-port 7777
 ```
 > Note: You must have redis installed (see: https://redis.io/docs/latest/operate/oss_and_stack/install/install-redis/)
