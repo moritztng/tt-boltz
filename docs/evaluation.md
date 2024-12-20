@@ -2,7 +2,8 @@
 
 To encourage reproducibility and facilitate comparison with other models, we provide the evaluation scripts and predictions for Boltz-1, Chai-1, and AlphaFold3 on our test benchmark dataset as well as CASP15. These datasets are created to contain biomolecules different from the training data and to benchmark the performance of these models we run them with the same input MSAs and the same number of recycling and diffusion steps.
 
-![Test set evaluations](../docs/test_evals.png)
+![Test set evaluations](../docs/plot_test.png)
+![CASP15 set evaluations](../docs/plot_casp.png)
 
 
 ## Evaluation files
