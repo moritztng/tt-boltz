@@ -66,7 +66,7 @@ We welcome external contributions and are eager to engage with the community. Co
 - [x] Confidence model checkpoint
 - [x] Chunking for lower memory usage
 - [x] Pocket conditioning support
-- [ ] Full data processing pipeline
+- [x] Full data processing pipeline
 - [ ] Colab notebook for inference
 - [ ] Kernel integration
 
