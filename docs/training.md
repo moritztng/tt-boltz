@@ -116,7 +116,7 @@ Unless you wish to do it again yourself, you can skip to the next step! If you d
 
 ```bash
 wget https://files.wwpdb.org/pub/pdb/data/monomers/components.cif
-python ccd.py --components components.cif --ouptut ccd.pkl
+python ccd.py --components components.cif --outdir ./ccd
 ```
 
 > Note: runs in parallel by default with as many threads as cpu cores on your machine, can be changed with `--num_processes`
@@ -136,7 +136,7 @@ gunzip -d pdb_seqres.txt.gz
 When this is done, you can run the clustering script, which assigns proteins to 40% similarity clusters and rna/dna to a cluster for each unique sequence. For ligands, each CCD code is also assigned to its own cluster.
 
 ```bash
-python cluster.py --ccd ccd.pkl --sequences pdb_seqres.txt --mmseqs PATH_TO_MMSEQS_EXECUTABLE
+python cluster.py --ccd ccd.pkl --sequences pdb_seqres.txt --mmseqs PATH_TO_MMSEQS_EXECUTABLE --output ./clustering
 ```
 
 > Note: you must install mmseqs (see: https://github.com/soedinglab/mmseqs2?tab=readme-ov-file#installation)
@@ -193,9 +193,12 @@ You can now process the raw MSAs. First launch a redis server. We use redis to s
 ```bash
 redis-server --dbfilename taxonomy.rdb --redis-port 7777
 ```
+
+Please wait a few minutes for the DB to initialize. It will print `Ready to accept connections` when ready.
+
 > Note: You must have redis installed (see: https://redis.io/docs/latest/operate/oss_and_stack/install/install-redis/)
 
-In a separate shell, run the processing script:
+In a separate shell, run the MSA processing script:
 ```bash
 python msa.py --msadir YOUR_MSA_DIR --outdir YOUR_OUTPUT_DIR --redis-port 7777
 ```
@@ -216,9 +219,9 @@ redis-server --dbfilename ccd.rdb --redis-port 7777
 ```
 > Note: You must have redis installed (see: https://redis.io/docs/latest/operate/oss_and_stack/install/install-redis/)
 
-In a separate shell, run the processing script, make sure to use the `clustering.json` file you previously created.
+In a separate shell, run the processing script, make sure to use the `clustering/clustering.json` file you previously created.
 ```bash
-python rcsb.py --datadir PATH_TO_MMCIF_DIR --cluster clustering.json --outdir YOUR_OUTPUT_DIR --use-assembly --max-file-size 7000000 --redis-port 7777
+python rcsb.py --datadir PATH_TO_MMCIF_DIR --cluster clustering/clustering.json --outdir YOUR_OUTPUT_DIR --use-assembly --max-file-size 7000000 --redis-port 7777
 ```
 
 > Important: the script looks for `.cif` or `cif.gz` files in the directory, make sure to match this extension and file format.

@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pandas as pd
 import rdkit
+from p_tqdm import p_umap
 from pdbeccdutils.core import ccd_reader
 from pdbeccdutils.core.component import ConformerType
 from rdkit import rdBase
-from rdkit.Chem.rdchem import AllChem, Conformer, Mol
-from tqdm import tqdm
+from rdkit.Chem import AllChem
+from rdkit.Chem.rdchem import Conformer, Mol
 
 
 def load_molecules(components: str) -> list[Mol]:
@@ -224,20 +225,17 @@ def main(args: argparse.Namespace) -> None:
     molecules = load_molecules(args.components)
 
     # Setup processing function
-    output = Path(args.output)
-    mol_output = output / "mols"
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    mol_output = outdir / "mols"
+    mol_output.mkdir(parents=True, exist_ok=True)
     process_fn = partial(process, output=str(mol_output))
 
     # Process the files in parallel
     metadata = []
-    num_processes = multiprocessing.cpu_count()
-    with (
-        multiprocessing.Pool(processes=num_processes) as pool,
-        tqdm(total=len(molecules)) as pbar,
-    ):
-        for name, result in pool.imap_unordered(process_fn, molecules):
-            metadata.append({"name": name, "result": result})
-            pbar.update()
+    num_processes = min(max(1, args.num_processes), multiprocessing.cpu_count())
+    for name, result in p_umap(process_fn, molecules, num_cpus=num_processes):
+        metadata.append({"name": name, "result": result})
 
     # Load and group outputs
     molecules = {}
@@ -252,12 +250,12 @@ def main(args: argparse.Namespace) -> None:
             molecules[item["name"]] = mol
 
     # Dump metadata
-    path = output / "results.csv"
+    path = outdir / "results.csv"
     metadata = pd.DataFrame(metadata)
     metadata.to_csv(path)
 
     # Dump the components
-    path = output / "conformers.pkl"
+    path = outdir / "ccd.pkl"
     with path.open("wb") as f:
         pickle.dump(molecules, f)
 
@@ -265,7 +263,7 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--components", type=str)
-    parser.add_argument("--output", type=str)
+    parser.add_argument("--outdir", type=str)
     parser.add_argument(
         "--num_processes",
         type=int,

@@ -19,34 +19,35 @@ def hash_sequence(seq: str) -> str:
 def main(args: argparse.Namespace) -> None:
     """Create clustering."""
     # Set output directory
-    output = Path(args.output)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     # Split the sequences into proteins and nucleotides
-    with Path(args.sequences).open("r") as handle:
-        data = list(SeqIO.parse(handle, "fasta"))
+    with Path(args.sequences).open("r") as f:
+        data = list(SeqIO.parse(f, "fasta"))
 
-    proteins = []
-    nucleotides = []
+    proteins = set()
+    nucleotides = set()
 
     for seq in data:
         if set(seq.seq).issubset({"A", "C", "G", "T", "U"}):
-            nucleotides.append(seq)
+            nucleotides.add(str(seq.seq))
         else:
-            proteins.append(seq)
+            proteins.add(str(seq.seq))
 
     # Run mmseqs on the protein data
     proteins = [f">{hash_sequence(seq)}\n{seq}" for seq in proteins]
-    with (output / "proteins.fasta").open("w") as handle:
-        SeqIO.write(proteins, handle, "fasta")
+    with (outdir / "proteins.fasta").open("w") as f:
+        f.write("\n".join(proteins))
 
     subprocess.run(
-        f"{args.mmseqs} easy-cluster {output / "proteins.fasta"} {output / 'clust_prot'} {output / 'tmp'} --min-seq-id 0.4",  # noqa: E501
+        f"{args.mmseqs} easy-cluster {outdir / 'proteins.fasta'} {outdir / 'clust_prot'} {outdir / 'tmp'} --min-seq-id 0.4",  # noqa: E501
         shell=True,  # noqa: S602
         check=True,
     )
 
     # Load protein clusters
-    clustering_path = output / "clust_prot_cluster.tsv"
+    clustering_path = outdir / "clust_prot_cluster.tsv"
     protein_data = pd.read_csv(clustering_path, sep="\t", header=None)
     clusters = protein_data[0]
     items = protein_data[1]
@@ -72,15 +73,30 @@ def main(args: argparse.Namespace) -> None:
         clustering[ccd_code] = ccd_code
 
     # Save clustering
-    with (output / "clustering.json").open("w") as handle:
+    with (outdir / "clustering.json").open("w") as handle:
         json.dump(clustering, handle)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sequences", type=str, help="Input to protein fasta.")
-    parser.add_argument("--ccd", type=str, help="Input to rna fasta.")
-    parser.add_argument("--output", type=str, help="Output clustering.")
+    parser.add_argument(
+        "--sequences",
+        type=str,
+        help="Input to protein fasta.",
+        required=True,
+    )
+    parser.add_argument(
+        "--ccd",
+        type=str,
+        help="Input to rna fasta.",
+        required=True,
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        help="Output directory.",
+        required=True,
+    )
     parser.add_argument(
         "--mmseqs",
         type=str,
