@@ -119,6 +119,7 @@ def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # n
     class _MyModel(AbInitioModel):
         def get_atoms(self) -> Iterator[Atom]:
             # Add all atom sites.
+            res_num = 0
             for chain in structure.chains:
                 # We rename the chains in alphabetical order
                 het = chain["mol_type"] == const.chain_type_ids["NONPOLYMER"]
@@ -155,9 +156,11 @@ def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # n
                             y=f"{pos[1]:.5f}",
                             z=f"{pos[2]:.5f}",
                             het=het,
-                            biso=1,
+                            biso=1 if plddts is None else plddts[res_num].item(),
                             occupancy=1,
                         )
+
+                    res_num += 1
 
         def add_plddt(self, plddts):
             res_num = 0

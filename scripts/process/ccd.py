@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import rdkit
-from p_tqdm import p_umap
+from p_tqdm import p_uimap
 from pdbeccdutils.core import ccd_reader
 from pdbeccdutils.core.component import ConformerType
 from rdkit import rdBase
@@ -222,6 +222,7 @@ def main(args: argparse.Namespace) -> None:
     rdkit.Chem.SetDefaultPickleProperties(rdkit.Chem.PropertyPickleOptions.AllProps)
 
     # Load components
+    print("Loading components")  # noqa: T201
     molecules = load_molecules(args.components)
 
     # Setup processing function
@@ -232,9 +233,10 @@ def main(args: argparse.Namespace) -> None:
     process_fn = partial(process, output=str(mol_output))
 
     # Process the files in parallel
+    print("Processing components")  # noqa: T201
     metadata = []
     num_processes = min(max(1, args.num_processes), multiprocessing.cpu_count())
-    for name, result in p_umap(process_fn, molecules, num_cpus=num_processes):
+    for name, result in p_uimap(process_fn, molecules, num_cpus=num_processes):
         metadata.append({"name": name, "result": result})
 
     # Load and group outputs
