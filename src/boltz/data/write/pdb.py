@@ -72,7 +72,7 @@ def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noq
                 res_name_3 = (
                     "LIG" if record_type == "HETATM" else str(residue["name"][:3])
                 )
-                b_factor = 1.00 if plddts is None else plddts[res_num].item()
+                b_factor = 1.00 if plddts is None else round(plddts[res_num].item(), 2)
 
                 # PDB is a columnar format, every space matters here!
                 atom_line = (

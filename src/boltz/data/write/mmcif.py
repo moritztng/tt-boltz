@@ -156,7 +156,9 @@ def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # n
                             y=f"{pos[1]:.5f}",
                             z=f"{pos[2]:.5f}",
                             het=het,
-                            biso=1 if plddts is None else plddts[res_num].item(),
+                            biso=1
+                            if plddts is None
+                            else round(plddts[res_num].item(), 2),
                             occupancy=1,
                         )
 
