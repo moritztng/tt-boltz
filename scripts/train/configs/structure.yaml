@@ -161,6 +161,7 @@ model:
     sampling_steps: 200
     diffusion_samples: 5
     symmetry_correction: true
+    run_confidence_sequentially: false
 
   diffusion_process_args:
     sigma_min: 0.0004
