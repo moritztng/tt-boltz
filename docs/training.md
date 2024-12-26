@@ -136,7 +136,7 @@ gunzip -d pdb_seqres.txt.gz
 When this is done, you can run the clustering script, which assigns proteins to 40% similarity clusters and rna/dna to a cluster for each unique sequence. For ligands, each CCD code is also assigned to its own cluster.
 
 ```bash
-python cluster.py --ccd ccd.pkl --sequences pdb_seqres.txt --mmseqs PATH_TO_MMSEQS_EXECUTABLE --output ./clustering
+python cluster.py --ccd ccd.pkl --sequences pdb_seqres.txt --mmseqs PATH_TO_MMSEQS_EXECUTABLE --outdir ./clustering
 ```
 
 > Note: you must install mmseqs (see: https://github.com/soedinglab/mmseqs2?tab=readme-ov-file#installation)
