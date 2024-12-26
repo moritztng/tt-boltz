@@ -75,7 +75,7 @@ data:
   atoms_per_window_queries: 32
 
 model:
-  _target_: boltz.model.models.boltz.BoltzPreview
+  _target_: boltz.model.model.Boltz1
   atom_s: 128
   atom_z: 16
   token_s: 384
@@ -125,12 +125,10 @@ model:
     offload_to_cpu: false
 
   structure_prediction_training: false
-  run_trunk_and_structure: true
   confidence_prediction: true
   alpha_pae: 1
   confidence_imitate_trunk: true
   confidence_model_args:
-    use_gaussian: false
     num_dist_bins: 64
     max_dist: 22
     add_s_to_z_prod: true
@@ -142,7 +140,6 @@ model:
       num_plddt_bins: 50
       num_pde_bins: 64
       num_pae_bins: 64
-      relative_confidence: none
 
   training_args:
     recycling_steps: 3
@@ -169,6 +166,7 @@ model:
     sampling_steps: 200
     diffusion_samples: 5
     symmetry_correction: true
+    run_confidence_sequentially: false
 
   diffusion_process_args:
     sigma_min: 0.0004

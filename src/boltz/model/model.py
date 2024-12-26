@@ -123,9 +123,6 @@ class Boltz1(LightningModule):
             "resolved_loss",
             "pde_loss",
             "pae_loss",
-            "rel_plddt_loss",
-            "rel_pde_loss",
-            "rel_pae_loss",
         ]:
             self.train_confidence_loss_dict_logger[m] = MeanMetric()
 
