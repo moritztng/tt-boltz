@@ -65,6 +65,34 @@ data:
 
 `max_tokens` and `max_atoms` are the maximum number of tokens and atoms in the crop. Depending on the size of the GPUs you are using (as well as the training speed desired), you may want to adjust these values. Other recommended values are 256 and 2304, or 384 and 3456 respectively.
 
+Here is an example of how to set multiple dataset sources like the PDB and OpenFold distillation dataset that we used to train the structure model:
+
+
+```yaml
+  datasets:
+    - _target_: foldeverything.task.train.data.DatasetConfig
+      target_dir: PATH_TO_PDB_TARGETS_DIR
+      msa_dir: PATH_TO_PDB_MSA_DIR
+      prob: 0.5
+      sampler:
+        _target_: boltz.data.sample.cluster.ClusterSampler
+      cropper:
+        _target_: boltz.data.crop.boltz.BoltzCropper
+        min_neighborhood: 0
+        max_neighborhood: 40
+      split: ./scripts/train/assets/validation_ids.txt
+    - _target_: foldeverything.task.train.data.DatasetConfig
+      target_dir: PATH_TO_DISTILLATION_TARGETS_DIR
+      msa_dir: PATH_TO_DISTILLATION_MSA_DIR
+      prob: 0.5
+      sampler:
+        _target_: boltz.data.sample.cluster.ClusterSampler
+      cropper:
+        _target_: boltz.data.crop.boltz.BoltzCropper
+        min_neighborhood: 0
+        max_neighborhood: 40
+```
+
 ## Run the training script
 
 Before running the full training, we recommend using the debug flag. This turns off DDP (sets single device) and sets `num_workers` to 0 so everything is in a single process, as well as disabling wandb:
