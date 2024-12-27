@@ -159,6 +159,7 @@ model:
     lr_decay_every_n_steps: 50000
     lr_decay_factor: 0.95
     symmetry_correction: true
+    run_confidence_sequentially: false
 
   validation_args:
     recycling_steps: 3
