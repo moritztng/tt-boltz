@@ -219,7 +219,7 @@ wget https://boltz1.s3.us-east-2.amazonaws.com/taxonomy.rdb
 You can now process the raw MSAs. First launch a redis server. We use redis to share the large taxonomy dictionary across workers, so MSA processing can happen in parallel without blowing up the RAM usage.
 
 ```bash
-redis-server --dbfilename taxonomy.rdb --redis-port 7777
+redis-server --dbfilename taxonomy.rdb --port 7777
 ```
 
 Please wait a few minutes for the DB to initialize. It will print `Ready to accept connections` when ready.
@@ -243,7 +243,7 @@ https://www.rcsb.org/docs/programmatic-access/file-download-services
 
 ```bash
 wget https://boltz1.s3.us-east-2.amazonaws.com/ccd.rdb
-redis-server --dbfilename ccd.rdb --redis-port 7777
+redis-server --dbfilename ccd.rdb --port 7777
 ```
 > Note: You must have redis installed (see: https://redis.io/docs/latest/operate/oss_and_stack/install/install-redis/)
 
