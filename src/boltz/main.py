@@ -267,6 +267,33 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     """
     click.echo("Processing input data.")
 
+    # Check if manifest exists at output path
+    manifest_path = out_dir / "processed" / "manifest.json"
+    if manifest_path.exists():
+        click.echo(f"Found a manifest file at output directory: {out_dir}")
+
+        manifest: Manifest = Manifest.load(manifest_path)
+        processed_ids = [record.id for record in manifest.records]
+        input_ids = [d.stem for d in data]
+
+        # Check how many examples need to be processed
+        missing_ids = list(set(input_ids).difference(processed_ids))
+        if not len(missing_ids):
+            click.echo("All examples in data are processed. Updating the manifest")
+            records = [
+                record for record in manifest.records
+                if record.id in input_ids
+            ]
+
+            # Dump updated manifest
+            updated_manifest = Manifest(records)
+            updated_manifest.dump(out_dir / "processed" / "manifest.json")
+            return
+        else:
+            click.echo(f"{len(missing_ids)} missing ids. Preprocessing these ids")
+            data = [d for d in data if d.stem in missing_ids]
+            assert len(data) == len(missing_ids)
+
     # Create output directories
     msa_dir = out_dir / "msa"
     structure_dir = out_dir / "processed" / "structures"
