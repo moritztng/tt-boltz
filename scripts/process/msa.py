@@ -57,13 +57,9 @@ def process(args) -> None:
     num_processes = min(args.num_processes, multiprocessing.cpu_count())
     parallel = num_processes > 1
 
-    # Load shared data from redis
-    print("Loading shared data from Redis...")
-    shared_data = Resource(host=args.redis_host, port=args.redis_port)
-
     # Get data points
     print("Fetching data...")
-    data = args.msadir.rglob("*.a3m*")
+    data = list(args.msadir.rglob("*.a3m*"))
     print(f"Found {len(data)} MSA's.")
 
     # Randomly permute the data
@@ -79,6 +75,7 @@ def process(args) -> None:
             host=args.redis_host,
             port=args.redis_port,
             outdir=args.outdir,
+            max_seqs=args.max_seqs,
         )
 
         # Split the data into random chunks
@@ -91,8 +88,13 @@ def process(args) -> None:
                 for _ in pool.imap_unordered(fn, chunks):
                     pbar.update()
     else:
-        for item in tqdm(data, total=len(data)):
-            process_msa(item, shared_data, args.outdir)
+        process_msa(
+            data,
+            host=args.redis_host,
+            port=args.redis_port,
+            outdir=args.outdir,
+            max_seqs=args.max_seqs,
+        )
 
 
 if __name__ == "__main__":
