@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 from p_tqdm import p_umap
 from redis import Redis
+from tqdm import tqdm
 
 from boltz.data.parse.a3m import parse_a3m
 
@@ -50,17 +51,18 @@ def process(args) -> None:
     # Create output directory
     args.outdir.mkdir(parents=True, exist_ok=True)
 
+    # Load the resource
+    resource = Resource(host=args.redis_host, port=args.redis_port)
+
     # Get data points
     print("Fetching data...")
     data = list(args.msadir.rglob("*.a3m*"))
     print(f"Found {len(data)} MSA's.")
 
     # Check if we can run in parallel
-    num_processes = max(1, min(args.num_processes, multiprocessing.cpu_count()))
-    parallel = num_processes > 1 and len(data) > num_processes
-
-    # Load the resource
-    resource = Resource(host=args.redis_host, port=args.redis_port)
+    max_processes = multiprocessing.cpu_count()
+    num_processes = max(1, min(args.num_processes, max_processes, len(data)))
+    parallel = num_processes > 1
 
     # Run processing
     if parallel:
@@ -77,7 +79,7 @@ def process(args) -> None:
 
     else:
         # Run in serial
-        for path in data:
+        for path in tqdm(data):
             process_msa(
                 path,
                 outdir=args.outdir,

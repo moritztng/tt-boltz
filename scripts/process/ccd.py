@@ -15,6 +15,7 @@ from pdbeccdutils.core.component import ConformerType
 from rdkit import rdBase
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdchem import Conformer, Mol
+from tqdm import tqdm
 
 
 def load_molecules(components: str) -> list[Mol]:
@@ -240,8 +241,11 @@ def main(args: argparse.Namespace) -> None:
     # Process the files in parallel
     print("Processing components")  # noqa: T201
     metadata = []
-    num_processes = min(max(1, args.num_processes), multiprocessing.cpu_count())
-    parallel = num_processes > 1 and len(molecules) > num_processes
+
+    # Check if we can run in parallel
+    max_processes = multiprocessing.cpu_count()
+    num_processes = max(1, min(args.num_processes, max_processes, len(molecules)))
+    parallel = num_processes > 1
 
     if parallel:
         for name, result in p_uimap(
@@ -251,7 +255,7 @@ def main(args: argparse.Namespace) -> None:
         ):
             metadata.append({"name": name, "result": result})
     else:
-        for mol in molecules:
+        for mol in tqdm(molecules):
             name, result = process_fn(mol)
             metadata.append({"name": name, "result": result})
 
