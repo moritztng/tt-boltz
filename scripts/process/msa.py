@@ -53,10 +53,6 @@ def process(args) -> None:
     # Create output directory
     args.outdir.mkdir(parents=True, exist_ok=True)
 
-    # Check if we can run in parallel
-    num_processes = min(args.num_processes, multiprocessing.cpu_count())
-    parallel = num_processes > 1
-
     # Get data points
     print("Fetching data...")
     data = list(args.msadir.rglob("*.a3m*"))
@@ -66,6 +62,10 @@ def process(args) -> None:
     random = np.random.RandomState()
     permute = random.permutation(len(data))
     data = [data[i] for i in permute]
+
+    # Check if we can run in parallel
+    num_processes = max(1, min(args.num_processes, multiprocessing.cpu_count()))
+    parallel = num_processes > 1 and len(data) > num_processes
 
     # Run processing
     if parallel:
