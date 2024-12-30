@@ -55,11 +55,6 @@ def process(args) -> None:
     data = list(args.msadir.rglob("*.a3m*"))
     print(f"Found {len(data)} MSA's.")
 
-    # Randomly permute the data
-    random = np.random.RandomState()
-    permute = random.permutation(len(data))
-    data = [data[i] for i in permute]
-
     # Check if we can run in parallel
     num_processes = max(1, min(args.num_processes, multiprocessing.cpu_count()))
     parallel = num_processes > 1 and len(data) > num_processes

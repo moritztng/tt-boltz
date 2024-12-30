@@ -241,12 +241,19 @@ def main(args: argparse.Namespace) -> None:
     print("Processing components")  # noqa: T201
     metadata = []
     num_processes = min(max(1, args.num_processes), multiprocessing.cpu_count())
-    for name, result in p_uimap(
-        process_fn,
-        molecules,
-        num_cpus=num_processes,
-    ):
-        metadata.append({"name": name, "result": result})
+    parallel = num_processes > 1 and len(molecules) > num_processes
+
+    if parallel:
+        for name, result in p_uimap(
+            process_fn,
+            molecules,
+            num_cpus=num_processes,
+        ):
+            metadata.append({"name": name, "result": result})
+    else:
+        for mol in molecules:
+            name, result = process_fn(mol)
+            metadata.append({"name": name, "result": result})
 
     # Load and group outputs
     molecules = {}
