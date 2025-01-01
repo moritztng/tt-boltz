@@ -352,7 +352,7 @@ def cli() -> None:
 )
 @click.option(
     "--accelerator",
-    type=click.Choice(["gpu", "cpu", "tpu"]),
+    type=click.Choice(["gpu", "cpu", "tpu", "tenstorrent"]),
     help="The accelerator to use for prediction. Default is gpu.",
     default="gpu",
 )
@@ -427,9 +427,14 @@ def predict(
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
+    tenstorrent = False
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
         click.echo(msg)
+    elif accelerator == "tenstorrent":
+        tenstorrent = True
+        accelerator = "cpu"
+    
 
     # Set no grad
     torch.set_grad_enabled(False)
@@ -499,6 +504,7 @@ def predict(
         predict_args=predict_args,
         map_location="cpu",
         diffusion_process_args=asdict(BoltzDiffusionParams()),
+        tenstorrent = tenstorrent
     )
     model_module.eval()
 

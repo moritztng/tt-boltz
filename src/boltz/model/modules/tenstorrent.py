@@ -2,8 +2,9 @@ import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable
 
-
 def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
+    if not prefix:
+        return state_dict
     prefix += "."
     return {
         key[len(prefix) :].replace(remove, ""): value
@@ -172,6 +173,7 @@ class AttentionPairBias(Module):
         self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
         self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
+        self.device = device
 
     def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
         if self.initial_norm:
@@ -202,7 +204,7 @@ class AttentionPairBias(Module):
         o = ttnn.to_torch(o)
         o = ttnn.from_torch(
             o.reshape(*o.shape[:-2], -1),
-            device=device,
+            device=self.device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
         )
@@ -363,8 +365,8 @@ class PairformerModule(nn.Module):
         self,
         s: torch.Tensor,
         z: torch.Tensor,
-        mask: torch.Tensor,
-        pair_mask: torch.Tensor,
+        mask: torch.Tensor = None,
+        pair_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return tuple(
             ttnn.to_torch(x)

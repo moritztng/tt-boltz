@@ -74,10 +74,9 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
-        tenstorrent: bool = True,
+        tenstorrent: bool = False,
     ) -> None:
         super().__init__()
-
         self.save_hyperparameters()
 
         self.lddt = nn.ModuleDict()
