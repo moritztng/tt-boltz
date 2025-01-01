@@ -25,4 +25,6 @@ def test_pairformer():
     pair_mask = mask[:, :, None] * mask[:, None, :]
     s_tt, z_tt = pairformer(s, z, mask, pair_mask)
     s_torch, z_torch = pairformer_torch(s, z, mask, pair_mask)
-    print(mse_loss(s_tt, s_torch), mse_loss(z_tt, z_torch))
+    def mean_absolute_error(a, b):
+        return torch.mean(torch.abs(a - b))
+    print(mean_absolute_error(s_tt, s_torch), mean_absolute_error(z_tt, z_torch))
