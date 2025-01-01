@@ -36,6 +36,7 @@ from boltz.model.modules.trunk import (
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
+from boltz.model.modules import tenstorrent
 
 class Boltz1(LightningModule):
     def __init__(  # noqa: PLR0915, C901, PLR0912
@@ -73,6 +74,7 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
+        tenstorrent: bool = True,
     ) -> None:
         super().__init__()
 
@@ -146,6 +148,8 @@ class Boltz1(LightningModule):
         self.max_dist = max_dist
         self.is_pairformer_compiled = False
 
+        self.tenstorrent = tenstorrent
+
         # Input projections
         s_input_dim = (
             token_s + 2 * const.num_tokens + 1 + len(const.pocket_contact_info)
@@ -188,7 +192,8 @@ class Boltz1(LightningModule):
                 s_input_dim=s_input_dim,
                 **msa_args,
             )
-        self.pairformer_module = PairformerModule(token_s, token_z, **pairformer_args)
+        self.pairformer_module = tenstorrent.PairformerModule(48, 32, 4, 24, 16) if self.tenstorrent else PairformerModule(token_s, token_z, **pairformer_args)
+        compile_pairformer &= not self.tenstorrent
         if compile_pairformer:
             # Big models hit the default cache limit (8)
             self.is_pairformer_compiled = True
