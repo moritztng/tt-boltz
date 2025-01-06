@@ -427,12 +427,12 @@ def predict(
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
-    tenstorrent = False
+    use_tenstorrent = False
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
         click.echo(msg)
     elif accelerator == "tenstorrent":
-        tenstorrent = True
+        use_tenstorrent = True
         accelerator = "cpu"
     
 
@@ -504,7 +504,7 @@ def predict(
         predict_args=predict_args,
         map_location="cpu",
         diffusion_process_args=asdict(BoltzDiffusionParams()),
-        tenstorrent = tenstorrent
+        use_tenstorrent = use_tenstorrent
     )
     model_module.eval()
 

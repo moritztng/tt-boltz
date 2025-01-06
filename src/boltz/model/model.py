@@ -74,7 +74,7 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
-        tenstorrent: bool = False,
+        use_tenstorrent: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -148,7 +148,7 @@ class Boltz1(LightningModule):
         self.max_dist = max_dist
         self.is_pairformer_compiled = False
 
-        self.tenstorrent = tenstorrent
+        self.use_tenstorrent = use_tenstorrent
 
         # Input projections
         s_input_dim = (
@@ -192,8 +192,8 @@ class Boltz1(LightningModule):
                 s_input_dim=s_input_dim,
                 **msa_args,
             )
-        self.pairformer_module = tenstorrent.PairformerModule(48, 32, 4, 24, 16) if self.tenstorrent else PairformerModule(token_s, token_z, **pairformer_args)
-        compile_pairformer &= not self.tenstorrent
+        self.pairformer_module = tenstorrent.PairformerModule(48, 32, 4, 24, 16) if self.use_tenstorrent else PairformerModule(token_s, token_z, **pairformer_args)
+        compile_pairformer &= not self.use_tenstorrent
         if compile_pairformer:
             # Big models hit the default cache limit (8)
             self.is_pairformer_compiled = True
