@@ -369,7 +369,7 @@ class PairformerModule(nn.Module):
         pair_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return tuple(
-            ttnn.to_torch(x)
+            ttnn.to_torch(x).to(torch.float32)
             for x in self.pairformer(
                 ttnn.from_torch(
                     s,
