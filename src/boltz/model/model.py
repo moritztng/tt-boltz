@@ -79,6 +79,7 @@ class Boltz1(LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
+        ema = False
         self.lddt = nn.ModuleDict()
         self.disto_lddt = nn.ModuleDict()
         self.complex_lddt = nn.ModuleDict()
