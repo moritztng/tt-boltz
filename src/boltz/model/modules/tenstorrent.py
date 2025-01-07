@@ -169,8 +169,10 @@ class AttentionPairBias(Module):
         self.k_weight = self.torch_to_tt("proj_k.weight")
         self.v_weight = self.torch_to_tt("proj_v.weight")
         self.g_weight = self.torch_to_tt("proj_g.weight")
-        self.z_norm_weight = self.torch_to_tt("proj_z.0.weight")
-        self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
+        self.z_norm_weight = self.torch_to_tt(
+            "proj_z.0.weight", lambda x: x.expand(32, -1)
+        )
+        self.z_norm_bias = self.torch_to_tt("proj_z.0.bias", lambda x: x.expand(32, -1))
         self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
         self.device = device
@@ -385,3 +387,191 @@ class PairformerModule(nn.Module):
                 ),
             )
         )
+
+
+class AdaLN(Module):
+    def __init__(
+        self,
+        device: ttnn._ttnn.device.Device,
+        state_dict: dict,
+    ):
+        super().__init__(device, state_dict)
+        self.s_norm_weight = self.torch_to_tt(
+            "s_norm.weight", lambda x: x.expand(32, -1)
+        )
+        self.s_scale_weight = self.torch_to_tt("s_scale.weight")
+        self.s_scale_bias = self.torch_to_tt("s_scale.bias")
+        self.s_bias_weight = self.torch_to_tt("s_bias.weight")
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        a = ttnn.layer_norm(a, epsilon=1e-5)
+        s = ttnn.layer_norm(s, weight=self.s_norm_weight, epsilon=1e-5)
+        s_scale = ttnn.linear(s, self.s_scale_weight, bias=self.s_scale_bias)
+        s_scale = ttnn.sigmoid(s_scale)
+        s_bias = ttnn.linear(s, self.s_bias_weight)
+        a = ttnn.multiply(a, s_scale)
+        a = ttnn.add(a, s_bias)
+        return a
+
+
+class ConditionedTransitionBlock(Module):
+    def __init__(
+        self,
+        device: ttnn._ttnn.device.Device,
+        state_dict: dict,
+    ):
+        super().__init__(device, state_dict)
+        self.adaln = AdaLN(device, filter_dict(state_dict, "adaln"))
+        self.swish_weight = self.torch_to_tt("swish_gate.0.weight")
+        self.a_to_b_weight = self.torch_to_tt("a_to_b.weight")
+        self.b_to_a_weight = self.torch_to_tt("b_to_a.weight")
+        self.output_projection_weight = self.torch_to_tt("output_projection.0.weight")
+        self.output_projection_bias = self.torch_to_tt("output_projection.0.bias")
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        a = self.adaln(a, s)
+        a_swish = ttnn.linear(a, self.swish_weight)
+        dim = int(a_swish.shape[-1] / 2)
+        a_swish, gates = a_swish[:, :, :dim], a_swish[:, :, dim:]
+        gates = ttnn.silu(gates)
+        a_swish = ttnn.multiply(gates, a_swish)
+        a_b = ttnn.linear(a, self.a_to_b_weight)
+        b = ttnn.multiply(a_swish, a_b)
+        s = ttnn.linear(
+            s, self.output_projection_weight, bias=self.output_projection_bias
+        )
+        s = ttnn.sigmoid(s)
+        b_a = ttnn.linear(b, self.b_to_a_weight)
+        a = ttnn.multiply(s, b_a)
+        return a
+
+
+class DiffusionTransformerLayer(Module):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        device: ttnn._ttnn.device.Device,
+        state_dict: dict,
+    ):
+        super().__init__(device, state_dict)
+        self.adaln = AdaLN(device, filter_dict(state_dict, "adaln"))
+        self.attn_pair_bias = AttentionPairBias(
+            head_dim=dim // n_heads,
+            n_heads=n_heads,
+            initial_norm=False,
+            device=device,
+            state_dict=filter_dict(state_dict, "pair_bias_attn"),
+        )
+        self.output_projection_weight = self.torch_to_tt(
+            "output_projection_linear.weight"
+        )
+        self.output_projection_bias = self.torch_to_tt("output_projection_linear.bias")
+        self.transition = ConditionedTransitionBlock(
+            device, filter_dict(state_dict, "transition")
+        )
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        b = self.adaln(a, s)
+        b = self.attn_pair_bias(b, z)
+        s = ttnn.linear(
+            s, self.output_projection_weight, bias=self.output_projection_bias
+        )
+        b = ttnn.multiply(s, b)
+        a = ttnn.add(a, b)
+        a_t = self.transition(a, s)
+        a = ttnn.add(a, a_t)
+        return a
+
+
+class DiffusionTransformer(Module):
+    def __init__(
+        self,
+        n_layers: int,
+        dim: int,
+        n_heads: int,
+        device: ttnn._ttnn.device.Device,
+        state_dict: dict,
+    ):
+        super().__init__(device, state_dict)
+        self.layers = [
+            DiffusionTransformerLayer(
+                dim, n_heads, device, filter_dict(state_dict, f"layers.{i}")
+            )
+            for i in range(n_layers)
+        ]
+        self.z = None
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        if self.z is None:
+            self.z = z
+        for layer in self.layers:
+            a = layer(a, s, self.z)
+        return a
+
+
+class DiffusionTransformerModule(nn.Module):
+    def __init__(
+        self,
+        n_layers: int,
+        dim: int,
+        n_heads: int,
+    ):
+        super().__init__()
+        self.n_layers = n_layers
+        self.dim = dim
+        self.n_heads = n_heads
+        self.diffusion_transformer = None
+        self.device = ttnn.open_device(device_id=0)
+        ttnn.enable_program_cache(self.device)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self.diffusion_transformer = DiffusionTransformer(
+            self.n_layers,
+            self.dim,
+            self.n_heads,
+            self.device,
+            filter_dict(state_dict, prefix[:-1]),
+        )
+
+    def forward(
+        self,
+        a: torch.Tensor,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        mask: torch.Tensor = None,
+        to_keys=None,
+        multiplicity: int = 1,
+        model_cache: torch.Tensor = None,
+    ) -> torch.Tensor:
+        return ttnn.to_torch(
+            self.diffusion_transformer(
+                ttnn.from_torch(
+                    a,
+                    device=self.device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                ),
+                ttnn.from_torch(
+                    s,
+                    device=self.device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                ),
+                ttnn.from_torch(
+                    z,
+                    device=self.device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                ) if z is not None else None,
+            )
+        ).to(torch.float32)

@@ -35,6 +35,8 @@ from boltz.model.modules.utils import (
     log,
 )
 
+from boltz.model.modules import tenstorrent
+
 
 class DiffusionModule(Module):
     """Diffusion module"""
@@ -59,6 +61,7 @@ class DiffusionModule(Module):
         conditioning_transition_layers: int = 2,
         activation_checkpointing: bool = False,
         offload_to_cpu: bool = False,
+        use_tenstorrent: bool = False,
         **kwargs,
     ) -> None:
         """Initialize the diffusion module.
@@ -141,14 +144,22 @@ class DiffusionModule(Module):
         )
         init.final_init_(self.s_to_a_linear[1].weight)
 
-        self.token_transformer = DiffusionTransformer(
-            dim=2 * token_s,
-            dim_single_cond=2 * token_s,
-            dim_pairwise=token_z,
-            depth=token_transformer_depth,
-            heads=token_transformer_heads,
-            activation_checkpointing=activation_checkpointing,
-            offload_to_cpu=offload_to_cpu,
+        self.token_transformer = (
+            tenstorrent.DiffusionTransformerModule(
+                n_layers=token_transformer_depth,
+                dim=2 * token_s,
+                n_heads=token_transformer_heads,
+            )
+            if use_tenstorrent
+            else DiffusionTransformer(
+                dim=2 * token_s,
+                dim_single_cond=2 * token_s,
+                dim_pairwise=token_z,
+                depth=token_transformer_depth,
+                heads=token_transformer_heads,
+                activation_checkpointing=activation_checkpointing,
+                offload_to_cpu=offload_to_cpu,
+            )
         )
 
         self.a_norm = nn.LayerNorm(2 * token_s)

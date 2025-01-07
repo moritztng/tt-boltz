@@ -215,6 +215,7 @@ class Boltz1(LightningModule):
                 "atoms_per_window_queries": atoms_per_window_queries,
                 "atoms_per_window_keys": atoms_per_window_keys,
                 "atom_feature_dim": atom_feature_dim,
+                "use_tenstorrent": use_tenstorrent,
                 **score_model_args,
             },
             compile_score=compile_structure,
