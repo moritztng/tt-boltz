@@ -141,6 +141,7 @@ class TriangleAttention(nn.Module):
                 chunk_size,
                 use_memory_efficient_kernel=use_memory_efficient_kernel,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_lma=use_lma,
                 use_trifast=use_trifast,
                 inplace_safe=inplace_safe,
             )
@@ -151,6 +152,7 @@ class TriangleAttention(nn.Module):
                 biases,
                 use_memory_efficient_kernel=use_memory_efficient_kernel,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_lma=use_lma,
                 use_trifast=use_trifast,
             )
 
