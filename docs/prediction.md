@@ -189,3 +189,4 @@ The output `.json` file contains various aggregated confidence scores for specif
     }
 }
 ```
+`confidence_score`, `ptm` and `plddt` scores (and their interface and individual chain analogues) have a range of [0, 1], where higher values indicate higher confidence. `pde` scores have a unit of angstroms, where lower values indicate higher confidence.
