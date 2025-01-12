@@ -2,6 +2,8 @@ import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable
 
+device = None
+
 def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
     if not prefix:
         return state_dict
@@ -340,8 +342,10 @@ class PairformerModule(nn.Module):
         self.att_head_dim = att_head_dim
         self.att_n_heads = att_n_heads
         self.pairformer = None
-        self.device = ttnn.open_device(device_id=0)
-        ttnn.enable_program_cache(self.device)
+        global device
+        if device is None:
+            device = ttnn.open_device(device_id=0)
+        self.device = device
 
     def _load_from_state_dict(
         self,
@@ -522,8 +526,10 @@ class DiffusionTransformerModule(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
         self.diffusion_transformer = None
-        self.device = ttnn.open_device(device_id=0)
-        ttnn.enable_program_cache(self.device)
+        global device
+        if device is None:
+            device = ttnn.open_device(device_id=0)
+        self.device = device
 
     def _load_from_state_dict(
         self,
