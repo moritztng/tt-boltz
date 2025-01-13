@@ -23,8 +23,16 @@ def mean_absolute_error(a, b):
 
 
 def test_pairformer():
-    pairformer = PairformerModule(1, 32, 4, 24, 16)
-    pairformer_torch = PairformerModuleTorch(384, 128, 1).eval()
+    pairformer = PairformerModule(
+        n_blocks=1,
+        tri_att_head_dim=32,
+        tri_att_n_heads=4,
+        att_head_dim=24,
+        att_n_heads=16,
+    )
+    pairformer_torch = PairformerModuleTorch(
+        token_s=384, token_z=128, num_blocks=1
+    ).eval()
     pairformer_state_dict = filter_dict(state_dict, "pairformer_module")
     pairformer.load_state_dict(
         pairformer_state_dict,
