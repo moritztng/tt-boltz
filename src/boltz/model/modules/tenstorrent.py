@@ -375,7 +375,7 @@ class PairformerModule(nn.Module):
         pair_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return tuple(
-            ttnn.to_torch(x).to(torch.float32)
+            torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
             for x in self.pairformer(
                 ttnn.from_torch(
                     s,
@@ -559,7 +559,7 @@ class DiffusionTransformerModule(nn.Module):
         multiplicity: int = 1,
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
-        return ttnn.to_torch(
+        return torch.Tensor(ttnn.to_torch(
             self.diffusion_transformer(
                 ttnn.from_torch(
                     a,
@@ -580,4 +580,4 @@ class DiffusionTransformerModule(nn.Module):
                     dtype=ttnn.bfloat16,
                 ) if z is not None else None,
             )
-        ).to(torch.float32)
+        )).to(torch.float32)

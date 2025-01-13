@@ -4,7 +4,7 @@ from typing import Optional
 
 import click
 import numpy as np
-from rdkit import rdBase
+from rdkit import rdBase, Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdchem import Conformer, Mol
 
@@ -16,6 +16,7 @@ from boltz.data.types import (
     ChainInfo,
     Connection,
     Interface,
+    InferenceOptions,
     Record,
     Residue,
     Structure,
@@ -130,6 +131,14 @@ def compute_3d_conformer(mol: Mol, version: str = "v3") -> bool:
 
     try:
         conf_id = AllChem.EmbedMolecule(mol, options)
+
+        if conf_id == -1:
+            print(f"WARNING: RDKit ETKDGv3 failed to generate a conformer for molecule "
+                  f"{Chem.MolToSmiles(AllChem.RemoveHs(mol))}, so the program will start with random coordinates. "
+                  f"Note that the performance of the model under this behaviour was not tested.")
+            options.useRandomCoords = True
+            conf_id = AllChem.EmbedMolecule(mol, options)
+
         AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
 
     except RuntimeError:
@@ -772,20 +781,42 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
     # Parse constraints
     connections = []
+    pocket_binders = []
+    pocket_residues = []
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "bond" in constraint:
+            if "atom1" not in constraint["bond"] or "atom2" not in constraint["bond"]:
+                msg = f"Bond constraint was not properly specified"
+                raise ValueError(msg)
+
             c1, r1, a1 = tuple(constraint["bond"]["atom1"])
             c2, r2, a2 = tuple(constraint["bond"]["atom2"])
             c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
             c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
             connections.append((c1, c2, r1, r2, a1, a2))
-
         elif "pocket" in constraint:
+            if "binder" not in constraint["pocket"] or "contacts" not in constraint["pocket"]:
+                msg = f"Pocket constraint was not properly specified"
+                raise ValueError(msg)
+
             binder = constraint["pocket"]["binder"]
             contacts = constraint["pocket"]["contacts"]
-            msg = f"Pocket constraints not implemented yet: {binder} - {contacts}"
-            raise NotImplementedError(msg)
+
+            if len(pocket_binders) > 0:
+                if pocket_binders[-1] != chain_to_idx[binder]:
+                    msg = f"Only one pocket binders is supported!"
+                    raise ValueError(msg)
+                else:
+                    pocket_residues[-1].extend([
+                        (chain_to_idx[chain_name], residue_index - 1) for chain_name, residue_index in contacts
+                    ])
+
+            else:
+                pocket_binders.append(chain_to_idx[binder])
+                pocket_residues.extend(
+                    [(chain_to_idx[chain_name],residue_index-1) for chain_name,residue_index in contacts]
+                )
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)
@@ -825,11 +856,17 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         )
         chain_infos.append(chain_info)
 
+    options = InferenceOptions(
+        binders=pocket_binders,
+        pocket=pocket_residues
+    )
+
     record = Record(
         id=name,
         structure=struct_info,
         chains=chain_infos,
         interfaces=[],
+        inference_options=options,
     )
     return Target(
         record=record,
