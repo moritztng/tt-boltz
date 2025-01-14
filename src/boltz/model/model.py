@@ -211,7 +211,7 @@ class Boltz1(LightningModule):
                 **score_model_args,
             },
             compile_score=compile_structure,
-            accumulate_token_repr=use_accumulate_token_repr
+            accumulate_token_repr=use_accumulate_token_repr,
             **diffusion_process_args,
         )
         self.distogram_module = DistogramModule(token_z, num_bins)
