@@ -14,7 +14,7 @@ trainer:
 
 
 output: SET_PATH_HERE
-pretrained: PATH_TO_STRUCTURE_CHECKPOINT_FILE
+pretrained: PATH_TO_CHECKPOINT_FILE
 resume: null
 disable_checkpoint: false
 matmul_precision: null
