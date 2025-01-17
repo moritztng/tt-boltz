@@ -164,7 +164,7 @@ class TriangleAttention(Module):
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         a = ttnn.add(a, triangle_bias)
-        a = ttnn.softmax(a, -1, compute_kernel_config=self.compute_kernel_config)
+        a = ttnn.from_torch(torch.softmax(ttnn.to_torch(a), dim=-1), device=self.device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32)
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
@@ -251,8 +251,7 @@ class AttentionPairBias(Module):
         )
         z = ttnn.permute(z, (0, 3, 1, 2))
         a = ttnn.add(a, z)
-        # diffusion transformer second layer precision to low
-        a = ttnn.softmax(a, -1, compute_kernel_config=self.compute_kernel_config)
+        a = ttnn.from_torch(torch.softmax(ttnn.to_torch(a), dim=-1), device=self.device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32)
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.to_torch(o)
