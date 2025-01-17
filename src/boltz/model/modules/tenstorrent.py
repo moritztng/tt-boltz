@@ -609,13 +609,14 @@ class DiffusionTransformerLayer(Module):
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
         b = self.adaln(a, s)
         b = self.attn_pair_bias(b, z)
-        s = ttnn.linear(
+        s_o = ttnn.linear(
             s,
             self.output_projection_weight,
             bias=self.output_projection_bias,
             compute_kernel_config=self.compute_kernel_config,
         )
-        b = ttnn.multiply(s, b)
+        s_o = ttnn.sigmoid_accurate(s_o)
+        b = ttnn.multiply(s_o, b)
         a = ttnn.add(a, b)
         a_t = self.transition(a, s)
         a = ttnn.add(a, a_t)
