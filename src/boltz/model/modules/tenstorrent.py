@@ -438,6 +438,7 @@ class PairformerModule(nn.Module):
         global device
         if device is None:
             device = ttnn.open_device(device_id=0)
+            ttnn.enable_program_cache(device)
         self.device = device
 
     def _load_from_state_dict(
@@ -668,6 +669,7 @@ class DiffusionTransformerModule(nn.Module):
         global device
         if device is None:
             device = ttnn.open_device(device_id=0)
+            ttnn.enable_program_cache(device)
         self.device = device
 
     def _load_from_state_dict(
