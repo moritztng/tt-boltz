@@ -154,30 +154,15 @@ class TriangleAttention(Module):
         v = ttnn.linear(
             x, self.v_weight, compute_kernel_config=self.compute_kernel_config
         )
-        q = ttnn.from_torch(
-            torch.reshape(
-                ttnn.to_torch(q), (*tuple(q.shape)[:2], self.n_heads, self.head_dim)
-            ),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
-        k = ttnn.from_torch(
-            torch.reshape(
-                ttnn.to_torch(k), (*tuple(k.shape)[:2], self.n_heads, self.head_dim)
-            ),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
-        v = ttnn.from_torch(
-            torch.reshape(
-                ttnn.to_torch(v), (*tuple(v.shape)[:2], self.n_heads, self.head_dim)
-            ),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
+        q = ttnn.permute(q, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        q = ttnn.permute(q, (2, 3, 0, 1))
+        k = ttnn.permute(k, (2, 0, 1))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+        k = ttnn.permute(k, (2, 3, 0, 1))
+        v = ttnn.permute(v, (2, 0, 1))
+        v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+        v = ttnn.permute(v, (2, 3, 0, 1))
         q = ttnn.permute(q, (0, 2, 1, 3))
         k = ttnn.permute(k, (0, 2, 3, 1))
         v = ttnn.permute(v, (0, 2, 1, 3))
@@ -192,12 +177,9 @@ class TriangleAttention(Module):
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.from_torch(
-            torch.reshape(ttnn.to_torch(o), (*tuple(o.shape)[:2], -1)),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
+        o = ttnn.permute(o, (2, 3, 0, 1))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
             x, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -261,30 +243,15 @@ class AttentionPairBias(Module):
         v = ttnn.linear(
             s, self.v_weight, compute_kernel_config=self.compute_kernel_config
         )
-        q = ttnn.from_torch(
-            torch.reshape(
-                ttnn.to_torch(q), (*tuple(q.shape)[:2], self.n_heads, self.head_dim)
-            ),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
-        k = ttnn.from_torch(
-            torch.reshape(
-                ttnn.to_torch(k), (*tuple(k.shape)[:2], self.n_heads, self.head_dim)
-            ),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
-        v = ttnn.from_torch(
-            torch.reshape(
-                ttnn.to_torch(v), (*tuple(v.shape)[:2], self.n_heads, self.head_dim)
-            ),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
+        q = ttnn.permute(q, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        q = ttnn.permute(q, (2, 3, 0, 1))
+        k = ttnn.permute(k, (2, 0, 1))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+        k = ttnn.permute(k, (2, 3, 0, 1))
+        v = ttnn.permute(v, (2, 0, 1))
+        v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+        v = ttnn.permute(v, (2, 3, 0, 1))
         q = ttnn.permute(q, (0, 2, 1, 3))
         k = ttnn.permute(k, (0, 2, 3, 1))
         v = ttnn.permute(v, (0, 2, 1, 3))
@@ -310,12 +277,9 @@ class AttentionPairBias(Module):
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.from_torch(
-            torch.reshape(ttnn.to_torch(o), (*tuple(o.shape)[:-2], -1)),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
+        o = ttnn.permute(o, (2, 3, 0, 1))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
             s, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
