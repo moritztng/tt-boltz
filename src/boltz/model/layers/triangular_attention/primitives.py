@@ -517,7 +517,7 @@ class Attention(nn.Module):
             o = _trifast_attn(q, k, v, biases)
 
         else:
-            o = wrapped_attention(q, k, v, biases)
+            o = _attention(q, k, v, biases)
             o = o.transpose(-2, -3)
 
         o = self._wrap_up(o, q_x)
