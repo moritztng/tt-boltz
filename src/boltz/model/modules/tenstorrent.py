@@ -132,7 +132,7 @@ class TriangleAttention(Module):
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
-            x = ttnn.permute(x, (1, 0, 2))
+            x = ttnn.permute(x, (1, 0, 2)) #THIS CAUSES CACHE -> RESHAPE PROBLEM
         x = ttnn.layer_norm(
             x,
             weight=self.layer_norm_weight,
@@ -169,12 +169,7 @@ class TriangleAttention(Module):
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         a = ttnn.add(a, triangle_bias)
-        a = ttnn.from_torch(
-            torch.softmax(ttnn.to_torch(a), dim=-1),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
-        )
+        a = ttnn.softmax(a, dim=-1, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.permute(o, (2, 3, 0, 1))
@@ -199,7 +194,7 @@ class AttentionPairBias(Module):
         self,
         head_dim: int,
         n_heads: int,
-        initial_norm: bool,
+        diffusion: bool,
         device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
@@ -207,8 +202,8 @@ class AttentionPairBias(Module):
         super().__init__(device, state_dict, compute_kernel_config)
         self.head_dim = head_dim
         self.n_heads = n_heads
-        self.initial_norm = initial_norm
-        if initial_norm:
+        self.diffusion = diffusion
+        if not diffusion:
             self.norm_s_weight = self.torch_to_tt("norm_s.weight")
             self.norm_s_bias = self.torch_to_tt("norm_s.bias")
         self.q_weight = self.torch_to_tt("proj_q.weight")
@@ -223,7 +218,7 @@ class AttentionPairBias(Module):
         self.device = device
 
     def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
-        if self.initial_norm:
+        if not self.diffusion:
             s = ttnn.layer_norm(
                 s,
                 weight=self.norm_s_weight,
@@ -269,7 +264,7 @@ class AttentionPairBias(Module):
         )
         z = ttnn.permute(z, (0, 3, 1, 2))
         a = ttnn.add(a, z)
-        a = ttnn.from_torch(
+        a = ttnn.softmax(a, dim=-1, compute_kernel_config=self.compute_kernel_config) if not self.diffusion else ttnn.from_torch(
             torch.softmax(ttnn.to_torch(a), dim=-1),
             device=self.device,
             layout=ttnn.TILE_LAYOUT,
@@ -364,7 +359,7 @@ class PairformerLayer(Module):
         self.attention_pair_bias = AttentionPairBias(
             att_head_dim,
             att_n_heads,
-            True,
+            False,
             device,
             filter_dict(state_dict, "attention"),
             compute_kernel_config,
@@ -610,7 +605,7 @@ class DiffusionTransformerLayer(Module):
         self.attn_pair_bias = AttentionPairBias(
             head_dim=dim // n_heads,
             n_heads=n_heads,
-            initial_norm=False,
+            diffusion=True,
             device=device,
             state_dict=filter_dict(state_dict, "pair_bias_attn"),
             compute_kernel_config=compute_kernel_config,
