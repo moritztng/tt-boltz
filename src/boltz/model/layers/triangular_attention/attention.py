@@ -134,7 +134,7 @@ class TriangleAttention(nn.Module):
 
         biases = [mask_bias, triangle_bias]
 
-        if chunk_size is not None:
+        if chunk_size is not None and not use_trifast:
             x = self._chunk(
                 x,
                 biases,
