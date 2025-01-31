@@ -178,7 +178,7 @@ def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # n
                     self.qa_metrics.append(
                         _LocalPLDDT(
                             asym_unit_map[chain_idx].residue(residue_idx),
-                            plddts[res_num].item(),
+                            round(plddts[res_num].item() * 100, 2),
                         )
                     )
                     res_num += 1
