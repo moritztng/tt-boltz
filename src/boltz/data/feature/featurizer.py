@@ -556,6 +556,7 @@ def process_token_features(
         "token_resolved_mask": resolved_mask,
         "token_disto_mask": disto_mask,
         "pocket_feature": pocket_feature,
+        "cyclic_mask": cyclic_mask,
     }
     return token_features
 
