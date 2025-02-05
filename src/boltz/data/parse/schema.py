@@ -74,6 +74,7 @@ class ParsedChain:
     entity: str
     type: str
     residues: list[ParsedResidue]
+    is_cyclic: bool
 
 
 ####################################################################################################
