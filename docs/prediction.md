@@ -40,6 +40,7 @@ sequences:
         id: [CHAIN_ID, CHAIN_ID]    # multiple ids in case of multiple identical entities
         ...
 constraints:
+    - cyclic: CHAIN_ID
     - bond:
         atom1: [CHAIN_ID, RES_IDX, ATOM_NAME]
         atom2: [CHAIN_ID, RES_IDX, ATOM_NAME]
@@ -52,6 +53,7 @@ constraints:
 The `modifications` field is an optional field that allows you to specify modified residues in the polymer (`protein`, `dna` or`rna`). The `position` field specifies the index (starting from 1) of the residue, and `ccd` is the CCD code of the modified residue. This field is currently only supported for CCD ligands.
 
 `constraints` is an optional field that allows you to specify additional information about the input structure. 
+* The `cyclic` constraint specifies the chain on which a cyclic offset is applied. A cyclic offset modifies the traditional relative positional encoding from depicting distances left-to-right to depicting a cyclized entity in a head-to-tail fashion. `CHAIN_ID` refers to the id of the residue set above.
 
 * The `bond` constraint specifies covalent bonds between two atoms (`atom1` and `atom2`). It is currently only supported for CCD ligands and canonical residues, `CHAIN_ID` refers to the id of the residue set above, `RES_IDX` is the index (starting from 1) of the residue (1 for ligands), and `ATOM_NAME` is the standardized atom name (can be verified in CIF file of that component on the RCSB website).
 
