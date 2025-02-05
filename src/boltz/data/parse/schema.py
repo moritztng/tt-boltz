@@ -453,6 +453,7 @@ def parse_polymer(
         entity=entity,
         residues=parsed,
         type=chain_type,
+        is_cyclic=False,
     )
 
 
