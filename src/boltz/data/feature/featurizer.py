@@ -328,6 +328,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     msa_data_, del_data_, paired_data_ = prepare_msa_arrays(
         data.tokens, pairing, is_paired, deletions, msa
     )
+
     for token in data.tokens:
         token_res_types = []
         token_deletions = []
@@ -386,12 +387,12 @@ def prepare_msa_arrays(
     token_res_idxs_arr = np.array([t["res_idx"] for t in tokens], dtype=np.int64)
 
     chain_ids = sorted(msa.keys())
-    chain_id_map = {chain_id: i for i, chain_id in enumerate(chain_ids)}
 
     # chain_ids are not necessarily contiguous (e.g. they might be 0, 24, 25).
     # This allows us to look up a chain_id by it's index in the chain_ids list.
+    chain_id_to_idx = {chain_id: i for i, chain_id in enumerate(chain_ids)}
     token_asym_ids_idx_arr = np.array(
-        [chain_id_map[asym_id] for asym_id in token_asym_ids_arr], dtype=np.int64
+        [chain_id_to_idx[asym_id] for asym_id in token_asym_ids_arr], dtype=np.int64
     )
 
     pairing_arr = np.zeros((len(pairing), len(chain_ids)), dtype=np.int64)
@@ -399,11 +400,11 @@ def prepare_msa_arrays(
 
     for i, row_pairing in enumerate(pairing):
         for chain_id in chain_ids:
-            pairing_arr[i, chain_id_map[chain_id]] = row_pairing[chain_id]
+            pairing_arr[i, chain_id_to_idx[chain_id]] = row_pairing[chain_id]
 
     for i, row_is_paired in enumerate(is_paired):
         for chain_id in chain_ids:
-            is_paired_arr[i, chain_id_map[chain_id]] = row_is_paired[chain_id]
+            is_paired_arr[i, chain_id_to_idx[chain_id]] = row_is_paired[chain_id]
 
     max_seq_len = max(len(msa[chain_id].sequences) for chain_id in chain_ids)
 
@@ -411,14 +412,15 @@ def prepare_msa_arrays(
     msa_sequences = np.full((len(chain_ids), max_seq_len), -1, dtype=np.int64)
     for chain_id in chain_ids:
         for i, seq in enumerate(msa[chain_id].sequences):
-            msa_sequences[chain_id_map[chain_id], i] = seq["res_start"]
+            msa_sequences[chain_id_to_idx[chain_id], i] = seq["res_start"]
 
-    # we want 0 idxs from residues
     max_residues_len = max(len(msa[chain_id].residues) for chain_id in chain_ids)
     msa_residues = np.full((len(chain_ids), max_residues_len), -1, dtype=np.int64)
     for chain_id in chain_ids:
-        for i, res in enumerate(msa[chain_id].residues):
-            msa_residues[chain_id_map[chain_id], i] = res[0]
+        residues = msa[chain_id].residues.astype(np.int64)
+        idxs = np.arange(len(residues))
+        chain_idx = chain_id_to_idx[chain_id]
+        msa_residues[chain_idx, idxs] = residues
 
     deletions_dict = numba.typed.Dict.empty(
         key_type=numba.types.Tuple(
@@ -426,8 +428,7 @@ def prepare_msa_arrays(
         ),
         value_type=numba.types.int64,
     )
-    for key, value in deletions.items():
-        deletions_dict[key] = value
+    deletions_dict.update(deletions)
 
     return _prepare_msa_arrays_inner(
         token_asym_ids_arr,
