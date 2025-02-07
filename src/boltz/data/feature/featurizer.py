@@ -304,12 +304,6 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
         pairing = pairing[:max_seqs]
         is_paired = is_paired[:max_seqs]
 
-    # Create MSA data
-    msa_data = []
-    del_data = []
-    paired_data = []
-    gap_token_id = const.token_ids["-"]
-
     # Map (chain_id, seq_idx, res_idx) to deletion
     deletions = {}
     for chain_id, chain_msa in msa.items():
@@ -325,52 +319,13 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
                 deletions[(chain_id, seq_idx, res_idx)] = deletion
 
     # Add all the token MSA data
-    msa_data_, del_data_, paired_data_ = prepare_msa_arrays(
+    msa_data, del_data, paired_data = prepare_msa_arrays(
         data.tokens, pairing, is_paired, deletions, msa
     )
-
-    for token in data.tokens:
-        token_res_types = []
-        token_deletions = []
-        token_is_paired = []
-        for row_pairing, row_is_paired in zip(pairing, is_paired):
-            res_idx = int(token["res_idx"])
-            chain_id = int(token["asym_id"])
-            seq_idx = row_pairing[chain_id]
-            token_is_paired.append(row_is_paired[chain_id])
-
-            # Add residue type
-            if seq_idx == -1:
-                token_res_types.append(gap_token_id)
-                token_deletions.append(0)
-            else:
-                sequence = msa[chain_id].sequences[seq_idx]
-                res_start = sequence["res_start"]
-                res_type = msa[chain_id].residues[res_start + res_idx][0]
-                deletion = deletions.get((chain_id, seq_idx, res_idx), 0)
-                token_res_types.append(res_type)
-                token_deletions.append(deletion)
-
-        msa_data.append(token_res_types)
-        del_data.append(token_deletions)
-        paired_data.append(token_is_paired)
 
     msa_data = torch.tensor(msa_data, dtype=torch.long)
     del_data = torch.tensor(del_data, dtype=torch.float)
     paired_data = torch.tensor(paired_data, dtype=torch.float)
-
-    msa_data_ = torch.tensor(msa_data_, dtype=torch.long)
-    del_data_ = torch.tensor(del_data_, dtype=torch.float)
-    paired_data_ = torch.tensor(paired_data_, dtype=torch.float)
-
-    if not (msa_data == msa_data_).all():
-        print("MSA DATA")
-
-    if not (del_data == del_data_).all():
-        print("DEL DATA")
-
-    if not (paired_data == paired_data_).all():
-        print("PAIRED DATA")
 
     return msa_data, del_data, paired_data
 
