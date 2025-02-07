@@ -143,7 +143,7 @@ class BoltzTokenizer(Tokenizer):
                             disto_coords=atom_coords[i],
                             resolved_mask=is_present,
                             disto_mask=is_present,
-                            is_cyclic=chain["is_cyclic"],
+                            is_cyclic=chain["is_cyclic"], # Enforced to be False in chain parser
                         )
                         token_data.append(astuple(token))
 

@@ -644,6 +644,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 entity=entity_id,
                 residues=residues,
                 type=const.chain_type_ids["NONPOLYMER"],
+                is_cyclic=False,
             )
         elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
@@ -670,6 +671,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 entity=entity_id,
                 residues=[residue],
                 type=const.chain_type_ids["NONPOLYMER"],
+                is_cyclic=False,
             )
         else:
             msg = f"Invalid entity type: {entity_type}"
@@ -789,6 +791,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "cyclic" in constraint:
+            # TODO: Check that sequence item == protein
             if constraint["cyclic"] not in list(chains.keys()):
                 msg = f"Invalid cyclic chain: {constraint['cyclic']}. Available chains: {list(chains.keys())}"
                 raise ValueError(msg)
