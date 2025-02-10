@@ -792,10 +792,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     for constraint in constraints:
         if "cyclic" in constraint:
             sequence_items = schema.get("sequences", [])
-            for sequent_item in sequence_items:
-                if "protein" not in sequent_item:
-                    msg = f"Cyclic constraints are supported only on proteins. Got {sequent_item}"
-                    raise ValueError(msg)
+            if constraint["cyclic"] in list(chains.keys()):
+                for sequent_item in sequence_items:
+                    if "protein" not in sequent_item:
+                        msg = f"Cyclic constraints are supported only on proteins. Got {sequent_item}"
+                        raise ValueError(msg)
 
             if constraint["cyclic"] not in list(chains.keys()):
                 msg = f"Invalid cyclic chain: {constraint['cyclic']}. Available chains: {list(chains.keys())}"
