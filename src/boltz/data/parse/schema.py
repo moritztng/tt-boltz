@@ -791,7 +791,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "cyclic" in constraint:
-            # TODO: Check that sequence item == protein
             sequence_items = schema.get("sequences", [])
             for sequent_item in sequence_items:
                 if "protein" not in sequent_item:
