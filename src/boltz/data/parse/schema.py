@@ -791,13 +791,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "cyclic" in constraint:
-            sequence_items = schema.get("sequences", [])
-            if constraint["cyclic"] in list(chains.keys()):
-                for sequent_item in sequence_items:
-                    if "protein" not in sequent_item:
-                        msg = f"Cyclic constraints are supported only on proteins. Got {sequent_item}"
-                        raise ValueError(msg)
-
+            sequence_items = schema.get("sequences", {}) # pretty sure this should be a dict but need to check yaml parsing
+            cyclic_chain_id = constraint["cyclic"]
+            if cyclic_chain_id not in list(chains.keys()):
+                msg = f"Invalid cyclic chain: {constraint['cyclic']}. Available chains: {list(chains.keys())}"
+                raise ValueError(msg)
+            
             if constraint["cyclic"] not in list(chains.keys()):
                 msg = f"Invalid cyclic chain: {constraint['cyclic']}. Available chains: {list(chains.keys())}"
                 raise ValueError(msg)
