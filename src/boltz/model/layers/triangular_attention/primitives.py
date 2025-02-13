@@ -665,7 +665,7 @@ def _trifast_attn(q, k, v, biases):
 
     if len(b.shape) == 5:
         # Sometimes there is an extra batch dim -- why?
-        b = b.squeeze(0)
+        b = b.squeeze(1)
 
     if orig_n_dims == 4:
         # add fake batch dim
