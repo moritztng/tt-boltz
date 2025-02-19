@@ -296,7 +296,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     if random_subset:
         num_seqs = len(pairing)
         if num_seqs > max_seqs:
-            indices = np.random.choice(list(range(1, num_seqs)), replace=False)  # noqa: NPY002
+            indices = np.random.choice(list(range(1, num_seqs)), size=max_seqs-1, replace=False)  # noqa: NPY002
             pairing = [pairing[0]] + [pairing[i] for i in indices]
             is_paired = [is_paired[0]] + [is_paired[i] for i in indices]
     else:
