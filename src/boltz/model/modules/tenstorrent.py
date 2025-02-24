@@ -156,25 +156,20 @@ class TriangleAttention(Module):
         )
         q = ttnn.permute(q, (2, 0, 1))
         q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
-        q = ttnn.permute(q, (2, 3, 0, 1))
         k = ttnn.permute(k, (2, 0, 1))
         k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
-        k = ttnn.permute(k, (2, 3, 0, 1))
         v = ttnn.permute(v, (2, 0, 1))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-        v = ttnn.permute(v, (2, 3, 0, 1))
-        q = ttnn.permute(q, (0, 2, 1, 3))
-        k = ttnn.permute(k, (0, 2, 3, 1))
-        v = ttnn.permute(v, (0, 2, 1, 3))
+        q = ttnn.permute(q, (2, 0, 3, 1))
+        k = ttnn.permute(k, (2, 0, 1, 3))
+        v = ttnn.permute(v, (2, 0, 3, 1))
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         a = ttnn.add(a, triangle_bias)
         a = ttnn.softmax(a, dim=-1, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.permute(o, (2, 3, 0, 1))
-        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
-        o = ttnn.permute(o, (1, 2, 0))
+        o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
         g = ttnn.linear(
             x, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -748,3 +743,12 @@ class DiffusionTransformerModule(nn.Module):
                 )
             )
         ).to(torch.float32)
+
+# ttnn.to_torch(
+#                         a,
+#                         mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
+#                     )[:1],
+
+#  device = ttnn.open_mesh_device(
+#                 ttnn.MeshShape(1, 2),
+#             )
