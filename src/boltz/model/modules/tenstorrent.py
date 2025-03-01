@@ -1,8 +1,10 @@
 import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable
+from time import time
 
-device = None
+single_device = None
+mesh_device = None
 
 
 def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
@@ -19,11 +21,9 @@ def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
 class Module:
     def __init__(
         self,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        self.device = device
         self.state_dict = state_dict
         self.compute_kernel_config = compute_kernel_config
 
@@ -35,7 +35,7 @@ class Module:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
-            device=self.device,
+            device=single_device,
             dtype=ttnn.float32,
         )
 
@@ -44,11 +44,10 @@ class TriangleMultiplication(Module):
     def __init__(
         self,
         ending: bool,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.ending = ending
         self.in_norm_weight = self.torch_to_tt("norm_in.weight")
         self.in_norm_bias = self.torch_to_tt("norm_in.bias")
@@ -112,11 +111,10 @@ class TriangleAttention(Module):
         head_dim: int,
         n_heads: int,
         ending: bool,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.ending = ending
@@ -130,9 +128,10 @@ class TriangleAttention(Module):
         self.g_weight = self.torch_to_tt("linear_g.weight")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        # sequence_length = x.shape[1]
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
-            x = ttnn.permute(x, (1, 0, 2)) #THIS CAUSES CACHE -> RESHAPE PROBLEM
+            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
         x = ttnn.layer_norm(
             x,
             weight=self.layer_norm_weight,
@@ -163,13 +162,50 @@ class TriangleAttention(Module):
         q = ttnn.permute(q, (2, 0, 3, 1))
         k = ttnn.permute(k, (2, 0, 1, 3))
         v = ttnn.permute(v, (2, 0, 3, 1))
+        start_time = time()
+        # q = ttnn.from_torch(
+        #     ttnn.to_torch(q),
+        #     layout=ttnn.TILE_LAYOUT,
+        #     dtype=ttnn.float32,
+        #     device=mesh_device,
+        #     mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=0),
+        # )
+        # k = ttnn.from_torch(
+        #     ttnn.to_torch(k),
+        #     layout=ttnn.TILE_LAYOUT,
+        #     dtype=ttnn.float32,
+        #     device=mesh_device,
+        #     mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=0),
+        # )
+        # v = ttnn.from_torch(
+        #     ttnn.to_torch(v),
+        #     layout=ttnn.TILE_LAYOUT,
+        #     dtype=ttnn.float32,
+        #     device=mesh_device,
+        #     mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=0),
+        # )
+        # triangle_bias = ttnn.from_torch(
+        #     ttnn.to_torch(triangle_bias),
+        #     layout=ttnn.TILE_LAYOUT,
+        #     dtype=ttnn.float32,
+        #     device=mesh_device,
+        # )
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         a = ttnn.add(a, triangle_bias)
-        a = ttnn.softmax(a, dim=-1, compute_kernel_config=self.compute_kernel_config)
+        a = ttnn.softmax(
+            a,
+            dim=-1,
+            compute_kernel_config=self.compute_kernel_config,
+            numeric_stable=True,
+        )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
+        start_time = time()
+        # o = ttnn.all_gather(o, dim=0)
+        # o = ttnn.get_device_tensors(o)[0][:sequence_length]
+        o = ttnn.permute(o, (1, 3, 0, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
             x, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -190,11 +226,10 @@ class AttentionPairBias(Module):
         head_dim: int,
         n_heads: int,
         diffusion: bool,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.diffusion = diffusion
@@ -210,7 +245,6 @@ class AttentionPairBias(Module):
         self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
         self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
-        self.device = device
 
     def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
         if not self.diffusion:
@@ -259,11 +293,11 @@ class AttentionPairBias(Module):
         )
         z = ttnn.permute(z, (0, 3, 1, 2))
         a = ttnn.add(a, z)
-        a = ttnn.softmax(a, dim=-1, compute_kernel_config=self.compute_kernel_config) if not self.diffusion else ttnn.from_torch(
-            torch.softmax(ttnn.to_torch(a), dim=-1),
-            device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
+        a = ttnn.softmax(
+            a,
+            dim=-1,
+            compute_kernel_config=self.compute_kernel_config,
+            numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
@@ -284,11 +318,10 @@ class AttentionPairBias(Module):
 class Transition(Module):
     def __init__(
         self,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.norm_weight = self.torch_to_tt("norm.weight")
         self.norm_bias = self.torch_to_tt("norm.bias")
         self.fc1_weight = self.torch_to_tt("fc1.weight")
@@ -324,22 +357,20 @@ class PairformerLayer(Module):
         tri_att_n_heads: int,
         att_head_dim: int,
         att_n_heads: int,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.triangle_multiplication_start = TriangleMultiplication(
-            False, device, filter_dict(state_dict, "tri_mul_out"), compute_kernel_config
+            False, filter_dict(state_dict, "tri_mul_out"), compute_kernel_config
         )
         self.triangle_multiplication_end = TriangleMultiplication(
-            True, device, filter_dict(state_dict, "tri_mul_in"), compute_kernel_config
+            True, filter_dict(state_dict, "tri_mul_in"), compute_kernel_config
         )
         self.triangle_attention_start = TriangleAttention(
             tri_att_head_dim,
             tri_att_n_heads,
             False,
-            device,
             filter_dict(state_dict, "tri_att_start", "mha."),
             compute_kernel_config,
         )
@@ -347,7 +378,6 @@ class PairformerLayer(Module):
             tri_att_head_dim,
             tri_att_n_heads,
             True,
-            device,
             filter_dict(state_dict, "tri_att_end", "mha."),
             compute_kernel_config,
         )
@@ -355,15 +385,14 @@ class PairformerLayer(Module):
             att_head_dim,
             att_n_heads,
             False,
-            device,
             filter_dict(state_dict, "attention"),
             compute_kernel_config,
         )
         self.transition_z = Transition(
-            device, filter_dict(state_dict, "transition_z"), compute_kernel_config
+            filter_dict(state_dict, "transition_z"), compute_kernel_config
         )
         self.transition_s = Transition(
-            device, filter_dict(state_dict, "transition_s"), compute_kernel_config
+            filter_dict(state_dict, "transition_s"), compute_kernel_config
         )
 
     def __call__(
@@ -402,18 +431,16 @@ class Pairformer(Module):
         tri_att_n_heads: int,
         att_head_dim: int,
         att_n_heads: int,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.blocks = [
             PairformerLayer(
                 tri_att_head_dim,
                 tri_att_n_heads,
                 att_head_dim,
                 att_n_heads,
-                device,
                 filter_dict(state_dict, f"layers.{i}"),
                 compute_kernel_config,
             )
@@ -444,11 +471,11 @@ class PairformerModule(nn.Module):
         self.att_head_dim = att_head_dim
         self.att_n_heads = att_n_heads
         self.pairformer = None
-        global device
-        if device is None:
-            device = ttnn.open_device(device_id=0)
-            device.enable_program_cache()
-        self.device = device
+        global single_device, mesh_device
+        if single_device is None:
+            mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
+            mesh_device.enable_program_cache()
+            single_device = mesh_device.create_submeshes(ttnn.MeshShape(1, 1))[0]
 
     def _load_from_state_dict(
         self,
@@ -466,7 +493,6 @@ class PairformerModule(nn.Module):
             self.tri_att_n_heads,
             self.att_head_dim,
             self.att_n_heads,
-            self.device,
             filter_dict(state_dict, prefix[:-1]),
             ttnn.WormholeComputeKernelConfig(
                 math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -488,13 +514,13 @@ class PairformerModule(nn.Module):
             for x in self.pairformer(
                 ttnn.from_torch(
                     s,
-                    device=self.device,
+                    device=single_device,
                     layout=ttnn.TILE_LAYOUT,
                     dtype=ttnn.float32,
                 ),
                 ttnn.from_torch(
                     z,
-                    device=self.device,
+                    device=single_device,
                     layout=ttnn.TILE_LAYOUT,
                     dtype=ttnn.float32,
                 ),
@@ -505,11 +531,10 @@ class PairformerModule(nn.Module):
 class AdaLN(Module):
     def __init__(
         self,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.s_norm_weight = self.torch_to_tt("s_norm.weight")
         self.s_scale_weight = self.torch_to_tt("s_scale.weight")
         self.s_scale_bias = self.torch_to_tt("s_scale.bias")
@@ -543,14 +568,11 @@ class AdaLN(Module):
 class ConditionedTransitionBlock(Module):
     def __init__(
         self,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
-        self.adaln = AdaLN(
-            device, filter_dict(state_dict, "adaln"), compute_kernel_config
-        )
+        super().__init__(state_dict, compute_kernel_config)
+        self.adaln = AdaLN(filter_dict(state_dict, "adaln"), compute_kernel_config)
         self.swish_weight = self.torch_to_tt("swish_gate.0.weight")
         self.a_to_b_weight = self.torch_to_tt("a_to_b.weight")
         self.b_to_a_weight = self.torch_to_tt("b_to_a.weight")
@@ -589,19 +611,15 @@ class DiffusionTransformerLayer(Module):
         self,
         dim: int,
         n_heads: int,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
-        self.adaln = AdaLN(
-            device, filter_dict(state_dict, "adaln"), compute_kernel_config
-        )
+        super().__init__(state_dict, compute_kernel_config)
+        self.adaln = AdaLN(filter_dict(state_dict, "adaln"), compute_kernel_config)
         self.attn_pair_bias = AttentionPairBias(
             head_dim=dim // n_heads,
             n_heads=n_heads,
             diffusion=True,
-            device=device,
             state_dict=filter_dict(state_dict, "pair_bias_attn"),
             compute_kernel_config=compute_kernel_config,
         )
@@ -610,7 +628,6 @@ class DiffusionTransformerLayer(Module):
         )
         self.output_projection_bias = self.torch_to_tt("output_projection_linear.bias")
         self.transition = ConditionedTransitionBlock(
-            device,
             filter_dict(state_dict, "transition"),
             compute_kernel_config,
         )
@@ -638,16 +655,14 @@ class DiffusionTransformer(Module):
         n_layers: int,
         dim: int,
         n_heads: int,
-        device: ttnn._ttnn.device.Device,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        super().__init__(device, state_dict, compute_kernel_config)
+        super().__init__(state_dict, compute_kernel_config)
         self.layers = [
             DiffusionTransformerLayer(
                 dim,
                 n_heads,
-                device,
                 filter_dict(state_dict, f"layers.{i}"),
                 compute_kernel_config,
             )
@@ -675,11 +690,11 @@ class DiffusionTransformerModule(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
         self.diffusion_transformer = None
-        global device
-        if device is None:
-            device = ttnn.open_device(device_id=0)
-            device.enable_program_cache()
-        self.device = device
+        global single_device, mesh_device
+        if single_device is None:
+            mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
+            mesh_device.enable_program_cache()
+            single_device = mesh_device.create_submeshes(ttnn.MeshShape(1, 1))[0]
 
     def _load_from_state_dict(
         self,
@@ -695,7 +710,6 @@ class DiffusionTransformerModule(nn.Module):
             self.n_layers,
             self.dim,
             self.n_heads,
-            self.device,
             filter_dict(state_dict, prefix[:-1]),
             ttnn.WormholeComputeKernelConfig(
                 math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -715,25 +729,25 @@ class DiffusionTransformerModule(nn.Module):
         multiplicity: int = 1,
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
-        return torch.Tensor(
+        x = torch.Tensor(
             ttnn.to_torch(
                 self.diffusion_transformer(
                     ttnn.from_torch(
                         a,
-                        device=self.device,
+                        device=single_device,
                         layout=ttnn.TILE_LAYOUT,
                         dtype=ttnn.float32,
                     ),
                     ttnn.from_torch(
                         s,
-                        device=self.device,
+                        device=single_device,
                         layout=ttnn.TILE_LAYOUT,
                         dtype=ttnn.float32,
                     ),
                     (
                         ttnn.from_torch(
                             z,
-                            device=self.device,
+                            device=single_device,
                             layout=ttnn.TILE_LAYOUT,
                             dtype=ttnn.float32,
                         )
@@ -743,6 +757,8 @@ class DiffusionTransformerModule(nn.Module):
                 )
             )
         ).to(torch.float32)
+        return x
+
 
 # ttnn.to_torch(
 #                         a,
