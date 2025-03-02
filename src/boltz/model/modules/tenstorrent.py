@@ -154,15 +154,14 @@ class TriangleAttention(Module):
             x, self.v_weight, compute_kernel_config=self.compute_kernel_config
         )
         q = ttnn.permute(q, (2, 0, 1))
-        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
         k = ttnn.permute(k, (2, 0, 1))
-        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.permute(v, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
         q = ttnn.permute(q, (2, 0, 3, 1))
         k = ttnn.permute(k, (2, 0, 1, 3))
         v = ttnn.permute(v, (2, 0, 3, 1))
-        start_time = time()
         # q = ttnn.from_torch(
         #     ttnn.to_torch(q),
         #     layout=ttnn.TILE_LAYOUT,
@@ -200,12 +199,10 @@ class TriangleAttention(Module):
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-        start_time = time()
         # o = ttnn.all_gather(o, dim=0)
         # o = ttnn.get_device_tensors(o)[0][:sequence_length]
-        o = ttnn.permute(o, (1, 3, 0, 2))
-        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
-        o = ttnn.permute(o, (1, 2, 0))
+        o = ttnn.permute(o, (0, 2, 1, 3))
+        o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
         g = ttnn.linear(
             x, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -268,17 +265,14 @@ class AttentionPairBias(Module):
             s, self.v_weight, compute_kernel_config=self.compute_kernel_config
         )
         q = ttnn.permute(q, (2, 0, 1))
-        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
-        q = ttnn.permute(q, (2, 3, 0, 1))
         k = ttnn.permute(k, (2, 0, 1))
-        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
-        k = ttnn.permute(k, (2, 3, 0, 1))
         v = ttnn.permute(v, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-        v = ttnn.permute(v, (2, 3, 0, 1))
-        q = ttnn.permute(q, (0, 2, 1, 3))
-        k = ttnn.permute(k, (0, 2, 3, 1))
-        v = ttnn.permute(v, (0, 2, 1, 3))
+        q = ttnn.permute(q, (2, 0, 3, 1))
+        k = ttnn.permute(k, (2, 0, 1, 3))
+        v = ttnn.permute(v, (2, 0, 3, 1))
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         z = ttnn.layer_norm(
@@ -301,9 +295,7 @@ class AttentionPairBias(Module):
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.permute(o, (2, 3, 0, 1))
-        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
-        o = ttnn.permute(o, (1, 2, 0))
+        o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
         g = ttnn.linear(
             s, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
