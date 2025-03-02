@@ -188,7 +188,11 @@ class Boltz1(LightningModule):
                 s_input_dim=s_input_dim,
                 **msa_args,
             )
-        self.pairformer_module = tenstorrent.PairformerModule(48, 32, 4, 24, 16) if self.use_tenstorrent else PairformerModule(token_s, token_z, **pairformer_args)
+        self.pairformer_module = (
+            tenstorrent.PairformerModule(48, 32, 4, 24, 16)
+            if self.use_tenstorrent
+            else PairformerModule(token_s, token_z, **pairformer_args)
+        )
         compile_pairformer &= not self.use_tenstorrent
         if compile_pairformer:
             # Big models hit the default cache limit (8)
@@ -226,6 +230,10 @@ class Boltz1(LightningModule):
         self.structure_prediction_training = structure_prediction_training
         self.confidence_imitate_trunk = confidence_imitate_trunk
         if self.confidence_prediction:
+            confidence_model_args = {
+                "use_tenstorrent": use_tenstorrent,
+                **confidence_model_args,
+            }
             if self.confidence_imitate_trunk:
                 self.confidence_module = ConfidenceModule(
                     token_s,
@@ -310,7 +318,9 @@ class Boltz1(LightningModule):
 
                     # Revert to uncompiled version for validation
                     if self.is_pairformer_compiled and not self.training:
-                        pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                        pairformer_module = (
+                            self.pairformer_module._orig_mod
+                        )  # noqa: SLF001
                     else:
                         pairformer_module = self.pairformer_module
 

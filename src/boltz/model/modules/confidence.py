@@ -15,6 +15,7 @@ from boltz.model.modules.trunk import (
     PairformerModule,
 )
 from boltz.model.modules.utils import LinearNoBias
+from boltz.model.modules import tenstorrent
 
 
 class ConfidenceModule(nn.Module):
@@ -37,6 +38,7 @@ class ConfidenceModule(nn.Module):
         full_embedder_args: dict = None,
         msa_args: dict = None,
         compile_pairformer=False,
+        use_tenstorrent: bool = False,
     ):
         """Initialize the confidence module.
 
@@ -133,10 +135,14 @@ class ConfidenceModule(nn.Module):
                 s_input_dim=s_input_dim,
                 **msa_args,
             )
-            self.pairformer_module = PairformerModule(
-                token_s,
-                token_z,
-                **pairformer_args,
+            self.pairformer_module = (
+                tenstorrent.PairformerModule(48, 32, 4, 24, 16)
+                if use_tenstorrent
+                else PairformerModule(
+                    token_s,
+                    token_z,
+                    **pairformer_args,
+                )
             )
             if compile_pairformer:
                 # Big models hit the default cache limit (8)
@@ -205,9 +211,11 @@ class ConfidenceModule(nn.Module):
                         feats,
                         pred_distogram_logits,
                         multiplicity=1,
-                        s_diffusion=s_diffusion[sample_idx : sample_idx + 1]
-                        if s_diffusion is not None
-                        else None,
+                        s_diffusion=(
+                            s_diffusion[sample_idx : sample_idx + 1]
+                            if s_diffusion is not None
+                            else None
+                        ),
                         run_sequentially=False,
                     )
                 )
