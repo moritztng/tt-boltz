@@ -1,9 +1,7 @@
 import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable
-from time import time
 
-single_device = None
 mesh_device = None
 
 
@@ -35,7 +33,7 @@ class Module:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
-            device=single_device,
+            device=mesh_device.get_devices()[0],
             dtype=ttnn.float32,
         )
 
@@ -494,11 +492,10 @@ class PairformerModule(nn.Module):
         self.att_head_dim = att_head_dim
         self.att_n_heads = att_n_heads
         self.pairformer = None
-        global single_device, mesh_device
-        if single_device is None:
+        global mesh_device
+        if mesh_device is None:
             mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
             mesh_device.enable_program_cache()
-            single_device = mesh_device.create_submeshes(ttnn.MeshShape(1, 1))[0]
 
     def _load_from_state_dict(
         self,
@@ -537,13 +534,13 @@ class PairformerModule(nn.Module):
             for x in self.pairformer(
                 ttnn.from_torch(
                     s,
-                    device=single_device,
+                    device=mesh_device.get_devices()[0],
                     layout=ttnn.TILE_LAYOUT,
                     dtype=ttnn.float32,
                 ),
                 ttnn.from_torch(
                     z,
-                    device=single_device,
+                    device=mesh_device.get_devices()[0],
                     layout=ttnn.TILE_LAYOUT,
                     dtype=ttnn.float32,
                 ),
@@ -714,11 +711,10 @@ class DiffusionTransformerModule(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
         self.diffusion_transformer = None
-        global single_device, mesh_device
-        if single_device is None:
+        global mesh_device
+        if mesh_device is None:
             mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
             mesh_device.enable_program_cache()
-            single_device = mesh_device.create_submeshes(ttnn.MeshShape(1, 1))[0]
 
     def _load_from_state_dict(
         self,
@@ -758,20 +754,20 @@ class DiffusionTransformerModule(nn.Module):
                 self.diffusion_transformer(
                     ttnn.from_torch(
                         a,
-                        device=single_device,
+                        device=mesh_device.get_devices()[0],
                         layout=ttnn.TILE_LAYOUT,
                         dtype=ttnn.float32,
                     ),
                     ttnn.from_torch(
                         s,
-                        device=single_device,
+                        device=mesh_device.get_devices()[0],
                         layout=ttnn.TILE_LAYOUT,
                         dtype=ttnn.float32,
                     ),
                     (
                         ttnn.from_torch(
                             z,
-                            device=single_device,
+                            device=mesh_device.get_devices()[0],
                             layout=ttnn.TILE_LAYOUT,
                             dtype=ttnn.float32,
                         )
@@ -782,13 +778,3 @@ class DiffusionTransformerModule(nn.Module):
             )
         ).to(torch.float32)
         return x
-
-
-# ttnn.to_torch(
-#                         a,
-#                         mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
-#                     )[:1],
-
-#  device = ttnn.open_mesh_device(
-#                 ttnn.MeshShape(1, 2),
-#             )
