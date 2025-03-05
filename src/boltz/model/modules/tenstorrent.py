@@ -128,7 +128,6 @@ class TriangleAttention(Module):
         self.g_weight = self.torch_to_tt("linear_g.weight")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
-        # sequence_length = x.shape[1]
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
@@ -162,33 +161,63 @@ class TriangleAttention(Module):
         q = ttnn.permute(q, (2, 0, 3, 1))
         k = ttnn.permute(k, (2, 0, 1, 3))
         v = ttnn.permute(v, (2, 0, 3, 1))
-        # q = ttnn.from_torch(
-        #     ttnn.to_torch(q),
-        #     layout=ttnn.TILE_LAYOUT,
-        #     dtype=ttnn.float32,
-        #     device=mesh_device,
-        #     mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=0),
-        # )
-        # k = ttnn.from_torch(
-        #     ttnn.to_torch(k),
-        #     layout=ttnn.TILE_LAYOUT,
-        #     dtype=ttnn.float32,
-        #     device=mesh_device,
-        #     mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=0),
-        # )
-        # v = ttnn.from_torch(
-        #     ttnn.to_torch(v),
-        #     layout=ttnn.TILE_LAYOUT,
-        #     dtype=ttnn.float32,
-        #     device=mesh_device,
-        #     mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=0),
-        # )
-        # triangle_bias = ttnn.from_torch(
-        #     ttnn.to_torch(triangle_bias),
-        #     layout=ttnn.TILE_LAYOUT,
-        #     dtype=ttnn.float32,
-        #     device=mesh_device,
-        # )
+        q = ttnn.aggregate_as_tensor(
+            [
+                ttnn.slice(
+                    q,
+                    [0, 0, 0, 0],
+                    [q.shape[0], q.shape[1] // 2, q.shape[2], q.shape[3]],
+                ),
+                ttnn.from_device(ttnn.slice(q, [0, q.shape[1] // 2, 0, 0], q.shape)).to(
+                    mesh_device.get_devices()[1]
+                ),
+            ]
+        )
+        k = ttnn.aggregate_as_tensor(
+            [
+                ttnn.slice(
+                    k,
+                    [0, 0, 0, 0],
+                    [k.shape[0], k.shape[1] // 2, k.shape[2], k.shape[3]],
+                ),
+                ttnn.from_device(ttnn.slice(k, [0, k.shape[1] // 2, 0, 0], k.shape)).to(
+                    mesh_device.get_devices()[1]
+                ),
+            ]
+        )
+        v = ttnn.aggregate_as_tensor(
+            [
+                ttnn.slice(
+                    v,
+                    [0, 0, 0, 0],
+                    [v.shape[0], v.shape[1] // 2, v.shape[2], v.shape[3]],
+                ),
+                ttnn.from_device(ttnn.slice(v, [0, v.shape[1] // 2, 0, 0], v.shape)).to(
+                    mesh_device.get_devices()[1]
+                ),
+            ]
+        )
+        triangle_bias = ttnn.aggregate_as_tensor(
+            [
+                ttnn.slice(
+                    triangle_bias,
+                    [0, 0, 0, 0],
+                    [
+                        triangle_bias.shape[0],
+                        triangle_bias.shape[1] // 2,
+                        triangle_bias.shape[2],
+                        triangle_bias.shape[3],
+                    ],
+                ),
+                ttnn.from_device(
+                    ttnn.slice(
+                        triangle_bias,
+                        [0, triangle_bias.shape[1] // 2, 0, 0],
+                        triangle_bias.shape,
+                    )
+                ).to(mesh_device.get_devices()[1]),
+            ]
+        )
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         a = ttnn.add(a, triangle_bias)
@@ -199,8 +228,8 @@ class TriangleAttention(Module):
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-        # o = ttnn.all_gather(o, dim=0)
-        # o = ttnn.get_device_tensors(o)[0][:sequence_length]
+        o = ttnn.all_gather(o, dim=1)
+        o = ttnn.get_device_tensors(o)[0]
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
         g = ttnn.linear(
@@ -501,7 +530,7 @@ class PairformerModule(nn.Module):
         mask: torch.Tensor = None,
         pair_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return tuple(
+        x = tuple(
             torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
             for x in self.pairformer(
                 ttnn.from_torch(
@@ -518,6 +547,7 @@ class PairformerModule(nn.Module):
                 ),
             )
         )
+        return x
 
 
 class AdaLN(Module):
