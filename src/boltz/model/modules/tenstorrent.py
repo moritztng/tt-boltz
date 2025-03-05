@@ -230,8 +230,9 @@ class TriangleAttention(Module):
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
         o = ttnn.all_gather(o, dim=1)
         o = ttnn.get_device_tensors(o)[0]
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
+        o = ttnn.permute(o, (1, 3, 0, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
             x, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -323,8 +324,9 @@ class AttentionPairBias(Module):
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.reshape(o, (*tuple(o.shape)[:2], -1))
+        o = ttnn.permute(o, (1, 3, 0, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
             s, self.g_weight, compute_kernel_config=self.compute_kernel_config
         )
