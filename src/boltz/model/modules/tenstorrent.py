@@ -139,8 +139,8 @@ class TriangleAttention(Module):
         triangle_bias = ttnn.linear(
             x, self.bias_weight, compute_kernel_config=self.compute_kernel_config
         )
-        triangle_bias = ttnn.permute(triangle_bias, (2, 0, 1))
         triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
         q = ttnn.linear(
             x, self.q_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -156,17 +156,17 @@ class TriangleAttention(Module):
         q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
         k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-        q = ttnn.permute(q, (2, 0, 3, 1))
-        k = ttnn.permute(k, (2, 0, 1, 3))
-        v = ttnn.permute(v, (2, 0, 3, 1))
+        q = ttnn.permute(q, (0, 2, 3, 1))
+        k = ttnn.permute(k, (0, 2, 1, 3))
+        v = ttnn.permute(v, (0, 2, 3, 1))
         q = ttnn.aggregate_as_tensor(
             [
                 ttnn.slice(
                     q,
                     [0, 0, 0, 0],
-                    [q.shape[0], q.shape[1] // 2, q.shape[2], q.shape[3]],
+                    [q.shape[0] // 2, *tuple(q.shape)[1:]],
                 ),
-                ttnn.from_device(ttnn.slice(q, [0, q.shape[1] // 2, 0, 0], q.shape)).to(
+                ttnn.from_device(ttnn.slice(q, [q.shape[0] // 2, 0, 0, 0], q.shape)).to(
                     mesh_device.get_devices()[1]
                 ),
             ]
@@ -176,9 +176,9 @@ class TriangleAttention(Module):
                 ttnn.slice(
                     k,
                     [0, 0, 0, 0],
-                    [k.shape[0], k.shape[1] // 2, k.shape[2], k.shape[3]],
+                    [k.shape[0] // 2, *tuple(k.shape)[1:]],
                 ),
-                ttnn.from_device(ttnn.slice(k, [0, k.shape[1] // 2, 0, 0], k.shape)).to(
+                ttnn.from_device(ttnn.slice(k, [k.shape[0] // 2, 0, 0, 0], k.shape)).to(
                     mesh_device.get_devices()[1]
                 ),
             ]
@@ -188,9 +188,9 @@ class TriangleAttention(Module):
                 ttnn.slice(
                     v,
                     [0, 0, 0, 0],
-                    [v.shape[0], v.shape[1] // 2, v.shape[2], v.shape[3]],
+                    [v.shape[0] // 2, *tuple(v.shape)[1:]],
                 ),
-                ttnn.from_device(ttnn.slice(v, [0, v.shape[1] // 2, 0, 0], v.shape)).to(
+                ttnn.from_device(ttnn.slice(v, [v.shape[0] // 2, 0, 0, 0], v.shape)).to(
                     mesh_device.get_devices()[1]
                 ),
             ]
@@ -200,17 +200,12 @@ class TriangleAttention(Module):
                 ttnn.slice(
                     triangle_bias,
                     [0, 0, 0, 0],
-                    [
-                        triangle_bias.shape[0],
-                        triangle_bias.shape[1] // 2,
-                        triangle_bias.shape[2],
-                        triangle_bias.shape[3],
-                    ],
+                    [triangle_bias.shape[0] // 2, *tuple(triangle_bias.shape)[1:]],
                 ),
                 ttnn.from_device(
                     ttnn.slice(
                         triangle_bias,
-                        [0, triangle_bias.shape[1] // 2, 0, 0],
+                        [triangle_bias.shape[0] // 2, 0, 0, 0],
                         triangle_bias.shape,
                     )
                 ).to(mesh_device.get_devices()[1]),
@@ -222,13 +217,18 @@ class TriangleAttention(Module):
         a = ttnn.softmax(
             a,
             dim=-1,
-            compute_kernel_config=self.compute_kernel_config,
+            compute_kernel_config=ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=False,
+                packer_l1_acc=True,
+            ),
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-        o = ttnn.all_gather(o, dim=1)
+        o = ttnn.all_gather(o, dim=0)
         o = ttnn.get_device_tensors(o)[0]
-        o = ttnn.permute(o, (1, 3, 0, 2))
+        o = ttnn.permute(o, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
@@ -318,7 +318,12 @@ class AttentionPairBias(Module):
         a = ttnn.softmax(
             a,
             dim=-1,
-            compute_kernel_config=self.compute_kernel_config,
+            compute_kernel_config=ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=False,
+                packer_l1_acc=True,
+            ),
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
