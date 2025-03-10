@@ -218,10 +218,10 @@ class TriangleAttention(Module):
             a,
             dim=-1,
             compute_kernel_config=ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi4,
-                math_approx_mode=False,
+                math_fidelity=self.compute_kernel_config.math_fidelity,
+                math_approx_mode=self.compute_kernel_config.math_approx_mode,
                 fp32_dest_acc_en=False,
-                packer_l1_acc=True,
+                packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
             ),
             numeric_stable=True,
         )
@@ -298,9 +298,9 @@ class AttentionPairBias(Module):
         q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
         k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-        q = ttnn.permute(q, (2, 0, 3, 1))
-        k = ttnn.permute(k, (2, 0, 1, 3))
-        v = ttnn.permute(v, (2, 0, 3, 1))
+        q = ttnn.permute(q, (0, 2, 3, 1))
+        k = ttnn.permute(k, (0, 2, 1, 3))
+        v = ttnn.permute(v, (0, 2, 3, 1))
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         z = ttnn.layer_norm(
@@ -313,21 +313,21 @@ class AttentionPairBias(Module):
         z = ttnn.linear(
             z, self.z_weight, compute_kernel_config=self.compute_kernel_config
         )
-        z = ttnn.permute(z, (0, 3, 1, 2))
+        z = ttnn.permute(z, (3, 0, 1, 2))
         a = ttnn.add(a, z)
         a = ttnn.softmax(
             a,
             dim=-1,
             compute_kernel_config=ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi4,
-                math_approx_mode=False,
+                math_fidelity=self.compute_kernel_config.math_fidelity,
+                math_approx_mode=self.compute_kernel_config.math_approx_mode,
                 fp32_dest_acc_en=False,
-                packer_l1_acc=True,
+                packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
             ),
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-        o = ttnn.permute(o, (1, 3, 0, 2))
+        o = ttnn.permute(o, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
@@ -481,79 +481,6 @@ class Pairformer(Module):
         return s, z
 
 
-class PairformerModule(nn.Module):
-    def __init__(
-        self,
-        n_blocks: int,
-        tri_att_head_dim: int,
-        tri_att_n_heads: int,
-        att_head_dim: int,
-        att_n_heads: int,
-    ):
-        super().__init__()
-        self.n_blocks = n_blocks
-        self.tri_att_head_dim = tri_att_head_dim
-        self.tri_att_n_heads = tri_att_n_heads
-        self.att_head_dim = att_head_dim
-        self.att_n_heads = att_n_heads
-        self.pairformer = None
-        global mesh_device
-        if mesh_device is None:
-            mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
-            mesh_device.enable_program_cache()
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        self.pairformer = Pairformer(
-            self.n_blocks,
-            self.tri_att_head_dim,
-            self.tri_att_n_heads,
-            self.att_head_dim,
-            self.att_n_heads,
-            filter_dict(state_dict, prefix[:-1]),
-            ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi4,
-                math_approx_mode=False,
-                fp32_dest_acc_en=True,
-                packer_l1_acc=True,
-            ),
-        )
-
-    def forward(
-        self,
-        s: torch.Tensor,
-        z: torch.Tensor,
-        mask: torch.Tensor = None,
-        pair_mask: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = tuple(
-            torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
-            for x in self.pairformer(
-                ttnn.from_torch(
-                    s,
-                    device=mesh_device.get_devices()[0],
-                    layout=ttnn.TILE_LAYOUT,
-                    dtype=ttnn.float32,
-                ),
-                ttnn.from_torch(
-                    z,
-                    device=mesh_device.get_devices()[0],
-                    layout=ttnn.TILE_LAYOUT,
-                    dtype=ttnn.float32,
-                ),
-            )
-        )
-        return x
-
-
 class AdaLN(Module):
     def __init__(
         self,
@@ -704,22 +631,48 @@ class DiffusionTransformer(Module):
         return a
 
 
-class DiffusionTransformerModule(nn.Module):
-    def __init__(
-        self,
-        n_layers: int,
-        dim: int,
-        n_heads: int,
-    ):
+class TorchWrapper(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.n_layers = n_layers
-        self.dim = dim
-        self.n_heads = n_heads
-        self.diffusion_transformer = None
+        self.module = None
         global mesh_device
         if mesh_device is None:
             mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
             mesh_device.enable_program_cache()
+        self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    def _from_torch(self, x: torch.Tensor) -> ttnn.Tensor:
+        return ttnn.from_torch(
+            x,
+            device=mesh_device.get_devices()[0],
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.float32,
+        )
+
+    def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
+        return torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
+
+
+class PairformerModule(TorchWrapper):
+    def __init__(
+        self,
+        n_blocks: int,
+        tri_att_head_dim: int,
+        tri_att_n_heads: int,
+        att_head_dim: int,
+        att_n_heads: int,
+    ):
+        super().__init__()
+        self.n_blocks = n_blocks
+        self.tri_att_head_dim = tri_att_head_dim
+        self.tri_att_n_heads = tri_att_n_heads
+        self.att_head_dim = att_head_dim
+        self.att_n_heads = att_n_heads
 
     def _load_from_state_dict(
         self,
@@ -731,17 +684,60 @@ class DiffusionTransformerModule(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
-        self.diffusion_transformer = DiffusionTransformer(
+        self.module = Pairformer(
+            self.n_blocks,
+            self.tri_att_head_dim,
+            self.tri_att_n_heads,
+            self.att_head_dim,
+            self.att_n_heads,
+            filter_dict(state_dict, prefix[:-1]),
+            self.compute_kernel_config,
+        )
+
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        mask: torch.Tensor = None,
+        pair_mask: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return tuple(
+            self._to_torch(x)
+            for x in self.module(
+                self._from_torch(s),
+                self._from_torch(z),
+            )
+        )
+
+
+class DiffusionTransformerModule(TorchWrapper):
+    def __init__(
+        self,
+        n_layers: int,
+        dim: int,
+        n_heads: int,
+    ):
+        super().__init__()
+        self.n_layers = n_layers
+        self.dim = dim
+        self.n_heads = n_heads
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self.module = DiffusionTransformer(
             self.n_layers,
             self.dim,
             self.n_heads,
             filter_dict(state_dict, prefix[:-1]),
-            ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi4,
-                math_approx_mode=False,
-                fp32_dest_acc_en=True,
-                packer_l1_acc=True,
-            ),
+            self.compute_kernel_config,
         )
 
     def forward(
@@ -754,32 +750,10 @@ class DiffusionTransformerModule(nn.Module):
         multiplicity: int = 1,
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
-        x = torch.Tensor(
-            ttnn.to_torch(
-                self.diffusion_transformer(
-                    ttnn.from_torch(
-                        a,
-                        device=mesh_device.get_devices()[0],
-                        layout=ttnn.TILE_LAYOUT,
-                        dtype=ttnn.float32,
-                    ),
-                    ttnn.from_torch(
-                        s,
-                        device=mesh_device.get_devices()[0],
-                        layout=ttnn.TILE_LAYOUT,
-                        dtype=ttnn.float32,
-                    ),
-                    (
-                        ttnn.from_torch(
-                            z,
-                            device=mesh_device.get_devices()[0],
-                            layout=ttnn.TILE_LAYOUT,
-                            dtype=ttnn.float32,
-                        )
-                        if z is not None
-                        else None
-                    ),
-                )
+        return self._to_torch(
+            self.module(
+                self._from_torch(a),
+                self._from_torch(s),
+                self._from_torch(z) if z is not None else None,
             )
-        ).to(torch.float32)
-        return x
+        )
