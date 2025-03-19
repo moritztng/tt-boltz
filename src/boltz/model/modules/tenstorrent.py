@@ -637,6 +637,7 @@ class TorchWrapper(nn.Module):
         self.module = None
         global mesh_device
         if mesh_device is None:
+            ttnn.device.EnablePersistentKernelCache()
             mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
             mesh_device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
