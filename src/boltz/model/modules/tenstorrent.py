@@ -363,9 +363,8 @@ class Transition(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         x_1 = ttnn.linear(
-            x_norm, self.fc1_weight, compute_kernel_config=self.compute_kernel_config
+            x_norm, self.fc1_weight, activation="silu", compute_kernel_config=self.compute_kernel_config
         )
-        x_1 = ttnn.silu(x_1)
         x_2 = ttnn.linear(
             x_norm, self.fc2_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -637,6 +636,7 @@ class TorchWrapper(nn.Module):
         self.module = None
         global mesh_device
         if mesh_device is None:
+            ttnn.device.EnablePersistentKernelCache()
             mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, 2))
             mesh_device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
