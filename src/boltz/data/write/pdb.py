@@ -5,7 +5,6 @@ from torch import Tensor
 
 from boltz.data import const
 from boltz.data.types import Structure
-from boltz.data.write.utils import generate_tags
 
 
 def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: PLR0915
@@ -26,7 +25,6 @@ def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noq
 
     atom_index = 1
     atom_reindex_ter = []
-    chain_tags = generate_tags()
 
     # Load periodic table for element mapping
     periodic_table = Chem.GetPeriodicTable()
@@ -36,7 +34,7 @@ def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noq
     for chain in structure.chains:
         # We rename the chains in alphabetical order
         chain_idx = chain["asym_id"]
-        chain_tag = next(chain_tags)
+        chain_tag = chain["name"]
 
         res_start = chain["res_idx"]
         res_end = chain["res_idx"] + chain["res_num"]
@@ -72,7 +70,9 @@ def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noq
                 res_name_3 = (
                     "LIG" if record_type == "HETATM" else str(residue["name"][:3])
                 )
-                b_factor = 1.00 if plddts is None else round(plddts[res_num].item(), 2)
+                b_factor = (
+                    100.00 if plddts is None else round(plddts[res_num].item() * 100, 2)
+                )
 
                 # PDB is a columnar format, every space matters here!
                 atom_line = (

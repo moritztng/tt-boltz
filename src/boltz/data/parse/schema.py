@@ -651,7 +651,10 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             # Set atom names
             canonical_order = AllChem.CanonicalRankAtoms(mol)
             for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
-                atom.SetProp("name", atom.GetSymbol().upper() + str(can_idx + 1))
+                atom_name = atom.GetSymbol().upper() + str(can_idx + 1)
+                if len(atom_name) > 4:
+                    raise ValueError(f"{seq} has an atom with a name longer than 4 characters: {atom_name}")
+                atom.SetProp("name", atom_name)
 
             success = compute_3d_conformer(mol)
             if not success:

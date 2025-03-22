@@ -151,7 +151,7 @@ def get_resolution(block: gemmi.cif.Block) -> float:
         "_reflns.d_resolution_high",
     ):
         with contextlib.suppress(Exception):
-            resolution = float(block.find([res_key])[0])
+            resolution = float(block.find([res_key])[0].str(0))
             break
     return resolution
 
@@ -747,7 +747,7 @@ def parse_polymer(  # noqa: C901, PLR0915, PLR0912
         entity=entity,
         residues=parsed,
         type=chain_type,
-        sequence=sequence,
+        sequence=gemmi.one_letter_code(sequence),
     )
 
 
@@ -966,6 +966,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
                         entity=entity.name,
                         residues=residues,
                         type=const.chain_type_ids["NONPOLYMER"],
+                        sequence=None
                     )
                 )
 
@@ -1119,4 +1120,4 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
         mask=mask,
     )
 
-    return ParsedStructure(data=data, info=info)
+    return ParsedStructure(data=data, info=info, covalents=[])
