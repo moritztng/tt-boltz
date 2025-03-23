@@ -12,32 +12,49 @@
 
 ## Introduction
 
+This is the Tenstorrent branch which supports a single Tenstorrent Wormhole n150 or n300.
+
 Boltz-1 is the state-of-the-art open-source model to predict biomolecular structures containing combinations of proteins, RNA, DNA, and other molecules. It also supports modified residues, covalent ligands and glycans, as well as conditioning the prediction on specified interaction pockets or contacts. 
 
 All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see our [technical report](https://doi.org/10.1101/2024.11.19.624167). To discuss updates, tools and applications join our [Slack channel](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ).
 
 ## Installation
-Install boltz with PyPI (recommended):
-
-```
-pip install boltz -U
-```
-
-or directly from GitHub for daily updates:
-
-```
+### Clone Boltz & Checkout Tenstorrent Branch
+```bash
 git clone https://github.com/jwohlwend/boltz.git
-cd boltz; pip install -e .
+cd boltz
+git checkout tenstorrent
 ```
-> Note: we recommend installing boltz in a fresh python environment
+### Create Virtual Environment
+```bash
+python3 -m venv env
+source env/bin/activate
+```
+### Build TT-Metal from Source
+Don't install tt-nn with `./create_venv.sh`.
 
+[Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
+### Install TT-NN
+```bash
+pip config set global.extra-index-url https://download.pytorch.org/whl/cpu
+pip install setuptools wheel
+pip install -r <path-to-tt-metal-repo>/tt_metal/python_env/requirements-dev.txt
+pip install <path-to-tt-metal-repo>
+```
+### Install Boltz
+```bash
+pip install -e .
+```
+You can ignore the error about the pandas version.
 ## Inference
 
 You can run inference using Boltz-1 with:
 
 ```
-boltz predict input_path --use_msa_server
+boltz predict input_path --use_msa_server --accelerator=tenstorrent
 ```
+
+Pass `--accelerator=tenstorrent` to run on Tenstorrent Wormhole.
 
 Boltz currently accepts three input formats:
 
