@@ -11,7 +11,7 @@
 
 ## Introduction
 
-TT-Boltz is the Boltz-1 fork that supports a single Tenstorrent Wormhole n150 or n300.
+TT-Boltz is the Boltz-1 fork that runs on a single Tenstorrent Wormhole n150 or n300.
 
 Boltz-1 is the state-of-the-art open-source model to predict biomolecular structures containing combinations of proteins, RNA, DNA, and other molecules. It also supports modified residues, covalent ligands and glycans, as well as conditioning the prediction on specified interaction pockets or contacts. 
 
