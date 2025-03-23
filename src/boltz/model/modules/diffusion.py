@@ -37,7 +37,6 @@ from boltz.model.modules.utils import (
 
 from boltz.model.modules import tenstorrent
 
-
 class DiffusionModule(Module):
     """Diffusion module"""
 

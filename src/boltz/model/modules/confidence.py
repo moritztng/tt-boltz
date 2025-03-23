@@ -15,6 +15,7 @@ from boltz.model.modules.trunk import (
     PairformerModule,
 )
 from boltz.model.modules.utils import LinearNoBias
+
 from boltz.model.modules import tenstorrent
 
 
@@ -211,11 +212,9 @@ class ConfidenceModule(nn.Module):
                         feats,
                         pred_distogram_logits,
                         multiplicity=1,
-                        s_diffusion=(
-                            s_diffusion[sample_idx : sample_idx + 1]
-                            if s_diffusion is not None
-                            else None
-                        ),
+                        s_diffusion=s_diffusion[sample_idx : sample_idx + 1]
+                        if s_diffusion is not None
+                        else None,
                         run_sequentially=False,
                     )
                 )

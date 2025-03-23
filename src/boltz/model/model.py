@@ -318,9 +318,7 @@ class Boltz1(LightningModule):
 
                     # Revert to uncompiled version for validation
                     if self.is_pairformer_compiled and not self.training:
-                        pairformer_module = (
-                            self.pairformer_module._orig_mod
-                        )  # noqa: SLF001
+                        pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
                     else:
                         pairformer_module = self.pairformer_module
 
