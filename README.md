@@ -2,8 +2,7 @@
   <div>&nbsp;</div>
   <img src="docs/boltz_title.png" width="400"/>
 
-[Paper](https://doi.org/10.1101/2024.11.19.624167) |
-[Slack](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ) <br> <br>
+[Paper](https://doi.org/10.1101/2024.11.19.624167)
 </div>
 
 
@@ -12,18 +11,17 @@
 
 ## Introduction
 
-This is the Tenstorrent branch which supports a single Tenstorrent Wormhole n150 or n300.
+TT-Boltz is the Boltz-1 fork that supports a single Tenstorrent Wormhole n150 or n300.
 
 Boltz-1 is the state-of-the-art open-source model to predict biomolecular structures containing combinations of proteins, RNA, DNA, and other molecules. It also supports modified residues, covalent ligands and glycans, as well as conditioning the prediction on specified interaction pockets or contacts. 
 
-All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see our [technical report](https://doi.org/10.1101/2024.11.19.624167). To discuss updates, tools and applications join our [Slack channel](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ).
+All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see our [technical report](https://doi.org/10.1101/2024.11.19.624167).
 
 ## Installation
-### Clone Boltz & Checkout Tenstorrent Branch
+### Clone
 ```bash
-git clone https://github.com/jwohlwend/boltz.git
-cd boltz
-git checkout tenstorrent
+git clone https://github.com/moritztng/tt-boltz.git
+cd tt-boltz
 ```
 ### Create Virtual Environment
 ```bash
@@ -41,7 +39,7 @@ pip install setuptools wheel
 pip install -r <path-to-tt-metal-repo>/tt_metal/python_env/requirements-dev.txt
 pip install <path-to-tt-metal-repo>
 ```
-### Install Boltz
+### Install TT-Boltz
 ```bash
 pip install -e .
 ```
@@ -78,9 +76,10 @@ To encourage reproducibility and facilitate comparison with other models, we pro
 
 If you're interested in retraining the model, see our [training instructions](docs/training.md).
 
-## Contributing
-
-We welcome external contributions and are eager to engage with the community. Connect with us on our [Slack channel](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ) to discuss advancements, share insights, and foster collaboration around Boltz-1.
+## Community
+- [I build in public on X](https://x.com/moritzthuening)
+- [Boltz-1 Slack](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ)
+- [Tenstorrent Discord](https://discord.gg/tvhGzHQwaj)
 
 ## License
 
