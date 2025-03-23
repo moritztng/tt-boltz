@@ -2,6 +2,7 @@
   <div>&nbsp;</div>
   <img src="docs/boltz_title.png" width="400"/>
 
+[Original Repo](https://github.com/jwohlwend/boltz) |
 [Paper](https://doi.org/10.1101/2024.11.19.624167)
 </div>
 
