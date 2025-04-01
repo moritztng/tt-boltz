@@ -275,16 +275,8 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
 
         manifest: Manifest = Manifest.load(manifest_path)
         input_ids = [d.stem for d in data]
-        existing_records, processed_ids = zip(
-            *[
-                (record, record.id)
-                for record in manifest.records
-                if record.id in input_ids
-            ]
-        )
-
-        if isinstance(existing_records, tuple):
-            existing_records = list(existing_records)
+        existing_records = [record for record in manifest.records if record.id in input_ids]
+        processed_ids = [record.id for record in existing_records]
 
         # Check how many examples need to be processed
         missing = len(input_ids) - len(processed_ids)
