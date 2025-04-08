@@ -65,6 +65,8 @@ If you're interested in retraining the model, see our [training instructions](do
 
 We welcome external contributions and are eager to engage with the community. Connect with us on our [Slack channel](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ) to discuss advancements, share insights, and foster collaboration around Boltz-1.
 
+Boltz also runs on Tenstorrent hardware thanks to a [fork](https://github.com/moritztng/tt-boltz) by Moritz Thüning.
+
 ## License
 
 Our model and code are released under MIT License, and can be freely used for both academic and commercial purposes.
