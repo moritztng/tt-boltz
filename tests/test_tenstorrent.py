@@ -91,3 +91,25 @@ def test_token_transformer():
     print(
         median_relative_error(a_tt, a_torch),
     )
+
+def test_msa():
+    msa = MSAModule(
+        n_blocks=1,
+        avg_head_dim=32,
+        avg_n_heads=8,
+        tri_att_head_dim=32,
+        tri_att_n_heads=4,
+    )
+    msa_torch = MSALayerTorch(msa_s=64, token_z=128, msa_dropout=0, z_dropout=0).eval()
+    msa_state_dict = filter_dict(state_dict, "msa_module")
+    msa.load_state_dict(
+        msa_state_dict,
+    )
+    msa_torch.load_state_dict(filter_dict(msa_state_dict, "layers.0"))
+    z = torch.randn(1, 10, 10, 128)
+    m = torch.randn(1, 3603, 10, 64)
+    token_mask = torch.ones(1, 10)
+    msa_mask = torch.ones(1, 3603, 10)
+    z_tt, m_tt = msa(z, m)
+    z_torch, m_torch = msa_torch(z, m, token_mask, msa_mask)
+    print(median_relative_error(z_tt, z_torch), median_relative_error(m_tt, m_torch))
