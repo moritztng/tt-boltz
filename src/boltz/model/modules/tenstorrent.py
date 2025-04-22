@@ -682,6 +682,238 @@ class DiffusionTransformer(Module):
         return a
 
 
+class PairWeightedAveraging(Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.m_norm_weight = self.torch_to_tt("norm_m.weight")
+        self.m_norm_bias = self.torch_to_tt("norm_m.bias")
+        self.z_norm_weight = self.torch_to_tt("norm_z.weight")
+        self.z_norm_bias = self.torch_to_tt("norm_z.bias")
+        self.m_weight = self.torch_to_tt("proj_m.weight")
+        self.g_weight = self.torch_to_tt("proj_g.weight")
+        self.z_weight = self.torch_to_tt("proj_z.weight")
+        self.o_weight = self.torch_to_tt("proj_o.weight")
+
+    def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        m = ttnn.reshape(m, tuple(m.shape)[1:])
+        z = ttnn.reshape(z, tuple(z.shape)[1:])
+        m = ttnn.layer_norm(
+            m,
+            weight=self.m_norm_weight,
+            bias=self.m_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        z = ttnn.layer_norm(
+            z,
+            weight=self.z_norm_weight,
+            bias=self.z_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        for i in range(self.n_heads):
+            b = ttnn.linear(
+                z,
+                self.z_weight[:, i : i + 1],
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            b = ttnn.permute(b, (2, 0, 1))
+            w = ttnn.softmax(
+                b,
+                dim=-1,
+                compute_kernel_config=ttnn.WormholeComputeKernelConfig(
+                    math_fidelity=self.compute_kernel_config.math_fidelity,
+                    math_approx_mode=self.compute_kernel_config.math_approx_mode,
+                    fp32_dest_acc_en=False,
+                    packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
+                ),
+                numeric_stable=True,
+            )
+            v = ttnn.linear(
+                m,
+                self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            w = ttnn.repeat(w, [v.shape[0], 1, 1])
+            o = ttnn.matmul(w, v, compute_kernel_config=self.compute_kernel_config)
+            del v, w
+            g = ttnn.linear(
+                m,
+                self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            g = ttnn.sigmoid_accurate(g)
+            o = ttnn.multiply(o, g)
+            o = ttnn.linear(
+                o,
+                self.o_weight[i * self.head_dim : (i + 1) * self.head_dim, :],
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            if i == 0:
+                o_out = o
+            else:
+                o_out += o
+        o_out = ttnn.reshape(o_out, (1, *o_out.shape))
+        return o_out
+
+
+class OuterProductMean(Module):
+    def __init__(
+        self,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.norm_weight = self.torch_to_tt("norm.weight")
+        self.norm_bias = self.torch_to_tt("norm.bias")
+        self.a_weight = self.torch_to_tt("proj_a.weight")
+        self.b_weight = self.torch_to_tt("proj_b.weight")
+        self.o_weight = self.torch_to_tt("proj_o.weight")
+        self.o_bias = self.torch_to_tt("proj_o.bias")
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        m = ttnn.layer_norm(
+            x,
+            weight=self.norm_weight,
+            bias=self.norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        a = ttnn.linear(
+            m, self.a_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        b = ttnn.linear(
+            m, self.b_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        a = ttnn.reshape(a, (a.shape[0], a.shape[1], a.shape[2], 1, a.shape[3], 1))
+        b = ttnn.reshape(b, (b.shape[0], b.shape[1], 1, b.shape[2], 1, b.shape[3]))
+        z = ttnn.multiply(a, b)
+        z = ttnn.sum(z, dim=1)
+        z = ttnn.reshape(z, (z.shape[0], *tuple(z.shape)[2:4], -1))
+        z = ttnn.multiply(z, 1 / a.shape[1])
+        z = ttnn.linear(
+            z,
+            self.o_weight,
+            bias=self.o_bias,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        return z
+
+
+class MSALayer(Module):
+    def __init__(
+        self,
+        avg_head_dim: int,
+        avg_n_heads: int,
+        tri_att_head_dim: int,
+        tri_att_n_heads: int,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.msa_transition = Transition(
+            filter_dict(state_dict, "msa_transition"), compute_kernel_config
+        )
+        self.pair_weighted_averaging = PairWeightedAveraging(
+            head_dim=avg_head_dim,
+            n_heads=avg_n_heads,
+            state_dict=filter_dict(state_dict, "pair_weighted_averaging"),
+            compute_kernel_config=compute_kernel_config,
+        )
+        self.outer_product_mean = OuterProductMean(
+            state_dict=filter_dict(state_dict, "outer_product_mean"),
+            compute_kernel_config=compute_kernel_config,
+        )
+        self.triangle_multiplication_start = TriangleMultiplication(
+            False, filter_dict(state_dict, "tri_mul_out"), compute_kernel_config
+        )
+        self.triangle_multiplication_end = TriangleMultiplication(
+            True, filter_dict(state_dict, "tri_mul_in"), compute_kernel_config
+        )
+        self.triangle_attention_start = TriangleAttention(
+            tri_att_head_dim,
+            tri_att_n_heads,
+            False,
+            filter_dict(state_dict, "tri_att_start", "mha."),
+            compute_kernel_config,
+        )
+        self.triangle_attention_end = TriangleAttention(
+            tri_att_head_dim,
+            tri_att_n_heads,
+            True,
+            filter_dict(state_dict, "tri_att_end", "mha."),
+            compute_kernel_config,
+        )
+        self.z_transition = Transition(
+            filter_dict(state_dict, "z_transition"), compute_kernel_config
+        )
+
+    def __call__(
+        self, z: ttnn.Tensor, m: ttnn.Tensor
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        m = ttnn.add(m, self.pair_weighted_averaging(m, z))
+        m = ttnn.add(m, self.msa_transition(m))
+        z = ttnn.add(z, self.outer_product_mean(m))
+        z = ttnn.add(
+            z,
+            self.triangle_multiplication_start(z),
+        )
+        z = ttnn.add(
+            z,
+            self.triangle_multiplication_end(z),
+        )
+        z = ttnn.add(
+            z,
+            self.triangle_attention_start(z),
+        )
+        z = ttnn.add(
+            z,
+            self.triangle_attention_end(z),
+        )
+        z = ttnn.add(z, self.z_transition(z))
+        return z, m
+
+
+class MSA(Module):
+    def __init__(
+        self,
+        n_blocks: int,
+        avg_head_dim: int,
+        avg_n_heads: int,
+        tri_att_head_dim: int,
+        tri_att_n_heads: int,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.blocks = [
+            MSALayer(
+                avg_head_dim,
+                avg_n_heads,
+                tri_att_head_dim,
+                tri_att_n_heads,
+                filter_dict(state_dict, f"layers.{i}"),
+                compute_kernel_config,
+            )
+            for i in range(n_blocks)
+        ]
+
+    def __call__(
+        self, z: ttnn.Tensor, m: ttnn.Tensor
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        for block in self.blocks:
+            z, m = block(z, m)
+        return z, m
+
+
 class TorchWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -808,5 +1040,55 @@ class DiffusionTransformerModule(TorchWrapper):
                 self._from_torch(a),
                 self._from_torch(s),
                 self._from_torch(z) if z is not None else None,
+            )
+        )
+
+
+class MSAModule(TorchWrapper):
+    def __init__(
+        self,
+        n_blocks: int,
+        avg_head_dim: int,
+        avg_n_heads: int,
+        tri_att_head_dim: int,
+        tri_att_n_heads: int,
+    ):
+        super().__init__()
+        self.n_blocks = n_blocks
+        self.avg_head_dim = avg_head_dim
+        self.avg_n_heads = avg_n_heads
+        self.tri_att_head_dim = tri_att_head_dim
+        self.tri_att_n_heads = tri_att_n_heads
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self.module = MSA(
+            self.n_blocks,
+            self.avg_head_dim,
+            self.avg_n_heads,
+            self.tri_att_head_dim,
+            self.tri_att_n_heads,
+            filter_dict(state_dict, prefix[:-1]),
+            self.compute_kernel_config,
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        m: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return tuple(
+            self._to_torch(x)
+            for x in self.module(
+                self._from_torch(z),
+                self._from_torch(m),
             )
         )
