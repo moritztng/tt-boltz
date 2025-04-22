@@ -1158,7 +1158,7 @@ class Boltz1(LightningModule):
                 gc.collect()
                 return {"exception": True}
             else:
-                raise {"exception": True}
+                raise
 
     def configure_optimizers(self):
         """Configure the optimizer."""
