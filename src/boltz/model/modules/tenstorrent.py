@@ -795,7 +795,7 @@ class OuterProductMean(Module):
         )
         a = ttnn.reshape(a, (a.shape[0], a.shape[1], a.shape[2], 1, a.shape[3], 1))
         b = ttnn.reshape(b, (b.shape[0], b.shape[1], 1, b.shape[2], 1, b.shape[3]))
-        z = ttnn.multiply(a, b)
+        z = ttnn.multiply(a, b, use_legacy=False)
         z = ttnn.sum(z, dim=1)
         z = ttnn.reshape(z, (z.shape[0], *tuple(z.shape)[2:4], -1))
         z = ttnn.multiply(z, 1 / a.shape[1])
