@@ -1,6 +1,6 @@
 import torch, ttnn
 from torch import nn
-from typing import Tuple, Callable
+from typing import Tuple, Callable, Dict
 
 TRIANGLE_ATTENTION_CHUNK_SIZE = 64
 TRANSITION_CHUNK_SIZE = 64
@@ -793,11 +793,17 @@ class OuterProductMean(Module):
         b = ttnn.linear(
             m, self.b_weight, compute_kernel_config=self.compute_kernel_config
         )
-        a = ttnn.reshape(a, (a.shape[0], a.shape[1], a.shape[2], 1, a.shape[3], 1))
-        b = ttnn.reshape(b, (b.shape[0], b.shape[1], 1, b.shape[2], 1, b.shape[3]))
-        z = ttnn.multiply(a, b, use_legacy=False)
-        z = ttnn.sum(z, dim=1)
-        z = ttnn.reshape(z, (z.shape[0], *tuple(z.shape)[2:4], -1))
+        for i in range(a.shape[1]):
+            chunk = ttnn.multiply(
+                ttnn.reshape(a[:, i, :, :], (a.shape[0], a.shape[2], 1, a.shape[3], 1)),
+                ttnn.reshape(b[:, i, :, :], (b.shape[0], 1, b.shape[2], 1, b.shape[3])),
+                use_legacy=False,
+            )
+            if i == 0:
+                z = chunk
+            else:
+                z = ttnn.add(z, chunk)
+        z = ttnn.reshape(z, (*tuple(z.shape)[:3], -1))
         z = ttnn.multiply(z, 1 / a.shape[1])
         z = ttnn.linear(
             z,
@@ -894,6 +900,8 @@ class MSA(Module):
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
+        self.s_weight = self.torch_to_tt("s_proj.weight")
+        self.msa_weight = self.torch_to_tt("msa_proj.weight")
         self.blocks = [
             MSALayer(
                 avg_head_dim,
@@ -906,12 +914,23 @@ class MSA(Module):
             for i in range(n_blocks)
         ]
 
-    def __call__(
-        self, z: ttnn.Tensor, m: ttnn.Tensor
-    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+    def __call__(self, z: ttnn.Tensor, m: ttnn.Tensor, emb: ttnn.Tensor) -> ttnn.Tensor:
+        m = ttnn.linear(
+            m,
+            self.msa_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        m = ttnn.add(
+            m,
+            ttnn.linear(
+                emb,
+                self.s_weight,
+                compute_kernel_config=self.compute_kernel_config,
+            ),
+        )
         for block in self.blocks:
             z, m = block(z, m)
-        return z, m
+        return z
 
 
 class TorchWrapper(nn.Module):
@@ -1083,12 +1102,14 @@ class MSAModule(TorchWrapper):
     def forward(
         self,
         z: torch.Tensor,
-        m: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return tuple(
-            self._to_torch(x)
-            for x in self.module(
+        emb: torch.Tensor,
+        feats: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        m = torch.cat([feats["msa"], feats["has_deletion"].unsqueeze(-1), feats["deletion_value"].unsqueeze(-1)], dim=-1)
+        return self._to_torch(
+            self.module(
                 self._from_torch(z),
                 self._from_torch(m),
+                self._from_torch(emb),
             )
         )

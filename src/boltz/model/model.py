@@ -183,7 +183,13 @@ class Boltz1(LightningModule):
         # Pairwise stack
         self.no_msa = no_msa
         if not no_msa:
-            self.msa_module = MSAModule(
+            self.msa_module = tenstorrent.MSAModule(
+                n_blocks=4,
+                avg_head_dim=32,
+                avg_n_heads=8,
+                tri_att_head_dim=32,
+                tri_att_n_heads=4,
+            ) if self.use_tenstorrent else MSAModule(
                 token_z=token_z,
                 s_input_dim=s_input_dim,
                 **msa_args,

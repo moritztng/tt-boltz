@@ -131,7 +131,13 @@ class ConfidenceModule(nn.Module):
             init.gating_init_(self.z_recycle.weight)
 
             # Pairwise stack
-            self.msa_module = MSAModule(
+            self.msa_module = tenstorrent.MSAModule(
+                n_blocks=4,
+                avg_head_dim=32,
+                avg_n_heads=8,
+                tri_att_head_dim=32,
+                tri_att_n_heads=4,
+            ) if use_tenstorrent else MSAModule(
                 token_z=token_z,
                 s_input_dim=s_input_dim,
                 **msa_args,
