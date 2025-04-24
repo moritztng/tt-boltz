@@ -4,6 +4,7 @@ from typing import Tuple, Callable, Dict
 
 TRIANGLE_ATTENTION_CHUNK_SIZE = 64
 TRANSITION_CHUNK_SIZE = 64
+MSA_CHUNK_SIZE = 64
 mesh_device = None
 
 
@@ -742,8 +743,13 @@ class PairWeightedAveraging(Module):
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
             )
-            w = ttnn.repeat(w, [v.shape[0], 1, 1])
-            o = ttnn.matmul(w, v, compute_kernel_config=self.compute_kernel_config)
+            for chunk_start in range(0, v.shape[0], MSA_CHUNK_SIZE):
+                chunk_end = min(chunk_start + MSA_CHUNK_SIZE, v.shape[0])
+                o_chunk = ttnn.matmul(ttnn.repeat(w, [chunk_end - chunk_start, 1, 1]), v[chunk_start:chunk_end], compute_kernel_config=self.compute_kernel_config)
+                if chunk_start == 0:
+                    o = o_chunk
+                else:
+                    o = ttnn.concat([o, o_chunk], dim=0)
             del v, w
             g = ttnn.linear(
                 m,
@@ -760,7 +766,7 @@ class PairWeightedAveraging(Module):
             if i == 0:
                 o_out = o
             else:
-                o_out += o
+                o_out = ttnn.add(o_out, o)
         o_out = ttnn.reshape(o_out, (1, *o_out.shape))
         return o_out
 
