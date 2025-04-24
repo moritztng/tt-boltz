@@ -43,7 +43,7 @@ def test_pairformer():
     )
     pairformer_torch.load_state_dict(pairformer_state_dict, strict=False)
     inputs = torch.load(
-        "/home/moritz/tt-metal/tt-boltz/tests/pairformer_inputs_long.pt"
+        "/home/moritz/tt-metal/tt-boltz/tests/pairformer_inputs_686.pt"
     )
     s = inputs["s"]
     z = inputs["z"]
@@ -71,7 +71,7 @@ def test_token_transformer():
         strict=False,
     )
     token_transformer_torch.load_state_dict(token_transformer_state_dict, strict=False)
-    inputs = torch.load("/home/moritz/tt-metal/tt-boltz/tests/diffusion_inputs_long.pt")
+    inputs = torch.load("/home/moritz/tt-metal/tt-boltz/tests/diffusion_inputs_686.pt")
     a = inputs["a"]
     s = inputs["s"]
     z = inputs["z"]
