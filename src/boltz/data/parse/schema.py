@@ -74,7 +74,7 @@ class ParsedChain:
     entity: str
     type: str
     residues: list[ParsedResidue]
-    is_cyclic: bool
+    cyclic_period: int
 
 
 ####################################################################################################
@@ -341,6 +341,7 @@ def parse_polymer(
     entity: str,
     chain_type: str,
     components: dict[str, Mol],
+    cyclic: bool,
 ) -> Optional[ParsedChain]:
     """Process a sequence into a chain object.
 
@@ -448,12 +449,17 @@ def parse_polymer(
             )
         )
 
+    if cyclic:
+        cyclic_period = len(sequence)
+    else:
+        cyclic_period = 0
+
     # Return polymer object
     return ParsedChain(
         entity=entity,
         residues=parsed,
         type=chain_type,
-        is_cyclic=False,
+        cyclic_period=cyclic_period,
     )
 
 
@@ -611,12 +617,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 idx = mod["position"] - 1  # 1-indexed
                 seq[idx] = code
 
+            cyclic = items[0][entity_type].get("cyclic", False)
+
             # Parse a polymer
             parsed_chain = parse_polymer(
                 sequence=seq,
                 entity=entity_id,
                 chain_type=chain_type,
                 components=ccd,
+                cyclic=cyclic,
             )
 
         # Parse a non-polymer
@@ -644,8 +653,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 entity=entity_id,
                 residues=residues,
                 type=const.chain_type_ids["NONPOLYMER"],
-                is_cyclic=False,
+                cyclic_period=0,
             )
+
+            assert not items[0][entity_type].get("cyclic", False), "Cyclic flag is not supported for ligands"
+
         elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
             mol = AllChem.MolFromSmiles(seq)
@@ -671,8 +683,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 entity=entity_id,
                 residues=[residue],
                 type=const.chain_type_ids["NONPOLYMER"],
-                is_cyclic=False,
+                cyclic_period=0,
             )
+
+            assert not items[0][entity_type].get("cyclic", False), "Cyclic flag is not supported for ligands"
+
         else:
             msg = f"Invalid entity type: {entity_type}"
             raise ValueError(msg)
@@ -731,7 +746,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 atom_num,
                 res_idx,
                 res_num,
-                chain.is_cyclic,
+                chain.cyclic_period,
             )
         )
         chain_to_idx[chain_name] = asym_id
@@ -790,31 +805,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     pocket_residues = []
     constraints = schema.get("constraints", [])
     for constraint in constraints:
-        if "cyclic" in constraint:
-            sequence_items = schema.get("sequences", {}) # pretty sure this should be a dict but need to check yaml parsing
-            cyclic_chain_id = constraint["cyclic"]
-            if cyclic_chain_id not in list(chains.keys()):
-                msg = f"Invalid cyclic chain: {constraint['cyclic']}. Available chains: {list(chains.keys())}"
-                raise ValueError(msg)
-            
-            for sequence_item in sequence_items:
-                for sequence_type, sequence_data in sequence_item.items():
-                    if sequence_type!="protein" and cyclic_chain_id in sequence_data["id"] :
-                        msg = f"Cyclic constraints are supported only on proteins. Got {sequence_item}"
-                        raise ValueError(msg)
-
-            # flip the final flag (cyclic) for chain flagged as cyclic
-            for chain_dat_idx, chain_dat in enumerate(chain_data):
-                if chain_dat[0] == cyclic_chain_id:
-                    new_chain_dat = []
-                    for i, dat in enumerate(chain_dat):
-                        if i == len(chain_dat) - 1:
-                            # last element is the cyclic flag
-                            new_chain_dat.append(not dat)
-                        else:
-                            new_chain_dat.append(dat)
-                    chain_data[chain_dat_idx] = tuple(new_chain_dat)
-        elif "bond" in constraint:
+        if "bond" in constraint:
             if "atom1" not in constraint["bond"] or "atom2" not in constraint["bond"]:
                 msg = f"Bond constraint was not properly specified"
                 raise ValueError(msg)

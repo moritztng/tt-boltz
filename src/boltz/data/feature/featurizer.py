@@ -420,7 +420,7 @@ def process_token_features(
     pad_mask = torch.ones(len(token_data), dtype=torch.float)
     resolved_mask = from_numpy(token_data["resolved_mask"].copy()).float()
     disto_mask = from_numpy(token_data["disto_mask"].copy()).float()
-    cyclic_mask = from_numpy(token_data["is_cyclic"].copy()).float()
+    cyclic_period = from_numpy(token_data["cyclic_period"].copy())
 
     # Token bond features
     if max_tokens is not None:
@@ -556,7 +556,7 @@ def process_token_features(
         "token_resolved_mask": resolved_mask,
         "token_disto_mask": disto_mask,
         "pocket_feature": pocket_feature,
-        "cyclic_mask": cyclic_mask,
+        "cyclic_period": cyclic_period,
     }
     return token_features
 

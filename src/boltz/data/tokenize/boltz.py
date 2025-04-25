@@ -26,7 +26,7 @@ class TokenData:
     disto_coords: np.ndarray
     resolved_mask: bool
     disto_mask: bool
-    is_cyclic: bool
+    cyclic_period: int
 
 
 class BoltzTokenizer(Tokenizer):
@@ -100,7 +100,7 @@ class BoltzTokenizer(Tokenizer):
                         disto_coords=d_coords,
                         resolved_mask=is_present,
                         disto_mask=is_disto_present,
-                        is_cyclic=chain["is_cyclic"],
+                        cyclic_period=chain["cyclic_period"],
                     )
                     token_data.append(astuple(token))
 
@@ -143,7 +143,7 @@ class BoltzTokenizer(Tokenizer):
                             disto_coords=atom_coords[i],
                             resolved_mask=is_present,
                             disto_mask=is_present,
-                            is_cyclic=chain["is_cyclic"], # Enforced to be False in chain parser
+                            cyclic_period=chain["cyclic_period"], # Enforced to be False in chain parser
                         )
                         token_data.append(astuple(token))
 
