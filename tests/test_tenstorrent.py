@@ -1,20 +1,16 @@
-import torch
-import numpy as np
+import pytest, torch
 from boltz.model.modules.tenstorrent import (
     filter_dict,
     PairformerModule,
     DiffusionTransformerModule,
-    MSAModule,
 )
 from boltz.model.modules.trunk import PairformerModule as PairformerModuleTorch
 from boltz.model.modules.diffusion import (
     DiffusionTransformer as DiffusionTransformerTorch,
 )
-from boltz.model.modules.trunk import MSALayer as MSALayerTorch
-
 
 torch.set_grad_enabled(False)
-torch.manual_seed(0)
+torch.manual_seed(893)
 
 state_dict = torch.load(
     "/home/moritz/.boltz/boltz1_conf.ckpt", map_location="cpu", mmap=True
@@ -25,7 +21,8 @@ def median_relative_error(a, b):
     return ((a - b).abs() / b.abs()).median().item()
 
 
-def test_pairformer():
+@pytest.mark.parametrize("seq_len", [100, 500, 1000])
+def test_pairformer(seq_len):
     pairformer = PairformerModule(
         n_blocks=2,
         tri_att_head_dim=32,
@@ -42,26 +39,25 @@ def test_pairformer():
         strict=False,
     )
     pairformer_torch.load_state_dict(pairformer_state_dict, strict=False)
-    inputs = torch.load(
-        "/home/moritz/tt-metal/tt-boltz/tests/pairformer_inputs_686.pt"
-    )
-    s = inputs["s"]
-    z = inputs["z"]
-    mask = torch.ones(1, 686)
+    s = torch.randn(1, seq_len, 384) * 8
+    z = torch.randn(1, seq_len, seq_len, 128) * 26
+    mask = torch.ones(1, seq_len)
     pair_mask = mask[:, :, None] * mask[:, None, :]
     s_tt, z_tt = pairformer(s, z, mask, pair_mask)
     s_torch, z_torch = pairformer_torch(s, z, mask, pair_mask)
-    print(median_relative_error(s_tt, s_torch), median_relative_error(z_tt, z_torch))
+    assert median_relative_error(s_tt, s_torch) < 1e-1, "s not accurate"
+    assert median_relative_error(z_tt, z_torch) < 1e-1, "z not accurate"
 
 
-def test_token_transformer():
+@pytest.mark.parametrize("seq_len", [100, 500, 1000])
+def test_token_transformer(seq_len):
     token_transformer = DiffusionTransformerModule(
-        n_layers=24,
+        n_layers=2,
         dim=768,
         n_heads=16,
     )
     token_transformer_torch = DiffusionTransformerTorch(
-        depth=24, heads=16, dim=768, dim_single_cond=768, dim_pairwise=128
+        depth=2, heads=16, dim=768, dim_single_cond=768, dim_pairwise=128
     ).eval()
     token_transformer_state_dict = filter_dict(
         state_dict, "structure_module.score_model.token_transformer"
@@ -71,11 +67,10 @@ def test_token_transformer():
         strict=False,
     )
     token_transformer_torch.load_state_dict(token_transformer_state_dict, strict=False)
-    inputs = torch.load("/home/moritz/tt-metal/tt-boltz/tests/diffusion_inputs_686.pt")
-    a = inputs["a"]
-    s = inputs["s"]
-    z = inputs["z"]
-    mask = torch.ones(1, 686)
+    a = 3 + 5 * torch.randn(1, seq_len, 768)
+    s = -2 + 42 * torch.randn(1, seq_len, 768)
+    z = 10 * torch.randn(1, seq_len, seq_len, 128)
+    mask = torch.ones(1, seq_len)
     a_tt = token_transformer(
         a,
         s,
@@ -88,6 +83,4 @@ def test_token_transformer():
         z,
         mask,
     )
-    print(
-        median_relative_error(a_tt, a_torch),
-    )
+    assert median_relative_error(a_tt, a_torch) < 1e-1, "a not accurate"
