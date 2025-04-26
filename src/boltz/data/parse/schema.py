@@ -74,6 +74,7 @@ class ParsedChain:
     entity: str
     type: str
     residues: list[ParsedResidue]
+    cyclic_period: int
 
 
 ####################################################################################################
@@ -237,7 +238,7 @@ def parse_ccd_residue(
         pos = (0, 0, 0)
         ref_atom = ref_mol.GetAtoms()[0]
         chirality_type = const.chirality_type_ids.get(
-            ref_atom.GetChiralTag(), unk_chirality
+            str(ref_atom.GetChiralTag()), unk_chirality
         )
         atom = ParsedAtom(
             name=ref_atom.GetProp("name"),
@@ -279,7 +280,7 @@ def parse_ccd_residue(
         ref_coords = conformer.GetAtomPosition(atom.GetIdx())
         ref_coords = (ref_coords.x, ref_coords.y, ref_coords.z)
         chirality_type = const.chirality_type_ids.get(
-            atom.GetChiralTag(), unk_chirality
+            str(atom.GetChiralTag()), unk_chirality
         )
 
         # Get PDB coordinates, if any
@@ -340,6 +341,7 @@ def parse_polymer(
     entity: str,
     chain_type: str,
     components: dict[str, Mol],
+    cyclic: bool,
 ) -> Optional[ParsedChain]:
     """Process a sequence into a chain object.
 
@@ -425,7 +427,7 @@ def parse_polymer(
                     conformer=ref_coords,
                     is_present=atom_is_present,
                     chirality=const.chirality_type_ids.get(
-                        ref_atom.GetChiralTag(), unk_chirality
+                        str(ref_atom.GetChiralTag()), unk_chirality
                     ),
                 )
             )
@@ -447,11 +449,17 @@ def parse_polymer(
             )
         )
 
+    if cyclic:
+        cyclic_period = len(sequence)
+    else:
+        cyclic_period = 0
+
     # Return polymer object
     return ParsedChain(
         entity=entity,
         residues=parsed,
         type=chain_type,
+        cyclic_period=cyclic_period,
     )
 
 
@@ -609,12 +617,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 idx = mod["position"] - 1  # 1-indexed
                 seq[idx] = code
 
+            cyclic = items[0][entity_type].get("cyclic", False)
+
             # Parse a polymer
             parsed_chain = parse_polymer(
                 sequence=seq,
                 entity=entity_id,
                 chain_type=chain_type,
                 components=ccd,
+                cyclic=cyclic,
             )
 
         # Parse a non-polymer
@@ -642,7 +653,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 entity=entity_id,
                 residues=residues,
                 type=const.chain_type_ids["NONPOLYMER"],
+                cyclic_period=0,
             )
+
+            assert not items[0][entity_type].get("cyclic", False), "Cyclic flag is not supported for ligands"
+
         elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
             mol = AllChem.MolFromSmiles(seq)
@@ -651,7 +666,10 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             # Set atom names
             canonical_order = AllChem.CanonicalRankAtoms(mol)
             for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
-                atom.SetProp("name", atom.GetSymbol().upper() + str(can_idx + 1))
+                atom_name = atom.GetSymbol().upper() + str(can_idx + 1)
+                if len(atom_name) > 4:
+                    raise ValueError(f"{seq} has an atom with a name longer than 4 characters: {atom_name}")
+                atom.SetProp("name", atom_name)
 
             success = compute_3d_conformer(mol)
             if not success:
@@ -668,7 +686,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 entity=entity_id,
                 residues=[residue],
                 type=const.chain_type_ids["NONPOLYMER"],
+                cyclic_period=0,
             )
+
+            assert not items[0][entity_type].get("cyclic", False), "Cyclic flag is not supported for ligands"
+
         else:
             msg = f"Invalid entity type: {entity_type}"
             raise ValueError(msg)
@@ -727,6 +749,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 atom_num,
                 res_idx,
                 res_num,
+                chain.cyclic_period,
             )
         )
         chain_to_idx[chain_name] = asym_id

@@ -151,7 +151,7 @@ def get_resolution(block: gemmi.cif.Block) -> float:
         "_reflns.d_resolution_high",
     ):
         with contextlib.suppress(Exception):
-            resolution = float(block.find([res_key])[0])
+            resolution = float(block.find([res_key])[0].str(0))
             break
     return resolution
 
@@ -428,7 +428,7 @@ def parse_ccd_residue(  # noqa: PLR0915, C901
             )
         ref_atom = ref_mol.GetAtoms()[0]
         chirality_type = const.chirality_type_ids.get(
-            ref_atom.GetChiralTag(), unk_chirality
+            str(ref_atom.GetChiralTag()), unk_chirality
         )
         atom = ParsedAtom(
             name=ref_atom.GetProp("name"),
@@ -479,7 +479,7 @@ def parse_ccd_residue(  # noqa: PLR0915, C901
         ref_coords = conformer.GetAtomPosition(atom.GetIdx())
         ref_coords = (ref_coords.x, ref_coords.y, ref_coords.z)
         chirality_type = const.chirality_type_ids.get(
-            atom.GetChiralTag(), unk_chirality
+            str(atom.GetChiralTag()), unk_chirality
         )
 
         # If the atom is a leaving atom, skip if not in the PDB and is_covalent
@@ -685,7 +685,7 @@ def parse_polymer(  # noqa: C901, PLR0915, PLR0912
                     conformer=ref_coords,
                     is_present=atom_is_present,
                     chirality=const.chirality_type_ids.get(
-                        ref_atom.GetChiralTag(), unk_chirality
+                        str(ref_atom.GetChiralTag()), unk_chirality
                     ),
                 )
             )
@@ -966,6 +966,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
                         entity=entity.name,
                         residues=residues,
                         type=const.chain_type_ids["NONPOLYMER"],
+                        sequence=None
                     )
                 )
 
@@ -1119,4 +1120,4 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
         mask=mask,
     )
 
-    return ParsedStructure(data=data, info=info)
+    return ParsedStructure(data=data, info=info, covalents=[])
