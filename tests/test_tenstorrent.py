@@ -86,7 +86,9 @@ def test_token_transformer(seq_len):
     )
     assert median_relative_error(a_tt, a_torch) < 1e-1, "a not accurate"
 
-def test_msa():
+@pytest.mark.parametrize("seq_len", [100, 500, 1000])
+def test_msa(seq_len):
+    n_sequences = 100
     msa = MSAModule(
         n_blocks=4,
         avg_head_dim=32,
@@ -98,10 +100,15 @@ def test_msa():
     msa_state_dict = filter_dict(state_dict, "msa_module")
     msa.load_state_dict(msa_state_dict)
     msa_torch.load_state_dict(msa_state_dict)
-    inputs = torch.load("/home/moritz/tt-metal/tt-boltz/tests/msa_inputs_prot.pt")
-    z = inputs["z"]
-    emb = inputs["emb"]
-    feats = inputs["feats"]
+    z = 7 * torch.randn(1, seq_len, seq_len, 128)
+    emb = torch.ones(1, seq_len, 455)
+    feats = {"msa": torch.nn.functional.one_hot(torch.randint(33, (1, n_sequences, seq_len)), 33),
+             "has_deletion": torch.zeros((1, n_sequences, seq_len), dtype=torch.bool),
+             "deletion_value": torch.zeros((1, n_sequences, seq_len)),
+             "msa_paired": torch.zeros((1, n_sequences, seq_len)),
+             "msa_mask": torch.ones((1, n_sequences, seq_len)),
+             "token_pad_mask": torch.ones((1, seq_len)),
+    }
     z_tt = msa(z, emb, feats)
     z_torch = msa_torch(z, emb, feats)
-    print(median_relative_error(z_tt, z_torch))
+    assert median_relative_error(z_tt, z_torch) < 1e-1, "z not accurate"
