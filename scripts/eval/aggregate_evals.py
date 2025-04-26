@@ -294,7 +294,16 @@ def compute_boltz_metrics(preds, evals, name):
     return results
 
 
-def eval_models(chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz_evals):
+def eval_models(
+    chai_preds,
+    chai_evals,
+    af3_preds,
+    af3_evals,
+    boltz_preds,
+    boltz_evals,
+    boltz_preds_x,
+    boltz_evals_x,
+):
     # Load preds and make sure we have predictions for all models
     chai_preds_names = {
         x.name.lower(): x
@@ -311,15 +320,22 @@ def eval_models(chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz
         for x in Path(boltz_preds).iterdir()
         if not x.name.lower().startswith(".")
     }
+    boltz_preds_names_x = {
+        x.name.lower(): x
+        for x in Path(boltz_preds_x).iterdir()
+        if not x.name.lower().startswith(".")
+    }
 
     print("Chai preds", len(chai_preds_names))
     print("Af3 preds", len(af3_preds_names))
     print("Boltz preds", len(boltz_preds_names))
+    print("Boltzx preds", len(boltz_preds_names_x))
 
     common = (
         set(chai_preds_names.keys())
         & set(af3_preds_names.keys())
         & set(boltz_preds_names.keys())
+        & set(boltz_preds_names_x.keys())
     )
 
     # Remove examples in the validation set
@@ -371,12 +387,34 @@ def eval_models(chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz
             print(f"Error evaluating Boltz {name}: {e}")
             continue
 
+        try:
+            boltz_results_x = compute_boltz_metrics(
+                boltz_preds_names_x[name],
+                boltz_evals_x,
+                name,
+            )
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            print(f"Error evaluating Boltzx {name}: {e}")
+            continue
+
         for metric_name in af3_results:
             if metric_name in chai_results and metric_name in boltz_results:
                 if (
-                    af3_results[metric_name]["len"] == chai_results[metric_name]["len"]
-                    and af3_results[metric_name]["len"]
-                    == boltz_results[metric_name]["len"]
+                    (
+                        af3_results[metric_name]["len"]
+                        == chai_results[metric_name]["len"]
+                    )
+                    and (
+                        af3_results[metric_name]["len"]
+                        == boltz_results[metric_name]["len"]
+                    )
+                    and (
+                        af3_results[metric_name]["len"]
+                        == boltz_results_x[metric_name]["len"]
+                    )
                 ):
                     results.append(
                         {
@@ -426,6 +464,22 @@ def eval_models(chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz
                             "value": boltz_results[metric_name]["top1"],
                         }
                     )
+                    results.append(
+                        {
+                            "tool": "Boltz-1x oracle",
+                            "target": name,
+                            "metric": metric_name,
+                            "value": boltz_results_x[metric_name]["oracle"],
+                        }
+                    )
+                    results.append(
+                        {
+                            "tool": "Boltz-1x top-1",
+                            "target": name,
+                            "metric": metric_name,
+                            "value": boltz_results_x[metric_name]["top1"],
+                        }
+                    )
                 else:
                     print(
                         "Different lengths",
@@ -434,6 +488,7 @@ def eval_models(chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz
                         af3_results[metric_name]["len"],
                         chai_results[metric_name]["len"],
                         boltz_results[metric_name]["len"],
+                        boltz_results_x[metric_name]["len"],
                     )
             else:
                 print(
@@ -442,11 +497,47 @@ def eval_models(chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz
                     metric_name,
                     metric_name in chai_results,
                     metric_name in boltz_results,
+                    metric_name in boltz_results_x,
                 )
 
     # Write the results to a file, ensure we only keep the target & metrics where we have all tools
     df = pd.DataFrame(results)
     return df
+
+
+def eval_validity_checks(df):
+    # Filter the dataframe to only include the targets in the validity checks
+    name_mapping = {
+        "af3": "AF3 top-1",
+        "chai": "Chai-1 top-1",
+        "boltz1": "Boltz-1 top-1",
+        "boltz1x": "Boltz-1x top-1",
+    }
+    top1 = df[df["model_idx"] == 0]
+    top1 = top1[["tool", "pdb_id", "valid"]]
+    top1["tool"] = top1["tool"].apply(lambda x: name_mapping[x])
+    top1 = top1.rename(columns={"tool": "tool", "pdb_id": "target", "valid": "value"})
+    top1["metric"] = "physical validity"
+    top1["target"] = top1["target"].apply(lambda x: x.lower())
+    top1 = top1[["tool", "target", "metric", "value"]]
+
+    name_mapping = {
+        "af3": "AF3 oracle",
+        "chai": "Chai-1 oracle",
+        "boltz1": "Boltz-1 oracle",
+        "boltz1x": "Boltz-1x oracle",
+    }
+    oracle = df[["tool", "model_idx", "pdb_id", "valid"]]
+    oracle = oracle.groupby(["tool", "pdb_id"])["valid"].max().reset_index()
+    oracle = oracle.rename(
+        columns={"tool": "tool", "pdb_id": "target", "valid": "value"}
+    )
+    oracle["tool"] = oracle["tool"].apply(lambda x: name_mapping[x])
+    oracle["metric"] = "physical validity"
+    oracle = oracle[["tool", "target", "metric", "value"]]
+    oracle["target"] = oracle["target"].apply(lambda x: x.lower())
+    out = pd.concat([top1, oracle])
+    return out
 
 
 def bootstrap_ci(series, n_boot=1000, alpha=0.05):
@@ -461,7 +552,7 @@ def bootstrap_ci(series, n_boot=1000, alpha=0.05):
         boot_means.append(sample.mean())
 
     boot_means = np.array(boot_means)
-    mean_val = np.mean(boot_means)
+    mean_val = np.mean(series)
     lower = np.percentile(boot_means, 100 * alpha / 2)
     upper = np.percentile(boot_means, 100 * (1 - alpha / 2))
     return mean_val, lower, upper
@@ -497,6 +588,8 @@ def plot_data(desired_tools, desired_metrics, df, dataset, filename):
         "Chai-1 top-1",
         "Boltz-1 oracle",
         "Boltz-1 top-1",
+        "Boltz-1x oracle",
+        "Boltz-1x top-1",
     ]
     plot_data = plot_data[tool_order]
     lower_data = lower_data[tool_order]
@@ -508,6 +601,7 @@ def plot_data(desired_tools, desired_metrics, df, dataset, filename):
         "rmsd<2": "L-RMSD < 2A",
         "lddt": "Mean LDDT",
         "dockq_>0.23": "DockQ > 0.23",
+        "physical validity": "Physical Validity",
     }
     plot_data = plot_data.rename(index=renaming)
     lower_data = lower_data.rename(index=renaming)
@@ -516,12 +610,14 @@ def plot_data(desired_tools, desired_metrics, df, dataset, filename):
 
     # Colors
     tool_colors = [
-        "#004D80",  # AF3 oracle
-        "#55C2FF",  # AF3 top-1
+        "#994C00",  # AF3 oracle
+        "#FFB55A",  # AF3 top-1
         "#931652",  # Chai-1 oracle
         "#FC8AD9",  # Chai-1 top-1
         "#188F52",  # Boltz-1 oracle
         "#86E935",  # Boltz-1 top-1
+        "#004D80",  # Boltz-1x oracle
+        "#55C2FF",  # Boltz-1x top-1
     ]
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -559,7 +655,7 @@ def plot_data(desired_tools, desired_metrics, df, dataset, filename):
     ax.set_title(f"Performances on {dataset} with 95% CI (Bootstrap)")
 
     plt.tight_layout()
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 0.85), ncol=3, frameon=False)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 0.85), ncols=4, frameon=False)
 
     plt.savefig(filename)
     plt.show()
@@ -567,6 +663,7 @@ def plot_data(desired_tools, desired_metrics, df, dataset, filename):
 
 def main():
     eval_folder = "../../boltz_results_final/"
+    output_folder = "../../boltz_results_final/"
 
     # Eval the test set
     chai_preds = eval_folder + "outputs/test/chai"
@@ -578,10 +675,27 @@ def main():
     boltz_preds = eval_folder + "outputs/test/boltz/predictions"
     boltz_evals = eval_folder + "evals/test/boltz"
 
+    boltz_preds_x = eval_folder + "outputs/test/boltzx/predictions"
+    boltz_evals_x = eval_folder + "evals/test/boltzx"
+
+    validity_checks = eval_folder + "physical_checks_test.csv"
+
+    df_validity_checks = pd.read_csv(validity_checks)
+    df_validity_checks = eval_validity_checks(df_validity_checks)
+
     df = eval_models(
-        chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz_evals
+        chai_preds,
+        chai_evals,
+        af3_preds,
+        af3_evals,
+        boltz_preds,
+        boltz_evals,
+        boltz_preds_x,
+        boltz_evals_x,
     )
-    df.to_csv(eval_folder + "results_test.csv", index=False)
+
+    df = pd.concat([df, df_validity_checks]).reset_index(drop=True)
+    df.to_csv(output_folder + "results_test.csv", index=False)
 
     desired_tools = [
         "AF3 oracle",
@@ -590,10 +704,12 @@ def main():
         "Chai-1 top-1",
         "Boltz-1 oracle",
         "Boltz-1 top-1",
+        "Boltz-1x oracle",
+        "Boltz-1x top-1",
     ]
-    desired_metrics = ["lddt", "dockq_>0.23", "lddt_pli", "rmsd<2"]
+    desired_metrics = ["lddt", "dockq_>0.23", "lddt_pli", "rmsd<2", "physical validity"]
     plot_data(
-        desired_tools, desired_metrics, df, "PDB Test", eval_folder + "plot_test.png"
+        desired_tools, desired_metrics, df, "PDB Test", output_folder + "plot_test.pdf"
     )
 
     # Eval CASP
@@ -606,13 +722,30 @@ def main():
     boltz_preds = eval_folder + "outputs/casp15/boltz/predictions"
     boltz_evals = eval_folder + "evals/casp15/boltz"
 
+    boltz_preds_x = eval_folder + "outputs/casp15/boltzx/predictions"
+    boltz_evals_x = eval_folder + "evals/casp15/boltzx"
+
+    validity_checks = eval_folder + "physical_checks_casp.csv"
+
+    df_validity_checks = pd.read_csv(validity_checks)
+    df_validity_checks = eval_validity_checks(df_validity_checks)
+
     df = eval_models(
-        chai_preds, chai_evals, af3_preds, af3_evals, boltz_preds, boltz_evals
+        chai_preds,
+        chai_evals,
+        af3_preds,
+        af3_evals,
+        boltz_preds,
+        boltz_evals,
+        boltz_preds_x,
+        boltz_evals_x,
     )
-    df.to_csv(eval_folder + "results_casp.csv", index=False)
+
+    df = pd.concat([df, df_validity_checks]).reset_index(drop=True)
+    df.to_csv(output_folder + "results_casp.csv", index=False)
 
     plot_data(
-        desired_tools, desired_metrics, df, "CASP15", eval_folder + "plot_casp.png"
+        desired_tools, desired_metrics, df, "CASP15", output_folder + "plot_casp.pdf"
     )
 
 
