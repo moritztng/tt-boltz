@@ -1,6 +1,6 @@
 import gc
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import torch
 import torch._dynamo
@@ -38,6 +38,8 @@ from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
 
 class Boltz1(LightningModule):
+    """Boltz1 model."""
+
     def __init__(  # noqa: PLR0915, C901, PLR0912
         self,
         atom_s: int,
@@ -54,6 +56,7 @@ class Boltz1(LightningModule):
         diffusion_process_args: dict[str, Any],
         diffusion_loss_args: dict[str, Any],
         confidence_model_args: dict[str, Any],
+        steering_args: dict[str, Any],
         atom_feature_dim: int = 128,
         confidence_prediction: bool = False,
         confidence_imitate_trunk: bool = False,
@@ -134,6 +137,7 @@ class Boltz1(LightningModule):
         self.validation_args = validation_args
         self.diffusion_loss_args = diffusion_loss_args
         self.predict_args = predict_args
+        self.steering_args = steering_args
 
         self.nucleotide_rmsd_weight = nucleotide_rmsd_weight
         self.ligand_rmsd_weight = ligand_rmsd_weight
@@ -343,6 +347,7 @@ class Boltz1(LightningModule):
                     atom_mask=feats["atom_pad_mask"],
                     multiplicity=diffusion_samples,
                     train_accumulate_token_repr=self.training,
+                    steering_args=self.steering_args,
                 )
             )
 

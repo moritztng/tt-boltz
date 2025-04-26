@@ -367,6 +367,8 @@ class InterfaceInfo:
 
 @dataclass(frozen=True)
 class InferenceOptions:
+    """InferenceOptions datatype."""
+
     binders: list[int]
     pocket: Optional[list[tuple[int, int]]]
 
@@ -383,6 +385,56 @@ class Record(JSONSerializable):
 
 
 ####################################################################################################
+# RESIDUE CONSTRAINTS
+####################################################################################################
+
+
+RDKitBoundsConstraint = [
+    ("atom_idxs", np.dtype("2i4")),
+    ("is_bond", np.dtype("?")),
+    ("is_angle", np.dtype("?")),
+    ("upper_bound", np.dtype("f4")),
+    ("lower_bound", np.dtype("f4")),
+]
+
+ChiralAtomConstraint = [
+    ("atom_idxs", np.dtype("4i4")),
+    ("is_reference", np.dtype("?")),
+    ("is_r", np.dtype("?")),
+]
+
+StereoBondConstraint = [
+    ("atom_idxs", np.dtype("4i4")),
+    ("is_reference", np.dtype("?")),
+    ("is_e", np.dtype("?")),
+]
+
+PlanarBondConstraint = [
+    ("atom_idxs", np.dtype("6i4")),
+]
+
+PlanarRing5Constraint = [
+    ("atom_idxs", np.dtype("5i4")),
+]
+
+PlanarRing6Constraint = [
+    ("atom_idxs", np.dtype("6i4")),
+]
+
+
+@dataclass(frozen=True)
+class ResidueConstraints(NumpySerializable):
+    """ResidueConstraints datatype."""
+
+    rdkit_bounds_constraints: np.ndarray
+    chiral_atom_constraints: np.ndarray
+    stereo_bond_constraints: np.ndarray
+    planar_bond_constraints: np.ndarray
+    planar_ring_5_constraints: np.ndarray
+    planar_ring_6_constraints: np.ndarray
+
+
+####################################################################################################
 # TARGET
 ####################################################################################################
 
@@ -394,6 +446,7 @@ class Target:
     record: Record
     structure: Structure
     sequences: Optional[dict[str, str]] = None
+    residue_constraints: Optional[ResidueConstraints] = None
 
 
 @dataclass(frozen=True)
@@ -448,6 +501,7 @@ class Input:
     structure: Structure
     msa: dict[str, MSA]
     record: Optional[Record] = None
+    residue_constraints: Optional[ResidueConstraints] = None
 
 
 ####################################################################################################
@@ -487,3 +541,4 @@ class Tokenized:
     bonds: np.ndarray
     structure: Structure
     msa: dict[str, MSA]
+    residue_constraints: Optional[ResidueConstraints] = None
