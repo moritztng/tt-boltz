@@ -38,6 +38,33 @@ class BoltzProcessedInput:
 
 
 @dataclass
+class PairformerArgs:
+    """Pairformer arguments."""
+
+    num_blocks: int = 48
+    num_heads: int = 16
+    dropout: float = 0.0
+    activation_checkpointing: bool = False
+    offload_to_cpu: bool = False
+    use_trifast: bool = True
+
+
+@dataclass
+class MSAModuleArgs:
+    """MSA module arguments."""
+
+    msa_s: int = 64
+    msa_blocks: int = 4
+    msa_dropout: float = 0.0
+    z_dropout: float = 0.0
+    pairwise_head_width: int = 32
+    pairwise_num_heads: int = 4
+    activation_checkpointing: bool = False
+    offload_to_cpu: bool = False
+    use_trifast: bool = True
+
+
+@dataclass
 class BoltzDiffusionParams:
     """Diffusion process parameters."""
 
@@ -275,9 +302,13 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
 
         manifest: Manifest = Manifest.load(manifest_path)
         input_ids = [d.stem for d in data]
-        existing_records, processed_ids = zip(*[
-            (record, record.id) for record in manifest.records if record.id in input_ids
-        ])
+        existing_records, processed_ids = zip(
+            *[
+                (record, record.id)
+                for record in manifest.records
+                if record.id in input_ids
+            ]
+        )
 
         if isinstance(existing_records, tuple):
             existing_records = list(existing_records)
@@ -311,7 +342,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     # Load CCD
     with ccd_path.open("rb") as file:
         ccd = pickle.load(file)  # noqa: S301
-    
+
     if existing_records is not None:
         click.echo(f"Found {len(existing_records)} records. Adding them to records")
 
@@ -649,6 +680,10 @@ def predict(
     }
     diffusion_params = BoltzDiffusionParams()
     diffusion_params.step_scale = step_scale
+
+    pairformer_args = PairformerArgs()
+    msa_module_args = MSAModuleArgs()
+
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=True,
@@ -656,6 +691,8 @@ def predict(
         map_location="cpu",
         diffusion_process_args=asdict(diffusion_params),
         ema=False,
+        pairformer_args=asdict(pairformer_args),
+        msa_module_args=asdict(msa_module_args),
     )
     model_module.eval()
 

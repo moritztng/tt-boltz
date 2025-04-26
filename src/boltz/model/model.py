@@ -1129,8 +1129,14 @@ class Boltz1(LightningModule):
             pred_dict["coords"] = out["sample_atom_coords"]
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
-                    4 * out["complex_plddt"] +
-                    (out["iptm"] if not torch.allclose(out["iptm"], torch.zeros_like(out["iptm"])) else out["ptm"])
+                    4 * out["complex_plddt"]
+                    + (
+                        out["iptm"]
+                        if not torch.allclose(
+                            out["iptm"], torch.zeros_like(out["iptm"])
+                        )
+                        else out["ptm"]
+                    )
                 ) / 5
                 for key in [
                     "ptm",
@@ -1195,7 +1201,11 @@ class Boltz1(LightningModule):
             checkpoint["ema"] = self.ema.state_dict()
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        if self.use_ema and "ema" in checkpoint and self.ema.compatible(checkpoint["ema"]["shadow_params"]):
+        if (
+            self.use_ema
+            and "ema" in checkpoint
+            and self.ema.compatible(checkpoint["ema"]["shadow_params"])
+        ):
             self.ema = ExponentialMovingAverage(
                 parameters=self.parameters(), decay=self.ema_decay
             )
