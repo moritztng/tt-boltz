@@ -39,8 +39,8 @@ def test_pairformer(seq_len):
         strict=False,
     )
     pairformer_torch.load_state_dict(pairformer_state_dict, strict=False)
-    s = torch.randn(1, seq_len, 384) * 8
-    z = torch.randn(1, seq_len, seq_len, 128) * 26
+    s = 8 * torch.randn(1, seq_len, 384)
+    z = 26 * torch.randn(1, seq_len, seq_len, 128)
     mask = torch.ones(1, seq_len)
     pair_mask = mask[:, :, None] * mask[:, None, :]
     s_tt, z_tt = pairformer(s, z, mask, pair_mask)
