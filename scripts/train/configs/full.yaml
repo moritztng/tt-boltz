@@ -4,6 +4,7 @@ trainer:
   precision: 32
   gradient_clip_val: 10.0
   max_epochs: -1
+  accumulate_grad_batches: 128    # to adjust depending on the number of devices
 
 # Optional set wandb here
 # wandb:
@@ -13,7 +14,7 @@ trainer:
 
 
 output: SET_PATH_HERE
-pretrained: PATH_TO_STRUCTURE_CHECKPOINT_FILE
+pretrained: PATH_TO_CHECKPOINT_FILE
 resume: null
 disable_checkpoint: false
 matmul_precision: null
@@ -166,6 +167,7 @@ model:
     sampling_steps: 200
     diffusion_samples: 5
     symmetry_correction: true
+    run_confidence_sequentially: true
 
   diffusion_process_args:
     sigma_min: 0.0004

@@ -4,6 +4,7 @@ trainer:
   precision: 32
   gradient_clip_val: 10.0
   max_epochs: -1
+  accumulate_grad_batches: 128    # to adjust depending on the number of devices
 
 # Optional set wandb here
 # wandb:
@@ -18,7 +19,7 @@ resume: null
 disable_checkpoint: false
 matmul_precision: null
 save_top_k: -1
-load_confidence_from_trunk: true
+load_confidence_from_trunk: false  # should be set to true only when starting from scratch, not from a pretrained confidence model
 
 data:
   datasets:
@@ -160,13 +161,14 @@ model:
     lr_decay_every_n_steps: 50000
     lr_decay_factor: 0.95
     symmetry_correction: true
+    run_confidence_sequentially: false
 
   validation_args:
     recycling_steps: 3
     sampling_steps: 200
     diffusion_samples: 5
     symmetry_correction: true
-    run_confidence_sequentially: false
+    run_confidence_sequentially: true
 
   diffusion_process_args:
     sigma_min: 0.0004
