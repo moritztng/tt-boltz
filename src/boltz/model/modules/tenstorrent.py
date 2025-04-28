@@ -688,7 +688,7 @@ class TorchWrapper(nn.Module):
         self.module = None
         global mesh_device
         if mesh_device is None:
-            ttnn.device.EnablePersistentKernelCache()
+            # ttnn.device.EnablePersistentKernelCache() # be careful, can lead to bugs when profiling etc.
             n_devices = min(len(ttnn.get_device_ids()), 2)
             mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, n_devices))
             mesh_device.enable_program_cache()
@@ -710,6 +710,13 @@ class TorchWrapper(nn.Module):
     def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
         return torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
 
+    def __del__(self):
+        global mesh_device
+        if mesh_device is not None:
+            for device in mesh_device.get_devices():
+                ttnn.DumpDeviceProfiler(device)
+            ttnn.close_mesh_device(mesh_device)
+            mesh_device = None
 
 class PairformerModule(TorchWrapper):
     def __init__(
