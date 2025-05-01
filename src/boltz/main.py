@@ -724,8 +724,8 @@ def predict(
     diffusion_params = BoltzDiffusionParams()
     diffusion_params.step_scale = step_scale
 
-    pairformer_args = PairformerArgs()
-    msa_module_args = MSAModuleArgs()
+    pairformer_args = PairformerArgs(use_trifast=(accelerator != "cpu"))
+    msa_module_args = MSAModuleArgs(use_trifast=(accelerator != "cpu"))
 
     steering_args = BoltzSteeringParams()
     if no_potentials:
