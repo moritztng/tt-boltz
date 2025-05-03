@@ -82,7 +82,7 @@ class RelativePositionEncoder(Module):
                 feats["cyclic_period"] > 0,
                 feats["cyclic_period"],
                 torch.zeros_like(feats["cyclic_period"]) + 10000,
-            )
+            ).unsqueeze(1)
             rel_pos = (rel_pos - period * torch.round(rel_pos / period)).long()
 
         d_residue = torch.clip(
