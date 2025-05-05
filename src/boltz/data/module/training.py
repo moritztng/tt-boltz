@@ -358,6 +358,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         return_symmetries: Optional[bool] = False,
         binder_pocket_conditioned_prop: Optional[float] = 0.0,
         binder_pocket_cutoff: Optional[float] = 6.0,
+        compute_constraint_features: bool = False,
     ) -> None:
         """Initialize the validation dataset."""
         super().__init__()
@@ -380,6 +381,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.return_symmetries = return_symmetries
         self.binder_pocket_conditioned_prop = binder_pocket_conditioned_prop
         self.binder_pocket_cutoff = binder_pocket_cutoff
+        self.compute_constraint_features = compute_constraint_features
 
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
         """Get an item from the dataset.
@@ -461,6 +463,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                 binder_pocket_cutoff=self.binder_pocket_cutoff,
                 binder_pocket_sampling_geometric_p=1.0,  # this will only sample a single pocket token
                 only_ligand_binder_pocket=True,
+                compute_constraint_features=self.compute_constraint_features,
             )
         except Exception as e:
             print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
