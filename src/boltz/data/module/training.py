@@ -206,6 +206,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         binder_pocket_cutoff: Optional[float] = 6.0,
         binder_pocket_sampling_geometric_p: Optional[float] = 0.0,
         return_symmetries: Optional[bool] = False,
+        compute_constraint_features: bool = False,
     ) -> None:
         """Initialize the training dataset."""
         super().__init__()
@@ -227,6 +228,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.binder_pocket_cutoff = binder_pocket_cutoff
         self.binder_pocket_sampling_geometric_p = binder_pocket_sampling_geometric_p
         self.return_symmetries = return_symmetries
+        self.compute_constraint_features = compute_constraint_features
         self.samples = []
         for dataset in datasets:
             records = dataset.manifest.records
@@ -313,6 +315,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                 binder_pocket_conditioned_prop=self.binder_pocket_conditioned_prop,
                 binder_pocket_cutoff=self.binder_pocket_cutoff,
                 binder_pocket_sampling_geometric_p=self.binder_pocket_sampling_geometric_p,
+                compute_constraint_features=self.compute_constraint_features,
             )
         except Exception as e:
             print(f"Featurizer failed on {sample.record.id} with error {e}. Skipping.")
