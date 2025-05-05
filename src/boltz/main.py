@@ -717,8 +717,7 @@ def predict(
         "recycling_steps": recycling_steps,
         "sampling_steps": sampling_steps,
         "diffusion_samples": diffusion_samples,
-        #"write_confidence_summary": True,
-        "write_confidence_summary": False,
+        "write_confidence_summary": True,
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
     }
