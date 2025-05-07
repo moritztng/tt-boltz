@@ -30,6 +30,7 @@ from boltz.model.modules.transformers import (
 from boltz.model.modules.utils import (
     LinearNoBias,
     compute_random_augmentation,
+    center_random_augmentation,
     default,
     log,
 )
