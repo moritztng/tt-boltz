@@ -1,6 +1,7 @@
 import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable, Dict
+from time import time
 
 TRIANGLE_ATTENTION_CHUNK_SIZE = 64
 TRANSITION_CHUNK_SIZE = 64
@@ -786,6 +787,7 @@ class OuterProductMean(Module):
         self.o_bias = self.torch_to_tt("proj_o.bias")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        x = ttnn.reshape(x, tuple(x.shape)[1:])
         m = ttnn.layer_norm(
             x,
             weight=self.norm_weight,
@@ -799,24 +801,23 @@ class OuterProductMean(Module):
         b = ttnn.linear(
             m, self.b_weight, compute_kernel_config=self.compute_kernel_config
         )
-        for i in range(a.shape[1]):
-            chunk = ttnn.multiply(
-                ttnn.reshape(a[:, i, :, :], (a.shape[0], a.shape[2], 1, a.shape[3], 1)),
-                ttnn.reshape(b[:, i, :, :], (b.shape[0], 1, b.shape[2], 1, b.shape[3])),
-                use_legacy=False,
-            )
-            if i == 0:
-                z = chunk
-            else:
-                z = ttnn.add(z, chunk)
-        z = ttnn.reshape(z, (*tuple(z.shape)[:3], -1))
-        z = ttnn.multiply(z, 1 / a.shape[1])
+        S, I, C = a.shape
+        _, J, D = b.shape
+        a = ttnn.permute(a, (1, 2, 0))
+        a = ttnn.reshape(a, (-1, S))
+        b = ttnn.reshape(b, (S, -1))
+        z = ttnn.matmul(a, b, compute_kernel_config=self.compute_kernel_config)
+        z = ttnn.reshape(z, (I, C, J, D))
+        z = ttnn.permute(z, (0, 2, 1, 3))
+        z = ttnn.reshape(z, (*tuple(z.shape)[:2], -1))
+        z = ttnn.multiply(z, 1 / S)
         z = ttnn.linear(
             z,
             self.o_weight,
             bias=self.o_bias,
             compute_kernel_config=self.compute_kernel_config,
         )
+        z = ttnn.reshape(z, (1, *z.shape))
         return z
 
 
