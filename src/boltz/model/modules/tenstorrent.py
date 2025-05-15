@@ -5,7 +5,8 @@ from time import time
 
 TRIANGLE_ATTENTION_CHUNK_SIZE = 64
 TRANSITION_CHUNK_SIZE = 64
-MSA_CHUNK_SIZE = 64
+PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
+OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
 mesh_device = None
 
 
@@ -744,9 +745,13 @@ class PairWeightedAveraging(Module):
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
             )
-            for chunk_start in range(0, v.shape[0], MSA_CHUNK_SIZE):
-                chunk_end = min(chunk_start + MSA_CHUNK_SIZE, v.shape[0])
-                o_chunk = ttnn.matmul(ttnn.repeat(w, [chunk_end - chunk_start, 1, 1]), v[chunk_start:chunk_end], compute_kernel_config=self.compute_kernel_config)
+            for chunk_start in range(0, v.shape[0], PAIR_WEIGHTED_AVG_CHUNK_SIZE):
+                chunk_end = min(chunk_start + PAIR_WEIGHTED_AVG_CHUNK_SIZE, v.shape[0])
+                o_chunk = ttnn.matmul(
+                    ttnn.repeat(w, [chunk_end - chunk_start, 1, 1]),
+                    v[chunk_start:chunk_end],
+                    compute_kernel_config=self.compute_kernel_config,
+                )
                 if chunk_start == 0:
                     o = o_chunk
                 else:
@@ -803,20 +808,26 @@ class OuterProductMean(Module):
         )
         S, I, C = a.shape
         _, J, D = b.shape
-        a = ttnn.permute(a, (1, 2, 0))
-        a = ttnn.reshape(a, (-1, S))
-        b = ttnn.reshape(b, (S, -1))
-        z = ttnn.matmul(a, b, compute_kernel_config=self.compute_kernel_config)
-        z = ttnn.reshape(z, (I, C, J, D))
-        z = ttnn.permute(z, (0, 2, 1, 3))
-        z = ttnn.reshape(z, (*tuple(z.shape)[:2], -1))
-        z = ttnn.multiply(z, 1 / S)
-        z = ttnn.linear(
-            z,
-            self.o_weight,
-            bias=self.o_bias,
-            compute_kernel_config=self.compute_kernel_config,
-        )
+        chunks = []
+        for chunk_start in range(0, I, OUTER_PRODUCT_MEAN_CHUNK_SIZE):
+            chunk_end = min(chunk_start + OUTER_PRODUCT_MEAN_CHUNK_SIZE, I)
+            a_chunk = a[:, chunk_start : chunk_end, :]
+            a_chunk = ttnn.permute(a_chunk, (1, 2, 0))
+            a_chunk = ttnn.reshape(a_chunk, (-1, S))
+            b = ttnn.reshape(b, (S, -1))
+            z = ttnn.matmul(a_chunk, b, compute_kernel_config=self.compute_kernel_config)
+            z = ttnn.reshape(z, (chunk_end - chunk_start, C, J, D))
+            z = ttnn.permute(z, (0, 2, 1, 3))
+            z = ttnn.reshape(z, (*tuple(z.shape)[:2], -1))
+            z = ttnn.multiply(z, 1 / S)
+            z = ttnn.linear(
+                z,
+                self.o_weight,
+                bias=self.o_bias,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            chunks.append(z)
+        z = ttnn.concat(chunks, dim=0)
         z = ttnn.reshape(z, (1, *z.shape))
         return z
 
@@ -1112,7 +1123,14 @@ class MSAModule(TorchWrapper):
         emb: torch.Tensor,
         feats: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        m = torch.cat([feats["msa"], feats["has_deletion"].unsqueeze(-1), feats["deletion_value"].unsqueeze(-1)], dim=-1)
+        m = torch.cat(
+            [
+                feats["msa"],
+                feats["has_deletion"].unsqueeze(-1),
+                feats["deletion_value"].unsqueeze(-1),
+            ],
+            dim=-1,
+        )
         return self._to_torch(
             self.module(
                 self._from_torch(z),
