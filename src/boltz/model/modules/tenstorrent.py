@@ -1,7 +1,6 @@
 import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable, Dict
-from time import time
 
 TRIANGLE_ATTENTION_CHUNK_SIZE = 64
 TRANSITION_CHUNK_SIZE = 64
@@ -811,11 +810,13 @@ class OuterProductMean(Module):
         chunks = []
         for chunk_start in range(0, I, OUTER_PRODUCT_MEAN_CHUNK_SIZE):
             chunk_end = min(chunk_start + OUTER_PRODUCT_MEAN_CHUNK_SIZE, I)
-            a_chunk = a[:, chunk_start : chunk_end, :]
+            a_chunk = a[:, chunk_start:chunk_end, :]
             a_chunk = ttnn.permute(a_chunk, (1, 2, 0))
             a_chunk = ttnn.reshape(a_chunk, (-1, S))
             b = ttnn.reshape(b, (S, -1))
-            z = ttnn.matmul(a_chunk, b, compute_kernel_config=self.compute_kernel_config)
+            z = ttnn.matmul(
+                a_chunk, b, compute_kernel_config=self.compute_kernel_config
+            )
             z = ttnn.reshape(z, (chunk_end - chunk_start, C, J, D))
             z = ttnn.permute(z, (0, 2, 1, 3))
             z = ttnn.reshape(z, (*tuple(z.shape)[:2], -1))
