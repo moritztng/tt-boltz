@@ -167,3 +167,5 @@ generated*
 
 *.pt
 *.yaml
+*.pyi
+.vscode

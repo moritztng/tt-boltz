@@ -1,22 +1,17 @@
-<div align="center">
-  <div>&nbsp;</div>
-  <img src="docs/boltz_title.png" width="400"/>
-
-[Original Repo](https://github.com/jwohlwend/boltz) |
-[Paper](https://doi.org/10.1101/2024.11.19.624167)
-</div>
-
 
 ![](docs/boltz1_pred_figure.png)
 
+# TT-Boltz
+[Original Repo](https://github.com/jwohlwend/boltz) | [Paper](https://doi.org/10.1101/2024.11.19.624167)
 
 ## Introduction
-
 TT-Boltz is the Boltz-1 fork that runs on a single Tenstorrent Wormhole n150 or n300.
 
 Boltz-1 is the state-of-the-art open-source model to predict biomolecular structures containing combinations of proteins, RNA, DNA, and other molecules. It also supports modified residues, covalent ligands and glycans, as well as conditioning the prediction on specified interaction pockets or contacts. 
 
 All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see our [technical report](https://doi.org/10.1101/2024.11.19.624167).
+
+For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
 ## Installation
 ### Clone
@@ -46,7 +41,6 @@ pip install -e .
 ```
 You can ignore the error about the pandas version.
 ## Inference
-
 You can run inference using Boltz-1 with:
 
 ```
@@ -66,29 +60,17 @@ Boltz currently accepts three input formats:
 To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md).
 
 ## Evaluation
-
 To encourage reproducibility and facilitate comparison with other models, we provide the evaluation scripts and predictions for Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset as well as CASP15. These datasets are created to contain biomolecules different from the training data and to benchmark the performance of these models we run them with the same input MSAs and same number  of recycling and diffusion steps. More details on these evaluations can be found in our [evaluation instructions](docs/evaluation.md).
 
 ![Test set evaluations](docs/plot_test.png)
 ![CASP15 set evaluations](docs/plot_casp.png)
-
-
-## Training
-
-If you're interested in retraining the model, see our [training instructions](docs/training.md).
 
 ## Community
 - [I build in public on X](https://x.com/moritzthuening)
 - [Boltz-1 Slack](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ)
 - [Tenstorrent Discord](https://discord.gg/tvhGzHQwaj)
 
-## License
-
-Our model and code are released under MIT License, and can be freely used for both academic and commercial purposes.
-
-
 ## Cite
-
 If you use this code or the models in your research, please cite the following paper:
 
 ```bibtex
