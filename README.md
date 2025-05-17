@@ -59,6 +59,15 @@ Boltz currently accepts three input formats:
 
 To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md).
 
+## Current Runtime
+We didn't even start writing low-level code yet and Tenstorrent Blackhole was just released. I'm confident we'll get to 2 minutes. 
+|Hardware|~Minutes|
+|---|---|
+|AMD Ryzen 5 8600G|45|
+|Tenstorrent Wormhole n300|10|
+|Nvidia T4|9|
+|Nvidia RTX 4090|2|
+
 ## Evaluation
 To encourage reproducibility and facilitate comparison with other models, we provide the evaluation scripts and predictions for Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset as well as CASP15. These datasets are created to contain biomolecules different from the training data and to benchmark the performance of these models we run them with the same input MSAs and same number  of recycling and diffusion steps. More details on these evaluations can be found in our [evaluation instructions](docs/evaluation.md).
 
