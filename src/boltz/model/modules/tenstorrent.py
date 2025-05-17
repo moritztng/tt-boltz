@@ -3,6 +3,7 @@ from torch import nn
 from typing import Tuple, Callable, Dict
 
 TRIANGLE_ATTENTION_CHUNK_SIZE = 64
+TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
 OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
@@ -68,31 +69,48 @@ class TriangleMultiplication(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        x = ttnn.multiply(
-            ttnn.linear(
-                x_norm_in, self.in_p, compute_kernel_config=self.compute_kernel_config
-            ),
-            ttnn.sigmoid_accurate(
+        x_chunks = []
+        for chunk_start in range(0, x_norm_in.shape[1], TRIANGLE_MULT_CHUNK_SIZE):
+            chunk_end = min(
+                chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_in.shape[1]
+            )
+            x_chunk = x_norm_in[:, chunk_start:chunk_end, :, :]
+            out = ttnn.multiply(
                 ttnn.linear(
-                    x_norm_in,
-                    self.in_g,
-                    compute_kernel_config=self.compute_kernel_config,
-                )
-            ),
-        )
+                    x_chunk, self.in_p, compute_kernel_config=self.compute_kernel_config
+                ),
+                ttnn.sigmoid_accurate(
+                    ttnn.linear(
+                        x_chunk,
+                        self.in_g,
+                        compute_kernel_config=self.compute_kernel_config,
+                    )
+                ),
+            )
+            x_chunks.append(out)
+        x = ttnn.concat(x_chunks, dim=1)
+        del x_chunks
         dim = int(x.shape[-1] / 2)
-        x = ttnn.permute(
-            ttnn.matmul(
-                ttnn.permute(
-                    x[:, :, :, :dim], (0, 3) + ((2, 1) if self.ending else (1, 2))
-                ),
-                ttnn.permute(
-                    x[:, :, :, dim:], (0, 3) + ((1, 2) if self.ending else (2, 1))
-                ),
-                compute_kernel_config=self.compute_kernel_config,
-            ),
-            (0, 2, 3, 1),
+        a = ttnn.permute(
+            x[:, :, :, :dim], (0, 3) + ((2, 1) if self.ending else (1, 2))
         )
+        b = ttnn.permute(
+            x[:, :, :, dim:], (0, 3) + ((1, 2) if self.ending else (2, 1))
+        )
+        del x
+        x_chunks = []
+        for chunk_start in range(0, a.shape[2], TRIANGLE_MULT_CHUNK_SIZE):
+            chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, a.shape[2])
+            x_chunk = ttnn.matmul(
+            a[:, :, chunk_start:chunk_end, :],
+            b,
+            compute_kernel_config=self.compute_kernel_config,
+            )
+            x_chunks.append(x_chunk)
+        del a, b
+        x = ttnn.concat(x_chunks, dim=2)
+        del x_chunks
+        x = ttnn.permute(x, (0, 2, 3, 1))
         x_norm_out = ttnn.layer_norm(
             x,
             weight=self.out_norm_weight,
@@ -100,18 +118,27 @@ class TriangleMultiplication(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        x = ttnn.multiply(
-            ttnn.linear(
-                x_norm_out, self.out_p, compute_kernel_config=self.compute_kernel_config
-            ),
-            ttnn.sigmoid_accurate(
+        x_chunks = []
+        for chunk_start in range(0, x_norm_out.shape[1], TRIANGLE_MULT_CHUNK_SIZE):
+            chunk_end = min(
+                chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_out.shape[1]
+            )
+            x_chunk = ttnn.multiply(
                 ttnn.linear(
-                    x_norm_in,
-                    self.out_g,
+                    x_norm_out[:, chunk_start:chunk_end, :, :],
+                    self.out_p,
                     compute_kernel_config=self.compute_kernel_config,
-                )
-            ),
-        )
+                ),
+                ttnn.sigmoid_accurate(
+                    ttnn.linear(
+                        x_norm_in[:, chunk_start:chunk_end, :, :],
+                        self.out_g,
+                        compute_kernel_config=self.compute_kernel_config,
+                    )
+                ),
+            )
+            x_chunks.append(x_chunk)
+        x = ttnn.concat(x_chunks, dim=1)
         return x
 
 
@@ -374,6 +401,7 @@ class AttentionPairBias(Module):
 class Transition(Module):
     def __init__(
         self,
+        chunking: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
@@ -383,6 +411,7 @@ class Transition(Module):
         self.fc1_weight = self.torch_to_tt("fc1.weight")
         self.fc2_weight = self.torch_to_tt("fc2.weight")
         self.fc3_weight = self.torch_to_tt("fc3.weight")
+        self.chunking = chunking
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         def f(x):
@@ -411,11 +440,9 @@ class Transition(Module):
                 compute_kernel_config=self.compute_kernel_config,
             )
             return x
-
-        if len(x.shape) < 4:
+        if not self.chunking:
             x = f(x)
         else:
-            x_chunks = []
             for chunk_start in range(0, x.shape[1], TRANSITION_CHUNK_SIZE):
                 x_chunk = x[
                     :,
@@ -424,8 +451,11 @@ class Transition(Module):
                     :,
                 ]
                 x_chunk = f(x_chunk)
-                x_chunks.append(x_chunk)
-            x = ttnn.concat(x_chunks, dim=1)
+                if chunk_start == 0:
+                    x_out = x_chunk
+                else:
+                    x_out = ttnn.concat([x_out, x_chunk], dim=1)
+            x = x_out
         return x
 
 
@@ -468,10 +498,10 @@ class PairformerLayer(Module):
             compute_kernel_config,
         )
         self.transition_z = Transition(
-            filter_dict(state_dict, "transition_z"), compute_kernel_config
+            True, filter_dict(state_dict, "transition_z"), compute_kernel_config
         )
         self.transition_s = Transition(
-            filter_dict(state_dict, "transition_s"), compute_kernel_config
+            False, filter_dict(state_dict, "transition_s"), compute_kernel_config
         )
 
     def __call__(
@@ -763,6 +793,7 @@ class PairWeightedAveraging(Module):
             )
             g = ttnn.sigmoid_accurate(g)
             o = ttnn.multiply(o, g)
+            del g
             o = ttnn.linear(
                 o,
                 self.o_weight[i * self.head_dim : (i + 1) * self.head_dim, :],
@@ -845,7 +876,7 @@ class MSALayer(Module):
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.msa_transition = Transition(
-            filter_dict(state_dict, "msa_transition"), compute_kernel_config
+            True, filter_dict(state_dict, "msa_transition"), compute_kernel_config
         )
         self.pair_weighted_averaging = PairWeightedAveraging(
             head_dim=avg_head_dim,
@@ -878,7 +909,7 @@ class MSALayer(Module):
             compute_kernel_config,
         )
         self.z_transition = Transition(
-            filter_dict(state_dict, "z_transition"), compute_kernel_config
+            True, filter_dict(state_dict, "z_transition"), compute_kernel_config
         )
 
     def __call__(
