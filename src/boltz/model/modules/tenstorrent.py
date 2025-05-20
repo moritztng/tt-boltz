@@ -7,7 +7,7 @@ TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
 OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
-mesh_device = None
+device = None
 
 
 def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
@@ -38,7 +38,7 @@ class Module:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
-            device=mesh_device.get_devices()[0],
+            device=device,
             dtype=ttnn.float32,
         )
 
@@ -182,25 +182,6 @@ class TriangleAttention(Module):
         )
         triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
         triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
-        two_devices = mesh_device.get_num_devices() == 2
-        if two_devices:
-            triangle_bias = ttnn.aggregate_as_tensor(
-                [
-                    ttnn.slice(
-                        triangle_bias,
-                        [0, 0, 0, 0],
-                        [triangle_bias.shape[0] // 2, *tuple(triangle_bias.shape)[1:]],
-                    ),
-                    ttnn.from_device(
-                        ttnn.slice(
-                            triangle_bias,
-                            [triangle_bias.shape[0] // 2, 0, 0, 0],
-                            triangle_bias.shape,
-                        )
-                    ).to(mesh_device.get_devices()[1]),
-                ]
-            )
-
         o_chunks = []
         for chunk_start in range(0, x.shape[0], TRIANGLE_ATTENTION_CHUNK_SIZE):
             x_chunk = x[
@@ -228,43 +209,6 @@ class TriangleAttention(Module):
             q = ttnn.permute(q, (0, 2, 3, 1))
             k = ttnn.permute(k, (0, 2, 1, 3))
             v = ttnn.permute(v, (0, 2, 3, 1))
-            if two_devices:
-                q = ttnn.aggregate_as_tensor(
-                    [
-                        ttnn.slice(
-                            q,
-                            [0, 0, 0, 0],
-                            [q.shape[0] // 2, *tuple(q.shape)[1:]],
-                        ),
-                        ttnn.from_device(
-                            ttnn.slice(q, [q.shape[0] // 2, 0, 0, 0], q.shape)
-                        ).to(mesh_device.get_devices()[1]),
-                    ]
-                )
-                k = ttnn.aggregate_as_tensor(
-                    [
-                        ttnn.slice(
-                            k,
-                            [0, 0, 0, 0],
-                            [k.shape[0] // 2, *tuple(k.shape)[1:]],
-                        ),
-                        ttnn.from_device(
-                            ttnn.slice(k, [k.shape[0] // 2, 0, 0, 0], k.shape)
-                        ).to(mesh_device.get_devices()[1]),
-                    ]
-                )
-                v = ttnn.aggregate_as_tensor(
-                    [
-                        ttnn.slice(
-                            v,
-                            [0, 0, 0, 0],
-                            [v.shape[0] // 2, *tuple(v.shape)[1:]],
-                        ),
-                        ttnn.from_device(
-                            ttnn.slice(v, [v.shape[0] // 2, 0, 0, 0], v.shape)
-                        ).to(mesh_device.get_devices()[1]),
-                    ]
-                )
             a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
             a = ttnn.multiply(a, self.head_dim**-0.5)
             a = ttnn.add(a, triangle_bias)
@@ -280,9 +224,6 @@ class TriangleAttention(Module):
                 numeric_stable=True,
             )
             o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-            if two_devices:
-                o = ttnn.all_gather(o, dim=0)
-                o = ttnn.get_device_tensors(o)[0]
             o_chunks.append(o)
         o = ttnn.concat(o_chunks, dim=1)
         o = ttnn.permute(o, (0, 3, 1, 2))
@@ -987,12 +928,11 @@ class TorchWrapper(nn.Module):
     def __init__(self):
         super().__init__()
         self.module = None
-        global mesh_device
-        if mesh_device is None:
+        global device
+        if device is None:
             # ttnn.device.EnablePersistentKernelCache() # be careful, can lead to bugs when profiling etc.
-            n_devices = min(len(ttnn.get_device_ids()), 2)
-            mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1, n_devices))
-            mesh_device.enable_program_cache()
+            device = ttnn.open_device(device_id=0)
+            device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
@@ -1003,7 +943,7 @@ class TorchWrapper(nn.Module):
     def _from_torch(self, x: torch.Tensor) -> ttnn.Tensor:
         return ttnn.from_torch(
             x,
-            device=mesh_device.get_devices()[0],
+            device=device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.float32,
         )
@@ -1012,12 +952,11 @@ class TorchWrapper(nn.Module):
         return torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
 
     def __del__(self):
-        global mesh_device
-        if mesh_device is not None:
-            for device in mesh_device.get_devices():
-                ttnn.DumpDeviceProfiler(device)
-            ttnn.close_mesh_device(mesh_device)
-            mesh_device = None
+        global device
+        if device is not None:
+            ttnn.DumpDeviceProfiler(device)
+            ttnn.close_device(device)
+            device = None
 
 class PairformerModule(TorchWrapper):
     def __init__(
