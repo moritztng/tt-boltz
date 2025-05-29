@@ -165,6 +165,9 @@ vis-env
 boltz_results*
 generated*
 
+layer_sizes.py
+notes.txt
+
 *.pt
 *.yaml
 *.pyi
