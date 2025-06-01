@@ -7,6 +7,8 @@ TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
 OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
+USE_FLOAT32 = False
+
 device = None
 
 
@@ -34,12 +36,13 @@ class Module:
         self,
         key: str,
         transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
+        use_float32: bool = False,
     ) -> ttnn.Tensor:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            dtype=ttnn.float32,
+            dtype=ttnn.float32 if USE_FLOAT32 or use_float32 else ttnn.bfloat16,
         )
 
 
@@ -71,9 +74,7 @@ class TriangleMultiplication(Module):
         )
         x_chunks = []
         for chunk_start in range(0, x_norm_in.shape[1], TRIANGLE_MULT_CHUNK_SIZE):
-            chunk_end = min(
-                chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_in.shape[1]
-            )
+            chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_in.shape[1])
             x_chunk = x_norm_in[:, chunk_start:chunk_end, :, :]
             out = ttnn.multiply(
                 ttnn.linear(
@@ -91,20 +92,16 @@ class TriangleMultiplication(Module):
         x = ttnn.concat(x_chunks, dim=1)
         del x_chunks
         dim = int(x.shape[-1] / 2)
-        a = ttnn.permute(
-            x[:, :, :, :dim], (0, 3) + ((2, 1) if self.ending else (1, 2))
-        )
-        b = ttnn.permute(
-            x[:, :, :, dim:], (0, 3) + ((1, 2) if self.ending else (2, 1))
-        )
+        a = ttnn.permute(x[:, :, :, :dim], (0, 3) + ((2, 1) if self.ending else (1, 2)))
+        b = ttnn.permute(x[:, :, :, dim:], (0, 3) + ((1, 2) if self.ending else (2, 1)))
         del x
         x_chunks = []
         for chunk_start in range(0, a.shape[2], TRIANGLE_MULT_CHUNK_SIZE):
             chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, a.shape[2])
             x_chunk = ttnn.matmul(
-            a[:, :, chunk_start:chunk_end, :],
-            b,
-            compute_kernel_config=self.compute_kernel_config,
+                a[:, :, chunk_start:chunk_end, :],
+                b,
+                compute_kernel_config=self.compute_kernel_config,
             )
             x_chunks.append(x_chunk)
         del a, b
@@ -120,9 +117,7 @@ class TriangleMultiplication(Module):
         )
         x_chunks = []
         for chunk_start in range(0, x_norm_out.shape[1], TRIANGLE_MULT_CHUNK_SIZE):
-            chunk_end = min(
-                chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_out.shape[1]
-            )
+            chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_out.shape[1])
             x_chunk = ttnn.multiply(
                 ttnn.linear(
                     x_norm_out[:, chunk_start:chunk_end, :, :],
@@ -299,6 +294,9 @@ class AttentionPairBias(Module):
         q = ttnn.permute(q, (0, 2, 3, 1))
         k = ttnn.permute(k, (0, 2, 1, 3))
         v = ttnn.permute(v, (0, 2, 3, 1))
+        if not USE_FLOAT32:
+            q = ttnn.clone(q, dtype=ttnn.float32)
+            k = ttnn.clone(k, dtype=ttnn.float32)
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         z = ttnn.layer_norm(
@@ -312,7 +310,11 @@ class AttentionPairBias(Module):
             z, self.z_weight, compute_kernel_config=self.compute_kernel_config
         )
         z = ttnn.permute(z, (3, 0, 1, 2))
+        if not USE_FLOAT32:
+            z = ttnn.clone(z, dtype=ttnn.float32)
         a = ttnn.add(a, z)
+        if not USE_FLOAT32:
+            a = ttnn.clone(a, dtype=ttnn.bfloat16)
         a = ttnn.softmax(
             a,
             dim=-1,
@@ -381,6 +383,7 @@ class Transition(Module):
                 compute_kernel_config=self.compute_kernel_config,
             )
             return x
+
         if not self.chunking:
             x = f(x)
         else:
@@ -512,12 +515,15 @@ class AdaLN(Module):
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
-        self.s_norm_weight = self.torch_to_tt("s_norm.weight")
+        self.s_norm_weight = self.torch_to_tt("s_norm.weight", use_float32=True)
         self.s_scale_weight = self.torch_to_tt("s_scale.weight")
         self.s_scale_bias = self.torch_to_tt("s_scale.bias")
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        if not USE_FLOAT32:
+            a = ttnn.clone(a, dtype=ttnn.float32)
+            s = ttnn.clone(s, dtype=ttnn.float32)
         a = ttnn.layer_norm(
             a, epsilon=1e-5, compute_kernel_config=self.compute_kernel_config
         )
@@ -527,6 +533,9 @@ class AdaLN(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
+        if not USE_FLOAT32:
+            a = ttnn.clone(a, dtype=ttnn.bfloat16)
+            s = ttnn.clone(s, dtype=ttnn.bfloat16)
         s_scale = ttnn.linear(
             s,
             self.s_scale_weight,
@@ -715,6 +724,9 @@ class PairWeightedAveraging(Module):
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
             )
+            if not USE_FLOAT32:
+                w = ttnn.clone(w, dtype=ttnn.float32)
+                v = ttnn.clone(v, dtype=ttnn.float32)
             for chunk_start in range(0, v.shape[0], PAIR_WEIGHTED_AVG_CHUNK_SIZE):
                 chunk_end = min(chunk_start + PAIR_WEIGHTED_AVG_CHUNK_SIZE, v.shape[0])
                 o_chunk = ttnn.matmul(
@@ -727,6 +739,8 @@ class PairWeightedAveraging(Module):
                 else:
                     o = ttnn.concat([o, o_chunk], dim=0)
             del v, w
+            if not USE_FLOAT32:
+                o = ttnn.clone(o, dtype=ttnn.bfloat16)
             g = ttnn.linear(
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
@@ -930,7 +944,7 @@ class TorchWrapper(nn.Module):
         self.module = None
         global device
         if device is None:
-            # ttnn.device.EnablePersistentKernelCache() # be careful, can lead to bugs when profiling etc.
+            ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
             device = ttnn.open_device(device_id=0)
             device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
@@ -945,7 +959,7 @@ class TorchWrapper(nn.Module):
             x,
             device=device,
             layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
         )
 
     def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
@@ -957,6 +971,7 @@ class TorchWrapper(nn.Module):
             ttnn.DumpDeviceProfiler(device)
             ttnn.close_device(device)
             device = None
+
 
 class PairformerModule(TorchWrapper):
     def __init__(
