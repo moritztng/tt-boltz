@@ -64,8 +64,8 @@ We didn't even start writing low-level code yet and Tenstorrent Blackhole was ju
 |Hardware|~Minutes|
 |---|---|
 |AMD Ryzen 5 8600G|45|
-|Tenstorrent Wormhole n300|10|
 |Nvidia T4|9|
+|Tenstorrent Wormhole n300|7|
 |Nvidia RTX 4090|2|
 
 ## Evaluation
