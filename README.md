@@ -4,8 +4,9 @@
   <img src="https://model-gateway.boltz.bio/a.png?x-pxid=bce1627f-f326-4bff-8a97-45c6c3bc929d" />
 
 [Boltz-1](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2](https://bit.ly/boltz2-pdf) |
-[Slack](https://join.slack.com/t/boltz-community/shared_invite/zt-34qg8uink-V1LGdRRUf3avAUVaRvv93w) <br> <br>
+[Slack](https://boltz-community.slack.com/join/shared_invite/zt-37b5dxiuo-80rPSDp6lXjD1GTC4bxNIw#/shared-invite/email) <br> <br>
 </div>
+
 
 
 ![](docs/boltz1_pred_figure.png)
