@@ -151,7 +151,11 @@ def to_pdb(
             atom_index += 1
 
     # Dump CONECT records.
-    for bonds in [structure.bonds, structure.connections]:
+    all_bonds = structure.bonds
+    if hasattr(structure, "connections"):
+        all_bonds = all_bonds + structure.connections
+
+    for bonds in all_bonds:
         for bond in bonds:
             atom1 = structure.atoms[bond["atom_1"]]
             atom2 = structure.atoms[bond["atom_2"]]
