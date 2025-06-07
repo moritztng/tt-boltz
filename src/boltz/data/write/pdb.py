@@ -155,16 +155,15 @@ def to_pdb(
     if hasattr(structure, "connections"):
         all_bonds = all_bonds + structure.connections
 
-    for bonds in all_bonds:
-        for bond in bonds:
-            atom1 = structure.atoms[bond["atom_1"]]
-            atom2 = structure.atoms[bond["atom_2"]]
-            if not atom1["is_present"] or not atom2["is_present"]:
-                continue
-            atom1_idx = atom_reindex_ter[bond["atom_1"]]
-            atom2_idx = atom_reindex_ter[bond["atom_2"]]
-            conect_line = f"CONECT{atom1_idx:>5}{atom2_idx:>5}"
-            pdb_lines.append(conect_line)
+    for bond in all_bonds:
+        atom1 = structure.atoms[bond["atom_1"]]
+        atom2 = structure.atoms[bond["atom_2"]]
+        if not atom1["is_present"] or not atom2["is_present"]:
+            continue
+        atom1_idx = atom_reindex_ter[bond["atom_1"]]
+        atom2_idx = atom_reindex_ter[bond["atom_2"]]
+        conect_line = f"CONECT{atom1_idx:>5}{atom2_idx:>5}"
+        pdb_lines.append(conect_line)
 
     pdb_lines.append("END")
     pdb_lines.append("")
