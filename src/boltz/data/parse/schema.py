@@ -919,14 +919,13 @@ def parse_polymer(
 def token_spec_to_ids(
     chain_name, residue_index_or_atom_name, chain_to_idx, atom_idx_map, chains
 ):
-    # TODO: unfinished
     if chains[chain_name].type == const.chain_type_ids["NONPOLYMER"]:
         # Non-polymer chains are indexed by atom name
         _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
         return (chain_to_idx[chain_name], atom_idx)
     else:
         # Polymer chains are indexed by residue index
-        contacts.append((chain_to_idx[chain_name], residue_index_or_atom_name - 1))
+        return (chain_to_idx[chain_name], residue_index_or_atom_name - 1)
 
 
 def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
@@ -1519,15 +1518,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             for chain_name, residue_index_or_atom_name in constraint["pocket"][
                 "contacts"
             ]:
-                if chains[chain_name].type == const.chain_type_ids["NONPOLYMER"]:
-                    # Non-polymer chains are indexed by atom name
-                    _, _, atom_idx = atom_idx_map[
-                        (chain_name, 0, residue_index_or_atom_name)
-                    ]
-                    contact = (chain_to_idx[chain_name], atom_idx)
-                else:
-                    # Polymer chains are indexed by residue index
-                    contact = (chain_to_idx[chain_name], residue_index_or_atom_name - 1)
+                contact = token_spec_to_ids(
+                    chain_name, residue_index_or_atom_name, chain_to_idx, atom_idx_map, chains
+                )
                 contacts.append(contact)
 
             pocket_constraints.append((binder, contacts, max_distance))
@@ -1546,17 +1539,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             max_distance = constraint["contact"].get("max_distance", 6.0)
 
             chain_name1, residue_index_or_atom_name1 = constraint["contact"]["token1"]
-            if chains[chain_name1].type == const.chain_type_ids["NONPOLYMER"]:
-                # Non-polymer chains are indexed by atom name
-                _, _, atom_idx = atom_idx_map[
-                    (chain_name1, 0, residue_index_or_atom_name1)
-                ]
-                token1 = (chain_to_idx[chain_name1], atom_idx)
-            else:
-                # Polymer chains are indexed by residue index
-                token1 = (chain_to_idx[chain_name1], residue_index_or_atom_name1 - 1)
+            token1 = token_spec_to_ids(
+                chain_name1, residue_index_or_atom_name1, chain_to_idx, atom_idx_map, chains
+            )
+            chain_name2, residue_index_or_atom_name2 = constraint["contact"]["token2"]
+            token2 = token_spec_to_ids(
+                chain_name2, residue_index_or_atom_name2, chain_to_idx, atom_idx_map, chains
+            )
 
-            pocket_constraints.append((binder, contacts, max_distance))
+            contact_constraints.append((token1, token2, max_distance))
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)
@@ -1738,7 +1729,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         )
         chain_infos.append(chain_info)
 
-    options = InferenceOptions(pocket_constraints=pocket_constraints)
+    options = InferenceOptions(pocket_constraints=pocket_constraints, contact_constraints=contact_constraints)
     record = Record(
         id=name,
         structure=struct_info,

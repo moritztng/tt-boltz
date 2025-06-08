@@ -622,7 +622,8 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     binder_pocket_sampling_geometric_p: Optional[float] = 0.0,
     only_ligand_binder_pocket: Optional[bool] = False,
     only_pp_contact: Optional[bool] = False,
-    inference_pocket_constraints: Optional[bool] = False,
+    inference_pocket_constraints: Optional[list[tuple[int, list[tuple[int, int]], float]]] = False,
+    inference_contact_constraints: Optional[list[tuple[tuple[int, int], tuple[int, int], float]]] = False,
     override_method: Optional[str] = None,
 ) -> dict[str, Tensor]:
     """Get the token features.
@@ -734,6 +735,35 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
                     )
                     contact_threshold[binder_mask][:, idx] = max_distance
                     contact_threshold[idx][binder_mask] = max_distance
+
+    if inference_contact_constraints is not None:
+        for token1, token2, max_distance in inference_contact_constraints:
+            for idx1, _token1 in enumerate(token_data):
+                if (
+                    _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
+                    and (_token1["asym_id"], _token1["res_idx"]) == token1
+                ) or (
+                    _token1["mol_type"] == const.chain_type_ids["NONPOLYMER"]
+                    and (_token1["asym_id"], _token1["atom_idx"]) == token1
+                ):
+                    for idx2, _token2 in enumerate(token_data):
+                        if (
+                            _token2["mol_type"] != const.chain_type_ids["NONPOLYMER"]
+                            and (_token2["asym_id"], _token2["res_idx"]) == token2
+                        ) or (
+                            _token2["mol_type"] == const.chain_type_ids["NONPOLYMER"]
+                            and (_token2["asym_id"], _token2["atom_idx"]) == token2
+                        ):
+                            contact_conditioning[idx1][idx2] = (
+                                const.contact_conditioning_info["CONTACT"]
+                            )
+                            contact_conditioning[idx2][idx1] = (
+                                const.contact_conditioning_info["CONTACT"]
+                            )
+                            contact_threshold[idx1][idx2] = max_distance
+                            contact_threshold[idx2][idx1] = max_distance
+                            break
+                    break
 
     if binder_pocket_conditioned_prop > 0.0:
         # choose as binder a random ligand in the crop, if there are no ligands select a protein chain
@@ -2053,7 +2083,6 @@ class Boltz2Featurizer:
         binder_pocket_sampling_geometric_p: Optional[float] = 0.0,
         only_ligand_binder_pocket: Optional[bool] = False,
         only_pp_contact: Optional[bool] = False,
-        pocket_constraints: Optional[list] = None,
         single_sequence_prop: Optional[float] = 0.0,
         msa_sampling: bool = False,
         override_bfactor: float = False,
@@ -2062,7 +2091,8 @@ class Boltz2Featurizer:
         override_coords: Optional[Tensor] = None,
         bfactor_md_correction: bool = False,
         compute_constraint_features: bool = False,
-        inference_pocket_constraints: Optional[list] = None,
+        inference_pocket_constraints: Optional[list[tuple[int, list[tuple[int, int]], float]]] = None,
+        inference_contact_constraints: Optional[list[tuple[tuple[int, int], tuple[int, int], float]]] = None,
         compute_affinity: bool = False,
     ) -> dict[str, Tensor]:
         """Compute features.
@@ -2118,6 +2148,7 @@ class Boltz2Featurizer:
             only_pp_contact=only_pp_contact,
             override_method=override_method,
             inference_pocket_constraints=inference_pocket_constraints,
+            inference_contact_constraints=inference_contact_constraints,
         )
 
         # Compute atom features

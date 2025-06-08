@@ -522,6 +522,7 @@ class InferenceOptions:
     """InferenceOptions datatype."""
 
     pocket_constraints: Optional[list[tuple[int, list[tuple[int, int]], float]]] = None
+    contact_constraints: Optional[list[tuple[tuple[int, int], tuple[int, int], float]]] = None
 
 
 @dataclass(frozen=True)
