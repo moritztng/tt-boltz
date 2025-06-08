@@ -233,12 +233,19 @@ The output confidence `.json` file contains various aggregated confidence scores
 The output affinity `.json` file is organized as follows:
 ```yaml
 {
-    "affinity_pred_value": 0.8367,             # Predicted binding affinity (pIC50) from the enseble model
+    "affinity_pred_value": 0.8367,             # Predicted binding affinity from the enseble model
     "affinity_probability_binary": 0.8425,     # Predicted binding likelihood from the ensemble model
-    "affinity_pred_value1": 0.8225,            # Predicted binding affinity (pIC50) from the first model of the ensemble
+    "affinity_pred_value1": 0.8225,            # Predicted binding affinity from the first model of the ensemble
     "affinity_probability_binary1": 0.0,       # Predicted binding likelihood from the first model in the ensemble
-    "affinity_pred_value2": 0.8225,            # Predicted binding affinity (pIC50) from the second model of the ensemble
+    "affinity_pred_value2": 0.8225,            # Predicted binding affinity from the second model of the ensemble
     "affinity_probability_binary2": 0.8402,    # Predicted binding likelihood from the second model in the ensemble
 }
 ```
-The `affinity_pred_value`, `affinity_pred_value1`, and `affinity_pred_value2` fields report binding affinity in pIC50, derived from IC50 values measured in μM, and lower values indicate stronger predicted binding. The `affinity_probability_binary`, `affinity_probability_binary1` and `affinity_probability_binary2` fields range from 0 to 1 and represent the predicted probability that the ligand is a binder.
+The `affinity_pred_value`, `affinity_pred_value1`, and `affinity_pred_value2` fields report a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. Lower values indicate stronger predicted binding, for instance:
+- IC50 of $10^{-9}$ M $\longrightarrow$ our model outputs $-3$ (strong binder)
+- IC50 of $10^{-6}$ M $\longrightarrow$ our model outputs $0$ (moderate binder)
+- IC50 of $10^{-4}$ M $\longrightarrow$ our model outputs $2$ (weak binder / decoy)
+
+You can convert the model's output to pIC50 in `kcal/mol` by using `y --> (6 - y) * 1.364` where `y` is the model's prediction.
+
+The `affinity_probability_binary`, `affinity_probability_binary1` and `affinity_probability_binary2` fields range from 0 to 1 and represent the predicted probability that the ligand is a binder.
