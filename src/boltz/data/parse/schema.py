@@ -707,10 +707,6 @@ def parse_ccd_residue(
         # Get atom name, charge, element and reference coordinates
         atom_name = atom.GetProp("name")
 
-        # Get PDB coordinates, if any
-        coords = (0, 0, 0)
-        atom_is_present = True
-
         # Drop leaving atoms for non-canonical amino acids.
         if drop_leaving_atoms and int(atom.GetProp('leaving_atom')):
             continue
@@ -722,6 +718,10 @@ def parse_ccd_residue(
         chirality_type = const.chirality_type_ids.get(
             str(atom.GetChiralTag()), unk_chirality
         )
+
+        # Get PDB coordinates, if any
+        coords = (0, 0, 0)
+        atom_is_present = True
 
         # Add atom to list
         atoms.append(
