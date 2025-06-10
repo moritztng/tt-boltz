@@ -2,7 +2,7 @@ import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable, Dict
 
-TRIANGLE_ATTENTION_CHUNK_SIZE = 64
+TRIANGLE_ATTENTION_CHUNK_SIZE = 16
 TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
@@ -162,7 +162,7 @@ class TriangleAttention(Module):
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
-            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
+            x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.layer_norm(
             x,
             weight=self.layer_norm_weight,
@@ -177,7 +177,6 @@ class TriangleAttention(Module):
         )
         triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
         triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
-        o_chunks = []
         for chunk_start in range(0, x.shape[0], TRIANGLE_ATTENTION_CHUNK_SIZE):
             x_chunk = x[
                 chunk_start : min(
@@ -187,29 +186,67 @@ class TriangleAttention(Module):
                 :,
             ]
             q = ttnn.linear(
-                x_chunk, self.q_weight, compute_kernel_config=self.compute_kernel_config
+                x_chunk,
+                self.q_weight,
+                compute_kernel_config=self.compute_kernel_config,
             )
             k = ttnn.linear(
-                x_chunk, self.k_weight, compute_kernel_config=self.compute_kernel_config
-            )
-            v = ttnn.linear(
-                x_chunk, self.v_weight, compute_kernel_config=self.compute_kernel_config
+                x_chunk,
+                self.k_weight,
+                compute_kernel_config=self.compute_kernel_config,
             )
             q = ttnn.permute(q, (2, 0, 1))
             k = ttnn.permute(k, (2, 0, 1))
-            v = ttnn.permute(v, (2, 0, 1))
             q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
             k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
-            v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
             q = ttnn.permute(q, (0, 2, 3, 1))
             k = ttnn.permute(k, (0, 2, 1, 3))
-            v = ttnn.permute(v, (0, 2, 3, 1))
-            a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
-            a = ttnn.multiply(a, self.head_dim**-0.5)
-            a = ttnn.add(a, triangle_bias)
-            a = ttnn.softmax(
+            q = ttnn.interleaved_to_sharded(
+                q,
+                (8, 8),
+                [q.shape[2], q.shape[3]],
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.ShardOrientation.ROW_MAJOR,
+            )
+            k = ttnn.interleaved_to_sharded(
+                k,
+                (8, 8),
+                [k.shape[2], k.shape[3]],
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.ShardOrientation.ROW_MAJOR,
+            )
+            a = ttnn.matmul(
+                q,
+                k,
+                compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
+                program_config=ttnn.MatmulMultiCoreReuseProgramConfig(
+                    compute_with_storage_grid_size=(8, 8),
+                    in0_block_w=q.shape[3] // 32,
+                    out_subblock_h=1,
+                    out_subblock_w=1,
+                    per_core_M=q.shape[2] // 32,
+                    per_core_N=k.shape[3] // 32,
+                ),
+            )
+            ttnn.deallocate(q)
+            ttnn.deallocate(k)
+            a = ttnn.multiply(
                 a,
-                dim=-1,
+                self.head_dim**-0.5,
+            )
+            triangle_bias_repeat = ttnn.repeat(triangle_bias, (1, a.shape[1], 1, 1))
+            triangle_bias_repeat = ttnn.interleaved_to_sharded(
+                triangle_bias_repeat,
+                (8, 8),
+                [triangle_bias.shape[2], triangle_bias.shape[3]],
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.ShardOrientation.ROW_MAJOR,
+            )
+            a = ttnn.add(a, triangle_bias_repeat)
+            ttnn.deallocate(triangle_bias_repeat)
+            ttnn.softmax_in_place(
+                a,
                 compute_kernel_config=ttnn.WormholeComputeKernelConfig(
                     math_fidelity=self.compute_kernel_config.math_fidelity,
                     math_approx_mode=self.compute_kernel_config.math_approx_mode,
@@ -217,11 +254,49 @@ class TriangleAttention(Module):
                     packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
                 ),
                 numeric_stable=True,
+                program_config=ttnn.SoftmaxShardedMultiCoreProgramConfig(
+                    compute_with_storage_grid_size=(8, 8),
+                    subblock_w=1,
+                    block_h=a.shape[2] // 32,
+                    block_w=a.shape[3] // 32,
+                ),
             )
-            o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-            o_chunks.append(o)
-        o = ttnn.concat(o_chunks, dim=1)
-        o = ttnn.permute(o, (0, 3, 1, 2))
+            v = ttnn.linear(
+                x_chunk,
+                self.v_weight,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            ttnn.deallocate(x_chunk)
+            v = ttnn.permute(v, (2, 0, 1))
+            v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+            v = ttnn.permute(v, (0, 2, 3, 1))
+            v = ttnn.interleaved_to_sharded(
+                v,
+                (8, 8),
+                [v.shape[2], v.shape[3]],
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.ShardOrientation.ROW_MAJOR,
+            )
+            o = ttnn.matmul(
+                a,
+                v,
+                compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
+                program_config=ttnn.MatmulMultiCoreReuseProgramConfig(
+                    compute_with_storage_grid_size=(8, 8),
+                    in0_block_w=a.shape[3] // 32,
+                    out_subblock_h=1,
+                    out_subblock_w=1,
+                    per_core_M=a.shape[2] // 32,
+                    per_core_N=v.shape[3] // 32,
+                ),
+            )
+            o = ttnn.sharded_to_interleaved(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            if chunk_start == 0:
+                o_out = o
+            else:
+                o_out = ttnn.concat([o_out, o], dim=1)
+        o = ttnn.permute(o_out, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
@@ -944,8 +1019,13 @@ class TorchWrapper(nn.Module):
         self.module = None
         global device
         if device is None:
-            ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
-            device = ttnn.open_device(device_id=0)
+            # ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
+            device = ttnn.open_device(
+                device_id=0,
+                dispatch_core_config=ttnn.DispatchCoreConfig(
+                    ttnn.device.DispatchCoreType.ETH, ttnn.DispatchCoreAxis.ROW
+                ),
+            )
             device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
