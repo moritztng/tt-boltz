@@ -711,7 +711,7 @@ def parse_ccd_residue(
         coords = (0, 0, 0)
         atom_is_present = True
 
-        # # Drop leaving atoms for non-canonical amino acids.
+        # Drop leaving atoms for non-canonical amino acids.
         if drop_leaving_atoms and int(atom.GetProp('leaving_atom')):
             continue
 
