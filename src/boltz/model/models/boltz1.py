@@ -261,6 +261,14 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
+    def setup(self, stage: str) -> None:
+        """Set the model for training, validation and inference."""
+        if stage == "predict" and not (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
+        ):
+            self.use_kernels = False
+
     def forward(
         self,
         feats: dict[str, Tensor],
