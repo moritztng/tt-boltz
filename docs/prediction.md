@@ -58,7 +58,7 @@ constraints:
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
     - cif: CIF_PATH
-      chain_id: CHAIN_ID   # optional, specifiy which chain to find a template for
+      chain_id: CHAIN_ID   # optional, specify which chain to find a template for
     - cif: CIF_PATH
       chain_id: [CHAIN_ID, CHAIN_ID]  # can be more than one
       template_id: [TEMPLATE_CHAIN_ID, TEMPLATE_CHAIN_ID]
