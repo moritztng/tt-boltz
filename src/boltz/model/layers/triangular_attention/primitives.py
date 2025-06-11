@@ -198,8 +198,8 @@ def _attention(
 
 
 @torch.compiler.disable
-def kernel_triangular_attn(q, k, v, tri_bias, mask):
-    return triangle_attention(q, k, v, tri_bias, mask=mask)
+def kernel_triangular_attn(q, k, v, tri_bias, mask, scale):
+    return triangle_attention(q, k, v, tri_bias, mask=mask, scale=scale)
 
 
 class Attention(nn.Module):
@@ -311,7 +311,9 @@ class Attention(nn.Module):
         self,
         q_x: torch.Tensor,
         kv_x: torch.Tensor,
-        biases: Optional[List[torch.Tensor]] = None,
+        tri_bias: torch.Tensor,
+        mask_bias: torch.Tensor,
+        mask: torch.Tensor,
         use_kernels: bool = False,
     ) -> torch.Tensor:
         """Compute attention.
@@ -322,8 +324,12 @@ class Attention(nn.Module):
             [*, Q, C_q] query data
         kv_x : torch.Tensor
             [*, K, C_k] key data
-        biases : list[torch.Tensor]
-            List of biases that broadcast to [*, H, Q, K]
+        tri_bias : torch.Tensor
+            [*, H, Q, K] triangular bias
+        mask_bias : torch.Tensor
+            [*, H, Q, K] mask bias
+        mask : torch.Tensor
+            [*, Q, K] mask
         use_kernels : bool, default=False
             Whether to use optimized CUDA kernels
 
@@ -332,10 +338,7 @@ class Attention(nn.Module):
             [*, Q, C_q] attention update
 
         """
-        if biases is None:
-            biases = []
-
-        # DeepSpeed/TriFast attention kernel applies scaling internally
+        # Attention kernel applies scaling internally
         q, k, v = self._prep_qkv(
             q_x,
             kv_x,
@@ -343,10 +346,18 @@ class Attention(nn.Module):
         )
 
         if use_kernels:
-            mask_bias, tri_bias = biases
-            o = kernel_triangular_attn(q, k, v, tri_bias=tri_bias, mask=mask_bias)
+            scale = 1.0 / math.sqrt(self.c_hidden)
+            o = kernel_triangular_attn(
+                q,
+                k,
+                v,
+                tri_bias=tri_bias,
+                mask=mask.bool(),
+                scale=scale,
+            )
             o = o.transpose(-2, -3)
         else:
+            biases = [mask_bias, tri_bias]
             o = _attention(q, k, v, biases)
             o = o.transpose(-2, -3)
 

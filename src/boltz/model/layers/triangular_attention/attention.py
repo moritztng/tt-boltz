@@ -141,7 +141,8 @@ class TriangleAttention(nn.Module):
         x = self.layer_norm(x)
 
         # [*, I, 1, 1, J]
-        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+        mask = mask[..., :, None, None, :]
+        mask_bias = self.inf * (mask - 1)
 
         # [*, H, I, J]
         triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
@@ -149,9 +150,8 @@ class TriangleAttention(nn.Module):
         # [*, 1, H, I, J]
         triangle_bias = triangle_bias.unsqueeze(-4)
 
-        biases = [mask_bias, triangle_bias]
-
         if chunk_size is not None and not use_kernels:
+            biases = [triangle_bias, mask_bias]
             x = self._chunk(
                 x,
                 biases,
@@ -162,7 +162,9 @@ class TriangleAttention(nn.Module):
             x = self.mha(
                 x,
                 x,
-                biases,
+                triangle_bias,
+                mask_bias,
+                mask,
                 use_kernels=use_kernels,
             )
 
