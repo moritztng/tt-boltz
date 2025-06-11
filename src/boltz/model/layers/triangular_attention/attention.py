@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from functools import partial, partialmethod
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -61,7 +61,9 @@ class TriangleAttention(nn.Module):
     def _chunk(
         self,
         x: torch.Tensor,
-        biases: list[torch.Tensor],
+        tri_bias: torch.Tensor,
+        mask_bias: torch.Tensor,
+        mask: torch.Tensor,
         chunk_size: int,
         use_kernels: bool = False,
     ) -> torch.Tensor:
@@ -87,7 +89,9 @@ class TriangleAttention(nn.Module):
         mha_inputs = {
             "q_x": x,
             "kv_x": x,
-            "biases": biases,
+            "tri_bias": tri_bias,
+            "mask_bias": mask_bias,
+            "mask": mask,
         }
 
         return chunk_layer(
@@ -151,10 +155,11 @@ class TriangleAttention(nn.Module):
         triangle_bias = triangle_bias.unsqueeze(-4)
 
         if chunk_size is not None and not use_kernels:
-            biases = [triangle_bias, mask_bias]
             x = self._chunk(
                 x,
-                biases,
+                triangle_bias,
+                mask_bias,
+                mask,
                 chunk_size,
                 use_kernels=use_kernels,
             )
