@@ -986,9 +986,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     if seed is not None:
         seed_everything(seed)
 
-    # Disable kernel tuning by default
-    os.environ["CUEQ_DEFAULT_CONFIG"] = "1"
-    os.environ["CUEQ_DISABLE_AOT_TUNING"] = "1"
+    for key in ["CUEQ_DEFAULT_CONFIG", "CUEQ_DISABLE_AOT_TUNING"]:
+        # Disable kernel tuning by default,
+        # but do not modify envvar if already set by caller
+        os.environ[key] = os.environ.get(key, "1")
 
     # Set cache path
     cache = Path(cache).expanduser()
