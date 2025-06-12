@@ -58,7 +58,7 @@ constraints:
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
     - cif: CIF_PATH
-      chain_id: CHAIN_ID   # optional, specifiy which chain to find a template for
+      chain_id: CHAIN_ID   # optional, specify which chain to find a template for
     - cif: CIF_PATH
       chain_id: [CHAIN_ID, CHAIN_ID]  # can be more than one
       template_id: [TEMPLATE_CHAIN_ID, TEMPLATE_CHAIN_ID]
@@ -233,7 +233,7 @@ The output confidence `.json` file contains various aggregated confidence scores
 The output affinity `.json` file is organized as follows:
 ```yaml
 {
-    "affinity_pred_value": 0.8367,             # Predicted binding affinity from the enseble model
+    "affinity_pred_value": 0.8367,             # Predicted binding affinity from the ensemble model
     "affinity_probability_binary": 0.8425,     # Predicted binding likelihood from the ensemble model
     "affinity_pred_value1": 0.8225,            # Predicted binding affinity from the first model of the ensemble
     "affinity_probability_binary1": 0.0,       # Predicted binding likelihood from the first model in the ensemble
