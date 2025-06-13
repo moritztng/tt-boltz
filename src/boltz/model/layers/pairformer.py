@@ -194,11 +194,11 @@ class PairformerModule(nn.Module):
                     mask,
                     pair_mask,
                     chunk_size_tri_attn,
-                    use_kernels=use_kernels,
+                    use_kernels,
                 )
             else:
                 s, z = layer(
-                    s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels=use_kernels
+                    s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels
                 )
         return s, z
 
