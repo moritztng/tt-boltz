@@ -2,6 +2,8 @@ import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable, Dict
 
+from time import time
+
 TRIANGLE_ATTENTION_CHUNK_SIZE = 16
 TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
@@ -160,6 +162,8 @@ class TriangleAttention(Module):
         self.g_weight = self.torch_to_tt("linear_g.weight")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
@@ -170,6 +174,9 @@ class TriangleAttention(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
+        seq_len = x.shape[0]
+        padding = -seq_len % 32
+        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
@@ -207,6 +214,7 @@ class TriangleAttention(Module):
                 [q.shape[2], q.shape[3]],
                 ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
                 ttnn.ShardOrientation.ROW_MAJOR,
+                output_dtype=ttnn.bfloat8_b,
             )
             k = ttnn.interleaved_to_sharded(
                 k,
@@ -214,6 +222,7 @@ class TriangleAttention(Module):
                 [k.shape[2], k.shape[3]],
                 ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
                 ttnn.ShardOrientation.ROW_MAJOR,
+                output_dtype=ttnn.bfloat8_b,
             )
             a = ttnn.matmul(
                 q,
@@ -228,22 +237,23 @@ class TriangleAttention(Module):
                     per_core_M=q.shape[2] // 32,
                     per_core_N=k.shape[3] // 32,
                 ),
+                dtype=ttnn.bfloat8_b,
             )
             ttnn.deallocate(q)
             ttnn.deallocate(k)
-            a = ttnn.multiply(
+            a = ttnn.multiply_(
                 a,
                 self.head_dim**-0.5,
             )
             triangle_bias_repeat = ttnn.repeat(triangle_bias, (1, a.shape[1], 1, 1))
-            triangle_bias_repeat = ttnn.interleaved_to_sharded(
-                triangle_bias_repeat,
-                (8, 8),
-                [triangle_bias.shape[2], triangle_bias.shape[3]],
-                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
-                ttnn.ShardOrientation.ROW_MAJOR,
-            )
-            a = ttnn.add(a, triangle_bias_repeat)
+            # triangle_bias_repeat = ttnn.interleaved_to_sharded(
+            #     triangle_bias_repeat,
+            #     (8, 8),
+            #     [triangle_bias.shape[2], triangle_bias.shape[3]],
+            #     ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            #     ttnn.ShardOrientation.ROW_MAJOR,
+            # )
+            a = ttnn.add_(a, triangle_bias_repeat)
             ttnn.deallocate(triangle_bias_repeat)
             ttnn.softmax_in_place(
                 a,
@@ -307,9 +317,12 @@ class TriangleAttention(Module):
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config
         )
+        x = x[:seq_len, :seq_len, :]
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
+        ttnn.synchronize_device(device)
+        print("triangle attention time: ", time() - start_time)
         return x
 
 
