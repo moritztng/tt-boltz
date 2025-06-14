@@ -2,7 +2,6 @@ import torch, ttnn
 from torch import nn
 from typing import Tuple, Callable, Dict
 
-TRIANGLE_ATTENTION_CHUNK_SIZE = 64
 TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
@@ -170,6 +169,9 @@ class TriangleAttention(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
+        seq_len = x.shape[0]
+        padding = -seq_len % 32
+        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
@@ -177,50 +179,47 @@ class TriangleAttention(Module):
         )
         triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
         triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
-        o_chunks = []
-        for chunk_start in range(0, x.shape[0], TRIANGLE_ATTENTION_CHUNK_SIZE):
-            x_chunk = x[
-                chunk_start : min(
-                    chunk_start + TRIANGLE_ATTENTION_CHUNK_SIZE, x.shape[0]
+        q = ttnn.linear(
+            x, self.q_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        k = ttnn.linear(
+            x, self.k_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        v = ttnn.linear(
+            x, self.v_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        q = ttnn.permute(q, (2, 0, 1))
+        k = ttnn.permute(k, (2, 0, 1))
+        v = ttnn.permute(v, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+        v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+        q = ttnn.permute(q, (0, 2, 3, 1))
+        k = ttnn.permute(k, (0, 2, 3, 1))
+        v = ttnn.permute(v, (0, 2, 3, 1))
+        for head in range(0, q.shape[0]):
+            head_q = q[head : head + 1, :, :, :]
+            head_k = k[head : head + 1, :, :, :]
+            head_v = v[head : head + 1, :, :, :]
+            head_triangle_bias = triangle_bias[head : head + 1, :, :, :]
+            head_o = ttnn.transformer.scaled_dot_product_attention(
+                head_q,
+                head_k,
+                head_v,
+                attn_mask=head_triangle_bias,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(8, 8),
+                    exp_approx_mode=False,
+                    q_chunk_size=32,
+                    k_chunk_size=32,
                 ),
-                :,
-                :,
-            ]
-            q = ttnn.linear(
-                x_chunk, self.q_weight, compute_kernel_config=self.compute_kernel_config
             )
-            k = ttnn.linear(
-                x_chunk, self.k_weight, compute_kernel_config=self.compute_kernel_config
-            )
-            v = ttnn.linear(
-                x_chunk, self.v_weight, compute_kernel_config=self.compute_kernel_config
-            )
-            q = ttnn.permute(q, (2, 0, 1))
-            k = ttnn.permute(k, (2, 0, 1))
-            v = ttnn.permute(v, (2, 0, 1))
-            q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
-            k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
-            v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-            q = ttnn.permute(q, (0, 2, 3, 1))
-            k = ttnn.permute(k, (0, 2, 1, 3))
-            v = ttnn.permute(v, (0, 2, 3, 1))
-            a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
-            a = ttnn.multiply(a, self.head_dim**-0.5)
-            a = ttnn.add(a, triangle_bias)
-            a = ttnn.softmax(
-                a,
-                dim=-1,
-                compute_kernel_config=ttnn.WormholeComputeKernelConfig(
-                    math_fidelity=self.compute_kernel_config.math_fidelity,
-                    math_approx_mode=self.compute_kernel_config.math_approx_mode,
-                    fp32_dest_acc_en=False,
-                    packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
-                ),
-                numeric_stable=True,
-            )
-            o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-            o_chunks.append(o)
-        o = ttnn.concat(o_chunks, dim=1)
+            if head == 0:
+                o = head_o
+            else:
+                o = ttnn.concat([o, head_o], dim=0)
         o = ttnn.permute(o, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
@@ -232,6 +231,7 @@ class TriangleAttention(Module):
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config
         )
+        x = x[:seq_len, :seq_len, :]
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
@@ -945,7 +945,12 @@ class TorchWrapper(nn.Module):
         global device
         if device is None:
             ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
-            device = ttnn.open_device(device_id=0)
+            device = ttnn.open_device(
+                device_id=0,
+                dispatch_core_config=ttnn.DispatchCoreConfig(
+                    ttnn.device.DispatchCoreType.ETH, ttnn.DispatchCoreAxis.ROW
+                ),
+            )
             device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
