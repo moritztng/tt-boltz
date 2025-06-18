@@ -31,9 +31,9 @@ Don't install tt-nn with `./create_venv.sh`.
 ### Install TT-NN
 ```bash
 pip config set global.extra-index-url https://download.pytorch.org/whl/cpu
-pip install setuptools wheel
+pip install setuptools wheel==0.45.1
 pip install -r <path-to-tt-metal-repo>/tt_metal/python_env/requirements-dev.txt
-pip install <path-to-tt-metal-repo>
+pip install -e <path-to-tt-metal-repo>
 ```
 ### Install TT-Boltz
 ```bash
