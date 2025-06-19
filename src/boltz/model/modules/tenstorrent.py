@@ -152,11 +152,21 @@ class TriangleAttention(Module):
         self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
         self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
         self.bias_weight = self.torch_to_tt("linear.weight")
-        self.q_weight = self.torch_to_tt("linear_q.weight")
-        self.k_weight = self.torch_to_tt("linear_k.weight")
-        self.v_weight = self.torch_to_tt("linear_v.weight")
         self.o_weight = self.torch_to_tt("linear_o.weight")
-        self.g_weight = self.torch_to_tt("linear_g.weight")
+        self.qkvg_weight = ttnn.from_torch(
+            torch.cat(
+                [
+                    self.state_dict["linear_q.weight"],
+                    self.state_dict["linear_k.weight"],
+                    self.state_dict["linear_v.weight"],
+                    self.state_dict["linear_g.weight"],
+                ],
+                dim=0,
+            ).t(),
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
+        )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
@@ -170,7 +180,7 @@ class TriangleAttention(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         seq_len = x.shape[0]
-        padding = -seq_len % 32
+        padding = -seq_len % 256
         x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
         triangle_bias = ttnn.linear(
             x,
@@ -179,24 +189,24 @@ class TriangleAttention(Module):
         )
         triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
         triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
-        q = ttnn.linear(
-            x, self.q_weight, compute_kernel_config=self.compute_kernel_config
+        qkvg = ttnn.linear(
+            x,
+            self.qkvg_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat8_b,
         )
-        k = ttnn.linear(
-            x, self.k_weight, compute_kernel_config=self.compute_kernel_config
+        split_idx = 3 * self.head_dim * self.n_heads
+        qkv = qkvg[:, :, :split_idx]
+        g = qkvg[:, :, split_idx:]
+        del qkvg
+        qkv = ttnn.unsqueeze(qkv, 0)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads_boltz(
+            qkv,
+            num_heads=self.n_heads,
+            num_kv_heads=self.n_heads,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        v = ttnn.linear(
-            x, self.v_weight, compute_kernel_config=self.compute_kernel_config
-        )
-        q = ttnn.permute(q, (2, 0, 1))
-        k = ttnn.permute(k, (2, 0, 1))
-        v = ttnn.permute(v, (2, 0, 1))
-        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
-        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
-        v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-        q = ttnn.permute(q, (0, 2, 3, 1))
-        k = ttnn.permute(k, (0, 2, 3, 1))
-        v = ttnn.permute(v, (0, 2, 3, 1))
         for head in range(0, q.shape[0]):
             head_q = q[head : head + 1, :, :, :]
             head_k = k[head : head + 1, :, :, :]
@@ -212,24 +222,25 @@ class TriangleAttention(Module):
                 program_config=ttnn.SDPAProgramConfig(
                     compute_with_storage_grid_size=(8, 8),
                     exp_approx_mode=False,
-                    q_chunk_size=32,
-                    k_chunk_size=32,
+                    q_chunk_size=256,
+                    k_chunk_size=256,
                 ),
             )
             if head == 0:
                 o = head_o
             else:
                 o = ttnn.concat([o, head_o], dim=0)
-        o = ttnn.permute(o, (0, 3, 1, 2))
-        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
-        o = ttnn.permute(o, (1, 2, 0))
-        g = ttnn.linear(
-            x, self.g_weight, compute_kernel_config=self.compute_kernel_config
+        o = ttnn.experimental.nlp_concat_heads_boltz(
+            o, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
+        o = ttnn.squeeze(o, 0)
         g = ttnn.sigmoid_accurate(g)
         o = ttnn.multiply(o, g)
         x = ttnn.linear(
-            o, self.o_weight, compute_kernel_config=self.compute_kernel_config
+            o,
+            self.o_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat8_b,
         )
         x = x[:seq_len, :seq_len, :]
         if self.ending:
@@ -724,7 +735,9 @@ class PairWeightedAveraging(Module):
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
             )
-            o = ttnn.linear(v, w, transpose_a=True, compute_kernel_config=self.compute_kernel_config)
+            o = ttnn.linear(
+                v, w, transpose_a=True, compute_kernel_config=self.compute_kernel_config
+            )
             del v, w
             o = ttnn.permute(o, (0, 2, 1))
             g = ttnn.linear(
