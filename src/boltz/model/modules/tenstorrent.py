@@ -289,9 +289,13 @@ class AttentionPairBias(Module):
             self.q_weight,
             bias=self.q_bias,
             compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.float32,
         )
         k = ttnn.linear(
-            s, self.k_weight, compute_kernel_config=self.compute_kernel_config
+            s,
+            self.k_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.float32,
         )
         v = ttnn.linear(
             s, self.v_weight, compute_kernel_config=self.compute_kernel_config
@@ -305,9 +309,6 @@ class AttentionPairBias(Module):
         q = ttnn.permute(q, (0, 2, 3, 1))
         k = ttnn.permute(k, (0, 2, 1, 3))
         v = ttnn.permute(v, (0, 2, 3, 1))
-        if not USE_FLOAT32:
-            q = ttnn.clone(q, dtype=ttnn.float32)
-            k = ttnn.clone(k, dtype=ttnn.float32)
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
         z = ttnn.layer_norm(
@@ -318,11 +319,12 @@ class AttentionPairBias(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         z = ttnn.linear(
-            z, self.z_weight, compute_kernel_config=self.compute_kernel_config
+            z,
+            self.z_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.float32,
         )
         z = ttnn.permute(z, (3, 0, 1, 2))
-        if not USE_FLOAT32:
-            z = ttnn.clone(z, dtype=ttnn.float32)
         a = ttnn.add(a, z)
         if not USE_FLOAT32:
             a = ttnn.clone(a, dtype=ttnn.bfloat16)
