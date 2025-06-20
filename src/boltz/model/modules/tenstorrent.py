@@ -737,23 +737,16 @@ class PairWeightedAveraging(Module):
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
             )
-            if not USE_FLOAT32:
-                w = ttnn.clone(w, dtype=ttnn.float32)
-                v = ttnn.clone(v, dtype=ttnn.float32)
-            for chunk_start in range(0, v.shape[0], PAIR_WEIGHTED_AVG_CHUNK_SIZE):
-                chunk_end = min(chunk_start + PAIR_WEIGHTED_AVG_CHUNK_SIZE, v.shape[0])
-                o_chunk = ttnn.matmul(
-                    ttnn.repeat(w, [chunk_end - chunk_start, 1, 1]),
-                    v[chunk_start:chunk_end],
-                    compute_kernel_config=self.compute_kernel_config,
-                )
-                if chunk_start == 0:
-                    o = o_chunk
-                else:
-                    o = ttnn.concat([o, o_chunk], dim=0)
+
+            o = ttnn.matmul(
+                v,
+                w,
+                transpose_a=True,
+                transpose_b=True,
+                compute_kernel_config=self.compute_kernel_config,
+            )
             del v, w
-            if not USE_FLOAT32:
-                o = ttnn.clone(o, dtype=ttnn.bfloat16)
+            o = ttnn.permute(o, (0, 2, 1))
             g = ttnn.linear(
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
