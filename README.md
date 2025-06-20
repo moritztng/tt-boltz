@@ -25,7 +25,7 @@ python3 -m venv env
 source env/bin/activate
 ```
 ### Build TT-Metal from Source
-Don't install tt-nn with `./create_venv.sh`.
+Build the latest release `v0.x.x`. Don't install tt-nn with `./create_venv.sh`.
 
 [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
 ### Install TT-NN
@@ -65,7 +65,7 @@ We didn't even start writing low-level code yet and Tenstorrent Blackhole was ju
 |---|---|
 |AMD Ryzen 5 8600G|45|
 |Nvidia T4|9|
-|Tenstorrent Wormhole n300|7|
+|Tenstorrent Wormhole n300|5|
 |Nvidia RTX 4090|2|
 
 ## Evaluation
