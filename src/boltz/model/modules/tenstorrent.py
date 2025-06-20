@@ -752,7 +752,8 @@ class PairWeightedAveraging(Module):
                 else:
                     o = ttnn.concat([o, o_chunk], dim=0)
             del v, w
-            o = ttnn.permute(o, (0, 2, 1))
+            if not USE_FLOAT32:
+                o = ttnn.clone(o, dtype=ttnn.bfloat16)
             g = ttnn.linear(
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
