@@ -6,6 +6,7 @@ TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
 OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
+ATTENTION_PAIR_BIAS_CHUNK_SIZE = 128
 USE_FLOAT32 = False
 
 device = None
@@ -311,19 +312,57 @@ class AttentionPairBias(Module):
         v = ttnn.permute(v, (0, 2, 3, 1))
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
-        z = ttnn.layer_norm(
-            z,
-            weight=self.z_norm_weight,
-            bias=self.z_norm_bias,
-            epsilon=1e-5,
-            compute_kernel_config=self.compute_kernel_config,
-        )
-        z = ttnn.linear(
-            z,
-            self.z_weight,
-            compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.float32,
-        )
+        if self.diffusion:
+            for chunk_start in range(0, z.shape[0], ATTENTION_PAIR_BIAS_CHUNK_SIZE * 64 * 32): # (64 * 32) because 64 cores and shards have to be multiples of 32
+                z_chunk = z[chunk_start : min(chunk_start + ATTENTION_PAIR_BIAS_CHUNK_SIZE * 64 * 32, z.shape[0]), :]
+                z_chunk = ttnn.to_memory_config(
+                    z_chunk,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+                # seems like only block sharding is allowed in layer_norm. but dim is 128, so max x cores is 4. 128 / 4 = 32 per core dim.
+                z_chunk = ttnn.layer_norm(
+                    z_chunk,
+                    weight=self.z_norm_weight,
+                    bias=self.z_norm_bias,
+                    epsilon=1e-5,
+                    compute_kernel_config=self.compute_kernel_config,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+                z_chunk = ttnn.to_memory_config(
+                    z_chunk,
+                    memory_config=ttnn.create_sharded_memory_config(
+                        z_chunk.shape,
+                        core_grid=ttnn.CoreGrid(y=8, x=8),
+                        strategy=ttnn.ShardStrategy.HEIGHT,
+                        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    ),
+                )
+                # is this doing sharded matmul? or do i need program_config etc.?
+                z_chunk = ttnn.linear(
+                    z_chunk,
+                    self.z_weight,
+                    compute_kernel_config=self.compute_kernel_config,
+                )
+                if chunk_start == 0:
+                    z_out = z_chunk
+                else:
+                    z_out = ttnn.concat([z_out, z_chunk], dim=0)
+            z = z_out[: s.shape[1] * s.shape[1], :]
+            z = ttnn.reshape(z, (1, s.shape[1], s.shape[1], -1))
+        else:
+            z = ttnn.layer_norm(
+                z,
+                weight=self.z_norm_weight,
+                bias=self.z_norm_bias,
+                epsilon=1e-5,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            z = ttnn.linear(
+                z,
+                self.z_weight,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+        z = ttnn.clone(z, dtype=ttnn.float32)
         z = ttnn.permute(z, (3, 0, 1, 2))
         a = ttnn.add(a, z)
         if not USE_FLOAT32:
@@ -671,6 +710,9 @@ class DiffusionTransformer(Module):
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
         if self.z is None:
+            z = ttnn.reshape(z, (-1, z.shape[3]))
+            z = ttnn.pad(z, [(0, -z.shape[0] % 2048), (0, 0)], 0)
+            z = ttnn.clone(z, dtype=ttnn.bfloat8_b)
             self.z = z
         for layer in self.layers:
             a = layer(a, s, self.z)
