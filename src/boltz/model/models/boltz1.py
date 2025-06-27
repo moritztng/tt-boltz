@@ -1,6 +1,6 @@
 import gc
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import torch
 import torch._dynamo
@@ -39,6 +39,8 @@ from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 from boltz.model.modules import tenstorrent
 
 class Boltz1(LightningModule):
+    """Boltz1 model."""
+
     def __init__(  # noqa: PLR0915, C901, PLR0912
         self,
         atom_s: int,
@@ -74,7 +76,12 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
+<<<<<<< HEAD:src/boltz/model/model.py
         use_tenstorrent: bool = False,
+=======
+        steering_args: Optional[dict[str, Any]] = None,
+        use_kernels: bool = False,
+>>>>>>> upstream/main:src/boltz/model/models/boltz1.py
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -135,6 +142,9 @@ class Boltz1(LightningModule):
         self.validation_args = validation_args
         self.diffusion_loss_args = diffusion_loss_args
         self.predict_args = predict_args
+        self.steering_args = steering_args
+
+        self.use_kernels = use_kernels
 
         self.nucleotide_rmsd_weight = nucleotide_rmsd_weight
         self.ligand_rmsd_weight = ligand_rmsd_weight
@@ -212,7 +222,11 @@ class Boltz1(LightningModule):
             )
 
         # Output modules
-        use_accumulate_token_repr = confidence_prediction and "use_s_diffusion" in confidence_model_args and confidence_model_args["use_s_diffusion"]
+        use_accumulate_token_repr = (
+            confidence_prediction
+            and "use_s_diffusion" in confidence_model_args
+            and confidence_model_args["use_s_diffusion"]
+        )
         self.structure_module = AtomDiffusion(
             score_model_args={
                 "token_z": token_z,
@@ -269,6 +283,14 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
+    def setup(self, stage: str) -> None:
+        """Set the model for training, validation and inference."""
+        if stage == "predict" and not (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
+        ):
+            self.use_kernels = False
+
     def forward(
         self,
         feats: dict[str, Tensor],
@@ -276,6 +298,7 @@ class Boltz1(LightningModule):
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
+        max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
         dict_out = {}
@@ -320,7 +343,9 @@ class Boltz1(LightningModule):
 
                     # Compute pairwise stack
                     if not self.no_msa:
-                        z = z + self.msa_module(z, s_inputs, feats)
+                        z = z + self.msa_module(
+                            z, s_inputs, feats, use_kernels=self.use_kernels
+                        )
 
                     # Revert to uncompiled version for validation
                     if self.is_pairformer_compiled and not self.training:
@@ -328,7 +353,13 @@ class Boltz1(LightningModule):
                     else:
                         pairformer_module = self.pairformer_module
 
-                    s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+                    s, z = pairformer_module(
+                        s,
+                        z,
+                        mask=mask,
+                        pair_mask=pair_mask,
+                        use_kernels=self.use_kernels,
+                    )
 
             pdistogram = self.distogram_module(z)
             dict_out = {"pdistogram": pdistogram}
@@ -357,7 +388,9 @@ class Boltz1(LightningModule):
                     num_sampling_steps=num_sampling_steps,
                     atom_mask=feats["atom_pad_mask"],
                     multiplicity=diffusion_samples,
+                    max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
+                    steering_args=self.steering_args,
                 )
             )
 
@@ -377,6 +410,7 @@ class Boltz1(LightningModule):
                     pred_distogram_logits=dict_out["pdistogram"].detach(),
                     multiplicity=diffusion_samples,
                     run_sequentially=run_confidence_sequentially,
+                    use_kernels=self.use_kernels,
                 )
             )
         if self.confidence_prediction and self.confidence_module.use_s_diffusion:
@@ -1141,6 +1175,7 @@ class Boltz1(LightningModule):
                 recycling_steps=self.predict_args["recycling_steps"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
+                max_parallel_samples=self.predict_args["diffusion_samples"],
                 run_confidence_sequentially=True,
             )
             pred_dict = {"exception": False}
@@ -1148,8 +1183,14 @@ class Boltz1(LightningModule):
             pred_dict["coords"] = out["sample_atom_coords"]
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
-                    4 * out["complex_plddt"] +
-                    (out["iptm"] if not torch.allclose(out["iptm"], torch.zeros_like(out["iptm"])) else out["ptm"])
+                    4 * out["complex_plddt"]
+                    + (
+                        out["iptm"]
+                        if not torch.allclose(
+                            out["iptm"], torch.zeros_like(out["iptm"])
+                        )
+                        else out["ptm"]
+                    )
                 ) / 5
                 for key in [
                     "ptm",
@@ -1177,7 +1218,7 @@ class Boltz1(LightningModule):
                 gc.collect()
                 return {"exception": True}
             else:
-                raise {"exception": True}
+                raise
 
     def configure_optimizers(self):
         """Configure the optimizer."""
@@ -1188,7 +1229,9 @@ class Boltz1(LightningModule):
             parameters = [
                 p for p in self.confidence_module.parameters() if p.requires_grad
             ] + [
-                p for p in self.structure_module.out_token_feat_update.parameters() if p.requires_grad
+                p
+                for p in self.structure_module.out_token_feat_update.parameters()
+                if p.requires_grad
             ]
 
         optimizer = torch.optim.Adam(
@@ -1224,7 +1267,9 @@ class Boltz1(LightningModule):
                 self.ema.load_state_dict(checkpoint["ema"], device=torch.device("cpu"))
             else:
                 self.ema = None
-                print("Warning: EMA state not loaded due to incompatible model parameters.")
+                print(
+                    "Warning: EMA state not loaded due to incompatible model parameters."
+                )
 
     def on_train_start(self):
         if self.use_ema and self.ema is None:

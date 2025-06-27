@@ -1,5 +1,7 @@
 # Training
 
+⚠️ **Coming soon updated training information for Boltz-2!**
+
 ## Download the pre-processed data
 
 To run training, you will need to download a few pre-processed datasets. Note that you will need ~250G of storage for all the data. If instead you want to re-run the preprocessing pipeline or processed your own raw data for training, please see the [instructions](#processing-raw-data) at the bottom of this page.
@@ -70,7 +72,7 @@ Here is an example of how to set multiple dataset sources like the PDB and OpenF
 
 ```yaml
   datasets:
-    - _target_: foldeverything.task.train.data.DatasetConfig
+    - _target_: boltz.data.module.training.DatasetConfig
       target_dir: PATH_TO_PDB_TARGETS_DIR
       msa_dir: PATH_TO_PDB_MSA_DIR
       prob: 0.5
@@ -81,7 +83,7 @@ Here is an example of how to set multiple dataset sources like the PDB and OpenF
         min_neighborhood: 0
         max_neighborhood: 40
       split: ./scripts/train/assets/validation_ids.txt
-    - _target_: foldeverything.task.train.data.DatasetConfig
+    - _target_: boltz.data.module.training.DatasetConfig
       target_dir: PATH_TO_DISTILLATION_TARGETS_DIR
       msa_dir: PATH_TO_DISTILLATION_MSA_DIR
       prob: 0.5

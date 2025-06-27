@@ -2,14 +2,14 @@
 ![](docs/boltz1_pred_figure.png)
 
 # TT-Boltz
-[Original Repo](https://github.com/jwohlwend/boltz) | [Paper](https://doi.org/10.1101/2024.11.19.624167)
+[Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2](https://doi.org/10.1101/2025.06.14.659707)
 
 ## Introduction
-TT-Boltz is the Boltz-1 fork that runs on a single Tenstorrent Wormhole n150 or n300.
+TT-Boltz is the Boltz fork that runs on a single Tenstorrent Wormhole n150 or n300.
 
-Boltz-1 is the state-of-the-art open-source model to predict biomolecular structures containing combinations of proteins, RNA, DNA, and other molecules. It also supports modified residues, covalent ligands and glycans, as well as conditioning the prediction on specified interaction pockets or contacts. 
+Boltz is a family of models for biomolecular interaction prediction. Boltz-1 was the first fully open source model to approach AlphaFold3 accuracy. Our latest work Boltz-2 is a new biomolecular foundation model that goes beyond AlphaFold3 and Boltz-1 by jointly modeling complex structures and binding affinities, a critical component towards accurate molecular design. Boltz-2 is the first deep learning model to approach the accuracy of physics-based free-energy perturbation (FEP) methods, while running 1000x faster — making accurate in silico screening practical for early-stage drug discovery.
 
-All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see our [technical report](https://doi.org/10.1101/2024.11.19.624167).
+All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see the [Boltz-1](https://doi.org/10.1101/2024.11.19.624167) and [Boltz-2](https://doi.org/10.1101/2025.06.14.659707) technical reports.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -41,7 +41,8 @@ pip install -e .
 ```
 You can ignore the error about the pandas version.
 ## Inference
-You can run inference using Boltz-1 with:
+
+You can run inference using Boltz with:
 
 ```
 boltz predict input_path --use_msa_server --accelerator=tenstorrent
@@ -49,15 +50,10 @@ boltz predict input_path --use_msa_server --accelerator=tenstorrent
 
 Pass `--accelerator=tenstorrent` to run on Tenstorrent Wormhole.
 
-Boltz currently accepts three input formats:
+`input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
 
-1. Fasta file, for most use cases
-
-2. A comprehensive YAML schema, for more complex use cases
-
-3. A directory containing files of the above formats, for batched processing
-
-To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md).
+### Binding Affinity Prediction
+There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. It's value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder. The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. More details on how to run affinity predictions and parse the output can be found in our [prediction instructions](docs/prediction.md).
 
 ## Current Runtime
 We didn't even start writing low-level code yet and Tenstorrent Blackhole was just released. I'm confident we'll get to 2 minutes. 
@@ -69,22 +65,32 @@ We didn't even start writing low-level code yet and Tenstorrent Blackhole was ju
 |Nvidia RTX 4090|2|
 
 ## Evaluation
+
 To encourage reproducibility and facilitate comparison with other models, we provide the evaluation scripts and predictions for Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset as well as CASP15. These datasets are created to contain biomolecules different from the training data and to benchmark the performance of these models we run them with the same input MSAs and same number  of recycling and diffusion steps. More details on these evaluations can be found in our [evaluation instructions](docs/evaluation.md).
 
-![Test set evaluations](docs/plot_test.png)
-![CASP15 set evaluations](docs/plot_casp.png)
+![Affinity test sets evaluations](docs/pearson_plot.png)
+![Test set evaluations](docs/plot_test_boltz2.png)
 
 ## Community
 - [I build in public on X](https://x.com/moritzthuening)
-- [Boltz-1 Slack](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ)
+- [Boltz Slack](https://join.slack.com/t/boltz-community/shared_invite/zt-2zj7e077b-D1R9S3JVOolhv_NaMELgjQ)
 - [Tenstorrent Discord](https://discord.gg/tvhGzHQwaj)
 
 ## Cite
-If you use this code or the models in your research, please cite the following paper:
+
+If you use this code or the models in your research, please cite the following papers:
 
 ```bibtex
+@article{passaro2025boltz2,
+  author = {Passaro, Saro and Corso, Gabriele and Wohlwend, Jeremy and Reveiz, Mateo and Thaler, Stephan and Somnath, Vignesh Ram and Getz, Noah and Portnoi, Tally and Roy, Julien and Stark, Hannes and Kwabi-Addo, David and Beaini, Dominique and Jaakkola, Tommi and Barzilay, Regina},
+  title = {Boltz-2: Towards Accurate and Efficient Binding Affinity Prediction},
+  year = {2025},
+  doi = {10.1101/2025.06.14.659707},
+  journal = {bioRxiv}
+}
+
 @article{wohlwend2024boltz1,
-  author = {Wohlwend, Jeremy and Corso, Gabriele and Passaro, Saro and Reveiz, Mateo and Leidal, Ken and Swiderski, Wojtek and Portnoi, Tally and Chinn, Itamar and Silterra, Jacob and Jaakkola, Tommi and Barzilay, Regina},
+  author = {Wohlwend, Jeremy and Corso, Gabriele and Passaro, Saro and Getz, Noah and Reveiz, Mateo and Leidal, Ken and Swiderski, Wojtek and Atkinson, Liam and Portnoi, Tally and Chinn, Itamar and Silterra, Jacob and Jaakkola, Tommi and Barzilay, Regina},
   title = {Boltz-1: Democratizing Biomolecular Interaction Modeling},
   year = {2024},
   doi = {10.1101/2024.11.19.624167},

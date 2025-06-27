@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pytorch_lightning as pl
@@ -8,12 +9,25 @@ from torch.utils.data import DataLoader
 
 from boltz.data import const
 from boltz.data.feature.featurizer import BoltzFeaturizer
-from boltz.data.feature.pad import pad_to_max
+from boltz.data.pad import pad_to_max
 from boltz.data.tokenize.boltz import BoltzTokenizer
-from boltz.data.types import MSA, Connection, Input, Manifest, Record, Structure
+from boltz.data.types import (
+    MSA,
+    Connection,
+    Input,
+    Manifest,
+    Record,
+    ResidueConstraints,
+    Structure,
+)
 
 
-def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
+def load_input(
+    record: Record,
+    target_dir: Path,
+    msa_dir: Path,
+    constraints_dir: Optional[Path] = None,
+) -> Input:
     """Load the given input data.
 
     Parameters
@@ -51,7 +65,13 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
             msa = np.load(msa_dir / f"{msa_id}.npz")
             msas[chain.chain_id] = MSA(**msa)
 
-    return Input(structure, msas)
+    residue_constraints = None
+    if constraints_dir is not None:
+        residue_constraints = ResidueConstraints.load(
+            constraints_dir / f"{record.id}.npz"
+        )
+
+    return Input(structure, msas, record, residue_constraints)
 
 
 def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
@@ -106,6 +126,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         manifest: Manifest,
         target_dir: Path,
         msa_dir: Path,
+        constraints_dir: Optional[Path] = None,
     ) -> None:
         """Initialize the training dataset.
 
@@ -123,6 +144,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.manifest = manifest
         self.target_dir = target_dir
         self.msa_dir = msa_dir
+        self.constraints_dir = constraints_dir
         self.tokenizer = BoltzTokenizer()
         self.featurizer = BoltzFeaturizer()
 
@@ -140,7 +162,12 @@ class PredictionDataset(torch.utils.data.Dataset):
 
         # Get the structure
         try:
-            input_data = load_input(record, self.target_dir, self.msa_dir)
+            input_data = load_input(
+                record,
+                self.target_dir,
+                self.msa_dir,
+                self.constraints_dir,
+            )
         except Exception as e:  # noqa: BLE001
             print(f"Failed to load input for {record.id} with error {e}. Skipping.")  # noqa: T201
             return self.__getitem__(0)
@@ -154,10 +181,10 @@ class PredictionDataset(torch.utils.data.Dataset):
 
         # Inference specific options
         options = record.inference_options
-        if options is None:
-            binders, pocket = None, None
+        if options is None or len(options.pocket_constraints) == 0:
+            binder, pocket = None, None
         else:
-            binders, pocket = options.binders, options.pocket
+            binder, pocket = options.pocket_constraints[0][0], options.pocket_constraints[0][1]
 
         # Compute features
         try:
@@ -170,8 +197,9 @@ class PredictionDataset(torch.utils.data.Dataset):
                 pad_to_max_seqs=False,
                 symmetries={},
                 compute_symmetries=False,
-                inference_binder=binders,
+                inference_binder=binder,
                 inference_pocket=pocket,
+                compute_constraint_features=True,
             )
         except Exception as e:  # noqa: BLE001
             print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
@@ -201,6 +229,7 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         target_dir: Path,
         msa_dir: Path,
         num_workers: int,
+        constraints_dir: Optional[Path] = None,
     ) -> None:
         """Initialize the DataModule.
 
@@ -215,6 +244,7 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         self.manifest = manifest
         self.target_dir = target_dir
         self.msa_dir = msa_dir
+        self.constraints_dir = constraints_dir
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -229,6 +259,7 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
             manifest=self.manifest,
             target_dir=self.target_dir,
             msa_dir=self.msa_dir,
+            constraints_dir=self.constraints_dir,
         )
         return DataLoader(
             dataset,

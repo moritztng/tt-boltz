@@ -2,14 +2,14 @@
 from functools import partial
 from math import pi
 
-from einops import rearrange
 import torch
+from einops import rearrange
 from torch import nn
 from torch.nn import Module, ModuleList
 from torch.nn.functional import one_hot
 
-from boltz.data import const
 import boltz.model.layers.initialize as init
+from boltz.data import const
 from boltz.model.layers.transition import Transition
 from boltz.model.modules.transformers import AtomTransformer
 from boltz.model.modules.utils import LinearNoBias
@@ -27,7 +27,6 @@ class FourierEmbedding(Module):
             The dimension of the embeddings.
 
         """
-
         super().__init__()
         self.proj = nn.Linear(1, dim)
         torch.nn.init.normal_(self.proj.weight, mean=0, std=1)
@@ -74,14 +73,23 @@ class RelativePositionEncoder(Module):
         b_same_entity = torch.eq(
             feats["entity_id"][:, :, None], feats["entity_id"][:, None, :]
         )
+        rel_pos = (
+            feats["residue_index"][:, :, None] - feats["residue_index"][:, None, :]
+        )
+        if torch.any(feats["cyclic_period"] != 0):
+            period = torch.where(
+                feats["cyclic_period"] > 0,
+                feats["cyclic_period"],
+                torch.zeros_like(feats["cyclic_period"]) + 10000,
+            ).unsqueeze(1)
+            rel_pos = (rel_pos - period * torch.round(rel_pos / period)).long()
 
         d_residue = torch.clip(
-            feats["residue_index"][:, :, None]
-            - feats["residue_index"][:, None, :]
-            + self.r_max,
+            rel_pos + self.r_max,
             0,
             2 * self.r_max,
         )
+
         d_residue = torch.where(
             b_same_chain, d_residue, torch.zeros_like(d_residue) + 2 * self.r_max + 1
         )
