@@ -301,7 +301,9 @@ class AtomDiffusion(Module):
         steering_args=None,
         **network_condition_kwargs,
     ):
-        potentials = get_potentials()
+        if steering_args is not None and (steering_args["fk_steering"] or steering_args["guidance_update"]):
+            potentials = get_potentials(boltz2=False)
+
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
             energy_traj = torch.empty((multiplicity, 0), device=self.device)
