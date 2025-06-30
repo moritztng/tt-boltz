@@ -58,7 +58,7 @@ constraints:
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
     - cif: CIF_PATH
-      chain_id: CHAIN_ID   # optional, specifiy which chain to find a template for
+      chain_id: CHAIN_ID   # optional, specify which chain to find a template for
     - cif: CIF_PATH
       chain_id: [CHAIN_ID, CHAIN_ID]  # can be more than one
       template_id: [TEMPLATE_CHAIN_ID, TEMPLATE_CHAIN_ID]
@@ -78,9 +78,9 @@ The `modifications` field is an optional field that allows you to specify modifi
 
 * The `pocket` constraint specifies the residues associated with a ligand, where `binder` refers to the chain binding to the pocket (which can be a molecule, protein, DNA or RNA) and `contacts` is the list of chain and residue indices (starting from 1) associated with the pocket. The model currently only supports the specification of a single `binder` chain (and any number of `contacts` residues in other chains).
 
-`templates` is an otional field that allows you to specify structural templates for your prediction. At minimum, you must provide the path to the structural template, which must provided as a CIF file. If you wish to explicitely define which of the chains in your YAML should be templated using this CIF file, you can use the `chain_id` entry to specify them. Whether a set of ids is provided or not, Boltz will find the best matching chains from the provided template. If you wish to explicitely define the mapping yourself, you may provide the corresponding template_id. Note that only protein chains can be templated.
+`templates` is an otional field that allows you to specify structural templates for your prediction. At minimum, you must provide the path to the structural template, which must provided as a CIF file. If you wish to explicitly define which of the chains in your YAML should be templated using this CIF file, you can use the `chain_id` entry to specify them. Whether a set of ids is provided or not, Boltz will find the best matching chains from the provided template. If you wish to explicitly define the mapping yourself, you may provide the corresponding template_id. Note that only protein chains can be templated.
 
-`properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed.
+`properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed. Only one single molecule can be specified for affinity computation, and it must be a ligand chain (not a protein, DNA or RNA).
 
 As an example:
 
@@ -233,7 +233,7 @@ The output confidence `.json` file contains various aggregated confidence scores
 The output affinity `.json` file is organized as follows:
 ```yaml
 {
-    "affinity_pred_value": 0.8367,             # Predicted binding affinity from the enseble model
+    "affinity_pred_value": 0.8367,             # Predicted binding affinity from the ensemble model
     "affinity_probability_binary": 0.8425,     # Predicted binding likelihood from the ensemble model
     "affinity_pred_value1": 0.8225,            # Predicted binding affinity from the first model of the ensemble
     "affinity_probability_binary1": 0.0,       # Predicted binding likelihood from the first model in the ensemble
