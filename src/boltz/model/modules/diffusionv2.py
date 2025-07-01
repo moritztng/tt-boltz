@@ -302,7 +302,7 @@ class AtomDiffusion(Module):
         **network_condition_kwargs,
     ):
         if steering_args is not None and (steering_args["fk_steering"] or steering_args["guidance_update"]):
-            potentials = get_potentials(boltz2=False)
+            potentials = get_potentials(boltz2=True)
 
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
