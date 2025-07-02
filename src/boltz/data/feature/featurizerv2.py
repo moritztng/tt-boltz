@@ -2060,56 +2060,56 @@ def process_contact_feature_constraints(
     inference_contact_constraints
 ):
     token_data = data.tokens
-    if len(inference_pocket_constraints) > 0 or len(inference_contact_constraints) > 0:
-        union_idx = 0
-        pair_index, union_index, negation_mask, thresholds = [], [], [], []
+    union_idx = 0
+    pair_index, union_index, negation_mask, thresholds = [], [], [], []
 
-        for (binder, contacts, max_distance) in inference_pocket_constraints:
-            binder_chain = data.structure.chains[binder]
-            for token in token_data:
-                if (token["mol_type"] != const.chain_type_ids["NONPOLYMER"] and
-                        (token["asym_id"], token["res_idx"]) in contacts) or \
-                        (token["mol_type"] == const.chain_type_ids["NONPOLYMER"] and
-                         (token["asym_id"], token["atom_idx"]) in contacts):
-                    atom_idx_pairs = torch.cartesian_prod(
-                        torch.arange(binder_chain['atom_idx'], binder_chain['atom_idx'] + binder_chain['atom_num']),
-                        torch.arange(token['atom_idx'], token['atom_idx'] + token['atom_num'])
-                    ).T
-                    pair_index.append(atom_idx_pairs)
-                    union_index.append(torch.full((atom_idx_pairs.shape[1],), union_idx))
-                    negation_mask.append(torch.ones((atom_idx_pairs.shape[1],), dtype=torch.bool))
-                    thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
-                    union_idx += 1
+    for (binder, contacts, max_distance) in inference_pocket_constraints:
+        binder_chain = data.structure.chains[binder]
+        for token in token_data:
+            if (token["mol_type"] != const.chain_type_ids["NONPOLYMER"] and
+                    (token["asym_id"], token["res_idx"]) in contacts) or \
+                    (token["mol_type"] == const.chain_type_ids["NONPOLYMER"] and
+                        (token["asym_id"], token["atom_idx"]) in contacts):
+                atom_idx_pairs = torch.cartesian_prod(
+                    torch.arange(binder_chain['atom_idx'], binder_chain['atom_idx'] + binder_chain['atom_num']),
+                    torch.arange(token['atom_idx'], token['atom_idx'] + token['atom_num'])
+                ).T
+                pair_index.append(atom_idx_pairs)
+                union_index.append(torch.full((atom_idx_pairs.shape[1],), union_idx))
+                negation_mask.append(torch.ones((atom_idx_pairs.shape[1],), dtype=torch.bool))
+                thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
+                union_idx += 1
 
-        for token1, token2, max_distance in inference_contact_constraints:
-            for idx1, _token1 in enumerate(token_data):
-                if (
-                    _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                    and (_token1["asym_id"], _token1["res_idx"]) == token1
-                ) or (
-                    _token1["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                    and (_token1["asym_id"], _token1["atom_idx"]) == token1
-                ):
-                    for idx2, _token2 in enumerate(token_data):
-                        if (
-                            _token2["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                            and (_token2["asym_id"], _token2["res_idx"]) == token2
-                        ) or (
-                            _token2["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                            and (_token2["asym_id"], _token2["atom_idx"]) == token2
-                        ):
-                            atom_idx_pairs = torch.cartesian_prod(
-                                torch.arange(_token1['atom_idx'], _token1['atom_idx'] + _token1['atom_num']),
-                                torch.arange(_token2['atom_idx'], _token2['atom_idx'] + _token2['atom_num'])
-                            ).T
-                            pair_index.append(atom_idx_pairs)
-                            union_index.append(torch.full((atom_idx_pairs.shape[1],), union_idx))
-                            negation_mask.append(torch.ones((atom_idx_pairs.shape[1],), dtype=torch.bool))
-                            thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
-                            union_idx += 1
-                            break
-                    break
+    for token1, token2, max_distance in inference_contact_constraints:
+        for idx1, _token1 in enumerate(token_data):
+            if (
+                _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
+                and (_token1["asym_id"], _token1["res_idx"]) == token1
+            ) or (
+                _token1["mol_type"] == const.chain_type_ids["NONPOLYMER"]
+                and (_token1["asym_id"], _token1["atom_idx"]) == token1
+            ):
+                for idx2, _token2 in enumerate(token_data):
+                    if (
+                        _token2["mol_type"] != const.chain_type_ids["NONPOLYMER"]
+                        and (_token2["asym_id"], _token2["res_idx"]) == token2
+                    ) or (
+                        _token2["mol_type"] == const.chain_type_ids["NONPOLYMER"]
+                        and (_token2["asym_id"], _token2["atom_idx"]) == token2
+                    ):
+                        atom_idx_pairs = torch.cartesian_prod(
+                            torch.arange(_token1['atom_idx'], _token1['atom_idx'] + _token1['atom_num']),
+                            torch.arange(_token2['atom_idx'], _token2['atom_idx'] + _token2['atom_num'])
+                        ).T
+                        pair_index.append(atom_idx_pairs)
+                        union_index.append(torch.full((atom_idx_pairs.shape[1],), union_idx))
+                        negation_mask.append(torch.ones((atom_idx_pairs.shape[1],), dtype=torch.bool))
+                        thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
+                        union_idx += 1
+                        break
+                break
 
+    if len(pair_index) > 0:
         pair_index = torch.cat(pair_index, dim=1)
         union_index = torch.cat(union_index)
         negation_mask = torch.cat(negation_mask)
@@ -2118,7 +2118,7 @@ def process_contact_feature_constraints(
         pair_index = torch.empty((2,0), dtype=torch.long)
         union_index = torch.empty((0,), dtype=torch.long)       
         negation_mask = torch.empty((0,), dtype=torch.bool)       
-        thresholds = torch.empty((0,), dtype=torch.float32)       
+        thresholds = torch.empty((0,), dtype=torch.float32)   
 
     return {
         'contact_pair_index': pair_index,

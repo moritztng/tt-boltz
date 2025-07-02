@@ -552,8 +552,11 @@ def get_potentials(boltz2=False):
         potentials.extend([
             ContactPotentital(
                 parameters={
-                    'guidance_interval': 1,
-                    'guidance_weight': 0.00,
+                    'guidance_interval': 10,
+                    'guidance_weight': PiecewiseStepFunction(
+                        thresholds=[0.75],
+                        values=[0.0, 0.5]
+                    ),
                     'resampling_weight': 1.0,
                     'union_lambda': ExponentialInterpolation(
                         start=10.0,
