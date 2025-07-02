@@ -15,6 +15,8 @@ from boltz.model.modules.trunkv2 import (
 )
 from boltz.model.modules.utils import LinearNoBias
 
+from boltz.model.modules import tenstorrent
+
 
 class ConfidenceModule(nn.Module):
     """Algorithm 31"""
@@ -39,6 +41,7 @@ class ConfidenceModule(nn.Module):
         return_latent_feats=False,
         conditioning_cutoff_min=None,
         conditioning_cutoff_max=None,
+        use_tenstorrent: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -92,10 +95,14 @@ class ConfidenceModule(nn.Module):
                 cutoff_max=conditioning_cutoff_max,
             )
         pairformer_args["v2"] = True
-        self.pairformer_stack = PairformerModule(
-            token_s,
-            token_z,
-            **pairformer_args,
+        self.pairformer_stack = (
+            tenstorrent.PairformerModule(8, 32, 4, 24, 16, True)
+            if use_tenstorrent
+            else PairformerModule(
+                token_s,
+                token_z,
+                **pairformer_args,
+            )
         )
         self.return_latent_feats = return_latent_feats
 

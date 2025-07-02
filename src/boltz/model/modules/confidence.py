@@ -16,8 +16,6 @@ from boltz.model.modules.trunk import (
 )
 from boltz.model.modules.utils import LinearNoBias
 
-from boltz.model.modules import tenstorrent
-
 
 class ConfidenceModule(nn.Module):
     """Confidence module."""
@@ -39,7 +37,6 @@ class ConfidenceModule(nn.Module):
         full_embedder_args: dict = None,
         msa_args: dict = None,
         compile_pairformer=False,
-        use_tenstorrent: bool = False,
     ):
         """Initialize the confidence module.
 
@@ -131,25 +128,15 @@ class ConfidenceModule(nn.Module):
             init.gating_init_(self.z_recycle.weight)
 
             # Pairwise stack
-            self.msa_module = tenstorrent.MSAModule(
-                n_blocks=4,
-                avg_head_dim=32,
-                avg_n_heads=8,
-                tri_att_head_dim=32,
-                tri_att_n_heads=4,
-            ) if use_tenstorrent else MSAModule(
+            self.msa_module = MSAModule(
                 token_z=token_z,
                 s_input_dim=s_input_dim,
                 **msa_args,
             )
-            self.pairformer_module = (
-                tenstorrent.PairformerModule(48, 32, 4, 24, 16)
-                if use_tenstorrent
-                else PairformerModule(
-                    token_s,
-                    token_z,
-                    **pairformer_args,
-                )
+            self.pairformer_module = PairformerModule(
+                token_s,
+                token_z,
+                **pairformer_args,
             )
             if compile_pairformer:
                 # Big models hit the default cache limit (8)

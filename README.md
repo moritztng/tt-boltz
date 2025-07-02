@@ -5,7 +5,7 @@
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2](https://doi.org/10.1101/2025.06.14.659707)
 
 ## Introduction
-TT-Boltz is the Boltz fork that runs on a single Tenstorrent Wormhole n150 or n300.
+TT-Boltz is the Boltz-2 fork that runs on a single Tenstorrent Wormhole n150 or n300.
 
 Boltz is a family of models for biomolecular interaction prediction. Boltz-1 was the first fully open source model to approach AlphaFold3 accuracy. Our latest work Boltz-2 is a new biomolecular foundation model that goes beyond AlphaFold3 and Boltz-1 by jointly modeling complex structures and binding affinities, a critical component towards accurate molecular design. Boltz-2 is the first deep learning model to approach the accuracy of physics-based free-energy perturbation (FEP) methods, while running 1000x faster — making accurate in silico screening practical for early-stage drug discovery.
 
@@ -48,7 +48,7 @@ You can run inference using Boltz with:
 boltz predict input_path --use_msa_server --accelerator=tenstorrent
 ```
 
-Pass `--accelerator=tenstorrent` to run on Tenstorrent Wormhole.
+Pass `--accelerator=tenstorrent` to run Boltz-2 on Tenstorrent Wormhole. Boltz-1 is not supported on Tenstorrent hardware anymore.
 
 `input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
 

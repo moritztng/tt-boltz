@@ -5,16 +5,17 @@ from boltz.model.modules.tenstorrent import (
     DiffusionTransformerModule,
     MSAModule,
 )
-from boltz.model.modules.trunk import PairformerModule as PairformerModuleTorch, MSAModule as MSAModuleTorch
-from boltz.model.modules.diffusion import (
-    DiffusionTransformer as DiffusionTransformerTorch,
+from boltz.model.modules.trunkv2 import MSAModule as MSAModuleTorch
+from boltz.model.modules.transformersv2 import (
+    DiffusionTransformer as DiffusionTransformerTorch
 )
+from boltz.model.layers.pairformer import PairformerModule as PairformerModuleTorch
 
 torch.set_grad_enabled(False)
 torch.manual_seed(893)
 
 state_dict = torch.load(
-    "/home/moritz/.boltz/boltz1_conf.ckpt", map_location="cpu", mmap=True
+    "/home/moritz/.boltz/boltz2_conf.ckpt", map_location="cpu", mmap=True
 )["state_dict"]
 
 
@@ -30,9 +31,10 @@ def test_pairformer(seq_len):
         tri_att_n_heads=4,
         att_head_dim=24,
         att_n_heads=16,
+        transform_s=True,
     )
     pairformer_torch = PairformerModuleTorch(
-        token_s=384, token_z=128, num_blocks=2
+        token_s=384, token_z=128, num_blocks=2, v2=True
     ).eval()
     pairformer_state_dict = filter_dict(state_dict, "pairformer_module")
     pairformer.load_state_dict(
@@ -52,13 +54,14 @@ def test_pairformer(seq_len):
 
 @pytest.mark.parametrize("seq_len", [100, 500, 1000])
 def test_token_transformer(seq_len):
-    token_transformer = DiffusionTransformerModule(
-        n_layers=2,
+    n_layers = 24
+    token_transformer = DiffusionTransformerModule( 
+        n_layers=n_layers,
         dim=768,
         n_heads=16,
     )
     token_transformer_torch = DiffusionTransformerTorch(
-        depth=2, heads=16, dim=768, dim_single_cond=768, dim_pairwise=128
+        depth=n_layers, heads=16, dim=768, dim_single_cond=768
     ).eval()
     token_transformer_state_dict = filter_dict(
         state_dict, "structure_module.score_model.token_transformer"
@@ -70,7 +73,7 @@ def test_token_transformer(seq_len):
     token_transformer_torch.load_state_dict(token_transformer_state_dict, strict=False)
     a = 3 + 5 * torch.randn(1, seq_len, 768)
     s = -2 + 42 * torch.randn(1, seq_len, 768)
-    z = 10 * torch.randn(1, seq_len, seq_len, 128)
+    z = 10 * torch.randn(1, seq_len, seq_len, n_layers * 16)
     mask = torch.ones(1, seq_len)
     a_tt = token_transformer(
         a,
@@ -96,13 +99,13 @@ def test_msa(seq_len):
         tri_att_head_dim=32,
         tri_att_n_heads=4,
     )
-    msa_torch = MSAModuleTorch(msa_s=64, token_z=128, s_input_dim=455, msa_blocks=4, msa_dropout=0, z_dropout=0).eval()
+    msa_torch = MSAModuleTorch(msa_s=64, token_z=128, token_s=384, msa_blocks=4, msa_dropout=0, z_dropout=0).eval()
     msa_state_dict = filter_dict(state_dict, "msa_module")
     msa.load_state_dict(msa_state_dict)
     msa_torch.load_state_dict(msa_state_dict)
     z = 7 * torch.randn(1, seq_len, seq_len, 128)
-    emb = torch.ones(1, seq_len, 455)
-    feats = {"msa": torch.nn.functional.one_hot(torch.randint(33, (1, n_sequences, seq_len)), 33),
+    emb = torch.ones(1, seq_len, 384)
+    feats = {"msa": torch.randint(33, (1, n_sequences, seq_len)),
              "has_deletion": torch.zeros((1, n_sequences, seq_len), dtype=torch.bool),
              "deletion_value": torch.zeros((1, n_sequences, seq_len)),
              "msa_paired": torch.zeros((1, n_sequences, seq_len)),

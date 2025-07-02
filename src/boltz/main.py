@@ -1268,6 +1268,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             msa_args=asdict(msa_args),
             steering_args={"fk_steering": False, "guidance_update": False},
             affinity_mw_correction=affinity_mw_correction,
+            use_tenstorrent=use_tenstorrent,
         )
         model_module.eval()
 

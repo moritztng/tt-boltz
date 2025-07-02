@@ -36,7 +36,6 @@ from boltz.model.modules.trunk import (
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
-from boltz.model.modules import tenstorrent
 
 class Boltz1(LightningModule):
     """Boltz1 model."""
@@ -76,14 +75,11 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
-<<<<<<< HEAD:src/boltz/model/model.py
-        use_tenstorrent: bool = False,
-=======
         steering_args: Optional[dict[str, Any]] = None,
         use_kernels: bool = False,
->>>>>>> upstream/main:src/boltz/model/models/boltz1.py
     ) -> None:
         super().__init__()
+
         self.save_hyperparameters()
 
         self.lddt = nn.ModuleDict()
@@ -154,8 +150,6 @@ class Boltz1(LightningModule):
         self.max_dist = max_dist
         self.is_pairformer_compiled = False
 
-        self.use_tenstorrent = use_tenstorrent
-
         # Input projections
         s_input_dim = (
             token_s + 2 * const.num_tokens + 1 + len(const.pocket_contact_info)
@@ -193,23 +187,12 @@ class Boltz1(LightningModule):
         # Pairwise stack
         self.no_msa = no_msa
         if not no_msa:
-            self.msa_module = tenstorrent.MSAModule(
-                n_blocks=4,
-                avg_head_dim=32,
-                avg_n_heads=8,
-                tri_att_head_dim=32,
-                tri_att_n_heads=4,
-            ) if self.use_tenstorrent else MSAModule(
+            self.msa_module = MSAModule(
                 token_z=token_z,
                 s_input_dim=s_input_dim,
                 **msa_args,
             )
-        self.pairformer_module = (
-            tenstorrent.PairformerModule(48, 32, 4, 24, 16)
-            if self.use_tenstorrent
-            else PairformerModule(token_s, token_z, **pairformer_args)
-        )
-        compile_pairformer &= not self.use_tenstorrent
+        self.pairformer_module = PairformerModule(token_s, token_z, **pairformer_args)
         if compile_pairformer:
             # Big models hit the default cache limit (8)
             self.is_pairformer_compiled = True
@@ -236,7 +219,6 @@ class Boltz1(LightningModule):
                 "atoms_per_window_queries": atoms_per_window_queries,
                 "atoms_per_window_keys": atoms_per_window_keys,
                 "atom_feature_dim": atom_feature_dim,
-                "use_tenstorrent": use_tenstorrent,
                 **score_model_args,
             },
             compile_score=compile_structure,
@@ -250,10 +232,6 @@ class Boltz1(LightningModule):
         self.structure_prediction_training = structure_prediction_training
         self.confidence_imitate_trunk = confidence_imitate_trunk
         if self.confidence_prediction:
-            confidence_model_args = {
-                "use_tenstorrent": use_tenstorrent,
-                **confidence_model_args,
-            }
             if self.confidence_imitate_trunk:
                 self.confidence_module = ConfidenceModule(
                     token_s,

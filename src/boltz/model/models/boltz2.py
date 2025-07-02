@@ -36,6 +36,8 @@ from boltz.model.modules.trunkv2 import (
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
+from boltz.model.modules import tenstorrent
+
 
 class Boltz2(LightningModule):
     """Boltz2 model."""
@@ -104,6 +106,7 @@ class Boltz2(LightningModule):
         checkpoint_diffusion_conditioning: bool = False,
         use_templates_v2: bool = False,
         use_kernels: bool = False,
+        use_tenstorrent: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["validators"])
@@ -162,6 +165,8 @@ class Boltz2(LightningModule):
         # Kernels
         self.use_kernels = use_kernels
 
+        self.use_tenstorrent = use_tenstorrent
+
         # Input embeddings
         full_embedder_args = {
             "atom_s": atom_s,
@@ -216,7 +221,9 @@ class Boltz2(LightningModule):
         self.use_templates = use_templates
         if use_templates:
             if use_templates_v2:
-                self.template_module = TemplateV2Module(token_z, **template_args)
+                self.template_module = TemplateV2Module(
+                    token_z, use_tenstorrent=use_tenstorrent, **template_args
+                )
             else:
                 self.template_module = TemplateModule(token_z, **template_args)
             if compile_templates:
@@ -227,10 +234,20 @@ class Boltz2(LightningModule):
                     fullgraph=False,
                 )
 
-        self.msa_module = MSAModule(
-            token_z=token_z,
-            token_s=token_s,
-            **msa_args,
+        self.msa_module = (
+            tenstorrent.MSAModule(
+                n_blocks=4,
+                avg_head_dim=32,
+                avg_n_heads=8,
+                tri_att_head_dim=32,
+                tri_att_n_heads=4,
+            )
+            if self.use_tenstorrent
+            else MSAModule(
+                token_z=token_z,
+                token_s=token_s,
+                **msa_args,
+            )
         )
         if compile_msa:
             self.is_msa_compiled = True
@@ -239,7 +256,11 @@ class Boltz2(LightningModule):
                 dynamic=False,
                 fullgraph=False,
             )
-        self.pairformer_module = PairformerModule(token_s, token_z, **pairformer_args)
+        self.pairformer_module = (
+            tenstorrent.PairformerModule(64, 32, 4, 24, 16, True)
+            if use_tenstorrent
+            else PairformerModule(token_s, token_z, **pairformer_args)
+        )
         if compile_pairformer:
             self.is_pairformer_compiled = True
             self.pairformer_module = torch.compile(
@@ -278,6 +299,7 @@ class Boltz2(LightningModule):
                 "atom_s": atom_s,
                 "atoms_per_window_queries": atoms_per_window_queries,
                 "atoms_per_window_keys": atoms_per_window_keys,
+                "use_tenstorrent": use_tenstorrent,
                 **score_model_args,
             },
             compile_score=compile_structure,
@@ -311,6 +333,7 @@ class Boltz2(LightningModule):
                 cyclic_pos_enc=cyclic_pos_enc,
                 conditioning_cutoff_min=conditioning_cutoff_min,
                 conditioning_cutoff_max=conditioning_cutoff_max,
+                use_tenstorrent=use_tenstorrent,
                 **confidence_model_args,
             )
             if compile_confidence:
@@ -323,11 +346,13 @@ class Boltz2(LightningModule):
                 self.affinity_module1 = AffinityModule(
                     token_s,
                     token_z,
+                    use_tenstorrent=use_tenstorrent,
                     **affinity_model_args1,
                 )
                 self.affinity_module2 = AffinityModule(
                     token_s,
                     token_z,
+                    use_tenstorrent=use_tenstorrent,
                     **affinity_model_args2,
                 )
                 if compile_affinity:
@@ -341,6 +366,7 @@ class Boltz2(LightningModule):
                 self.affinity_module = AffinityModule(
                     token_s,
                     token_z,
+                    use_tenstorrent=use_tenstorrent,
                     **affinity_model_args,
                 )
                 if compile_affinity:

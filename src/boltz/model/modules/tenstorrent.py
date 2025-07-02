@@ -1,4 +1,4 @@
-import torch, ttnn
+import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
 
@@ -9,6 +9,16 @@ OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
 USE_FLOAT32 = False
 
 device = None
+
+
+def cleanup():
+    global device
+    if device is not None:
+        ttnn.DumpDeviceProfiler(device)
+        ttnn.close_device(device)
+
+
+atexit.register(cleanup)
 
 
 def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
@@ -35,13 +45,12 @@ class Module:
         self,
         key: str,
         transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
-        use_float32: bool = False,
     ) -> ttnn.Tensor:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            dtype=ttnn.float32 if USE_FLOAT32 or use_float32 else ttnn.bfloat16,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
         )
 
 
@@ -254,48 +263,36 @@ class AttentionPairBias(Module):
         self,
         head_dim: int,
         n_heads: int,
-        diffusion: bool,
+        compute_pair_bias: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.head_dim = head_dim
         self.n_heads = n_heads
-        self.diffusion = diffusion
-        if not diffusion:
-            self.norm_s_weight = self.torch_to_tt("norm_s.weight")
-            self.norm_s_bias = self.torch_to_tt("norm_s.bias")
+        self.compute_pair_bias = compute_pair_bias
         self.q_weight = self.torch_to_tt("proj_q.weight")
         self.q_bias = self.torch_to_tt("proj_q.bias")
         self.k_weight = self.torch_to_tt("proj_k.weight")
         self.v_weight = self.torch_to_tt("proj_v.weight")
         self.g_weight = self.torch_to_tt("proj_g.weight")
-        self.z_norm_weight = self.torch_to_tt("proj_z.0.weight")
-        self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
-        self.z_weight = self.torch_to_tt("proj_z.1.weight")
+        if compute_pair_bias:
+            self.z_norm_weight = self.torch_to_tt("proj_z.0.weight")
+            self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
+            self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
     def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
-        if not self.diffusion:
-            s = ttnn.layer_norm(
-                s,
-                weight=self.norm_s_weight,
-                bias=self.norm_s_bias,
-                epsilon=1e-5,
-                compute_kernel_config=self.compute_kernel_config,
-            )
         q = ttnn.linear(
             s,
             self.q_weight,
             bias=self.q_bias,
             compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.float32,
         )
         k = ttnn.linear(
             s,
             self.k_weight,
             compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.float32,
         )
         v = ttnn.linear(
             s, self.v_weight, compute_kernel_config=self.compute_kernel_config
@@ -311,32 +308,25 @@ class AttentionPairBias(Module):
         v = ttnn.permute(v, (0, 2, 3, 1))
         a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
         a = ttnn.multiply(a, self.head_dim**-0.5)
-        z = ttnn.layer_norm(
-            z,
-            weight=self.z_norm_weight,
-            bias=self.z_norm_bias,
-            epsilon=1e-5,
-            compute_kernel_config=self.compute_kernel_config,
-        )
-        z = ttnn.linear(
-            z,
-            self.z_weight,
-            compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.float32,
-        )
+        if self.compute_pair_bias:
+            z = ttnn.layer_norm(
+                z,
+                weight=self.z_norm_weight,
+                bias=self.z_norm_bias,
+                epsilon=1e-5,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            z = ttnn.linear(
+                z,
+                self.z_weight,
+                compute_kernel_config=self.compute_kernel_config,
+            )
         z = ttnn.permute(z, (3, 0, 1, 2))
         a = ttnn.add(a, z)
-        if not USE_FLOAT32:
-            a = ttnn.clone(a, dtype=ttnn.bfloat16)
         a = ttnn.softmax(
             a,
             dim=-1,
-            compute_kernel_config=ttnn.WormholeComputeKernelConfig(
-                math_fidelity=self.compute_kernel_config.math_fidelity,
-                math_approx_mode=self.compute_kernel_config.math_approx_mode,
-                fp32_dest_acc_en=False,
-                packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
-            ),
+            compute_kernel_config=self.compute_kernel_config,
             numeric_stable=True,
         )
         o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
@@ -423,10 +413,12 @@ class PairformerLayer(Module):
         tri_att_n_heads: int,
         att_head_dim: int,
         att_n_heads: int,
+        transform_s: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
+        self.transform_s = transform_s
         self.triangle_multiplication_start = TriangleMultiplication(
             False, filter_dict(state_dict, "tri_mul_out"), compute_kernel_config
         )
@@ -447,19 +439,22 @@ class PairformerLayer(Module):
             filter_dict(state_dict, "tri_att_end", "mha."),
             compute_kernel_config,
         )
-        self.attention_pair_bias = AttentionPairBias(
-            att_head_dim,
-            att_n_heads,
-            False,
-            filter_dict(state_dict, "attention"),
-            compute_kernel_config,
-        )
         self.transition_z = Transition(
             True, filter_dict(state_dict, "transition_z"), compute_kernel_config
         )
-        self.transition_s = Transition(
-            False, filter_dict(state_dict, "transition_s"), compute_kernel_config
-        )
+        if transform_s:
+            self.pre_norm_s_weight = self.torch_to_tt("pre_norm_s.weight")
+            self.pre_norm_s_bias = self.torch_to_tt("pre_norm_s.bias")
+            self.attention_pair_bias = AttentionPairBias(
+                att_head_dim,
+                att_n_heads,
+                True,
+                filter_dict(state_dict, "attention"),
+                compute_kernel_config,
+            )
+            self.transition_s = Transition(
+                False, filter_dict(state_dict, "transition_s"), compute_kernel_config
+            )
 
     def __call__(
         self, s: ttnn.Tensor, z: ttnn.Tensor
@@ -481,11 +476,22 @@ class PairformerLayer(Module):
             self.triangle_attention_end(z),
         )
         z = ttnn.add(z, self.transition_z(z))
-        s = ttnn.add(
-            s,
-            self.attention_pair_bias(s, z),
-        )
-        s = ttnn.add(s, self.transition_s(s))
+        if self.transform_s:
+            s_norm = ttnn.layer_norm(
+                s,
+                weight=self.pre_norm_s_weight,
+                bias=self.pre_norm_s_bias,
+                epsilon=1e-5,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            s = ttnn.add(
+                s,
+                self.attention_pair_bias(
+                    s_norm,
+                    z,
+                ),
+            )
+            s = ttnn.add(s, self.transition_s(s))
         return s, z
 
 
@@ -497,6 +503,7 @@ class Pairformer(Module):
         tri_att_n_heads: int,
         att_head_dim: int,
         att_n_heads: int,
+        transform_s: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
@@ -507,6 +514,7 @@ class Pairformer(Module):
                 tri_att_n_heads,
                 att_head_dim,
                 att_n_heads,
+                transform_s,
                 filter_dict(state_dict, f"layers.{i}"),
                 compute_kernel_config,
             )
@@ -528,7 +536,7 @@ class AdaLN(Module):
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
-        self.s_norm_weight = self.torch_to_tt("s_norm.weight", use_float32=True)
+        self.s_norm_weight = self.torch_to_tt("s_norm.weight")
         self.s_scale_weight = self.torch_to_tt("s_scale.weight")
         self.s_scale_bias = self.torch_to_tt("s_scale.bias")
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
@@ -618,7 +626,7 @@ class DiffusionTransformerLayer(Module):
         self.attn_pair_bias = AttentionPairBias(
             head_dim=dim // n_heads,
             n_heads=n_heads,
-            diffusion=True,
+            compute_pair_bias=False,
             state_dict=filter_dict(state_dict, "pair_bias_attn"),
             compute_kernel_config=compute_kernel_config,
         )
@@ -667,13 +675,10 @@ class DiffusionTransformer(Module):
             )
             for i in range(n_layers)
         ]
-        self.z = None
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
-        if self.z is None:
-            self.z = z
-        for layer in self.layers:
-            a = layer(a, s, self.z)
+        for i, layer in enumerate(self.layers):
+            a = layer(a, s, z[:, :, :, i * 16 : (i + 1) * 16])
         return a
 
 
@@ -724,12 +729,7 @@ class PairWeightedAveraging(Module):
             w = ttnn.softmax(
                 b,
                 dim=-1,
-                compute_kernel_config=ttnn.WormholeComputeKernelConfig(
-                    math_fidelity=self.compute_kernel_config.math_fidelity,
-                    math_approx_mode=self.compute_kernel_config.math_approx_mode,
-                    fp32_dest_acc_en=False,
-                    packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
-                ),
+                compute_kernel_config=self.compute_kernel_config,
                 numeric_stable=True,
             )
             v = ttnn.linear(
@@ -849,28 +849,14 @@ class MSALayer(Module):
             state_dict=filter_dict(state_dict, "outer_product_mean"),
             compute_kernel_config=compute_kernel_config,
         )
-        self.triangle_multiplication_start = TriangleMultiplication(
-            False, filter_dict(state_dict, "tri_mul_out"), compute_kernel_config
-        )
-        self.triangle_multiplication_end = TriangleMultiplication(
-            True, filter_dict(state_dict, "tri_mul_in"), compute_kernel_config
-        )
-        self.triangle_attention_start = TriangleAttention(
+        self.pairformer_layer = PairformerLayer(
             tri_att_head_dim,
             tri_att_n_heads,
+            None,
+            None,
             False,
-            filter_dict(state_dict, "tri_att_start", "mha."),
+            filter_dict(state_dict, f"pairformer_layer"),
             compute_kernel_config,
-        )
-        self.triangle_attention_end = TriangleAttention(
-            tri_att_head_dim,
-            tri_att_n_heads,
-            True,
-            filter_dict(state_dict, "tri_att_end", "mha."),
-            compute_kernel_config,
-        )
-        self.z_transition = Transition(
-            True, filter_dict(state_dict, "z_transition"), compute_kernel_config
         )
 
     def __call__(
@@ -879,23 +865,7 @@ class MSALayer(Module):
         m = ttnn.add(m, self.pair_weighted_averaging(m, z))
         m = ttnn.add(m, self.msa_transition(m))
         z = ttnn.add(z, self.outer_product_mean(m))
-        z = ttnn.add(
-            z,
-            self.triangle_multiplication_start(z),
-        )
-        z = ttnn.add(
-            z,
-            self.triangle_multiplication_end(z),
-        )
-        z = ttnn.add(
-            z,
-            self.triangle_attention_start(z),
-        )
-        z = ttnn.add(
-            z,
-            self.triangle_attention_end(z),
-        )
-        z = ttnn.add(z, self.z_transition(z))
+        z = self.pairformer_layer(None, z)[1]
         return z, m
 
 
@@ -976,13 +946,6 @@ class TorchWrapper(nn.Module):
     def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
         return torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
 
-    def __del__(self):
-        global device
-        if device is not None:
-            ttnn.DumpDeviceProfiler(device)
-            ttnn.close_device(device)
-            device = None
-
 
 class PairformerModule(TorchWrapper):
     def __init__(
@@ -992,6 +955,7 @@ class PairformerModule(TorchWrapper):
         tri_att_n_heads: int,
         att_head_dim: int,
         att_n_heads: int,
+        transform_s: bool,
     ):
         super().__init__()
         self.n_blocks = n_blocks
@@ -999,6 +963,7 @@ class PairformerModule(TorchWrapper):
         self.tri_att_n_heads = tri_att_n_heads
         self.att_head_dim = att_head_dim
         self.att_n_heads = att_n_heads
+        self.transform_s = transform_s
 
     def _load_from_state_dict(
         self,
@@ -1016,6 +981,7 @@ class PairformerModule(TorchWrapper):
             self.tri_att_n_heads,
             self.att_head_dim,
             self.att_n_heads,
+            self.transform_s,
             filter_dict(state_dict, prefix[:-1]),
             self.compute_kernel_config,
         )
@@ -1026,11 +992,12 @@ class PairformerModule(TorchWrapper):
         z: torch.Tensor,
         mask: torch.Tensor = None,
         pair_mask: torch.Tensor = None,
+        use_kernels: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return tuple(
-            self._to_torch(x)
+            self._to_torch(x) if x is not None else None
             for x in self.module(
-                self._from_torch(s),
+                self._from_torch(s) if s is not None else None,
                 self._from_torch(z),
             )
         )
@@ -1047,6 +1014,7 @@ class DiffusionTransformerModule(TorchWrapper):
         self.n_layers = n_layers
         self.dim = dim
         self.n_heads = n_heads
+        self.bias = None
 
     def _load_from_state_dict(
         self,
@@ -1070,19 +1038,22 @@ class DiffusionTransformerModule(TorchWrapper):
         self,
         a: torch.Tensor,
         s: torch.Tensor,
-        z: torch.Tensor,
+        bias: torch.Tensor,
         mask: torch.Tensor = None,
         to_keys=None,
         multiplicity: int = 1,
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
-        return self._to_torch(
+        if self.bias is None:
+            self.bias = self._from_torch(bias)
+        x = self._to_torch(
             self.module(
                 self._from_torch(a),
                 self._from_torch(s),
-                self._from_torch(z) if z is not None else None,
+                self.bias,
             )
         )
+        return x
 
 
 class MSAModule(TorchWrapper):
@@ -1126,12 +1097,14 @@ class MSAModule(TorchWrapper):
         z: torch.Tensor,
         emb: torch.Tensor,
         feats: Dict[str, torch.Tensor],
+        use_kernels: bool = False,
     ) -> torch.Tensor:
         m = torch.cat(
             [
-                feats["msa"],
+                torch.nn.functional.one_hot(feats["msa"], num_classes=33),
                 feats["has_deletion"].unsqueeze(-1),
                 feats["deletion_value"].unsqueeze(-1),
+                feats["msa_paired"].unsqueeze(-1),
             ],
             dim=-1,
         )
