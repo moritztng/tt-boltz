@@ -1,7 +1,7 @@
 import math
 import random
 from typing import Optional
-
+from collections import deque
 import numba
 import numpy as np
 import numpy.typing as npt
@@ -210,9 +210,9 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     visited = {(c, s) for c, items in taxonomy_map for s in items}
     available = {}
     for c in chain_ids:
-        available[c] = [
+        available[c] = deque(
             i for i in range(1, len(msa[c].sequences)) if (c, i) not in visited
-        ]
+        )
 
     # Create sequence pairs
     is_paired = []
@@ -252,8 +252,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
                     row_is_paired[chain_id] = 0
                     if available[chain_id]:
                         # Add the next available sequence
-                        seq_idx = available[chain_id].pop(0)
-                        row_pairing[chain_id] = seq_idx
+                        row_pairing[chain_id] = available[chain_id].popleft()
                     else:
                         # No more sequences available, we place a gap
                         row_pairing[chain_id] = -1
@@ -278,8 +277,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
             row_is_paired[chain_id] = 0
             if available[chain_id]:
                 # Add the next available sequence
-                seq_idx = available[chain_id].pop(0)
-                row_pairing[chain_id] = seq_idx
+                row_pairing[chain_id] = available[chain_id].popleft()
             else:
                 # No more sequences available, we place a gap
                 row_pairing[chain_id] = -1
