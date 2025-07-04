@@ -29,6 +29,28 @@ class TokenData:
     cyclic_period: int
 
 
+def token_astuple(token: TokenData) -> tuple:
+    """Convert a TokenData object to a tuple."""
+    return (
+        token.token_idx,
+        token.atom_idx,
+        token.atom_num,
+        token.res_idx,
+        token.res_type,
+        token.sym_id,
+        token.asym_id,
+        token.entity_id,
+        token.mol_type,
+        token.center_idx,
+        token.disto_idx,
+        token.center_coords,
+        token.disto_coords,
+        token.resolved_mask,
+        token.disto_mask,
+        token.cyclic_period,
+    )
+
+
 class BoltzTokenizer(Tokenizer):
     """Tokenize an input structure for training."""
 
@@ -102,7 +124,7 @@ class BoltzTokenizer(Tokenizer):
                         disto_mask=is_disto_present,
                         cyclic_period=chain["cyclic_period"],
                     )
-                    token_data.append(astuple(token))
+                    token_data.append(token_astuple(token))
 
                     # Update atom_idx to token_idx
                     for atom_idx in range(atom_start, atom_end):
@@ -147,7 +169,7 @@ class BoltzTokenizer(Tokenizer):
                                 "cyclic_period"
                             ],  # Enforced to be False in chain parser
                         )
-                        token_data.append(astuple(token))
+                        token_data.append(token_astuple(token))
 
                         # Update atom_idx to token_idx
                         atom_to_token[index] = token_idx
