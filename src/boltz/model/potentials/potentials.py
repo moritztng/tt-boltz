@@ -20,7 +20,7 @@ class Potential(ABC):
         if index.shape[1] == 0:
             return torch.zeros(coords.shape[:-2], device=coords.device)
 
-        ref_coords = self.get_reference_coords(feats, parameters)
+        ref_coords, ref_mask = self.get_reference_coords(feats, parameters)
 
         if operator_args is not None:
             negation_mask, union_index = operator_args
@@ -43,7 +43,7 @@ class Potential(ABC):
             atom_token_id, ref_atom_idx = ref_args
             coords = coords[:, ref_atom_idx]
 
-        value = self.compute_variable(coords, index, ref_coords=ref_coords, compute_gradient=False)
+        value = self.compute_variable(coords, index, ref_coords=ref_coords, ref_mask=ref_mask, compute_gradient=False)
         energy = self.compute_function(value, *args, negation_mask=negation_mask, compute_derivative=False)
         normalization = self.compute_normalization(feats, parameters)
 
@@ -59,15 +59,14 @@ class Potential(ABC):
             softmax_energy[Z[...,union_index] == 0] = 0
             return (energy * softmax_energy).sum(dim=-1) / normalization
 
-
-        return energy.sum(dim=-1) / normalization
+        return energy.sum(dim=tuple(range(1, energy.dim()))) / normalization
 
     def compute_gradient(self, coords, feats, parameters):
         index, args, com_args, ref_args, operator_args = self.compute_args(feats, parameters)
         if index.shape[1] == 0:
             return torch.zeros_like(coords)
 
-        ref_coords = self.get_reference_coords(feats, parameters)
+        ref_coords, ref_mask = self.get_reference_coords(feats, parameters)
 
         if operator_args is not None:
             negation_mask, union_index = operator_args
@@ -99,7 +98,7 @@ class Potential(ABC):
         elif ref_atom_idx is not None:
             coords = coords[:, ref_atom_idx]
 
-        value, grad_value = self.compute_variable(coords, index, ref_coords=ref_coords, compute_gradient=True)
+        value, grad_value = self.compute_variable(coords, index, ref_coords=ref_coords, ref_mask=ref_mask, compute_gradient=True)
         energy, dEnergy = self.compute_function(value, *args, negation_mask=negation_mask, compute_derivative=True)
         if union_index is not None:
             neg_exp_energy = torch.exp(-1 * parameters['union_lambda'] * energy)
@@ -118,6 +117,9 @@ class Potential(ABC):
                 'sum',
             )
             dSoftmax = dEnergy * softmax_energy * (1 + parameters['union_lambda'] * (energy - f[...,union_index]))
+            prod = dSoftmax.tile(grad_value.shape[-3]).unsqueeze(-1) * grad_value.flatten(start_dim=-3, end_dim=-2)
+            if prod.dim() > 3:
+                prod = prod.sum(dim=list(range(1, prod.dim() - 2)))
             grad_atom = torch.zeros_like(coords).scatter_reduce(
                 -2,
                 index.flatten(start_dim=0, end_dim=1).unsqueeze(-1).expand((*coords.shape[:-2],-1,3)),
@@ -125,10 +127,13 @@ class Potential(ABC):
                 'sum',
             )
         else:
+            prod = dEnergy.tile(grad_value.shape[-3]).unsqueeze(-1) * grad_value.flatten(start_dim=-3, end_dim=-2)
+            if prod.dim() > 3:
+                prod = prod.sum(dim=list(range(1, prod.dim() - 2)))
             grad_atom = torch.zeros_like(coords).scatter_reduce(
                 -2,
-                index.flatten(start_dim=0, end_dim=1).unsqueeze(-1).expand((*coords.shape[:-2],-1,3)),
-                dEnergy.tile(grad_value.shape[-3]).unsqueeze(-1) * grad_value.flatten(start_dim=-3, end_dim=-2),
+                index.flatten(start_dim=0, end_dim=1).unsqueeze(-1).expand((*coords.shape[:-2],-1,3)), # 9 x 516 x 3
+                prod,
                 'sum',
             )
 
@@ -165,14 +170,14 @@ class Potential(ABC):
         raise NotImplementedError
         
     def get_reference_coords(self, feats, parameters):
-        return None
+        return None, None
 
 class FlatBottomPotential(Potential):
     def compute_function(self, value, k, lower_bounds, upper_bounds, negation_mask=None, compute_derivative=False):
         if lower_bounds is None:
-            lower_bounds = torch.full((value.shape[-1],), float('-inf')).to(value)
+            lower_bounds = torch.full(value.shape[1:], float('-inf')).to(value)
         if upper_bounds is None:
-            upper_bounds = torch.full((value.shape[-1],), float('inf')).to(value)
+            upper_bounds = torch.full(value.shape[1:], float('inf')).to(value)
 
         if negation_mask is not None:
             unbounded_below_mask = torch.isneginf(lower_bounds)
@@ -200,30 +205,26 @@ class FlatBottomPotential(Potential):
         return energy, dEnergy
 
 class ReferencePotential(Potential):
-    def compute_variable(self, coords, index, ref_coords, compute_gradient=False):
-        ref_mask = torch.zeros(coords.shape[-2], dtype=torch.float32, device=coords.device)
-        ref_mask[index[0]] = 1.0
-        ref_mask = ref_mask.repeat(coords.shape[0],1)
+    def compute_variable(self, coords, index, ref_coords, ref_mask, compute_gradient=False):
         aligned_ref_coords = weighted_rigid_align(
-            ref_coords.repeat(coords.shape[0],1,1).float(),
-            coords.float(),
+            ref_coords.float(),
+            coords[:, index].float(),
             ref_mask,
             ref_mask,
         )
 
-        r = coords.index_select(-2, index[0]) -  aligned_ref_coords.index_select(-2, index[0])
+        r = coords[:, index] - aligned_ref_coords
         r_norm = torch.linalg.norm(r, dim=-1)
-        r_hat = r / r_norm.unsqueeze(-1)
-        grad = r_hat.unsqueeze(1)
-        coords_prime = coords
-
+        
         if not compute_gradient:
             return r_norm
 
+        r_hat = r / r_norm.unsqueeze(-1)
+        grad = (r_hat * ref_mask.unsqueeze(-1)).unsqueeze(1)
         return r_norm, grad
 
 class DistancePotential(Potential):
-    def compute_variable(self, coords, index, ref_coords=None, compute_gradient=False):
+    def compute_variable(self, coords, index, ref_coords=None, ref_mask=None, compute_gradient=False):
         r_ij = coords.index_select(-2, index[0]) -  coords.index_select(-2, index[1])
         r_ij_norm = torch.linalg.norm(r_ij, dim=-1)
         r_hat_ij = r_ij / r_ij_norm.unsqueeze(-1)
@@ -237,7 +238,7 @@ class DistancePotential(Potential):
         return r_ij_norm, grad
 
 class DihedralPotential(Potential):
-    def compute_variable(self, coords, index, ref_coords=None, compute_gradient=False):
+    def compute_variable(self, coords, index, ref_coords=None, ref_mask=None, compute_gradient=False):
         r_ij = coords.index_select(-2, index[0]) - coords.index_select(-2, index[1])
         r_kj = coords.index_select(-2, index[2]) - coords.index_select(-2, index[1])
         r_kl = coords.index_select(-2, index[2]) - coords.index_select(-2, index[3])
@@ -273,7 +274,7 @@ class DihedralPotential(Potential):
         return phi, grad
 
 class AbsDihedralPotential(DihedralPotential):
-    def compute_variable(self, coords, index, ref_coords=None, compute_gradient=False):
+    def compute_variable(self, coords, index, ref_coords=None, ref_mask=None, compute_gradient=False):
         if not compute_gradient:
             phi = super().compute_variable(coords, index, compute_gradient=compute_gradient)
             phi = torch.abs(phi)
@@ -439,26 +440,35 @@ class PlanarBondPotential(FlatBottomPotential, AbsDihedralPotential):
 
 class TemplateReferencePotential(FlatBottomPotential, ReferencePotential):
     def compute_args(self, feats, parameters):
-        if 'template_mask_cb' not in feats or feats['template_mask_cb'].shape[1] == 0:
-            return None, None, None, None, None
+        if 'template_mask_cb' not in feats:
+            return torch.empty([1,0]), None, None, None, None
+        template_mask =  feats['template_mask_cb'][feats['template_force']]
+        if template_mask.shape[0] == 0:
+            return torch.empty([1,0]), None, None, None, None
 
         atom_token_id = (
             torch.bmm(feats["atom_to_token"].float(), feats["token_index"].unsqueeze(-1).float())
             .squeeze(-1)
             .long()
         )[0]
-        template_idx = parameters['template_idx']
-        cb_atom_idx = torch.argmax(feats['token_to_rep_atom'][template_idx], dim=1)
-        index = torch.argwhere(feats['template_mask_cb'][0, template_idx]).T
-        upper_bounds =  torch.full(index.shape, parameters['buffer'], device=index.device)
+        index = torch.argmax(feats['token_to_rep_atom'][0], dim=1)[None]
+        upper_bounds =  torch.full(
+            template_mask.shape,
+            float('inf'),
+            device=index.device,
+            dtype=torch.float32
+        )
+        ref_idxs = torch.argwhere(template_mask).T
+        upper_bounds[ref_idxs.unbind()] = feats['template_force_threshold'][feats['template_force']][ref_idxs[0]]
+
         lower_bounds = None
         k = torch.ones_like(upper_bounds)
-        return index, (k, lower_bounds, upper_bounds), None, (atom_token_id, cb_atom_idx), None
+        return index, (k, lower_bounds, upper_bounds), None, None, None
 
     def get_reference_coords(self, feats, parameters):
-        template_idx = parameters['template_idx']
-        ref_coords = feats['template_cb'][0, template_idx].clone()
-        return ref_coords
+        ref_coords = feats['template_cb'][feats['template_force']].clone()
+        ref_mask = feats['template_mask_cb'][feats['template_force']].clone()
+        return (ref_coords, ref_mask)
 
     def compute_normalization(self, feats, parameters):
         template_idx = parameters['template_idx']
@@ -552,14 +562,14 @@ def get_potentials(boltz2=False):
         potentials.extend([
             ContactPotentital(
                 parameters={
-                    'guidance_interval': 5,
+                    'guidance_interval': 4,
                     'guidance_weight': PiecewiseStepFunction(
-                        thresholds=[0.75],
-                        values=[0.0, 0.25]
+                        thresholds=[0.25, 0.75],
+                        values=[0.0, 0.5, 1.0]
                     ),
                     'resampling_weight': 1.0,
                     'union_lambda': ExponentialInterpolation(
-                        start=10.0,
+                        start=8.0,
                         end=0.0,
                         alpha=-2.0
                     )

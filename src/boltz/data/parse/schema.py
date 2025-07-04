@@ -544,6 +544,8 @@ def get_template_records_from_search(
     sequences: dict[str, str],
     template_chain_ids: list[str],
     template_sequences: dict[str, str],
+    force: bool = False,
+    threshold: Optional[float] = None,
 ) -> list[TemplateInfo]:
     """Get template records from an alignment."""
     # Compute pairwise scores
@@ -579,6 +581,8 @@ def get_template_records_from_search(
                 template_chain=template_chain_id,
                 template_st=alignment.template_st,
                 template_en=alignment.template_en,
+                force=force,
+                threshold=threshold
             )
             template_records.append(template_record)
 
@@ -591,6 +595,8 @@ def get_template_records_from_matching(
     sequences: dict[str, str],
     template_chain_ids: list[str],
     template_sequences: dict[str, str],
+    force: bool = False,
+    threshold: Optional[float] = None,
 ) -> list[TemplateInfo]:
     """Get template records from a given matching."""
     template_records = []
@@ -609,6 +615,8 @@ def get_template_records_from_matching(
                 template_chain=template_chain_id,
                 template_st=alignment.template_st,
                 template_en=alignment.template_en,
+                force=force,
+                threshold=threshold
             )
             template_records.append(template_record)
 
@@ -1523,7 +1531,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 )
                 contacts.append(contact)
 
-            pocket_constraints.append((binder, contacts, max_distance))
+            force = constraint["pocket"].get('force', False)
+            pocket_constraints.append((binder, contacts, max_distance, force))
         elif "contact" in constraint:
             if (
                 "token1" not in constraint["contact"]
@@ -1546,8 +1555,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             token2 = token_spec_to_ids(
                 chain_name2, residue_index_or_atom_name2, chain_to_idx, atom_idx_map, chains
             )
+            force = constraint["pocket"].get('force', False)
 
-            contact_constraints.append((token1, token2, max_distance))
+            contact_constraints.append((token1, token2, max_distance, force))
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)
@@ -1630,7 +1640,19 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 )
                 raise ValueError(msg)
 
+        force = template.get('force', False)
+        if force:
+            if 'threshold' in template:
+                threshold = template['threshold']
+            else:
+                msg = (
+                    f"Template {template_id} must have threshold specified if force is set to True"
+                )
+                raise ValueError(msg)
+        else:
+            threshold = float('inf')
         # Compute template records
+
         if matched:
             template_records.extend(
                 get_template_records_from_matching(
@@ -1639,6 +1661,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     sequences=protein_seqs,
                     template_chain_ids=template_chain_ids,
                     template_sequences=parsed_template.sequences,
+                    force=force,
+                    threshold=threshold
                 )
             )
         else:
@@ -1649,6 +1673,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     sequences=protein_seqs,
                     template_chain_ids=template_chain_ids,
                     template_sequences=parsed_template.sequences,
+                    force=force,
+                    threshold=threshold
                 )
             )
         # Save template
@@ -1748,7 +1774,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         planar_ring_5_constraints=planar_ring_5_constraints,
         planar_ring_6_constraints=planar_ring_6_constraints,
     )
-
     return Target(
         record=record,
         structure=data,

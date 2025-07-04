@@ -1,9 +1,0 @@
-sequences:
-    - protein:
-        id: [A, B, C]
-        sequence: "MVRSSSRTPSDKPVAHVVANPQAEGQLQWLNRRANALLANGVELRDNQLVVPSEGLYLIYSQVLFKGQGCPSTHVLLTHTISRIAVSYQTKVNLLSAIKSPCQRETPEGAEAKPWYEPIYLGGVFQLEKGDRLSAEINRPDYLDFAESGQVYFGIIAL"
-    - ligand:
-        id: D
-        ccd: "UTM"
-templates:
-    - cif: "/data/scratch/getzn/boltz_private/6x82-assembly1.cif"

@@ -716,7 +716,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     contact_threshold = np.zeros((len(token_data), len(token_data)))
 
     if inference_pocket_constraints is not None:
-        for binder, contacts, max_distance in inference_pocket_constraints:
+        for binder, contacts, max_distance, force in inference_pocket_constraints:
             binder_mask = token_data["asym_id"] == binder
 
             for idx, token in enumerate(token_data):
@@ -727,17 +727,17 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
                     token["mol_type"] == const.chain_type_ids["NONPOLYMER"]
                     and (token["asym_id"], token["atom_idx"]) in contacts
                 ):
-                    contact_conditioning[binder_mask][:, idx] = (
+                    contact_conditioning[binder_mask, idx] = (
                         const.contact_conditioning_info["BINDER>POCKET"]
                     )
-                    contact_conditioning[idx][binder_mask] = (
+                    contact_conditioning[idx, binder_mask] = (
                         const.contact_conditioning_info["POCKET>BINDER"]
                     )
-                    contact_threshold[binder_mask][:, idx] = max_distance
-                    contact_threshold[idx][binder_mask] = max_distance
+                    contact_threshold[binder_mask, idx] = max_distance
+                    contact_threshold[idx, binder_mask] = max_distance
 
     if inference_contact_constraints is not None:
-        for token1, token2, max_distance in inference_contact_constraints:
+        for token1, token2, max_distance, force in inference_contact_constraints:
             for idx1, _token1 in enumerate(token_data):
                 if (
                     _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
@@ -1825,13 +1825,14 @@ def process_template_features(
 
         # Compute template features for each row
         row_features = compute_template_features(data, row_tokens, max_tokens)
+        row_features['template_force'] = torch.tensor(template.force)
+        row_features['template_force_threshold'] = torch.tensor(template.threshold if template.threshold is not None else float('inf'), dtype=torch.float32)
         template_features.append(row_features)
 
     # Stack each feature
     out = {}
     for k in template_features[0]:
         out[k] = torch.stack([f[k] for f in template_features])
-
     return out
 
 
@@ -2062,8 +2063,10 @@ def process_contact_feature_constraints(
     token_data = data.tokens
     union_idx = 0
     pair_index, union_index, negation_mask, thresholds = [], [], [], []
+    for (binder, contacts, max_distanc, force) in inference_pocket_constraints:
+        if not force:
+            continue
 
-    for (binder, contacts, max_distance) in inference_pocket_constraints:
         binder_chain = data.structure.chains[binder]
         for token in token_data:
             if (token["mol_type"] != const.chain_type_ids["NONPOLYMER"] and
@@ -2080,7 +2083,10 @@ def process_contact_feature_constraints(
                 thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
                 union_idx += 1
 
-    for token1, token2, max_distance in inference_contact_constraints:
+    for (token1, token2, max_distance, force) in inference_contact_constraints:
+        if not force:
+            continue
+
         for idx1, _token1 in enumerate(token_data):
             if (
                 _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
