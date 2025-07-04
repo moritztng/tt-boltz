@@ -305,18 +305,22 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
         is_paired = is_paired[:max_seqs]
 
     # Map (chain_id, seq_idx, res_idx) to deletion
-    deletions = {}
+    deletions = numba.typed.Dict.empty(
+        key_type=numba.types.Tuple(
+            [numba.types.int64, numba.types.int64, numba.types.int64]),
+        value_type=numba.types.int64
+    )
     for chain_id, chain_msa in msa.items():
         chain_deletions = chain_msa.deletions
         for sequence in chain_msa.sequences:
+            seq_idx = sequence["seq_idx"]
             del_start = sequence["del_start"]
             del_end = sequence["del_end"]
-            chain_deletions = chain_msa.deletions[del_start:del_end]
+            chain_deletions = chain_deletions[del_start:del_end]
             for deletion_data in chain_deletions:
-                seq_idx = sequence["seq_idx"]
                 res_idx = deletion_data["res_idx"]
-                deletion = deletion_data["deletion"]
-                deletions[(chain_id, seq_idx, res_idx)] = deletion
+                deletion_values = deletion_data["deletion"]
+                deletions[(chain_id, seq_idx, res_idx)] = deletion_values
 
     # Add all the token MSA data
     msa_data, del_data, paired_data = prepare_msa_arrays(
@@ -377,21 +381,13 @@ def prepare_msa_arrays(
         chain_idx = chain_id_to_idx[chain_id]
         msa_residues[chain_idx, idxs] = residues
 
-    deletions_dict = numba.typed.Dict.empty(
-        key_type=numba.types.Tuple(
-            [numba.types.int64, numba.types.int64, numba.types.int64]
-        ),
-        value_type=numba.types.int64,
-    )
-    deletions_dict.update(deletions)
-
     return _prepare_msa_arrays_inner(
         token_asym_ids_arr,
         token_res_idxs_arr,
         token_asym_ids_idx_arr,
         pairing_arr,
         is_paired_arr,
-        deletions_dict,
+        deletions,
         msa_sequences,
         msa_residues,
         const.token_ids["-"],
