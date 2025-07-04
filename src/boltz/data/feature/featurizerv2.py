@@ -2063,7 +2063,7 @@ def process_contact_feature_constraints(
     token_data = data.tokens
     union_idx = 0
     pair_index, union_index, negation_mask, thresholds = [], [], [], []
-    for (binder, contacts, max_distanc, force) in inference_pocket_constraints:
+    for (binder, contacts, max_distance, force) in inference_pocket_constraints:
         if not force:
             continue
 
