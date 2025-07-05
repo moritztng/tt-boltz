@@ -23,10 +23,10 @@ def median_relative_error(a, b):
     return ((a - b).abs() / b.abs()).median().item()
 
 
-@pytest.mark.parametrize("seq_len", [100, 500, 1000])
+@pytest.mark.parametrize("seq_len", [100, 500, 768])
 def test_pairformer(seq_len):
     pairformer = PairformerModule(
-        n_blocks=2,
+        n_blocks=5,
         tri_att_head_dim=32,
         tri_att_n_heads=4,
         att_head_dim=24,
@@ -34,7 +34,7 @@ def test_pairformer(seq_len):
         transform_s=True,
     )
     pairformer_torch = PairformerModuleTorch(
-        token_s=384, token_z=128, num_blocks=2, v2=True
+        token_s=384, token_z=128, num_blocks=5, v2=True
     ).eval()
     pairformer_state_dict = filter_dict(state_dict, "pairformer_module")
     pairformer.load_state_dict(

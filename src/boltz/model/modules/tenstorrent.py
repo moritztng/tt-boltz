@@ -1,6 +1,7 @@
 import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
+from time import time
 
 TRIANGLE_MULT_CHUNK_SIZE = 256
 TRANSITION_CHUNK_SIZE = 64
@@ -51,6 +52,19 @@ class Module:
             layout=ttnn.TILE_LAYOUT,
             device=device,
             dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+        )
+
+    def torch_to_tt_qkv(
+        self,
+        weight_tensor: torch.Tensor,
+        transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
+        use_float32: bool = False,
+    ) -> ttnn.Tensor:
+        return ttnn.from_torch(
+            transform(weight_tensor),
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            dtype=ttnn.float32 if USE_FLOAT32 or use_float32 else ttnn.bfloat8_b,
         )
 
 
@@ -281,22 +295,97 @@ class AttentionPairBias(Module):
             self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
             self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
+        hidden_size = self.n_heads * self.head_dim * 3
+        self.qkv_weight_torch = torch.cat(
+            [
+                self.state_dict["proj_q.weight"].reshape(
+                    [self.n_heads, self.head_dim, -1]
+                ),
+                self.state_dict["proj_k.weight"].reshape(
+                    [self.n_heads, self.head_dim, -1]
+                ),
+                self.state_dict["proj_v.weight"].reshape(
+                    [self.n_heads, self.head_dim, -1]
+                ),
+            ],
+            dim=0,
+        ).reshape([hidden_size, -1])
+        self.qkv_bias_torch = torch.cat(
+            [
+                self.state_dict["proj_q.bias"],
+                torch.zeros([self.n_heads * self.head_dim]),
+                torch.zeros([self.n_heads * self.head_dim]),
+            ],
+            dim=0,
+        )
+        self.qkvg_weight_torch = torch.cat(
+            [self.qkv_weight_torch, self.state_dict["proj_g.weight"]],
+            dim=0,
+        )
+        self.qkvg_weight = self.torch_to_tt_qkv(self.qkvg_weight_torch)
+        self.qkvg_bias_torch = torch.cat(
+            [self.qkv_bias_torch, torch.zeros([self.n_heads * self.head_dim])],
+            dim=0,
+        )
+        self.qkvg_bias = self.torch_to_tt_qkv(self.qkvg_bias_torch)
 
     def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
-        q = ttnn.linear(
+        ttnn.synchronize_device(device)
+        start_time = time()
+        TILE_W = 32
+        compute_grid_x = (s.shape[-1] // 2) // 32  # 384 / 2 / 32 = 6
+        compute_grid_y = 8  # 768 / 32 / 3 = 8
+        s_sharded = ttnn.to_memory_config(
             s,
-            self.q_weight,
-            bias=self.q_bias,
+            memory_config=ttnn.create_sharded_memory_config(
+                s.shape,
+                core_grid=ttnn.CoreGrid(y=compute_grid_y, x=compute_grid_x),
+                strategy=ttnn.ShardStrategy.BLOCK,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            ),
+            dtype=ttnn.bfloat8_b,
+        )
+        ttnn.deallocate(s)
+        compute_grid_size = device.compute_with_storage_grid_size()
+        TILE_W = 32
+        per_core_M = s_sharded.shape[1] // (compute_grid_y * TILE_W)
+        in0_block_w = 2  # s_sharded.shape[1] // (compute_grid_y * 1 *  TILE_W)
+        per_core_N = self.qkvg_weight.shape[-1] // (compute_grid_x * TILE_W)
+        qkvg = ttnn.linear(
+            s_sharded,
+            self.qkvg_weight,
+            bias=self.qkvg_bias,
             compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat8_b,
+            memory_config=ttnn.L1_BLOCK_SHARDED_MEMORY_CONFIG,
+            program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                compute_with_storage_grid_size=(
+                    compute_grid_size.x,
+                    compute_grid_size.y,
+                ),
+                in0_block_w=in0_block_w,
+                out_subblock_h=1,
+                out_subblock_w=2,
+                per_core_M=per_core_M,
+                per_core_N=per_core_N,
+                transpose_mcast=False,
+                fused_activation=None,
+            ),
         )
-        k = ttnn.linear(
-            s,
-            self.k_weight,
-            compute_kernel_config=self.compute_kernel_config,
+        qkvg = ttnn.to_memory_config(
+            qkvg, memory_config=ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat16
         )
-        v = ttnn.linear(
-            s, self.v_weight, compute_kernel_config=self.compute_kernel_config
-        )
+
+        q = qkvg[:, :, : self.head_dim * self.n_heads]
+        k = qkvg[:, :, self.head_dim * self.n_heads : 2 * self.head_dim * self.n_heads]
+        v = qkvg[
+            :, :, 2 * self.head_dim * self.n_heads : 3 * self.head_dim * self.n_heads
+        ]
+        g = qkvg[:, :, 3 * self.head_dim * self.n_heads :]
+        g = g[:, :, : self.head_dim * self.n_heads]
+        g = ttnn.sigmoid_accurate(g)
+        ttnn.deallocate(qkvg)
+
         q = ttnn.permute(q, (2, 0, 1))
         k = ttnn.permute(k, (2, 0, 1))
         v = ttnn.permute(v, (2, 0, 1))
@@ -306,8 +395,18 @@ class AttentionPairBias(Module):
         q = ttnn.permute(q, (0, 2, 3, 1))
         k = ttnn.permute(k, (0, 2, 1, 3))
         v = ttnn.permute(v, (0, 2, 3, 1))
-        a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
-        a = ttnn.multiply(a, self.head_dim**-0.5)
+        a = ttnn.matmul(
+            q,
+            k,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(q)
+        ttnn.deallocate(k)
+        v = ttnn.reallocate(v)
+
+        a = ttnn.multiply_(a, self.head_dim**-0.5)
+
         if self.compute_pair_bias:
             z = ttnn.layer_norm(
                 z,
@@ -322,25 +421,32 @@ class AttentionPairBias(Module):
                 compute_kernel_config=self.compute_kernel_config,
             )
         z = ttnn.permute(z, (3, 0, 1, 2))
-        a = ttnn.add(a, z)
+        a = ttnn.add_(a, z)
         a = ttnn.softmax(
             a,
             dim=-1,
             compute_kernel_config=self.compute_kernel_config,
             numeric_stable=True,
         )
-        o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
+        a = ttnn.to_memory_config(a, memory_config=ttnn.L1_MEMORY_CONFIG)
+        o = ttnn.matmul(
+            a,
+            v,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
         o = ttnn.permute(o, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
-        g = ttnn.linear(
-            s, self.g_weight, compute_kernel_config=self.compute_kernel_config
-        )
-        g = ttnn.sigmoid_accurate(g)
         o = ttnn.multiply(o, g)
-        x = ttnn.linear(
-            o, self.o_weight, compute_kernel_config=self.compute_kernel_config
+        x = ttnn.matmul(
+            o,
+            self.o_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
+        ttnn.synchronize_device(device)
+        print("pair bias time", time() - start_time)
         return x
 
 
