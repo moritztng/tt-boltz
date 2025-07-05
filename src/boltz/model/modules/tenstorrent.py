@@ -384,6 +384,7 @@ class AttentionPairBias(Module):
         g = qkvg[:, :, 3 * self.head_dim * self.n_heads :]
         g = g[:, :, : self.head_dim * self.n_heads]
         g = ttnn.sigmoid_accurate(g)
+        ttnn.deallocate(s_sharded)
         ttnn.deallocate(qkvg)
 
         q = ttnn.permute(q, (2, 0, 1))
