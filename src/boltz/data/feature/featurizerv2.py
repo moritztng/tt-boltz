@@ -754,14 +754,14 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
                             _token2["mol_type"] == const.chain_type_ids["NONPOLYMER"]
                             and (_token2["asym_id"], _token2["atom_idx"]) == token2
                         ):
-                            contact_conditioning[idx1][idx2] = (
+                            contact_conditioning[idx1, idx2] = (
                                 const.contact_conditioning_info["CONTACT"]
                             )
-                            contact_conditioning[idx2][idx1] = (
+                            contact_conditioning[idx2, idx1] = (
                                 const.contact_conditioning_info["CONTACT"]
                             )
-                            contact_threshold[idx1][idx2] = max_distance
-                            contact_threshold[idx2][idx1] = max_distance
+                            contact_threshold[idx1, idx2] = max_distance
+                            contact_threshold[idx2, idx1] = max_distance
                             break
                     break
 
@@ -1826,7 +1826,10 @@ def process_template_features(
         # Compute template features for each row
         row_features = compute_template_features(data, row_tokens, max_tokens)
         row_features['template_force'] = torch.tensor(template.force)
-        row_features['template_force_threshold'] = torch.tensor(template.threshold if template.threshold is not None else float('inf'), dtype=torch.float32)
+        row_features['template_force_threshold'] = torch.tensor(
+            template.threshold if template.threshold is not None else float('inf'),
+            dtype=torch.float32
+        )
         template_features.append(row_features)
 
     # Stack each feature

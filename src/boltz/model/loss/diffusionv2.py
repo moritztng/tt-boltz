@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from einops import einsum, rearrange
 
+
 def weighted_rigid_align(
     true_coords,  # Float['b n 3'],       #  true coordinates
     pred_coords,  # Float['b n 3'],       # predicted coordinates
@@ -16,9 +17,9 @@ def weighted_rigid_align(
 
     out_shape = torch.broadcast_shapes(true_coords.shape, pred_coords.shape)
     *batch_size, num_points, dim = out_shape
+    weights = (mask * weights).unsqueeze(-1)
 
     # Compute weighted centroids
-    weights = (mask * weights).unsqueeze(-1)
     true_centroid = (true_coords * weights).sum(dim=-2, keepdim=True) / weights.sum(
         dim=-2, keepdim=True
     )

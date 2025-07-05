@@ -307,7 +307,7 @@ def check_inputs(data: Path) -> list[Path]:
             if d.suffix not in (".fa", ".fas", ".fasta", ".yml", ".yaml"):
                 msg = (
                     f"Unable to parse filetype {d.suffix}, "
-                    "please provide a .fasta or  .yaml file."
+                    "please provide a .fasta or .yaml file."
                 )
                 raise RuntimeError(msg)
     else:
