@@ -1214,12 +1214,11 @@ class BoltzFeaturizer:
             symmetry_features = process_symmetry_features(data, symmetries)
 
         # Compute constraint features
+        residue_constraint_features = {}
+        chain_constraint_features = {}
         if compute_constraint_features:
             residue_constraint_features = process_residue_constraint_features(data)
             chain_constraint_features = process_chain_feature_constraints(data)
-        else:
-            residue_constraint_features = {}
-            chain_constraint_features = {}
 
         return {
             **token_features,

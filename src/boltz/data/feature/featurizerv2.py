@@ -2303,6 +2303,9 @@ class Boltz2Featurizer:
             symmetry_features = process_symmetry_features(data, symmetries)
 
         # Compute constraint features
+        residue_constraint_features = {}
+        chain_constraint_features = {}
+        contact_constraint_features = {}
         if compute_constraint_features:
             residue_constraint_features = process_residue_constraint_features(data)
             chain_constraint_features = process_chain_feature_constraints(data)
@@ -2311,10 +2314,6 @@ class Boltz2Featurizer:
                 inference_pocket_constraints,
                 inference_contact_constraints
             )
-        else:
-            residue_constraint_features = {}
-            chain_constraint_features = {}
-            contact_constraint_features = {}
 
         return {
             **token_features,

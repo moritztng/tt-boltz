@@ -933,7 +933,7 @@ def token_spec_to_ids(
         return (chain_to_idx[chain_name], atom_idx)
     else:
         # Polymer chains are indexed by residue index
-        return (chain_to_idx[chain_name], residue_index_or_atom_name - 1)
+        return chain_to_idx[chain_name], residue_index_or_atom_name - 1
 
 
 def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
