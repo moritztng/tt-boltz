@@ -263,7 +263,10 @@ class PredictionDataset(torch.utils.data.Dataset):
         if options is None:
             pocket_constraints, contact_constraints = None, None
         else:
-            pocket_constraints, contact_constraints = options.pocket_constraints, options.contact_constraints
+            pocket_constraints, contact_constraints = (
+                options.pocket_constraints,
+                options.contact_constraints,
+            )
 
         # Get random seed
         seed = 42

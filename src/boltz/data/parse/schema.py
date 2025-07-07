@@ -582,7 +582,7 @@ def get_template_records_from_search(
                 template_st=alignment.template_st,
                 template_en=alignment.template_en,
                 force=force,
-                threshold=threshold
+                threshold=threshold,
             )
             template_records.append(template_record)
 
@@ -616,7 +616,7 @@ def get_template_records_from_matching(
                 template_st=alignment.template_st,
                 template_en=alignment.template_en,
                 force=force,
-                threshold=threshold
+                threshold=threshold,
             )
             template_records.append(template_record)
 
@@ -716,7 +716,7 @@ def parse_ccd_residue(
         atom_name = atom.GetProp("name")
 
         # Drop leaving atoms for non-canonical amino acids.
-        if drop_leaving_atoms and int(atom.GetProp('leaving_atom')):
+        if drop_leaving_atoms and int(atom.GetProp("leaving_atom")):
             continue
 
         charge = atom.GetFormalCharge()
@@ -1218,9 +1218,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 affinity_mw=affinity_mw,
             )
 
-            assert not items[0][entity_type].get(
-                "cyclic", False
-            ), "Cyclic flag is not supported for ligands"
+            assert not items[0][entity_type].get("cyclic", False), (
+                "Cyclic flag is not supported for ligands"
+            )
 
         elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
@@ -1268,9 +1268,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 affinity_mw=affinity_mw,
             )
 
-            assert not items[0][entity_type].get(
-                "cyclic", False
-            ), "Cyclic flag is not supported for ligands"
+            assert not items[0][entity_type].get("cyclic", False), (
+                "Cyclic flag is not supported for ligands"
+            )
 
         else:
             msg = f"Invalid entity type: {entity_type}"
@@ -1527,11 +1527,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 "contacts"
             ]:
                 contact = token_spec_to_ids(
-                    chain_name, residue_index_or_atom_name, chain_to_idx, atom_idx_map, chains
+                    chain_name,
+                    residue_index_or_atom_name,
+                    chain_to_idx,
+                    atom_idx_map,
+                    chains,
                 )
                 contacts.append(contact)
 
-            force = constraint["pocket"].get('force', False)
+            force = constraint["pocket"].get("force", False)
             pocket_constraints.append((binder, contacts, max_distance, force))
         elif "contact" in constraint:
             if (
@@ -1549,13 +1553,21 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
             chain_name1, residue_index_or_atom_name1 = constraint["contact"]["token1"]
             token1 = token_spec_to_ids(
-                chain_name1, residue_index_or_atom_name1, chain_to_idx, atom_idx_map, chains
+                chain_name1,
+                residue_index_or_atom_name1,
+                chain_to_idx,
+                atom_idx_map,
+                chains,
             )
             chain_name2, residue_index_or_atom_name2 = constraint["contact"]["token2"]
             token2 = token_spec_to_ids(
-                chain_name2, residue_index_or_atom_name2, chain_to_idx, atom_idx_map, chains
+                chain_name2,
+                residue_index_or_atom_name2,
+                chain_to_idx,
+                atom_idx_map,
+                chains,
             )
-            force = constraint["pocket"].get('force', False)
+            force = constraint["pocket"].get("force", False)
 
             contact_constraints.append((token1, token2, max_distance, force))
         else:
@@ -1640,17 +1652,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 )
                 raise ValueError(msg)
 
-        force = template.get('force', False)
+        force = template.get("force", False)
         if force:
-            if 'threshold' in template:
-                threshold = template['threshold']
+            if "threshold" in template:
+                threshold = template["threshold"]
             else:
-                msg = (
-                    f"Template {template_id} must have threshold specified if force is set to True"
-                )
+                msg = f"Template {template_id} must have threshold specified if force is set to True"
                 raise ValueError(msg)
         else:
-            threshold = float('inf')
+            threshold = float("inf")
         # Compute template records
 
         if matched:
@@ -1662,7 +1672,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     template_chain_ids=template_chain_ids,
                     template_sequences=parsed_template.sequences,
                     force=force,
-                    threshold=threshold
+                    threshold=threshold,
                 )
             )
         else:
@@ -1674,7 +1684,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     template_chain_ids=template_chain_ids,
                     template_sequences=parsed_template.sequences,
                     force=force,
-                    threshold=threshold
+                    threshold=threshold,
                 )
             )
         # Save template
@@ -1755,7 +1765,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         )
         chain_infos.append(chain_info)
 
-    options = InferenceOptions(pocket_constraints=pocket_constraints, contact_constraints=contact_constraints)
+    options = InferenceOptions(
+        pocket_constraints=pocket_constraints, contact_constraints=contact_constraints
+    )
     record = Record(
         id=name,
         structure=struct_info,

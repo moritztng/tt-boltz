@@ -39,7 +39,9 @@ def weighted_rigid_align(
 
     # Compute the weighted covariance matrix
     cov_matrix = einsum(
-        weights * pred_coords_centered, true_coords_centered, "... n i, ... n j -> ... i j",
+        weights * pred_coords_centered,
+        true_coords_centered,
+        "... n i, ... n j -> ... i j",
     )
 
     # Compute the SVD of the covariance matrix, required float32 for svd and determinant
@@ -60,7 +62,9 @@ def weighted_rigid_align(
         )
 
     # Compute the rotation matrix
-    rot_matrix = torch.einsum("... i j, ... k j -> ... i k", U, V).to(dtype=torch.float32)
+    rot_matrix = torch.einsum("... i j, ... k j -> ... i k", U, V).to(
+        dtype=torch.float32
+    )
 
     # Ensure proper rotation matrix with determinant 1
     F = torch.eye(dim, dtype=cov_matrix_32.dtype, device=cov_matrix.device)[
