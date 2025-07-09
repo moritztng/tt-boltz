@@ -282,7 +282,9 @@ class AttentionPairBias(Module):
             self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
-    def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor, s_kv: ttnn.Tensor = None) -> ttnn.Tensor:
+        if s_kv is None:
+            s_kv = s
         q = ttnn.linear(
             s,
             self.q_weight,
@@ -290,12 +292,12 @@ class AttentionPairBias(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         k = ttnn.linear(
-            s,
+            s_kv,
             self.k_weight,
             compute_kernel_config=self.compute_kernel_config,
         )
         v = ttnn.linear(
-            s, self.v_weight, compute_kernel_config=self.compute_kernel_config
+            s_kv, self.v_weight, compute_kernel_config=self.compute_kernel_config
         )
         q = ttnn.permute(q, (2, 0, 1))
         k = ttnn.permute(k, (2, 0, 1))
@@ -639,9 +641,18 @@ class DiffusionTransformerLayer(Module):
             compute_kernel_config,
         )
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
         b = self.adaln(a, s)
-        b = self.attn_pair_bias(b, z)
+        if keys_indexing is None:
+            b = self.attn_pair_bias(b, z)
+        else:
+            K, W, D = b.shape
+            x = ttnn.reshape(b, (2 * K, W // 2, D))
+            x = ttnn.permute(x, (1, 2, 0))
+            x = ttnn.matmul(x, keys_indexing)
+            x = ttnn.permute(x, (2, 0, 1))
+            x = ttnn.reshape(x, (K, -1, D))
+            b = self.attn_pair_bias(b, z, x)
         s_o = ttnn.linear(
             s,
             self.output_projection_weight,
@@ -676,9 +687,10 @@ class DiffusionTransformer(Module):
             for i in range(n_layers)
         ]
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
+        dim = z.shape[-1] // len(self.layers)
         for i, layer in enumerate(self.layers):
-            a = layer(a, s, z[:, :, :, i * 16 : (i + 1) * 16])
+            a = layer(a, s, z[:, :, :, i * dim : (i + 1) * dim], keys_indexing)
         return a
 
 
@@ -1002,7 +1014,6 @@ class PairformerModule(TorchWrapper):
             )
         )
 
-
 class DiffusionTransformerModule(TorchWrapper):
     def __init__(
         self,
@@ -1015,6 +1026,7 @@ class DiffusionTransformerModule(TorchWrapper):
         self.dim = dim
         self.n_heads = n_heads
         self.bias = None
+        self.keys_indexing = None
 
     def _load_from_state_dict(
         self,
@@ -1039,6 +1051,7 @@ class DiffusionTransformerModule(TorchWrapper):
         a: torch.Tensor,
         s: torch.Tensor,
         bias: torch.Tensor,
+        keys_indexing: torch.Tensor = None,
         mask: torch.Tensor = None,
         to_keys=None,
         multiplicity: int = 1,
@@ -1046,11 +1059,14 @@ class DiffusionTransformerModule(TorchWrapper):
     ) -> torch.Tensor:
         if self.bias is None:
             self.bias = self._from_torch(bias)
+        if self.keys_indexing is None and keys_indexing is not None:
+            self.keys_indexing = self._from_torch(keys_indexing)
         x = self._to_torch(
             self.module(
                 self._from_torch(a),
                 self._from_torch(s),
                 self.bias,
+                self.keys_indexing,
             )
         )
         return x

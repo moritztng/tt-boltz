@@ -84,6 +84,7 @@ class DiffusionModule(Module):
             structure_prediction=True,
             activation_checkpointing=activation_checkpointing,
             transformer_post_layer_norm=transformer_post_ln,
+            use_tenstorrent=use_tenstorrent
         )
 
         self.s_to_a_linear = nn.Sequential(
@@ -120,6 +121,7 @@ class DiffusionModule(Module):
             atom_decoder_depth=atom_decoder_depth,
             atom_decoder_heads=atom_decoder_heads,
             activation_checkpointing=activation_checkpointing,
+            use_tenstorrent=use_tenstorrent,
             # transformer_post_layer_norm=transformer_post_ln,
         )
 
