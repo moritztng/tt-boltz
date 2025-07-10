@@ -148,11 +148,12 @@ class Boltz2DiffusionParams:
 class BoltzSteeringParams:
     """Steering parameters."""
 
-    fk_steering: bool = True
+    fk_steering: bool = False
     num_particles: int = 3
     fk_lambda: float = 4.0
     fk_resampling_interval: int = 3
-    guidance_update: bool = True
+    physical_guidance_update: bool = False
+    contact_guidance_update: bool = True
     num_gd_steps: int = 20
 
 
@@ -206,13 +207,19 @@ def download_boltz2(cache: Path) -> None:
     # Download CCD
     mols = cache / "mols"
     tar_mols = cache / "mols.tar"
-    if not mols.exists():
+    if not tar_mols.exists():
         click.echo(
-            f"Downloading and extracting the CCD data to {mols}. "
+            f"Downloading the CCD data to {tar_mols}. "
             "This may take a bit of time. You may change the cache directory "
             "with the --cache flag."
         )
         urllib.request.urlretrieve(MOL_URL, str(tar_mols))  # noqa: S310
+    if not mols.exists():
+        click.echo(
+            f"Extracting the CCD data to {mols}. "
+            "This may take a bit of time. You may change the cache directory "
+            "with the --cache flag."
+        )
         with tarfile.open(str(tar_mols), "r") as tar:
             tar.extractall(cache)  # noqa: S202
 
@@ -331,9 +338,12 @@ def filter_inputs_structure(
         The manifest of the filtered input data.
 
     """
-    # Check if existing predictions are found
-    existing = (outdir / "predictions").rglob("*")
-    existing = {e.name for e in existing if e.is_dir()}
+    # Check if existing predictions are found (only top-level prediction folders)
+    pred_dir = outdir / "predictions"
+    if pred_dir.exists():
+        existing = {d.name for d in pred_dir.iterdir() if d.is_dir()}
+    else:
+        existing = set()
 
     # Remove them from the input data
     if existing and not override:
@@ -928,6 +938,11 @@ def cli() -> None:
     is_flag=True,
     help="Whether to disable the kernels. Default False",
 )
+@click.option(
+    "--write_embeddings",
+    is_flag=True,
+    help=" to dump the s and z embeddings into a npz file. Default is False.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -961,6 +976,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
+    write_embeddings: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1112,6 +1128,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         output_dir=out_dir / "predictions",
         output_format=output_format,
         boltz2=model == "boltz2",
+        write_embeddings=write_embeddings,
     )
 
     # Set up trainer
@@ -1170,7 +1187,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         steering_args = BoltzSteeringParams()
         steering_args.fk_steering = use_potentials
-        steering_args.guidance_update = use_potentials
+        steering_args.physical_guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(
