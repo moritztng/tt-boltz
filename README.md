@@ -53,7 +53,7 @@ There are two main predictions in the affinity output: `affinity_pred_value` and
 
 ⚠️ **Coming soon: updated evaluation code for Boltz-2!**
 
-To encourage reproducibility and facilitate comparison with other models, on top of the existing Boltz-1 evaluation pipeline, we will soon provide the evaluation scripts and structural predictions for Boltz-2, Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset, and our affinity predictions on the FEP+ benchamark, CASP16 and our MF-PCBA test set.
+To encourage reproducibility and facilitate comparison with other models, on top of the existing Boltz-1 evaluation pipeline, we will soon provide the evaluation scripts and structural predictions for Boltz-2, Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset, and our affinity predictions on the FEP+ benchmark, CASP16 and our MF-PCBA test set.
 
 ![Affinity test sets evaluations](docs/pearson_plot.png)
 ![Test set evaluations](docs/plot_test_boltz2.png)
@@ -70,7 +70,7 @@ If you're interested in retraining the model, currently for Boltz-1 but soon for
 
 We welcome external contributions and are eager to engage with the community. Connect with us on our [Slack channel](https://join.slack.com/t/boltz-community/shared_invite/zt-37uc4m8t2-gbbph6ka704ORcDCHLlFKg) to discuss advancements, share insights, and foster collaboration around Boltz-2.
 
-Boltz also runs on Tenstorrent hardware thanks to a [fork](https://github.com/moritztng/tt-boltz) by Moritz Thüning.
+On recent NVIDIA GPUs, Boltz leverages the acceleration provided by [NVIDIA  cuEquivariance](https://developer.nvidia.com/cuequivariance) kernels. Boltz also runs on Tenstorrent hardware thanks to a [fork](https://github.com/moritztng/tt-boltz) by Moritz Thüning.
 
 ## License
 
