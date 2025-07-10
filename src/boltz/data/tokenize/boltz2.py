@@ -46,6 +46,7 @@ class TokenData:
 def token_astuple(token: TokenData) -> tuple:
     """Convert a TokenData object to a tuple."""
     return (
+        token.token_idx,
         token.atom_idx,
         token.atom_num,
         token.res_idx,
@@ -250,7 +251,8 @@ def tokenize_structure(  # noqa: C901, PLR0915
 
                 # Update atom_idx to token_idx
                 atom_to_token.update(
-                    dict.fromkeys(range(atom_start, atom_end), token_idx))
+                    dict.fromkeys(range(atom_start, atom_end), token_idx)
+                )
 
                 token_idx += 1
 
@@ -349,7 +351,8 @@ def tokenize_structure(  # noqa: C901, PLR0915
 
                 # Update atom_idx to token_idx
                 atom_to_token.update(
-                    dict.fromkeys(range(atom_start, atom_end), token_idx))
+                    dict.fromkeys(range(atom_start, atom_end), token_idx)
+                )
 
                 token_idx += 1
 
