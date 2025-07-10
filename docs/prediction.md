@@ -50,13 +50,18 @@ constraints:
         binder: CHAIN_ID
         contacts: [[CHAIN_ID, RES_IDX/ATOM_NAME], [CHAIN_ID, RES_IDX/ATOM_NAME]]
         max_distance: DIST_ANGSTROM
+        force: false # if force is set to true (defualt is false), a potential will be used to enforce the pocket constraint
     - contact:
         token1: [CHAIN_ID, RES_IDX/ATOM_NAME]
         token2: [CHAIN_ID, RES_IDX/ATOM_NAME]
         max_distance: DIST_ANGSTROM
+        force: false # if force is set to true (defualt is false), a potential will be used to enforce the pocket constraint
 
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
+    - cif: CIF_PATH
+      force: true # if force is set to true (defualt is false), a potential will be used to enforce the template
+      threshold: DISTANCE_THRESHOLD # controls the distance (in Angstroms) that the prediction can deviate from the template
     - cif: CIF_PATH
       chain_id: CHAIN_ID   # optional, specify which chain to find a template for
     - cif: CIF_PATH
@@ -242,9 +247,10 @@ The output affinity `.json` file is organized as follows:
     "affinity_probability_binary2": 0.8402,    # Predicted binding likelihood from the second model in the ensemble
 }
 ```
-There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. Add commentMore actions
 
-The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. Its value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder.
+There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. 
+
+The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. It's value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder.
 
 The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. Lower values indicate stronger predicted binding, for instance:
 - IC50 of $10^{-9}$ M $\longrightarrow$ our model outputs $-3$ (strong binder)

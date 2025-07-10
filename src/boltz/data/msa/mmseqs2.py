@@ -51,10 +51,14 @@ def run_mmseqs2(  # noqa: PLR0912, D103, C901, PLR0915
                 )
             except Exception as e:
                 error_count += 1
-                logger.warning(f"Error while fetching result from MSA server. Retrying... ({error_count}/5)")
+                logger.warning(
+                    f"Error while fetching result from MSA server. Retrying... ({error_count}/5)"
+                )
                 logger.warning(f"Error: {e}")
                 if error_count > 5:
-                    raise Exception("Too many failed attempts for the MSA generation request.")
+                    raise Exception(
+                        "Too many failed attempts for the MSA generation request."
+                    )
                 time.sleep(5)
             else:
                 break
@@ -75,10 +79,14 @@ def run_mmseqs2(  # noqa: PLR0912, D103, C901, PLR0915
                 )
             except Exception as e:
                 error_count += 1
-                logger.warning(f"Error while fetching result from MSA server. Retrying... ({error_count}/5)")
+                logger.warning(
+                    f"Error while fetching result from MSA server. Retrying... ({error_count}/5)"
+                )
                 logger.warning(f"Error: {e}")
                 if error_count > 5:
-                    raise Exception("Too many failed attempts for the MSA generation request.")
+                    raise Exception(
+                        "Too many failed attempts for the MSA generation request."
+                    )
                 time.sleep(5)
             else:
                 break
@@ -98,10 +106,14 @@ def run_mmseqs2(  # noqa: PLR0912, D103, C901, PLR0915
                 )
             except Exception as e:
                 error_count += 1
-                logger.warning(f"Error while fetching result from MSA server. Retrying... ({error_count}/5)")
+                logger.warning(
+                    f"Error while fetching result from MSA server. Retrying... ({error_count}/5)"
+                )
                 logger.warning(f"Error: {e}")
                 if error_count > 5:
-                    raise Exception("Too many failed attempts for the MSA generation request.")
+                    raise Exception(
+                        "Too many failed attempts for the MSA generation request."
+                    )
                 time.sleep(5)
             else:
                 break

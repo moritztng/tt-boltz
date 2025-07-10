@@ -148,11 +148,12 @@ class Boltz2DiffusionParams:
 class BoltzSteeringParams:
     """Steering parameters."""
 
-    fk_steering: bool = True
+    fk_steering: bool = False
     num_particles: int = 3
     fk_lambda: float = 4.0
     fk_resampling_interval: int = 3
-    guidance_update: bool = True
+    physical_guidance_update: bool = False
+    contact_guidance_update: bool = True
     num_gd_steps: int = 20
 
 
@@ -1183,7 +1184,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         steering_args = BoltzSteeringParams()
         steering_args.fk_steering = use_potentials
-        steering_args.guidance_update = use_potentials
+        steering_args.physical_guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(

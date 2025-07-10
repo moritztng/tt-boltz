@@ -123,7 +123,7 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
         atoms=structure["atoms"],
         bonds=structure["bonds"],
         residues=structure["residues"],
-        chains=chains, # chains var accounting for missing cyclic_period
+        chains=chains,  # chains var accounting for missing cyclic_period
         connections=structure["connections"].astype(Connection),
         interfaces=structure["interfaces"],
         mask=structure["mask"],
