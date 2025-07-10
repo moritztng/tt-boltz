@@ -50,18 +50,18 @@ constraints:
         binder: CHAIN_ID
         contacts: [[CHAIN_ID, RES_IDX/ATOM_NAME], [CHAIN_ID, RES_IDX/ATOM_NAME]]
         max_distance: DIST_ANGSTROM
-        force: false # if force is set to true (defualt is false), a potential will be used to enforce the pocket constraint
+        force: false # if force is set to true (default is false), a potential will be used to enforce the pocket constraint
     - contact:
         token1: [CHAIN_ID, RES_IDX/ATOM_NAME]
         token2: [CHAIN_ID, RES_IDX/ATOM_NAME]
         max_distance: DIST_ANGSTROM
-        force: false # if force is set to true (defualt is false), a potential will be used to enforce the pocket constraint
+        force: false # if force is set to true (default is false), a potential will be used to enforce the pocket constraint
 
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
     - cif: CIF_PATH
-      force: true # if force is set to true (defualt is false), a potential will be used to enforce the template
-      threshold: DISTANCE_THRESHOLD # controls the distance (in Angstroms) that the prediction can deviate from the template
+      force: true # optional, if force is set to true (default is false), a potential will be used to enforce the template
+      threshold: DISTANCE_THRESHOLD # optional, controls the distance (in Angstroms) that the prediction can deviate from the template
     - cif: CIF_PATH
       chain_id: CHAIN_ID   # optional, specify which chain to find a template for
     - cif: CIF_PATH
