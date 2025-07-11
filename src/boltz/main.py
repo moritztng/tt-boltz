@@ -490,8 +490,6 @@ def compute_msa(
         msa_server_username=msa_server_username,
         msa_server_password=msa_server_password,
         auth_headers=auth_headers,
-        api_key_header=api_key_header,
-        api_key_value=api_key_value,
     )
 
     for idx, name in enumerate(data):

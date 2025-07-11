@@ -29,16 +29,13 @@ def run_mmseqs2(  # noqa: PLR0912, D103, C901, PLR0915
     msa_server_username: Optional[str] = None,
     msa_server_password: Optional[str] = None,
     auth_headers: Optional[Dict[str, str]] = None,
-    api_key_header: Optional[str] = None,
-    api_key_value: Optional[str] = None,
 ) -> tuple[list[str], list[str]]:
     submission_endpoint = "ticket/pair" if use_pairing else "ticket/msa"
 
     # Validate mutually exclusive authentication methods
     has_basic_auth = msa_server_username and msa_server_password
     has_header_auth = auth_headers is not None
-    has_api_key = api_key_value is not None
-    if has_basic_auth and (has_header_auth or has_api_key):
+    if has_basic_auth and (has_header_auth or auth_headers):
         raise ValueError(
             "Cannot use both basic authentication (username/password) and header/API key authentication. "
             "Please use only one authentication method."
@@ -56,12 +53,6 @@ def run_mmseqs2(  # noqa: PLR0912, D103, C901, PLR0915
     elif has_header_auth:
         headers.update(auth_headers)
         logger.debug("MMSeqs2 server authentication: using header-based authentication")
-    elif has_api_key:
-        # Use custom header if provided, else default to X-API-Key
-        key = api_key_header if api_key_header else "X-API-Key"
-        value = api_key_value
-        headers[key] = value
-        logger.debug(f"MMSeqs2 server authentication: using API key in header '{key}'")
     else:
         logger.debug("MMSeqs2 server authentication: no credentials provided")
     
