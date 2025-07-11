@@ -262,6 +262,7 @@ class AtomTransformer(Module):
             a=q,
             s=c,
             bias=bias,
+            mask=mask.float(),
             keys_indexing=to_keys.keywords['indexing_matrix'],
         ) if self.use_tenstorrent else self.diffusion_transformer(
             a=q,

@@ -282,7 +282,7 @@ class AttentionPairBias(Module):
             self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
-    def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor, s_kv: ttnn.Tensor = None) -> ttnn.Tensor:
+    def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor, s_kv: ttnn.Tensor = None, mask: ttnn.Tensor = None) -> ttnn.Tensor:
         if s_kv is None:
             s_kv = s
         q = ttnn.linear(
@@ -325,6 +325,8 @@ class AttentionPairBias(Module):
             )
         z = ttnn.permute(z, (3, 0, 1, 2))
         a = ttnn.add(a, z)
+        if mask is not None:
+            a = ttnn.add(a, mask)
         a = ttnn.softmax(
             a,
             dim=-1,
@@ -641,18 +643,18 @@ class DiffusionTransformerLayer(Module):
             compute_kernel_config,
         )
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
         b = self.adaln(a, s)
         if keys_indexing is None:
             b = self.attn_pair_bias(b, z)
         else:
             K, W, D = b.shape
-            x = ttnn.reshape(b, (2 * K, W // 2, D))
-            x = ttnn.permute(x, (1, 2, 0))
-            x = ttnn.matmul(x, keys_indexing)
-            x = ttnn.permute(x, (2, 0, 1))
-            x = ttnn.reshape(x, (K, -1, D))
-            b = self.attn_pair_bias(b, z, x)
+            b_kv = ttnn.reshape(b, (2 * K, W // 2, -1))
+            b_kv = ttnn.permute(b_kv, (1, 2, 0))
+            b_kv = ttnn.matmul(b_kv, keys_indexing, compute_kernel_config=self.compute_kernel_config)
+            b_kv = ttnn.permute(b_kv, (2, 0, 1))
+            b_kv = ttnn.reshape(b_kv, (K, -1, D))
+            b = self.attn_pair_bias(b, z, b_kv, mask)
         s_o = ttnn.linear(
             s,
             self.output_projection_weight,
@@ -687,10 +689,10 @@ class DiffusionTransformer(Module):
             for i in range(n_layers)
         ]
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
         dim = z.shape[-1] // len(self.layers)
         for i, layer in enumerate(self.layers):
-            a = layer(a, s, z[:, :, :, i * dim : (i + 1) * dim], keys_indexing)
+            a = layer(a, s, z[:, :, :, i * dim : (i + 1) * dim], mask, keys_indexing)
         return a
 
 
@@ -1026,6 +1028,7 @@ class DiffusionTransformerModule(TorchWrapper):
         self.dim = dim
         self.n_heads = n_heads
         self.bias = None
+        self.mask = None
         self.keys_indexing = None
 
     def _load_from_state_dict(
@@ -1051,8 +1054,8 @@ class DiffusionTransformerModule(TorchWrapper):
         a: torch.Tensor,
         s: torch.Tensor,
         bias: torch.Tensor,
-        keys_indexing: torch.Tensor = None,
         mask: torch.Tensor = None,
+        keys_indexing: torch.Tensor = None,
         to_keys=None,
         multiplicity: int = 1,
         model_cache: torch.Tensor = None,
@@ -1061,11 +1064,20 @@ class DiffusionTransformerModule(TorchWrapper):
             self.bias = self._from_torch(bias)
         if self.keys_indexing is None and keys_indexing is not None:
             self.keys_indexing = self._from_torch(keys_indexing)
+            mask = self._from_torch(mask)
+            K, W = mask.shape
+            mask = ttnn.reshape(mask, (2 * K, W // 2, -1))
+            mask = ttnn.permute(mask, (1, 2, 0))
+            mask = ttnn.matmul(mask, self.keys_indexing, compute_kernel_config=self.compute_kernel_config)
+            mask = ttnn.permute(mask, (2, 0, 1))
+            mask = ttnn.reshape(mask, (1, K, 1, -1))
+            self.mask = (-1 * mask + 1) * -1e9
         x = self._to_torch(
             self.module(
                 self._from_torch(a),
                 self._from_torch(s),
                 self.bias,
+                self.mask,
                 self.keys_indexing,
             )
         )
