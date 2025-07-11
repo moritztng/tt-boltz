@@ -460,7 +460,7 @@ def compute_msa(
             key: value
         }
         click.echo(f"Using API key authentication for MSA server (header: {key})")
-    elif msa_server_username:
+    elif msa_server_username and msa_server_password:
         click.echo("Using basic authentication for MSA server")
     else:
         click.echo("No authentication provided for MSA server")
@@ -490,6 +490,8 @@ def compute_msa(
         msa_server_username=msa_server_username,
         msa_server_password=msa_server_password,
         auth_headers=auth_headers,
+        api_key_header=api_key_header,
+        api_key_value=api_key_value,
     )
 
     for idx, name in enumerate(data):
@@ -1122,7 +1124,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         click.echo(f"MSA server enabled: {msa_server_url}")
         if api_key_value:
             click.echo("MSA server authentication: using API key header")
-        elif msa_server_username:
+        elif msa_server_username and msa_server_password:
             click.echo("MSA server authentication: using basic auth")
         else:
             click.echo("MSA server authentication: no credentials provided")
