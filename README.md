@@ -49,6 +49,52 @@ boltz predict input_path --use_msa_server
 ### Binding Affinity Prediction
 There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. It's value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder. The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. More details on how to run affinity predictions and parse the output can be found in our [prediction instructions](docs/prediction.md).
 
+## Authentication to MSA Server
+
+When using the `--use_msa_server` option with a server that requires authentication, you can provide credentials in one of two ways:
+
+### 1. Basic Authentication
+
+- Use the CLI options `--msa_server_username` and `--msa_server_password`.
+- Or, set the environment variables:
+  - `BOLTZ_MSA_USERNAME` (for the username)
+  - `BOLTZ_MSA_PASSWORD` (for the password, recommended for security)
+
+**Example:**
+```bash
+export BOLTZ_MSA_USERNAME=myuser
+export BOLTZ_MSA_PASSWORD=mypassword
+boltz predict ... --use_msa_server
+```
+Or:
+```bash
+boltz predict ... --use_msa_server --msa_server_username myuser --msa_server_password mypassword
+```
+
+### 2. API Key Authentication
+
+- Use the CLI options `--api_key_header` (default: `X-API-Key`) and `--api_key_value` to specify the header and value for API key authentication.
+- Or, set the API key value via the environment variable `MSA_API_KEY_VALUE` (recommended for security).
+
+**Example using CLI:**
+```bash
+boltz predict ... --use_msa_server --api_key_header X-API-Key --api_key_value <your-api-key>
+```
+
+**Example using environment variable:**
+```bash
+export MSA_API_KEY_VALUE=<your-api-key>
+boltz predict ... --use_msa_server --api_key_header X-API-Key
+```
+If both the CLI option and environment variable are set, the CLI option takes precedence.
+
+> If your server expects a different header, set `--api_key_header` accordingly (e.g., `--api_key_header X-Gravitee-Api-Key`).
+
+---
+
+**Note:**  
+Only one authentication method (basic or API key) can be used at a time. If both are provided, the program will raise an error.
+
 ## Evaluation
 
 ⚠️ **Coming soon: updated evaluation code for Boltz-2!**

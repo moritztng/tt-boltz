@@ -417,6 +417,10 @@ def compute_msa(
     msa_dir: Path,
     msa_server_url: str,
     msa_pairing_strategy: str,
+    msa_server_username: Optional[str] = None,
+    msa_server_password: Optional[str] = None,
+    api_key_header: Optional[str] = None,
+    api_key_value: Optional[str] = None,
 ) -> None:
     """Compute the MSA for the input data.
 
@@ -432,8 +436,35 @@ def compute_msa(
         The MSA server URL.
     msa_pairing_strategy : str
         The MSA pairing strategy.
+    msa_server_username : str, optional
+        Username for basic authentication with MSA server.
+    msa_server_password : str, optional
+        Password for basic authentication with MSA server.
+    api_key_header : str, optional
+        Custom header key for API key authentication (default: X-API-Key).
+    api_key_value : str, optional
+        Custom header value for API key authentication (overrides --api_key if set).
 
     """
+    click.echo(f"Calling MSA server for target {target_id} with {len(data)} sequences")
+    click.echo(f"MSA server URL: {msa_server_url}")
+    click.echo(f"MSA pairing strategy: {msa_pairing_strategy}")
+    
+    # Construct auth headers if API key header/value is provided
+    auth_headers = None
+    if api_key_value:
+        key = api_key_header if api_key_header else "X-API-Key"
+        value = api_key_value
+        auth_headers = {
+            "Content-Type": "application/json",
+            key: value
+        }
+        click.echo(f"Using API key authentication for MSA server (header: {key})")
+    elif msa_server_username:
+        click.echo("Using basic authentication for MSA server")
+    else:
+        click.echo("No authentication provided for MSA server")
+    
     if len(data) > 1:
         paired_msas = run_mmseqs2(
             list(data.values()),
@@ -442,6 +473,9 @@ def compute_msa(
             use_pairing=True,
             host_url=msa_server_url,
             pairing_strategy=msa_pairing_strategy,
+            msa_server_username=msa_server_username,
+            msa_server_password=msa_server_password,
+            auth_headers=auth_headers,
         )
     else:
         paired_msas = [""] * len(data)
@@ -453,6 +487,9 @@ def compute_msa(
         use_pairing=False,
         host_url=msa_server_url,
         pairing_strategy=msa_pairing_strategy,
+        msa_server_username=msa_server_username,
+        msa_server_password=msa_server_password,
+        auth_headers=auth_headers,
     )
 
     for idx, name in enumerate(data):
@@ -493,6 +530,10 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
     use_msa_server: bool,
     msa_server_url: str,
     msa_pairing_strategy: str,
+    msa_server_username: Optional[str],
+    msa_server_password: Optional[str],
+    api_key_header: Optional[str],
+    api_key_value: Optional[str],
     max_msa_seqs: int,
     processed_msa_dir: Path,
     processed_constraints_dir: Path,
@@ -549,6 +590,10 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
                 msa_dir=msa_dir,
                 msa_server_url=msa_server_url,
                 msa_pairing_strategy=msa_pairing_strategy,
+                msa_server_username=msa_server_username,
+                msa_server_password=msa_server_password,
+                api_key_header=api_key_header,
+                api_key_value=api_key_value,
             )
 
         # Parse MSA data
@@ -625,6 +670,10 @@ def process_inputs(
     msa_pairing_strategy: str,
     max_msa_seqs: int = 8192,
     use_msa_server: bool = False,
+    msa_server_username: Optional[str] = None,
+    msa_server_password: Optional[str] = None,
+    api_key_header: Optional[str] = None,
+    api_key_value: Optional[str] = None,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
 ) -> Manifest:
@@ -642,6 +691,14 @@ def process_inputs(
         Max number of MSA sequences, by default 4096.
     use_msa_server : bool, optional
         Whether to use the MMSeqs2 server for MSA generation, by default False.
+    msa_server_username : str, optional
+        Username for basic authentication with MSA server, by default None.
+    msa_server_password : str, optional
+        Password for basic authentication with MSA server, by default None.
+    api_key_header : str, optional
+        Custom header key for API key authentication (default: X-API-Key).
+    api_key_value : str, optional
+        Custom header value for API key authentication (overrides --api_key if set).
     boltz2: bool, optional
         Whether to use Boltz2, by default False.
     preprocessing_threads: int, optional
@@ -653,6 +710,16 @@ def process_inputs(
         The manifest of the processed input data.
 
     """
+    # Validate mutually exclusive authentication methods
+    has_basic_auth = msa_server_username and msa_server_password
+    has_api_key = api_key_value is not None
+    
+    if has_basic_auth and has_api_key:
+        raise ValueError(
+            "Cannot use both basic authentication (--msa_server_username/--msa_server_password) "
+            "and API key authentication (--api_key_header/--api_key_value). Please use only one authentication method."
+        )
+
     # Check if records exist at output path
     records_dir = out_dir / "processed" / "records"
     if records_dir.exists():
@@ -710,6 +777,10 @@ def process_inputs(
         use_msa_server=use_msa_server,
         msa_server_url=msa_server_url,
         msa_pairing_strategy=msa_pairing_strategy,
+        msa_server_username=msa_server_username,
+        msa_server_password=msa_server_password,
+        api_key_header=api_key_header,
+        api_key_value=api_key_value,
         max_msa_seqs=max_msa_seqs,
         processed_msa_dir=processed_msa_dir,
         processed_constraints_dir=processed_constraints_dir,
@@ -870,6 +941,30 @@ def cli() -> None:
     default="greedy",
 )
 @click.option(
+    "--msa_server_username",
+    type=str,
+    help="MSA server username for basic auth. Used only if --use_msa_server is set. Can also be set via BOLTZ_MSA_USERNAME environment variable.",
+    default=None,
+)
+@click.option(
+    "--msa_server_password",
+    type=str,
+    help="MSA server password for basic auth. Used only if --use_msa_server is set. Can also be set via BOLTZ_MSA_PASSWORD environment variable.",
+    default=None,
+)
+@click.option(
+    "--api_key_header",
+    type=str,
+    help="Custom header key for API key authentication (default: X-API-Key).",
+    default=None,
+)
+@click.option(
+    "--api_key_value",
+    type=str,
+    help="Custom header value for API key authentication.",
+    default=None,
+)
+@click.option(
     "--use_potentials",
     is_flag=True,
     help="Whether to not use potentials for steering. Default is False.",
@@ -967,6 +1062,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
+    msa_server_username: Optional[str] = None,
+    msa_server_password: Optional[str] = None,
+    api_key_header: Optional[str] = None,
+    api_key_value: Optional[str] = None,
     use_potentials: bool = False,
     model: Literal["boltz1", "boltz2"] = "boltz2",
     method: Optional[str] = None,
@@ -1011,6 +1110,23 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     cache = Path(cache).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
 
+    # Get MSA server credentials from environment variables if not provided
+    if use_msa_server:
+        if msa_server_username is None:
+            msa_server_username = os.environ.get("BOLTZ_MSA_USERNAME")
+        if msa_server_password is None:
+            msa_server_password = os.environ.get("BOLTZ_MSA_PASSWORD")
+        if api_key_value is None:
+            api_key_value = os.environ.get("MSA_API_KEY_VALUE")
+        
+        click.echo(f"MSA server enabled: {msa_server_url}")
+        if api_key_value:
+            click.echo("MSA server authentication: using API key header")
+        elif msa_server_username:
+            click.echo("MSA server authentication: using basic auth")
+        else:
+            click.echo("MSA server authentication: no credentials provided")
+
     # Create output directories
     data = Path(data).expanduser()
     out_dir = Path(out_dir).expanduser()
@@ -1050,6 +1166,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         use_msa_server=use_msa_server,
         msa_server_url=msa_server_url,
         msa_pairing_strategy=msa_pairing_strategy,
+        msa_server_username=msa_server_username,
+        msa_server_password=msa_server_password,
+        api_key_header=api_key_header,
+        api_key_value=api_key_value,
         boltz2=model == "boltz2",
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
