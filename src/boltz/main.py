@@ -1266,6 +1266,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.fk_steering = False
         steering_args.guidance_update = False
         steering_args.physical_guidance_update = False
+        steering_args.contact_guidance_update = False
         
         model_module = Boltz2.load_from_checkpoint(
             affinity_checkpoint,
