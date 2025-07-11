@@ -1262,6 +1262,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         if affinity_checkpoint is None:
             affinity_checkpoint = cache / "boltz2_aff.ckpt"
 
+        steering_args = BoltzSteeringParams()
+        steering_args.fk_steering = False
+        steering_args.guidance_update = False
+        steering_args.physical_guidance_update = False
+        steering_args.contact_guidance_update = False
+        
         model_module = Boltz2.load_from_checkpoint(
             affinity_checkpoint,
             strict=True,
@@ -1271,7 +1277,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             ema=False,
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
-            steering_args={"fk_steering": False, "guidance_update": False},
+            steering_args=asdict(steering_args),
             affinity_mw_correction=affinity_mw_correction,
         )
         model_module.eval()
