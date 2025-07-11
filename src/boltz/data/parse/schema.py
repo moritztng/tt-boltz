@@ -1567,7 +1567,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 atom_idx_map,
                 chains,
             )
-            force = constraint["pocket"].get("force", False)
+            force = constraint["contact"].get("force", False)
 
             contact_constraints.append((token1, token2, max_distance, force))
         else:
