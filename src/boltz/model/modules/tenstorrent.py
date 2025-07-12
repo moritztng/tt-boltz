@@ -1,6 +1,18 @@
 import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
+from time import time
+
+times = {
+    "tri_mul": 0,
+    "tri_att": 0,
+    "pair_bias": 0,
+    "transition": 0,
+    "adaln": 0,
+    "cond_trans": 0,
+    "outer_product_mean": 0,
+    "pair_avg": 0,
+}
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
@@ -12,6 +24,9 @@ device = None
 
 
 def cleanup():
+    print("Runtime distribution:")
+    for k, v in sorted(times.items(), key=lambda item: item[1], reverse=True):
+        print(f"  {k:>18}: {v:.2f}s")
     global device
     if device is not None:
         ttnn.DumpDeviceProfiler(device)
@@ -84,6 +99,8 @@ class TriangleMultiplication(Module):
         )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         x_norm_in = ttnn.layer_norm(
             x,
             weight=self.in_norm_weight,
@@ -162,6 +179,8 @@ class TriangleMultiplication(Module):
         )
         g_out = ttnn.sigmoid_accurate(g_out[:, :, :, : W // 2])
         x = ttnn.multiply_(p_out, g_out)
+        ttnn.synchronize_device(device)
+        times["tri_mul"] += time() - start_time
         return x
 
 
@@ -198,6 +217,8 @@ class TriangleAttention(Module):
         )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
@@ -275,6 +296,8 @@ class TriangleAttention(Module):
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
+        ttnn.synchronize_device(device)
+        times["tri_att"] += time() - start_time
         return x
 
 
@@ -303,6 +326,8 @@ class AttentionPairBias(Module):
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
     def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         q = ttnn.linear(
             s,
             self.q_weight,
@@ -361,6 +386,8 @@ class AttentionPairBias(Module):
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config
         )
+        ttnn.synchronize_device(device)
+        times["pair_bias"] += time() - start_time
         return x
 
 
@@ -380,6 +407,8 @@ class Transition(Module):
         self.chunking = chunking
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         def f(x):
             x_norm = ttnn.layer_norm(
                 x,
@@ -423,6 +452,8 @@ class Transition(Module):
                 else:
                     x_out = ttnn.concat([x_out, x_chunk], dim=1)
             x = x_out
+        ttnn.synchronize_device(device)
+        times["transition"] += time() - start_time
         return x
 
 
@@ -562,6 +593,8 @@ class AdaLN(Module):
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         if not USE_FLOAT32:
             a = ttnn.clone(a, dtype=ttnn.float32)
             s = ttnn.clone(s, dtype=ttnn.float32)
@@ -589,6 +622,8 @@ class AdaLN(Module):
         )
         a = ttnn.multiply(a, s_scale)
         a = ttnn.add(a, s_bias)
+        ttnn.synchronize_device(device)
+        times["adaln"] += time() - start_time
         return a
 
 
@@ -607,6 +642,8 @@ class ConditionedTransitionBlock(Module):
         self.output_projection_bias = self.torch_to_tt("output_projection.0.bias")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         a = self.adaln(a, s)
         a_swish = ttnn.linear(
             a, self.swish_weight, compute_kernel_config=self.compute_kernel_config
@@ -630,6 +667,8 @@ class ConditionedTransitionBlock(Module):
             b, self.b_to_a_weight, compute_kernel_config=self.compute_kernel_config
         )
         a = ttnn.multiply(s, b_a)
+        ttnn.synchronize_device(device)
+        times["cond_trans"] += time() - start_time
         return a
 
 
@@ -723,6 +762,8 @@ class PairWeightedAveraging(Module):
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
     def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         m = ttnn.reshape(m, tuple(m.shape)[1:])
         z = ttnn.reshape(z, tuple(z.shape)[1:])
         m = ttnn.layer_norm(
@@ -785,6 +826,8 @@ class PairWeightedAveraging(Module):
             else:
                 o_out = ttnn.add(o_out, o)
         o_out = ttnn.reshape(o_out, (1, *o_out.shape))
+        ttnn.synchronize_device(device)
+        times["pair_avg"] += time() - start_time
         return o_out
 
 
@@ -803,6 +846,8 @@ class OuterProductMean(Module):
         self.o_bias = self.torch_to_tt("proj_o.bias")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        ttnn.synchronize_device(device)
+        start_time = time()
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         m = ttnn.layer_norm(
             x,
@@ -842,6 +887,8 @@ class OuterProductMean(Module):
             chunks.append(z)
         z = ttnn.concat(chunks, dim=0)
         z = ttnn.reshape(z, (1, *z.shape))
+        ttnn.synchronize_device(device)
+        times["outer_product_mean"] += time() - start_time
         return z
 
 
