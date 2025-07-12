@@ -1211,7 +1211,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     if (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
     ):
-        start_method = "fork" if platform.system() != "win32" else "spawn"
+        start_method = "fork" if platform.system() != "win32" and platform.system() != "Windows" else "spawn"
         strategy = DDPStrategy(start_method=start_method)
         if len(filtered_manifest.records) < devices:
             msg = (
