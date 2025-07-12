@@ -2,7 +2,7 @@ import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
 
-TRIANGLE_MULT_CHUNK_SIZE = 256
+TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
 PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
 OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
@@ -65,12 +65,23 @@ class TriangleMultiplication(Module):
         self.ending = ending
         self.in_norm_weight = self.torch_to_tt("norm_in.weight")
         self.in_norm_bias = self.torch_to_tt("norm_in.bias")
-        self.in_p = self.torch_to_tt("p_in.weight")
-        self.in_g = self.torch_to_tt("g_in.weight")
         self.out_norm_weight = self.torch_to_tt("norm_out.weight")
         self.out_norm_bias = self.torch_to_tt("norm_out.bias")
         self.out_p = self.torch_to_tt("p_out.weight")
-        self.out_g = self.torch_to_tt("g_out.weight")
+        self.gpg_weight = ttnn.from_torch(
+            torch.cat(
+                [
+                    self.state_dict["g_in.weight"],
+                    self.state_dict["p_in.weight"],
+                    self.state_dict["g_out.weight"],
+                    torch.zeros_like(torch.zeros_like(self.state_dict["g_out.weight"])),
+                ],
+                dim=0,
+            ).t(),
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
+        )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         x_norm_in = ttnn.layer_norm(
@@ -80,42 +91,61 @@ class TriangleMultiplication(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        x_chunks = []
-        for chunk_start in range(0, x_norm_in.shape[1], TRIANGLE_MULT_CHUNK_SIZE):
-            chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_in.shape[1])
-            x_chunk = x_norm_in[:, chunk_start:chunk_end, :, :]
-            out = ttnn.multiply(
-                ttnn.linear(
-                    x_chunk, self.in_p, compute_kernel_config=self.compute_kernel_config
-                ),
-                ttnn.sigmoid_accurate(
-                    ttnn.linear(
-                        x_chunk,
-                        self.in_g,
-                        compute_kernel_config=self.compute_kernel_config,
-                    )
-                ),
+        gpg_in = ttnn.linear(
+            x_norm_in,
+            self.gpg_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat8_b,
+        )
+        g_in, p_in, g_out = ttnn.experimental.nlp_create_qkv_heads_boltz(
+            gpg_in,
+            num_heads=1,
+            num_kv_heads=1,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        g_in = ttnn.sigmoid_accurate(g_in)
+        x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
+        B, H, H, W = x_pg_in.shape
+        for chunk_start in range(0, W // 2, TRIANGLE_MULT_CHUNK_SIZE):
+            a_chunk = ttnn.slice(
+                x_pg_in,
+                [0, 0, 0, chunk_start],
+                [B, H, H, chunk_start + TRIANGLE_MULT_CHUNK_SIZE],
+                memory_config=ttnn.L1_MEMORY_CONFIG,
             )
-            x_chunks.append(out)
-        x = ttnn.concat(x_chunks, dim=1)
-        del x_chunks
-        dim = int(x.shape[-1] / 2)
-        a = ttnn.permute(x[:, :, :, :dim], (0, 3) + ((2, 1) if self.ending else (1, 2)))
-        b = ttnn.permute(x[:, :, :, dim:], (0, 3) + ((1, 2) if self.ending else (2, 1)))
-        del x
-        x_chunks = []
-        for chunk_start in range(0, a.shape[2], TRIANGLE_MULT_CHUNK_SIZE):
-            chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, a.shape[2])
+            a_chunk = ttnn.permute(
+                a_chunk, (0, 3) + ((2, 1) if self.ending else (1, 2))
+            )
+            a_chunk = ttnn.typecast(a_chunk, ttnn.bfloat8_b)
+            a_chunk = ttnn.reallocate(a_chunk)
+            b_chunk = ttnn.slice(
+                x_pg_in,
+                [0, 0, 0, W // 2 + chunk_start],
+                [B, H, H, W // 2 + chunk_start + TRIANGLE_MULT_CHUNK_SIZE],
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            b_chunk = ttnn.permute(
+                b_chunk, (0, 3) + ((1, 2) if self.ending else (2, 1))
+            )
+            b_chunk = ttnn.typecast(b_chunk, ttnn.bfloat8_b)
+            b_chunk = ttnn.reallocate(b_chunk)
             x_chunk = ttnn.matmul(
-                a[:, :, chunk_start:chunk_end, :],
-                b,
+                a_chunk,
+                b_chunk,
                 compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                dtype=ttnn.bfloat16,
             )
-            x_chunks.append(x_chunk)
-        del a, b
-        x = ttnn.concat(x_chunks, dim=2)
-        del x_chunks
-        x = ttnn.permute(x, (0, 2, 3, 1))
+            ttnn.deallocate(a_chunk)
+            ttnn.deallocate(b_chunk)
+            x_chunk = ttnn.permute(x_chunk, (0, 2, 3, 1))
+            if chunk_start == 0:
+                x = ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            else:
+                x = ttnn.concat([x, x_chunk], dim=-1)
+            ttnn.deallocate(x_chunk)
         x_norm_out = ttnn.layer_norm(
             x,
             weight=self.out_norm_weight,
@@ -123,25 +153,15 @@ class TriangleMultiplication(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        x_chunks = []
-        for chunk_start in range(0, x_norm_out.shape[1], TRIANGLE_MULT_CHUNK_SIZE):
-            chunk_end = min(chunk_start + TRIANGLE_MULT_CHUNK_SIZE, x_norm_out.shape[1])
-            x_chunk = ttnn.multiply(
-                ttnn.linear(
-                    x_norm_out[:, chunk_start:chunk_end, :, :],
-                    self.out_p,
-                    compute_kernel_config=self.compute_kernel_config,
-                ),
-                ttnn.sigmoid_accurate(
-                    ttnn.linear(
-                        x_norm_in[:, chunk_start:chunk_end, :, :],
-                        self.out_g,
-                        compute_kernel_config=self.compute_kernel_config,
-                    )
-                ),
-            )
-            x_chunks.append(x_chunk)
-        x = ttnn.concat(x_chunks, dim=1)
+        p_out = ttnn.linear(
+            x_norm_out,
+            self.out_p,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            dtype=ttnn.bfloat8_b,
+        )
+        g_out = ttnn.sigmoid_accurate(g_out[:, :, :, : W // 2])
+        x = ttnn.multiply_(p_out, g_out)
         return x
 
 
