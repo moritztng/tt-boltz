@@ -394,10 +394,10 @@ class PoseBustersPotential(FlatBottomPotential, DistancePotential):
         lower_bounds[~bond_mask * angle_mask] *= 1.0 - parameters["angle_buffer"]
         upper_bounds[~bond_mask * angle_mask] *= 1.0 + parameters["angle_buffer"]
         lower_bounds[bond_mask * angle_mask] *= 1.0 - min(
-            parameters["angle_buffer"], parameters["angle_buffer"]
+            parameters["bond_buffer"], parameters["angle_buffer"]
         )
         upper_bounds[bond_mask * angle_mask] *= 1.0 + min(
-            parameters["angle_buffer"], parameters["angle_buffer"]
+            parameters["bond_buffer"], parameters["angle_buffer"]
         )
         lower_bounds[~bond_mask * ~angle_mask] *= 1.0 - parameters["clash_buffer"]
         upper_bounds[~bond_mask * ~angle_mask] = float("inf")
