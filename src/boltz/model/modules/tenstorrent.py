@@ -346,7 +346,9 @@ class AttentionPairBias(Module):
             z = ttnn.permute(z, (3, 0, 1, 2))
         a = ttnn.add(a, z)
         if mask is not None:
+            a = ttnn.permute(a, (0, 2, 1, 3))
             a = ttnn.add(a, mask)
+            a = ttnn.permute(a, (0, 2, 1, 3))
         a = ttnn.softmax(
             a,
             dim=-1,
@@ -1090,7 +1092,7 @@ class DiffusionTransformerModule(TorchWrapper):
             mask = ttnn.permute(mask, (1, 2, 0))
             mask = ttnn.matmul(mask, self.keys_indexing, compute_kernel_config=self.compute_kernel_config)
             mask = ttnn.permute(mask, (2, 0, 1))
-            mask = ttnn.reshape(mask, (1, K, 1, -1))
+            mask = ttnn.reshape(mask, (1, 1, K, -1))
             self.mask = (-1 * mask + 1) * -1e9
         x = self._to_torch(
             self.module(
