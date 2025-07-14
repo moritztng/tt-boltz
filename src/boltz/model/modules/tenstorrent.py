@@ -343,7 +343,7 @@ class AttentionPairBias(Module):
                 self.z_weight,
                 compute_kernel_config=self.compute_kernel_config,
             )
-        z = ttnn.permute(z, (3, 0, 1, 2))
+            z = ttnn.permute(z, (3, 0, 1, 2))
         a = ttnn.add(a, z)
         if mask is not None:
             a = ttnn.add(a, mask)
@@ -710,9 +710,9 @@ class DiffusionTransformer(Module):
         ]
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor, keys_indexing: ttnn.Tensor) -> ttnn.Tensor:
-        dim = z.shape[-1] // len(self.layers)
+        dim = z.shape[0] // len(self.layers)
         for i, layer in enumerate(self.layers):
-            a = layer(a, s, z[:, :, :, i * dim : (i + 1) * dim], mask, keys_indexing)
+            a = layer(a, s, z[i * dim : (i + 1) * dim, :, :, :], mask, keys_indexing)
         return a
 
 
@@ -1081,7 +1081,7 @@ class DiffusionTransformerModule(TorchWrapper):
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
         if self.bias is None:
-            self.bias = self._from_torch(bias)
+            self.bias = self._from_torch(bias.permute(3, 0, 1, 2))
         if self.keys_indexing is None and keys_indexing is not None:
             self.keys_indexing = self._from_torch(keys_indexing)
             mask = self._from_torch(mask)
