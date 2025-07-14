@@ -84,9 +84,9 @@ class Potential(ABC):
             )
             softmax_energy = neg_exp_energy / Z[..., union_index]
             softmax_energy[Z[..., union_index] == 0] = 0
-            return (energy * softmax_energy).sum(dim=-1) / normalization
+            return (energy * softmax_energy).sum(dim=-1)
 
-        return energy.sum(dim=tuple(range(1, energy.dim()))) / normalization
+        return energy.sum(dim=tuple(range(1, energy.dim())))
 
     def compute_gradient(self, coords, feats, parameters):
         index, args, com_args, ref_args, operator_args = self.compute_args(
@@ -404,7 +404,7 @@ class PoseBustersPotential(FlatBottomPotential, DistancePotential):
 
         k = torch.ones_like(lower_bounds)
 
-        return pair_index, (k, lower_bounds, upper_bounds), None, None, None, None
+        return pair_index, (k, lower_bounds, upper_bounds), None, None, None
 
 
 class ConnectionsPotential(FlatBottomPotential, DistancePotential):
@@ -416,7 +416,7 @@ class ConnectionsPotential(FlatBottomPotential, DistancePotential):
         )
         k = torch.ones_like(upper_bounds)
 
-        return pair_index, (k, lower_bounds, upper_bounds), None, None, None, None
+        return pair_index, (k, lower_bounds, upper_bounds), None, None, None
 
 
 class VDWOverlapPotential(FlatBottomPotential, DistancePotential):
@@ -509,6 +509,7 @@ class SymmetricChainCOMPotential(FlatBottomPotential, DistancePotential):
             pair_index,
             (k, lower_bounds, upper_bounds),
             (atom_chain_id, atom_pad_mask),
+            None,
             None,
         )
 
