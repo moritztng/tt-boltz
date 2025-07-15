@@ -301,8 +301,11 @@ class AttentionPairBias(Module):
             self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
             self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
-
-    def __call__(self, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(
+        self,
+        s: ttnn.Tensor,
+        z: ttnn.Tensor,
+    ) -> ttnn.Tensor:
         q = ttnn.linear(
             s,
             self.q_weight,
@@ -324,10 +327,10 @@ class AttentionPairBias(Module):
         k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
         q = ttnn.permute(q, (0, 2, 3, 1))
-        k = ttnn.permute(k, (0, 2, 1, 3))
+        k = ttnn.permute(k, (0, 2, 3, 1))
         v = ttnn.permute(v, (0, 2, 3, 1))
-        a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
-        a = ttnn.multiply(a, self.head_dim**-0.5)
+        seq_len = s.shape[1]
+        seq_len_padding = -seq_len % 32
         if self.compute_pair_bias:
             z = ttnn.layer_norm(
                 z,
@@ -342,14 +345,27 @@ class AttentionPairBias(Module):
                 compute_kernel_config=self.compute_kernel_config,
             )
             z = ttnn.permute(z, (3, 0, 1, 2))
-        a = ttnn.add(a, z)
-        a = ttnn.softmax(
-            a,
-            dim=-1,
-            compute_kernel_config=self.compute_kernel_config,
-            numeric_stable=True,
+            z = ttnn.pad(z, [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)], 0)
+        head_dim = q.shape[-1]
+        head_dim_padding = -head_dim % 32
+        q = ttnn.pad(q, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0)
+        k = ttnn.pad(k, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0)
+        v = ttnn.pad(v, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0)
+        o = ttnn.transformer.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=z,
+            is_causal=False,
+            scale=self.head_dim**-0.5,
+            program_config=ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=(8, 8),
+                exp_approx_mode=False,
+                q_chunk_size=32,
+                k_chunk_size=32,
+            ),
         )
-        o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
+        o = o[:, :, :seq_len, :head_dim]
         o = ttnn.permute(o, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
@@ -1066,7 +1082,9 @@ class DiffusionTransformerModule(TorchWrapper):
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
         if self.bias is None:
-            self.bias = self._from_torch(bias.permute(3, 0, 1, 2))
+            bias = self._from_torch(bias.permute(3, 0, 1, 2))
+            seq_len_padding = -bias.shape[-1] % 32
+            self.bias = ttnn.pad(bias, [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)], 0)
         x = self._to_torch(
             self.module(
                 self._from_torch(a),
