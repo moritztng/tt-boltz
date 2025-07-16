@@ -229,6 +229,7 @@ class AtomTransformer(Module):
                 n_layers=3,
                 dim=128,
                 n_heads=4,
+                atom_level=True
             )
             if use_tenstorrent
             else DiffusionTransformer(**diffusion_transformer_kwargs)

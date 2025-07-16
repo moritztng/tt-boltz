@@ -97,6 +97,7 @@ class DiffusionModule(Module):
                 n_layers=24,
                 dim=2 * 384,
                 n_heads=16,
+                atom_level=False
             )
             if use_tenstorrent
             else DiffusionTransformer(

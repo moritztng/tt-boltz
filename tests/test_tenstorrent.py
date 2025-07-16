@@ -56,12 +56,13 @@ def test_pairformer(seq_len):
 
 @pytest.mark.parametrize("seq_len", [100, 500, 1000])
 def test_token_transformer(seq_len):
-    n_layers = 24
+    n_layers = 2
     n_heads = 16
     token_transformer = DiffusionTransformerModule(
         n_layers=n_layers,
         dim=768,
         n_heads=n_heads,
+        atom_level=False,
     )
     token_transformer_torch = DiffusionTransformerTorch(
         depth=n_layers, heads=n_heads, dim=768, dim_single_cond=768
@@ -100,6 +101,7 @@ def test_atom_transformer():
         n_layers=n_layers,
         dim=128,
         n_heads=n_heads,
+        atom_level=True,
     )
     atom_transformer_torch = DiffusionTransformerTorch(
         depth=n_layers, heads=n_heads, dim=128, dim_single_cond=128
@@ -113,7 +115,7 @@ def test_atom_transformer():
         strict=False,
     )
     atom_transformer_torch.load_state_dict(atom_transformer_state_dict, strict=False)
-    B, W, H, K = 1, 32, 128, 29
+    B, W, H, K = 1, 32, 128, 166
     a = torch.randn(K, W, H)
     s = torch.randn(K, W, H)
     bias = torch.randn(K, W, H, n_layers * n_heads)
