@@ -967,7 +967,7 @@ def cli() -> None:
 @click.option(
     "--use_potentials",
     is_flag=True,
-    help="Whether to not use potentials for steering. Default is False.",
+    help="Whether to use potentials for steering. Default is False.",
 )
 @click.option(
     "--model",
