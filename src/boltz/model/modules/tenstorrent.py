@@ -284,6 +284,7 @@ class AttentionPairBias(Module):
         head_dim: int,
         n_heads: int,
         compute_pair_bias: bool,
+        atom_level: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
@@ -291,6 +292,7 @@ class AttentionPairBias(Module):
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.compute_pair_bias = compute_pair_bias
+        self.atom_level = atom_level
         self.q_weight = self.torch_to_tt("proj_q.weight")
         self.q_bias = self.torch_to_tt("proj_q.bias")
         self.k_weight = self.torch_to_tt("proj_k.weight")
@@ -301,24 +303,34 @@ class AttentionPairBias(Module):
             self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
             self.z_weight = self.torch_to_tt("proj_z.1.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
+
     def __call__(
         self,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
+        s_kv: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
+        memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
+        if not self.atom_level:
+            s_kv = s
         q = ttnn.linear(
             s,
             self.q_weight,
             bias=self.q_bias,
             compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         k = ttnn.linear(
-            s,
+            s_kv,
             self.k_weight,
             compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         v = ttnn.linear(
-            s, self.v_weight, compute_kernel_config=self.compute_kernel_config
+            s_kv,
+            self.v_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         q = ttnn.permute(q, (2, 0, 1))
         k = ttnn.permute(k, (2, 0, 1))
@@ -327,53 +339,92 @@ class AttentionPairBias(Module):
         k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
         q = ttnn.permute(q, (0, 2, 3, 1))
-        k = ttnn.permute(k, (0, 2, 3, 1))
+        k = ttnn.permute(k, (0, 2) + ((1, 3) if self.atom_level else (3, 1)))
         v = ttnn.permute(v, (0, 2, 3, 1))
-        seq_len = s.shape[1]
-        seq_len_padding = -seq_len % 32
-        if self.compute_pair_bias:
-            z = ttnn.layer_norm(
-                z,
-                weight=self.z_norm_weight,
-                bias=self.z_norm_bias,
-                epsilon=1e-5,
-                compute_kernel_config=self.compute_kernel_config,
+        if not self.atom_level:
+            seq_len = s.shape[1]
+            seq_len_padding = -seq_len % 32
+            if self.compute_pair_bias:
+                z = ttnn.layer_norm(
+                    z,
+                    weight=self.z_norm_weight,
+                    bias=self.z_norm_bias,
+                    epsilon=1e-5,
+                    compute_kernel_config=self.compute_kernel_config,
+                )
+                z = ttnn.linear(
+                    z,
+                    self.z_weight,
+                    compute_kernel_config=self.compute_kernel_config,
+                )
+                z = ttnn.permute(z, (3, 0, 1, 2))
+                z = ttnn.pad(
+                    z, [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)], 0
+                )
+            head_dim = q.shape[-1]
+            head_dim_padding = -head_dim % 32
+            q = ttnn.pad(
+                q, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0
             )
-            z = ttnn.linear(
-                z,
-                self.z_weight,
-                compute_kernel_config=self.compute_kernel_config,
+            k = ttnn.pad(
+                k, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0
             )
-            z = ttnn.permute(z, (3, 0, 1, 2))
-            z = ttnn.pad(z, [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)], 0)
-        head_dim = q.shape[-1]
-        head_dim_padding = -head_dim % 32
-        q = ttnn.pad(q, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0)
-        k = ttnn.pad(k, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0)
-        v = ttnn.pad(v, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0)
-        o = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=z,
-            is_causal=False,
-            scale=self.head_dim**-0.5,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=(8, 8),
-                exp_approx_mode=False,
-                q_chunk_size=32,
-                k_chunk_size=32,
-            ),
-        )
-        o = o[:, :, :seq_len, :head_dim]
+            v = ttnn.pad(
+                v, [(0, 0), (0, 0), (0, seq_len_padding), (0, head_dim_padding)], 0
+            )
+            o = ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=z,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(8, 8),
+                    exp_approx_mode=False,
+                    q_chunk_size=32,
+                    k_chunk_size=32,
+                ),
+            )
+            o = o[:, :, :seq_len, :head_dim]
+        else:
+            a = ttnn.matmul(
+                q,
+                k,
+                compute_kernel_config=self.compute_kernel_config,
+                memory_config=memory_config,
+            )
+            ttnn.deallocate(q)
+            ttnn.deallocate(k)
+            a = ttnn.multiply_(a, self.head_dim**-0.5)
+            a = ttnn.add_(a, z)
+            a = ttnn.softmax(
+                a,
+                dim=-1,
+                compute_kernel_config=self.compute_kernel_config,
+                numeric_stable=True,
+            )
+            o = ttnn.matmul(
+                a,
+                v,
+                compute_kernel_config=self.compute_kernel_config,
+                memory_config=memory_config,
+            )
+            ttnn.deallocate(a)
+            ttnn.deallocate(v)
         o = ttnn.permute(o, (0, 3, 1, 2))
         o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
         o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
-            s, self.g_weight, compute_kernel_config=self.compute_kernel_config
+            s,
+            self.g_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         g = ttnn.sigmoid_accurate(g)
-        o = ttnn.multiply(o, g)
+        o = ttnn.multiply_(o, g)
+        if self.atom_level:
+            ttnn.deallocate(g)
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config
         )
@@ -485,6 +536,7 @@ class PairformerLayer(Module):
                 att_head_dim,
                 att_n_heads,
                 True,
+                False,
                 filter_dict(state_dict, "attention"),
                 compute_kernel_config,
             )
@@ -568,19 +620,22 @@ class Pairformer(Module):
 class AdaLN(Module):
     def __init__(
         self,
+        atom_level: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
+        self.atom_level = atom_level
         self.s_norm_weight = self.torch_to_tt("s_norm.weight")
         self.s_scale_weight = self.torch_to_tt("s_scale.weight")
         self.s_scale_bias = self.torch_to_tt("s_scale.bias")
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
         if not USE_FLOAT32:
-            a = ttnn.clone(a, dtype=ttnn.float32)
-            s = ttnn.clone(s, dtype=ttnn.float32)
+            a = ttnn.clone(a, dtype=ttnn.float32, memory_config=memory_config)
+            s = ttnn.clone(s, dtype=ttnn.float32, memory_config=memory_config)
         a = ttnn.layer_norm(
             a, epsilon=1e-5, compute_kernel_config=self.compute_kernel_config
         )
@@ -591,31 +646,39 @@ class AdaLN(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         if not USE_FLOAT32:
-            a = ttnn.clone(a, dtype=ttnn.bfloat16)
-            s = ttnn.clone(s, dtype=ttnn.bfloat16)
+            a = ttnn.clone(a, dtype=ttnn.bfloat16, memory_config=memory_config)
+            s = ttnn.clone(s, dtype=ttnn.bfloat16, memory_config=memory_config)
         s_scale = ttnn.linear(
             s,
             self.s_scale_weight,
             bias=self.s_scale_bias,
             compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         s_scale = ttnn.sigmoid_accurate(s_scale)
         s_bias = ttnn.linear(
-            s, self.s_bias_weight, compute_kernel_config=self.compute_kernel_config
+            s,
+            self.s_bias_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
-        a = ttnn.multiply(a, s_scale)
-        a = ttnn.add(a, s_bias)
+        a = ttnn.multiply_(a, s_scale)
+        a = ttnn.add_(a, s_bias)
         return a
 
 
 class ConditionedTransitionBlock(Module):
     def __init__(
         self,
+        atom_level: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
-        self.adaln = AdaLN(filter_dict(state_dict, "adaln"), compute_kernel_config)
+        self.atom_level = atom_level
+        self.adaln = AdaLN(
+            atom_level, filter_dict(state_dict, "adaln"), compute_kernel_config
+        )
         self.swish_weight = self.torch_to_tt("swish_gate.0.weight")
         self.a_to_b_weight = self.torch_to_tt("a_to_b.weight")
         self.b_to_a_weight = self.torch_to_tt("b_to_a.weight")
@@ -623,29 +686,44 @@ class ConditionedTransitionBlock(Module):
         self.output_projection_bias = self.torch_to_tt("output_projection.0.bias")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
         a = self.adaln(a, s)
         a_swish = ttnn.linear(
-            a, self.swish_weight, compute_kernel_config=self.compute_kernel_config
+            a,
+            self.swish_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         dim = int(a_swish.shape[-1] / 2)
         a_swish, gates = a_swish[:, :, :dim], a_swish[:, :, dim:]
         gates = ttnn.silu(gates)
-        a_swish = ttnn.multiply(gates, a_swish)
+        a_swish = ttnn.multiply_(gates, a_swish)
         a_b = ttnn.linear(
-            a, self.a_to_b_weight, compute_kernel_config=self.compute_kernel_config
+            a,
+            self.a_to_b_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
-        b = ttnn.multiply(a_swish, a_b)
+        b = ttnn.multiply_(a_swish, a_b)
+        if self.atom_level:
+            ttnn.deallocate(a_b)
         s = ttnn.linear(
             s,
             self.output_projection_weight,
             bias=self.output_projection_bias,
             compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
         s = ttnn.sigmoid_accurate(s)
         b_a = ttnn.linear(
-            b, self.b_to_a_weight, compute_kernel_config=self.compute_kernel_config
+            b,
+            self.b_to_a_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
         )
-        a = ttnn.multiply(s, b_a)
+        if self.atom_level:
+            ttnn.deallocate(b)
+        a = ttnn.multiply_(s, b_a)
         return a
 
 
@@ -654,15 +732,20 @@ class DiffusionTransformerLayer(Module):
         self,
         dim: int,
         n_heads: int,
+        atom_level: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
-        self.adaln = AdaLN(filter_dict(state_dict, "adaln"), compute_kernel_config)
+        self.atom_level = atom_level
+        self.adaln = AdaLN(
+            atom_level, filter_dict(state_dict, "adaln"), compute_kernel_config
+        )
         self.attn_pair_bias = AttentionPairBias(
             head_dim=dim // n_heads,
             n_heads=n_heads,
             compute_pair_bias=False,
+            atom_level=atom_level,
             state_dict=filter_dict(state_dict, "pair_bias_attn"),
             compute_kernel_config=compute_kernel_config,
         )
@@ -671,13 +754,31 @@ class DiffusionTransformerLayer(Module):
         )
         self.output_projection_bias = self.torch_to_tt("output_projection_linear.bias")
         self.transition = ConditionedTransitionBlock(
+            atom_level,
             filter_dict(state_dict, "transition"),
             compute_kernel_config,
         )
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(
+        self,
+        a: ttnn.Tensor,
+        s: ttnn.Tensor,
+        z: ttnn.Tensor,
+        keys_indexing: ttnn.Tensor,
+    ) -> ttnn.Tensor:
         b = self.adaln(a, s)
-        b = self.attn_pair_bias(b, z)
+        if not self.atom_level:
+            b = self.attn_pair_bias(b, z)
+        else:
+            K, W, D = b.shape
+            b_kv = ttnn.reshape(b, (2 * K, W // 2, -1))
+            b_kv = ttnn.permute(b_kv, (1, 2, 0))
+            b_kv = ttnn.matmul(
+                b_kv, keys_indexing, compute_kernel_config=self.compute_kernel_config
+            )
+            b_kv = ttnn.permute(b_kv, (2, 0, 1))
+            b_kv = ttnn.reshape(b_kv, (K, -1, D))
+            b = self.attn_pair_bias(b, z, b_kv)
         s_o = ttnn.linear(
             s,
             self.output_projection_weight,
@@ -698,6 +799,7 @@ class DiffusionTransformer(Module):
         n_layers: int,
         dim: int,
         n_heads: int,
+        atom_level: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
@@ -706,16 +808,23 @@ class DiffusionTransformer(Module):
             DiffusionTransformerLayer(
                 dim,
                 n_heads,
+                atom_level,
                 filter_dict(state_dict, f"layers.{i}"),
                 compute_kernel_config,
             )
             for i in range(n_layers)
         ]
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(
+        self,
+        a: ttnn.Tensor,
+        s: ttnn.Tensor,
+        z: ttnn.Tensor,
+        keys_indexing: ttnn.Tensor,
+    ) -> ttnn.Tensor:
         dim = z.shape[0] // len(self.layers)
         for i, layer in enumerate(self.layers):
-            a = layer(a, s, z[i * dim : (i + 1) * dim, :, :, :])
+            a = layer(a, s, z[i * dim : (i + 1) * dim, :, :, :], keys_indexing)
         return a
 
 
@@ -1041,17 +1150,14 @@ class PairformerModule(TorchWrapper):
 
 
 class DiffusionTransformerModule(TorchWrapper):
-    def __init__(
-        self,
-        n_layers: int,
-        dim: int,
-        n_heads: int,
-    ):
+    def __init__(self, n_layers: int, dim: int, n_heads: int, atom_level: bool):
         super().__init__()
         self.n_layers = n_layers
         self.dim = dim
         self.n_heads = n_heads
+        self.atom_level = atom_level
         self.bias = None
+        self.keys_indexing = None
 
     def _load_from_state_dict(
         self,
@@ -1067,6 +1173,7 @@ class DiffusionTransformerModule(TorchWrapper):
             self.n_layers,
             self.dim,
             self.n_heads,
+            self.atom_level,
             filter_dict(state_dict, prefix[:-1]),
             self.compute_kernel_config,
         )
@@ -1077,19 +1184,41 @@ class DiffusionTransformerModule(TorchWrapper):
         s: torch.Tensor,
         bias: torch.Tensor,
         mask: torch.Tensor = None,
+        keys_indexing: torch.Tensor = None,
         to_keys=None,
         multiplicity: int = 1,
         model_cache: torch.Tensor = None,
     ) -> torch.Tensor:
         if self.bias is None:
-            bias = self._from_torch(bias.permute(3, 0, 1, 2))
-            seq_len_padding = -bias.shape[-1] % 32
-            self.bias = ttnn.pad(bias, [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)], 0)
+            self.bias = self._from_torch(bias.permute(3, 0, 1, 2))
+            if not self.atom_level:
+                seq_len_padding = -self.bias.shape[-1] % 32
+                self.bias = ttnn.pad(
+                    self.bias,
+                    [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)],
+                    0,
+                )
+        if self.atom_level and self.keys_indexing is None:
+            self.keys_indexing = self._from_torch(keys_indexing)
+            mask = self._from_torch(mask)
+            K, W = mask.shape
+            mask = ttnn.reshape(mask, (2 * K, W // 2, -1))
+            mask = ttnn.permute(mask, (1, 2, 0))
+            mask = ttnn.matmul(
+                mask,
+                self.keys_indexing,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            mask = ttnn.permute(mask, (2, 0, 1))
+            mask = ttnn.reshape(mask, (1, K, 1, -1))
+            mask = (-1 * mask + 1) * -1e9
+            self.bias = ttnn.add(self.bias, mask)
         x = self._to_torch(
             self.module(
                 self._from_torch(a),
                 self._from_torch(s),
                 self.bias,
+                self.keys_indexing,
             )
         )
         return x
