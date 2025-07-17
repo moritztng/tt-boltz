@@ -304,7 +304,7 @@ def check_inputs(data: Path) -> list[Path]:
             if d.is_dir():
                 msg = f"Found directory {d} instead of .fasta or .yaml."
                 raise RuntimeError(msg)
-            if d.suffix not in (".fa", ".fas", ".fasta", ".yml", ".yaml"):
+            if d.suffix.lower() not in (".fa", ".fas", ".fasta", ".yml", ".yaml"):
                 msg = (
                     f"Unable to parse filetype {d.suffix}, "
                     "please provide a .fasta or .yaml file."
@@ -545,9 +545,9 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
 ) -> None:
     try:
         # Parse data
-        if path.suffix in (".fa", ".fas", ".fasta"):
+        if path.suffix.lower() in (".fa", ".fas", ".fasta"):
             target = parse_fasta(path, ccd, mol_dir, boltz2)
-        elif path.suffix in (".yml", ".yaml"):
+        elif path.suffix.lower() in (".yml", ".yaml"):
             target = parse_yaml(path, ccd, mol_dir, boltz2)
         elif path.is_dir():
             msg = f"Found directory {path} instead of .fasta or .yaml, skipping."
@@ -689,7 +689,7 @@ def process_inputs(
     ccd_path : Path
         The path to the CCD dictionary.
     max_msa_seqs : int, optional
-        Max number of MSA sequences, by default 4096.
+        Max number of MSA sequences, by default 8192.
     use_msa_server : bool, optional
         Whether to use the MMSeqs2 server for MSA generation, by default False.
     msa_server_username : str, optional
