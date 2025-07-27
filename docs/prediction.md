@@ -54,7 +54,7 @@ constraints:
         token1: [CHAIN_ID, RES_IDX/ATOM_NAME]
         token2: [CHAIN_ID, RES_IDX/ATOM_NAME]
         max_distance: DIST_ANGSTROM
-        force: false # if force is set to true (default is false), a potential will be used to enforce the pocket constraint
+        force: false # if force is set to true (default is false), a potential will be used to enforce the contact constraint
 
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
