@@ -1,6 +1,7 @@
 import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
+from models.utility_functions import is_wormhole_b0
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
@@ -1067,12 +1068,12 @@ class TorchWrapper(nn.Module):
         global device
         if device is None:
             ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
-            device = ttnn.open_device(
-                device_id=0,
-                dispatch_core_config=ttnn.DispatchCoreConfig(
+            args = {"device_id": 0}
+            if is_wormhole_b0():
+                args["dispatch_core_config"] = ttnn.DispatchCoreConfig(
                     ttnn.device.DispatchCoreType.ETH, ttnn.DispatchCoreAxis.ROW
-                ),
-            )
+                )
+            device = ttnn.open_device(**args)
             device.enable_program_cache()
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
