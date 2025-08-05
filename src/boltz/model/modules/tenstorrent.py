@@ -455,23 +455,35 @@ class Transition(Module):
                 bias=self.norm_bias,
                 epsilon=1e-5,
                 compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
             )
             x_1 = ttnn.linear(
                 x_norm,
                 self.fc1_weight,
                 activation="silu",
                 compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                dtype=ttnn.bfloat8_b,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             x_2 = ttnn.linear(
                 x_norm,
                 self.fc2_weight,
                 compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                dtype=ttnn.bfloat8_b,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-            x = ttnn.multiply(x_1, x_2)
+            ttnn.deallocate(x_norm)
+            x = ttnn.multiply(x_1, x_2, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(x_1)
+            ttnn.deallocate(x_2)
             x = ttnn.linear(
                 x,
                 self.fc3_weight,
                 compute_kernel_config=self.compute_kernel_config,
+                dtype=ttnn.bfloat16,
+                core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
             )
             return x
 
