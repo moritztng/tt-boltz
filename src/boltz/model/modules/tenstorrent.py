@@ -5,8 +5,6 @@ from models.utility_functions import is_wormhole_b0, is_blackhole
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
-PAIR_WEIGHTED_AVG_CHUNK_SIZE = 64
-OUTER_PRODUCT_MEAN_CHUNK_SIZE = 64
 USE_FLOAT32 = False
 
 device = None
@@ -98,6 +96,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat8_b,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         g_in, p_in, g_out = ttnn.experimental.nlp_create_qkv_heads_boltz(
             gpg_in,
@@ -138,6 +137,7 @@ class TriangleMultiplication(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 dtype=ttnn.bfloat16,
+                core_grid=ttnn.CoreGrid(y=9, x=2) if is_blackhole() else None,
             )
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
@@ -160,6 +160,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.L1_MEMORY_CONFIG,
             dtype=ttnn.bfloat8_b,
+            core_grid=ttnn.CoreGrid(y=10, x=11) if is_blackhole() else None,
         )
         g_out = ttnn.sigmoid_accurate(g_out[:, :, :, : W // 2])
         x = ttnn.multiply_(p_out, g_out)
@@ -209,13 +210,17 @@ class TriangleAttention(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
         seq_len = x.shape[0]
         padding = -seq_len % 256
         x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
+        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
             compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat8_b,
+            core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
         )
         triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
         triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
@@ -224,6 +229,7 @@ class TriangleAttention(Module):
             self.qkvg_weight,
             compute_kernel_config=self.compute_kernel_config,
             dtype=ttnn.bfloat8_b,
+            core_grid=ttnn.CoreGrid(y=10, x=12) if is_blackhole() else None,
         )
         split_idx = 3 * self.head_dim * self.n_heads
         qkv = qkvg[:, :, :split_idx]
@@ -250,7 +256,9 @@ class TriangleAttention(Module):
                 is_causal=False,
                 scale=self.head_dim**-0.5,
                 program_config=ttnn.SDPAProgramConfig(
-                    compute_with_storage_grid_size=(8, 8),
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
                     exp_approx_mode=False,
                     q_chunk_size=256,
                     k_chunk_size=256,
@@ -271,6 +279,7 @@ class TriangleAttention(Module):
             self.o_weight,
             compute_kernel_config=self.compute_kernel_config,
             dtype=ttnn.bfloat8_b,
+            core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
         )
         x = x[:seq_len, :seq_len, :]
         if self.ending:
@@ -357,6 +366,7 @@ class AttentionPairBias(Module):
                     z,
                     self.z_weight,
                     compute_kernel_config=self.compute_kernel_config,
+                    core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
                 )
                 z = ttnn.permute(z, (3, 0, 1, 2))
                 z = ttnn.pad(
@@ -381,7 +391,9 @@ class AttentionPairBias(Module):
                 is_causal=False,
                 scale=self.head_dim**-0.5,
                 program_config=ttnn.SDPAProgramConfig(
-                    compute_with_storage_grid_size=(8, 8),
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
                     exp_approx_mode=False,
                     q_chunk_size=32,
                     k_chunk_size=32,
@@ -706,6 +718,7 @@ class ConditionedTransitionBlock(Module):
             self.swish_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         dim = int(a_swish.shape[-1] / 2)
         a_swish, gates = a_swish[:, :, :dim], a_swish[:, :, dim:]
@@ -787,7 +800,10 @@ class DiffusionTransformerLayer(Module):
             b_kv = ttnn.reshape(b, (2 * K, W // 2, -1))
             b_kv = ttnn.permute(b_kv, (1, 2, 0))
             b_kv = ttnn.matmul(
-                b_kv, keys_indexing, compute_kernel_config=self.compute_kernel_config
+                b_kv,
+                keys_indexing,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             b_kv = ttnn.permute(b_kv, (2, 0, 1))
             b_kv = ttnn.reshape(b_kv, (K, -1, D))
@@ -797,6 +813,7 @@ class DiffusionTransformerLayer(Module):
             self.output_projection_weight,
             bias=self.output_projection_bias,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         s_o = ttnn.sigmoid_accurate(s_o)
         b = ttnn.multiply(s_o, b)
@@ -883,6 +900,7 @@ class PairWeightedAveraging(Module):
                 z,
                 self.z_weight[:, i : i + 1],
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             b = ttnn.permute(b, (2, 0, 1))
             w = ttnn.softmax(
@@ -895,6 +913,7 @@ class PairWeightedAveraging(Module):
                 m,
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
 
             o = ttnn.matmul(
@@ -903,6 +922,7 @@ class PairWeightedAveraging(Module):
                 transpose_a=True,
                 transpose_b=True,
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             del v, w
             o = ttnn.permute(o, (0, 2, 1))
@@ -910,6 +930,7 @@ class PairWeightedAveraging(Module):
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             g = ttnn.sigmoid_accurate(g)
             o = ttnn.multiply(o, g)
@@ -918,6 +939,7 @@ class PairWeightedAveraging(Module):
                 o,
                 self.o_weight[i * self.head_dim : (i + 1) * self.head_dim, :],
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             if i == 0:
                 o_out = o
@@ -951,7 +973,10 @@ class OuterProductMean(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         a = ttnn.linear(
-            m, self.a_weight, compute_kernel_config=self.compute_kernel_config
+            m,
+            self.a_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         b = ttnn.linear(
             m,
@@ -1219,6 +1244,7 @@ class DiffusionTransformerModule(TorchWrapper):
                 mask,
                 self.keys_indexing,
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             mask = ttnn.permute(mask, (2, 0, 1))
             mask = ttnn.reshape(mask, (1, K, 1, -1))
