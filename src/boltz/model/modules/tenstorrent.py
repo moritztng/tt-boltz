@@ -1,7 +1,7 @@
 import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
-from models.utility_functions import is_wormhole_b0
+from models.utility_functions import is_wormhole_b0, is_blackhole
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
@@ -942,32 +942,30 @@ class OuterProductMean(Module):
             m, self.a_weight, compute_kernel_config=self.compute_kernel_config
         )
         b = ttnn.linear(
-            m, self.b_weight, compute_kernel_config=self.compute_kernel_config
+            m,
+            self.b_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         S, I, C = a.shape
         _, J, D = b.shape
-        chunks = []
-        for chunk_start in range(0, I, OUTER_PRODUCT_MEAN_CHUNK_SIZE):
-            chunk_end = min(chunk_start + OUTER_PRODUCT_MEAN_CHUNK_SIZE, I)
-            a_chunk = a[:, chunk_start:chunk_end, :]
-            a_chunk = ttnn.permute(a_chunk, (1, 2, 0))
-            a_chunk = ttnn.reshape(a_chunk, (-1, S))
-            b = ttnn.reshape(b, (S, -1))
-            z = ttnn.matmul(
-                a_chunk, b, compute_kernel_config=self.compute_kernel_config
-            )
-            z = ttnn.reshape(z, (chunk_end - chunk_start, C, J, D))
-            z = ttnn.permute(z, (0, 2, 1, 3))
-            z = ttnn.reshape(z, (*tuple(z.shape)[:2], -1))
-            z = ttnn.multiply(z, 1 / S)
-            z = ttnn.linear(
-                z,
-                self.o_weight,
-                bias=self.o_bias,
-                compute_kernel_config=self.compute_kernel_config,
-            )
-            chunks.append(z)
-        z = ttnn.concat(chunks, dim=0)
+        a = ttnn.permute(a, (1, 2, 0))
+        a = ttnn.reshape(a, (-1, S))
+        b = ttnn.permute(b, (0, 2, 1))
+        b = ttnn.reshape(b, (S, -1))
+        z = ttnn.matmul(a, b, compute_kernel_config=self.compute_kernel_config)
+        z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
+        z = ttnn.reshape(z, (I, C * D, J))
+        z = ttnn.to_layout(z, ttnn.TILE_LAYOUT)
+        z = ttnn.permute(z, (0, 2, 1))
+        z = ttnn.multiply(z, 1 / S)
+        z = ttnn.linear(
+            z,
+            self.o_weight,
+            bias=self.o_bias,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+        )
         z = ttnn.reshape(z, (1, *z.shape))
         return z
 
