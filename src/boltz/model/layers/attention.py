@@ -112,7 +112,6 @@ class AttentionPairBias(nn.Module):
                 model_cache["z"] = z
         else:
             z = model_cache["z"]
-        z = z.repeat_interleave(multiplicity, 0)
 
         g = self.proj_g(s).sigmoid()
 
