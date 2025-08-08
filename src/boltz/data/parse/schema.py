@@ -19,6 +19,8 @@ from scipy.optimize import linear_sum_assignment
 from boltz.data import const
 from boltz.data.mol import load_molecules
 from boltz.data.parse.mmcif import parse_mmcif
+from boltz.data.parse.pdb import parse_pdb
+
 from boltz.data.types import (
     AffinityInfo,
     Atom,
@@ -1587,11 +1589,16 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     templates = {}
     template_records = []
     for template in template_schema:
-        if "cif" not in template:
-            msg = "Template was not properly specified, missing CIF path!"
+        if "cif" in template:
+            path = template["cif"]
+            pdb = False
+        elif "pdb" in template:
+            path = template["pdb"]
+            pdb = True
+        else:
+            msg = "Template was not properly specified, missing CIF or PDB path!"
             raise ValueError(msg)
 
-        path = template["cif"]
         template_id = Path(path).stem
         chain_ids = template.get("chain_id", None)
         template_chain_ids = template.get("template_id", None)
@@ -1632,13 +1639,22 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
 
         # Get relevant template chain ids
-        parsed_template = parse_mmcif(
-            path,
-            mols=ccd,
-            moldir=mol_dir,
-            use_assembly=False,
-            compute_interfaces=False,
-        )
+        if pdb:
+            parsed_template = parse_pdb(
+                path,
+                mols=ccd,
+                moldir=mol_dir,
+                use_assembly=False,
+                compute_interfaces=False,
+            )
+        else:
+            parsed_template = parse_mmcif(
+                path,
+                mols=ccd,
+                moldir=mol_dir,
+                use_assembly=False,
+                compute_interfaces=False,
+            )
         template_proteins = {
             str(c["name"])
             for c in parsed_template.data.chains

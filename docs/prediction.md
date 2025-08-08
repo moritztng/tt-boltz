@@ -58,13 +58,15 @@ constraints:
 
 templates:
     - cif: CIF_PATH  # if only a path is provided, Boltz will find the best matchings
-    - cif: CIF_PATH
       force: true # optional, if force is set to true (default is false), a potential will be used to enforce the template
       threshold: DISTANCE_THRESHOLD # optional, controls the distance (in Angstroms) that the prediction can deviate from the template
     - cif: CIF_PATH
       chain_id: CHAIN_ID   # optional, specify which chain to find a template for
     - cif: CIF_PATH
       chain_id: [CHAIN_ID, CHAIN_ID]  # can be more than one
+      template_id: [TEMPLATE_CHAIN_ID, TEMPLATE_CHAIN_ID]
+    - pdb: PDB_PATH # if a pdb path is provided, Boltz will incrementally assign template chain ids based on the chain names in the PDB file (A1, A2, B1, etc)
+      chain_id: [CHAIN_ID, CHAIN_ID]
       template_id: [TEMPLATE_CHAIN_ID, TEMPLATE_CHAIN_ID]
 properties:
     - affinity:
@@ -83,7 +85,7 @@ The `modifications` field is an optional field that allows you to specify modifi
 
 * The `pocket` constraint specifies the residues associated with a ligand, where `binder` refers to the chain binding to the pocket (which can be a molecule, protein, DNA or RNA) and `contacts` is the list of chain and residue indices (starting from 1) associated with the pocket. The model currently only supports the specification of a single `binder` chain (and any number of `contacts` residues in other chains).
 
-`templates` is an optional field that allows you to specify structural templates for your prediction. At minimum, you must provide the path to the structural template, which must provided as a CIF file. If you wish to explicitly define which of the chains in your YAML should be templated using this CIF file, you can use the `chain_id` entry to specify them. Whether a set of ids is provided or not, Boltz will find the best matching chains from the provided template. If you wish to explicitly define the mapping yourself, you may provide the corresponding template_id. Note that only protein chains can be templated.
+`templates` is an optional field that allows you to specify structural templates for your prediction. At minimum, you must provide the path to the structural template, which must provided as a CIF or PDB file. If you wish to explicitly define which of the chains in your YAML should be templated using this file, you can use the `chain_id` entry to specify them. If providing a PDB file, chain ids will be incrementally assigned to each subchain in a parent PDB chain resulting in template chain ids of A1, A2, B1, etc for PDB chains A and B. Make sure to look at the structure of the template PDB file to determine the corresponding value of `template_id` to provide. Whether a set of ids is provided or not, Boltz will find the best matching chains from the provided template. If you wish to explicitly define the mapping yourself, you may provide the corresponding template_id. Note that only protein chains can be templated.
 
 `properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed. Only one single molecule can be specified for affinity computation, and it must be a ligand chain (not a protein, DNA or RNA).
 
