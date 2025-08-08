@@ -92,6 +92,7 @@ class AttentionPairBias(nn.Module):
         v = self.proj_v(k_in).view(B, -1, self.num_heads, self.head_dim)
 
         bias = self.proj_z(z)
+        bias = bias.repeat_interleave(multiplicity, 0)
 
         g = self.proj_g(s).sigmoid()
 

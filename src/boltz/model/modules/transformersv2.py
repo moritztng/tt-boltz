@@ -254,7 +254,7 @@ class AtomTransformer(Module):
             s=c,
             bias=bias,
             mask=mask.float(),
-            multiplicity=multiplicity,
+            multiplicity=1, # bias term already expanded with multiplicity
             to_keys=to_keys_new,
         )
 
