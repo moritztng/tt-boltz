@@ -7,13 +7,15 @@ TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
 USE_FLOAT32 = False
 
-device = None
+# ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
+device = ttnn.open_device(device_id=0)
+device.enable_program_cache()
 
 
 def cleanup():
     global device
     if device is not None:
-        ttnn.DumpDeviceProfiler(device)
+        # ttnn.DumpDeviceProfiler(device)
         ttnn.close_device(device)
 
 
@@ -252,7 +254,7 @@ class TriangleAttention(Module):
                 head_q,
                 head_k,
                 head_v,
-                attn_mask=head_triangle_bias,
+                attn_mask=head_triangle_bias, # comment out to test without triangle bias 
                 is_causal=False,
                 scale=self.head_dim**-0.5,
                 program_config=ttnn.SDPAProgramConfig(
@@ -287,6 +289,106 @@ class TriangleAttention(Module):
         x = ttnn.reshape(x, (1, *x.shape))
         return x
 
+TRIANGLE_ATTENTION_CHUNK_SIZE = 64
+class TriangleAttentionGolden(Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        ending: bool,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.ending = ending
+        self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
+        self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
+        self.bias_weight = self.torch_to_tt("linear.weight")
+        self.q_weight = self.torch_to_tt("linear_q.weight")
+        self.k_weight = self.torch_to_tt("linear_k.weight")
+        self.v_weight = self.torch_to_tt("linear_v.weight")
+        self.o_weight = self.torch_to_tt("linear_o.weight")
+        self.g_weight = self.torch_to_tt("linear_g.weight")
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        x = ttnn.reshape(x, tuple(x.shape)[1:])
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
+        x = ttnn.layer_norm(
+            x,
+            weight=self.layer_norm_weight,
+            bias=self.layer_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        triangle_bias = ttnn.linear(
+            x,
+            self.bias_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
+        o_chunks = []
+        for chunk_start in range(0, x.shape[0], TRIANGLE_ATTENTION_CHUNK_SIZE):
+            x_chunk = x[
+                chunk_start : min(
+                    chunk_start + TRIANGLE_ATTENTION_CHUNK_SIZE, x.shape[0]
+                ),
+                :,
+                :,
+            ]
+            q = ttnn.linear(
+                x_chunk, self.q_weight, compute_kernel_config=self.compute_kernel_config
+            )
+            k = ttnn.linear(
+                x_chunk, self.k_weight, compute_kernel_config=self.compute_kernel_config
+            )
+            v = ttnn.linear(
+                x_chunk, self.v_weight, compute_kernel_config=self.compute_kernel_config
+            )
+            q = ttnn.permute(q, (2, 0, 1))
+            k = ttnn.permute(k, (2, 0, 1))
+            v = ttnn.permute(v, (2, 0, 1))
+            q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+            k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+            v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+            q = ttnn.permute(q, (0, 2, 3, 1))
+            k = ttnn.permute(k, (0, 2, 1, 3))
+            v = ttnn.permute(v, (0, 2, 3, 1))
+            a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
+            a = ttnn.multiply(a, self.head_dim**-0.5)
+            a = ttnn.add(a, triangle_bias) # comment out to test without triangle bias
+            a = ttnn.softmax(
+                a,
+                dim=-1,
+                compute_kernel_config=ttnn.WormholeComputeKernelConfig(
+                    math_fidelity=self.compute_kernel_config.math_fidelity,
+                    math_approx_mode=self.compute_kernel_config.math_approx_mode,
+                    fp32_dest_acc_en=False,
+                    packer_l1_acc=self.compute_kernel_config.packer_l1_acc,
+                ),
+                numeric_stable=True,
+            )
+            o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
+            o_chunks.append(o)
+        o = ttnn.concat(o_chunks, dim=1)
+        o = ttnn.permute(o, (0, 3, 1, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
+        g = ttnn.linear(
+            x, self.g_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        g = ttnn.sigmoid_accurate(g)
+        o = ttnn.multiply(o, g)
+        x = ttnn.linear(
+            o, self.o_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))
+        x = ttnn.reshape(x, (1, *x.shape))
+        return x
 
 class AttentionPairBias(Module):
     def __init__(
@@ -390,6 +492,7 @@ class AttentionPairBias(Module):
                 attn_mask=z,
                 is_causal=False,
                 scale=self.head_dim**-0.5,
+                compute_kernel_config=self.compute_kernel_config,
                 program_config=ttnn.SDPAProgramConfig(
                     compute_with_storage_grid_size=(
                         (13, 10) if is_blackhole() else (8, 8)
