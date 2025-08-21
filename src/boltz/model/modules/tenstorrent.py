@@ -181,7 +181,9 @@ class TriangleAttention(Module):
         self.ending = ending
         self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
         self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
-        self.bias_weight = self.torch_to_tt("linear.weight")
+        self.bias_weight = ttnn.multiply_(
+            self.torch_to_tt("linear.weight"), self.head_dim**0.5
+        )
         self.o_weight = self.torch_to_tt("linear_o.weight")
         self.qkvg_weight = ttnn.from_torch(
             torch.cat(
@@ -310,7 +312,9 @@ class AttentionPairBias(Module):
         if compute_pair_bias:
             self.z_norm_weight = self.torch_to_tt("proj_z.0.weight")
             self.z_norm_bias = self.torch_to_tt("proj_z.0.bias")
-            self.z_weight = self.torch_to_tt("proj_z.1.weight")
+            self.z_weight = ttnn.multiply_(
+                self.torch_to_tt("proj_z.1.weight"), self.head_dim**0.5
+            )
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
     def __call__(
@@ -1226,6 +1230,7 @@ class DiffusionTransformerModule(TorchWrapper):
     ) -> torch.Tensor:
         if self.bias is None:
             self.bias = self._from_torch(bias.permute(3, 0, 1, 2))
+            self.bias = ttnn.multiply_(self.bias, (self.dim / self.n_heads) ** 0.5)
             if not self.atom_level:
                 seq_len_padding = -self.bias.shape[-1] % 32
                 self.bias = ttnn.pad(
