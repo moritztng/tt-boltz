@@ -13,7 +13,6 @@ device = None
 def cleanup():
     global device
     if device is not None:
-        ttnn.DumpDeviceProfiler(device)
         ttnn.close_device(device)
 
 
