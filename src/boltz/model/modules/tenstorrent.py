@@ -261,6 +261,7 @@ class TriangleAttention(Module):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        o = []
         for head in range(0, q.shape[0]):
             head_q = q[head : head + 1, :, :, :]
             head_k = k[head : head + 1, :, :, :]
@@ -282,10 +283,8 @@ class TriangleAttention(Module):
                     k_chunk_size=256,
                 ),
             )
-            if head == 0:
-                o = head_o
-            else:
-                o = ttnn.concat([o, head_o], dim=0)
+            o.append(head_o)
+        o = ttnn.concat(o, dim=0)
         o = ttnn.experimental.nlp_concat_heads_boltz(
             o, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
