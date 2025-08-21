@@ -107,6 +107,23 @@ class TriangleMultiplication(Module):
         g_in = ttnn.sigmoid_accurate(g_in)
         x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
         B, H, H, W = x_pg_in.shape
+        seq_len_tiles = (H + 31) // 32
+        core_grid = (10, 13) if is_blackhole() else (8, 8)
+        per_core_M = (seq_len_tiles + core_grid[0] - 1) // core_grid[0]
+        per_core_N = (seq_len_tiles + core_grid[1] - 1) // core_grid[1]
+        program_config = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+            compute_with_storage_grid_size=core_grid[::-1],
+            in0_block_w=1,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            out_block_h=per_core_M,
+            out_block_w=per_core_N,
+            per_core_M=per_core_M,
+            per_core_N=per_core_N,
+            transpose_mcast=False,
+            fused_activation=None,
+            fuse_batch=False,
+        )
         for chunk_start in range(0, W // 2, TRIANGLE_MULT_CHUNK_SIZE):
             a_chunk = ttnn.slice(
                 x_pg_in,
@@ -136,7 +153,7 @@ class TriangleMultiplication(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 dtype=ttnn.bfloat16,
-                core_grid=ttnn.CoreGrid(y=9, x=2) if is_blackhole() else None,
+                program_config=program_config,
             )
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
