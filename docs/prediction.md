@@ -240,7 +240,7 @@ There are two main predictions in the affinity output: `affinity_pred_value` and
 
 The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. It's value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder.
 
-The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. Lower values indicate stronger predicted binding, for instance:
+The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule (*note that this implies that it should only be used when comparing different active molecules, not inactives*). This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. Lower values indicate stronger predicted binding, for instance:
 - IC50 of $10^{-9}$ M $\longrightarrow$ our model outputs $-3$ (strong binder)
 - IC50 of $10^{-6}$ M $\longrightarrow$ our model outputs $0$ (moderate binder)
 - IC50 of $10^{-4}$ M $\longrightarrow$ our model outputs $2$ (weak binder / decoy)
