@@ -1201,6 +1201,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 if affinity:
                     affinity_mw = AllChem.Descriptors.MolWt(ref_mol)
 
+                    # Add error and warning messaging when computing affinity with ligands too large
+                    if ref_mol.GetNumAtoms() > 128:
+                        msg = f"The ligand for affinity is too large, ligands with more than 128 atoms are not " \
+                              f"supported in the affinity prediction module"
+                        raise ValueError(msg)
+                    elif ref_mol.GetNumAtoms() > 56:
+                        print("WARNING: the ligand used for affinity calculation is larger than 56 heavy-atoms, which "
+                              "was the maximum during training, therefore the affinity output might be inaccurate.")
+
                 # Parse residue
                 residue = parse_ccd_residue(
                     name=code,
@@ -1252,6 +1261,16 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
 
             mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
+
+            if affinity:
+                # Add error and warning messaging when computing affinity with ligands too large
+                if mol_no_h.GetNumAtoms() > 128:
+                    msg = f"The ligand for affinity is too large, ligands with more than 128 atoms are not supported in the affinity prediction module"
+                    raise ValueError(msg)
+                elif mol_no_h.GetNumAtoms() > 56:
+                    print("WARNING: the ligand used for affinity calculation is larger than 56 heavy-atoms, "
+                          "which was the maximum during training, therefore the affinity output might be inaccurate.")
+
             affinity_mw = AllChem.Descriptors.MolWt(mol_no_h) if affinity else None
             extra_mols[f"LIG{ligand_id}"] = mol_no_h
             residue = parse_ccd_residue(
