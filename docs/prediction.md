@@ -7,6 +7,7 @@ Once `boltz` is installed, you can run predictions with:
 * `<INPUT_PATH>` can be either a single .yaml or .fasta file (YAML is preferred; FASTA is deprecated), or a directory, in which case predictions will be run on all `.yaml` and `.fasta` files inside.
 * If you include `--use_msa_server`, the MSA will be generated automatically via the mmseqs2 server. Without this flag, you must provide a pre-computed MSA.
 * If you include `--use_potentials`, Boltz will apply inference-time potentials to improve the physical plausibility of the predicted poses.
+* Without the `--override` options, Boltz will try to use the cached preprocessed files and existing predictions, if any are present in your output directory (name of your input by default). Add the `--override` flag to run the prediction from scratch, e.g. if you change some parameters or complex details without changing the output directory.
 
 
 ## Input format
@@ -99,8 +100,8 @@ If you wish to explicitly define which of the chains in your YAML should be temp
 
 For any template you provide, you can also specify a `force` flag which will use a potential to enforce that the backbone does not deviate excessively from the template during the prediction. When using `force` one must specify also the `threshold` field which controls the distance (in Angstroms) that the prediction can deviate from the template. 
 
-### Properties
-`properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed. Only one single molecule can be specified for affinity computation, and it must be a ligand chain (not a protein, DNA or RNA). At this point, Boltz only supports the computation of affinity of small molecules to protein targets, if ran with an RNA/DNA/co-factor target, the code will not crash but the output will be unreliable.
+### Properties (affinity)
+`properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed. Only one single small molecule can be specified for affinity computation. It must be a ligand chain (not a protein, DNA or RNA) and has to be at most 128 atoms counting heavy atoms and hydrogens kept by `RDKit RemoveHs`, however, we do not recommend running the affinity module with ligands significantly larger than 56 atoms (counted as above, limit set during training). At this point, Boltz only supports the computation of affinity of small molecules to protein targets, if ran with an RNA/DNA/co-factor target, the code will not crash but the output will be unreliable.
 
 
 ### Example
