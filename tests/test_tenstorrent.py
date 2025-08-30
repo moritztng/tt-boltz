@@ -2,13 +2,11 @@ import pytest, torch
 from boltz.model.modules.tenstorrent import (
     filter_dict,
     PairformerModule,
-    DiffusionTransformerModule,
     MSAModule,
+    DiffusionModule,
 )
 from boltz.model.modules.trunkv2 import MSAModule as MSAModuleTorch
-from boltz.model.modules.transformersv2 import (
-    DiffusionTransformer as DiffusionTransformerTorch,
-)
+from boltz.model.modules.diffusionv2 import DiffusionModule as DiffusionModuleTorch
 from boltz.model.layers.pairformer import PairformerModule as PairformerModuleTorch
 from boltz.model.modules.encoders import get_indexing_matrix, single_to_keys
 from functools import partial
@@ -17,7 +15,10 @@ torch.set_grad_enabled(False)
 torch.manual_seed(893)
 
 state_dict = torch.load(
-    "/home/moritz/.boltz/boltz2_conf.ckpt", map_location="cpu", mmap=True, weights_only=False,
+    "/home/moritz/.boltz/boltz2_conf.ckpt",
+    map_location="cpu",
+    mmap=True,
+    weights_only=False,
 )["state_dict"]
 
 
@@ -54,84 +55,70 @@ def test_pairformer(seq_len):
     assert median_relative_error(z_tt, z_torch) < 1e-1, "z not accurate"
 
 
-@pytest.mark.parametrize("seq_len", [100, 500, 1000])
-def test_token_transformer(seq_len):
-    n_layers = 2
-    n_heads = 16
-    token_transformer = DiffusionTransformerModule(
-        n_layers=n_layers,
-        dim=768,
-        n_heads=n_heads,
-        atom_level=False,
-    )
-    token_transformer_torch = DiffusionTransformerTorch(
-        depth=n_layers, heads=n_heads, dim=768, dim_single_cond=768
-    ).eval()
-    token_transformer_state_dict = filter_dict(
-        state_dict, "structure_module.score_model.token_transformer"
-    )
-    token_transformer.load_state_dict(
-        token_transformer_state_dict,
+def test_diffusion():
+    diffusion = DiffusionModule()
+    diffusion_torch = DiffusionModuleTorch(384, 128, token_transformer_heads=16).eval()
+    diffusion_state_dict = filter_dict(state_dict, "structure_module.score_model")
+    diffusion.load_state_dict(
+        diffusion_state_dict,
         strict=False,
     )
-    token_transformer_torch.load_state_dict(token_transformer_state_dict, strict=False)
-    a = 3 + 5 * torch.randn(1, seq_len, 768)
-    s = -2 + 42 * torch.randn(1, seq_len, 768)
-    z = 10 * torch.randn(1, seq_len, seq_len, n_layers * n_heads)
-    mask = torch.ones(1, seq_len)
-    a_tt = token_transformer(
-        a,
-        s,
-        z,
-        mask,
-    )
-    a_torch = token_transformer_torch(
-        a,
-        s,
-        z,
-        mask,
-    )
-    assert median_relative_error(a_tt, a_torch) < 1e-1, "a not accurate"
-
-
-def test_atom_transformer():
-    n_layers = 3
-    n_heads = 4
-    atom_transformer = DiffusionTransformerModule(
-        n_layers=n_layers,
-        dim=128,
-        n_heads=n_heads,
-        atom_level=True,
-    )
-    atom_transformer_torch = DiffusionTransformerTorch(
-        depth=n_layers, heads=n_heads, dim=128, dim_single_cond=128
-    ).eval()
-    atom_transformer_state_dict = filter_dict(
-        state_dict,
-        "input_embedder.atom_attention_encoder.atom_encoder.diffusion_transformer",
-    )
-    atom_transformer.load_state_dict(
-        atom_transformer_state_dict,
+    diffusion_torch.load_state_dict(
+        diffusion_state_dict,
         strict=False,
     )
-    atom_transformer_torch.load_state_dict(atom_transformer_state_dict, strict=False)
-    B, W, H, K = 1, 32, 128, 166
-    a = torch.randn(K, W, H)
-    s = torch.randn(K, W, H)
-    bias = torch.randn(K, W, H, n_layers * n_heads)
-    mask = torch.ones(K, W)
-    keys_indexing = get_indexing_matrix(K, W, H, "cpu")
-    to_keys = partial(single_to_keys, indexing_matrix=keys_indexing, W=W, H=H)
-    to_keys_new = lambda x: to_keys(x.view(B, K * W, -1)).view(K, H, -1)
-    a_tt = atom_transformer(a, s, bias, mask, keys_indexing)
-    a_torch = atom_transformer_torch(
-        a,
-        s,
-        bias,
-        mask,
-        to_keys_new,
+    r_noisy = torch.randn(1, 928, 3)
+    times = torch.randn(1)
+    s_inputs = torch.randn(1, 117, 384)
+    s_trunk = torch.randn(1, 117, 384)
+    q = torch.randn(1, 928, 128)
+    c = torch.randn(1, 928, 128)
+    bias_encoder = torch.randn([1, 29, 32, 128, 12])
+    bias_decoder = torch.randn([1, 29, 32, 128, 12])
+    bias_token = torch.randn([1, 117, 117, 384])
+    mask_atom = torch.ones([1, 928])
+    mask_token = torch.ones([1, 117])
+    atom_to_token = torch.ones([1, 928, 117])
+    keys_indexing = get_indexing_matrix(29, 32, 128, "cpu")
+    r_update = diffusion(
+        r_noisy,
+        times,
+        s_inputs,
+        s_trunk,
+        q,
+        c,
+        bias_encoder,
+        bias_token,
+        bias_decoder,
+        keys_indexing,
+        mask_atom,
+        atom_to_token,
     )
-    assert median_relative_error(a_tt, a_torch) < 1e-1, "a not accurate"
+    r_update_torch = diffusion_torch(
+        r_noisy=r_noisy,
+        times=times,
+        s_inputs=s_inputs,
+        s_trunk=s_trunk,
+        diffusion_conditioning={
+            "q": q,
+            "c": c,
+            "atom_enc_bias": bias_encoder,
+            "token_trans_bias": bias_token,
+            "atom_dec_bias": bias_decoder,
+            "to_keys": partial(
+                single_to_keys, indexing_matrix=keys_indexing, W=32, H=128
+            ),
+        },
+        feats={
+            "atom_pad_mask": mask_atom,
+            "atom_to_token": atom_to_token,
+            "ref_pos": torch.randn(1, 928, 3),
+            "token_pad_mask": mask_token,
+        },
+    )
+    assert (
+        median_relative_error(r_update, r_update_torch) < 1e-1
+    ), "r_update not accurate"
 
 
 @pytest.mark.parametrize("seq_len", [100, 500, 1000])

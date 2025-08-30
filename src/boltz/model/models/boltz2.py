@@ -299,10 +299,10 @@ class Boltz2(LightningModule):
                 "atom_s": atom_s,
                 "atoms_per_window_queries": atoms_per_window_queries,
                 "atoms_per_window_keys": atoms_per_window_keys,
-                "use_tenstorrent": use_tenstorrent,
                 **score_model_args,
             },
             compile_score=compile_structure,
+            use_tenstorrent=use_tenstorrent,
             **diffusion_process_args,
         )
         self.distogram_module = DistogramModule(

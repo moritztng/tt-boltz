@@ -217,22 +217,13 @@ class AtomTransformer(Module):
         self,
         attn_window_queries,
         attn_window_keys,
-        use_tenstorrent=False,
         **diffusion_transformer_kwargs,
     ):
         super().__init__()
         self.attn_window_queries = attn_window_queries
         self.attn_window_keys = attn_window_keys
-        self.use_tenstorrent = use_tenstorrent
-        self.diffusion_transformer = (
-            tenstorrent.DiffusionTransformerModule(
-                n_layers=3,
-                dim=128,
-                n_heads=4,
-                atom_level=True
-            )
-            if use_tenstorrent
-            else DiffusionTransformer(**diffusion_transformer_kwargs)
+        self.diffusion_transformer = DiffusionTransformer(
+            **diffusion_transformer_kwargs
         )
 
     def forward(
@@ -260,12 +251,6 @@ class AtomTransformer(Module):
 
         # main transformer
         q = self.diffusion_transformer(
-            a=q,
-            s=c,
-            bias=bias,
-            mask=mask.float(),
-            keys_indexing=to_keys.keywords['indexing_matrix'],
-        ) if self.use_tenstorrent else self.diffusion_transformer(
             a=q,
             s=c,
             bias=bias,

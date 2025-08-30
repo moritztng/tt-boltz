@@ -2,6 +2,7 @@ import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
 from models.utility_functions import is_wormhole_b0, is_blackhole
+from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
@@ -827,14 +828,19 @@ class DiffusionTransformerLayer(Module):
             b_kv = ttnn.permute(b_kv, (2, 0, 1))
             b_kv = ttnn.reshape(b_kv, (K, -1, D))
             b = self.attn_pair_bias(b, z, b_kv)
-        s_o = ttnn.linear(
-            s,
-            self.output_projection_weight,
-            bias=self.output_projection_bias,
-            compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
-        )
-        s_o = ttnn.sigmoid_accurate(s_o)
+        if not self.atom_level or not hasattr(self, "s_o"):
+            s_o = ttnn.linear(
+                s,
+                self.output_projection_weight,
+                bias=self.output_projection_bias,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+            )
+            s_o = ttnn.sigmoid_accurate(s_o)
+            if self.atom_level:
+                self.s_o = s_o
+        else:
+            s_o = self.s_o
         b = ttnn.multiply(s_o, b)
         a = ttnn.add(a, b)
         a_t = self.transition(a, s)
@@ -869,7 +875,7 @@ class DiffusionTransformer(Module):
         a: ttnn.Tensor,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
-        keys_indexing: ttnn.Tensor,
+        keys_indexing: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
         dim = z.shape[0] // len(self.layers)
         for i, layer in enumerate(self.layers):
@@ -1115,6 +1121,231 @@ class MSA(Module):
         return z
 
 
+class Diffusion(Module):
+    def __init__(
+        self,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.conditioner_norm_weight = self.torch_to_tt(
+            "single_conditioner.norm_single.weight"
+        )
+        self.conditioner_norm_bias = self.torch_to_tt(
+            "single_conditioner.norm_single.bias"
+        )
+        self.conditioner_embed_weight = self.torch_to_tt(
+            "single_conditioner.single_embed.weight"
+        )
+        self.conditioner_embed_bias = self.torch_to_tt(
+            "single_conditioner.single_embed.bias"
+        )
+        self.conditioner_fourier_embed_weight = self.torch_to_tt(
+            "single_conditioner.fourier_embed.proj.weight"
+        )
+        self.conditioner_fourier_embed_bias = self.torch_to_tt(
+            "single_conditioner.fourier_embed.proj.bias"
+        )
+        self.conditioner_norm_fourier_weight = self.torch_to_tt(
+            "single_conditioner.norm_fourier.weight"
+        )
+        self.conditioner_norm_fourier_bias = self.torch_to_tt(
+            "single_conditioner.norm_fourier.bias"
+        )
+        self.conditioner_fourier_single_weight = self.torch_to_tt(
+            "single_conditioner.fourier_to_single.weight"
+        )
+        self.conditioner_transition_0 = Transition(
+            False,
+            filter_dict(state_dict, "single_conditioner.transitions.0"),
+            compute_kernel_config,
+        )
+        self.conditioner_transition_1 = Transition(
+            False,
+            filter_dict(state_dict, "single_conditioner.transitions.1"),
+            compute_kernel_config,
+        )
+        self.a_norm_bias = self.torch_to_tt("a_norm.bias")
+        self.r_to_q_weight = self.torch_to_tt(
+            "atom_attention_encoder.r_to_q_trans.weight"
+        )
+        self.encoder = DiffusionTransformer(
+            n_layers=3,
+            dim=128,
+            n_heads=4,
+            atom_level=True,
+            state_dict=filter_dict(
+                state_dict, f"atom_attention_encoder.atom_encoder.diffusion_transformer"
+            ),
+            compute_kernel_config=compute_kernel_config,
+        )
+        self.atom_to_token_weight = self.torch_to_tt(
+            "atom_attention_encoder.atom_to_token_trans.0.weight"
+        )
+        self.s_to_a_norm_weight = self.torch_to_tt("s_to_a_linear.0.weight")
+        self.s_to_a_norm_bias = self.torch_to_tt("s_to_a_linear.0.bias")
+        self.s_to_a_linear_weight = self.torch_to_tt("s_to_a_linear.1.weight")
+        self.token_transformer = DiffusionTransformer(
+            n_layers=24,
+            dim=2 * 384,
+            n_heads=16,
+            atom_level=False,
+            state_dict=filter_dict(state_dict, f"token_transformer"),
+            compute_kernel_config=compute_kernel_config,
+        )
+        self.a_norm_weight = self.torch_to_tt("a_norm.weight")
+        self.a_norm_bias = self.torch_to_tt("a_norm.bias")
+        self.a_to_q_weight = self.torch_to_tt(
+            "atom_attention_decoder.a_to_q_trans.weight"
+        )
+        self.decoder = DiffusionTransformer(
+            n_layers=3,
+            dim=128,
+            n_heads=4,
+            atom_level=True,
+            state_dict=filter_dict(
+                state_dict, f"atom_attention_decoder.atom_decoder.diffusion_transformer"
+            ),
+            compute_kernel_config=compute_kernel_config,
+        )
+        self.feat_to_pos_norm_weight = self.torch_to_tt(
+            "atom_attention_decoder.atom_feat_to_atom_pos_update.0.weight"
+        )
+        self.feat_to_pos_norm_bias = self.torch_to_tt(
+            "atom_attention_decoder.atom_feat_to_atom_pos_update.0.bias"
+        )
+        self.feat_to_pos_linear_weight = self.torch_to_tt(
+            "atom_attention_decoder.atom_feat_to_atom_pos_update.1.weight"
+        )
+
+    def __call__(
+        self,
+        r: ttnn.Tensor,
+        times: ttnn.Tensor,
+        s_inputs: ttnn.Tensor,
+        s_trunk: ttnn.Tensor,
+        q: ttnn.Tensor,
+        c: ttnn.Tensor,
+        bias_encoder: ttnn.Tensor,
+        bias_token: ttnn.Tensor,
+        bias_decoder: ttnn.Tensor,
+        keys_indexing: ttnn.Tensor,
+        atom_to_token: ttnn.Tensor,
+        atom_to_token_normed: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        W = 32
+        B, N, D = q.shape
+        NW = N // W
+        s = ttnn.concat([s_trunk, s_inputs], dim=-1)
+        s = ttnn.layer_norm(
+            s,
+            weight=self.conditioner_norm_weight,
+            bias=self.conditioner_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        s = ttnn.linear(
+            s,
+            self.conditioner_embed_weight,
+            bias=self.conditioner_embed_bias,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        fourier = ttnn.linear(
+            times,
+            self.conditioner_fourier_embed_weight,
+            bias=self.conditioner_fourier_embed_bias,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        fourier = ttnn.multiply(fourier, 2 * pi)
+        fourier = ttnn.cos(fourier)
+        fourier = ttnn.layer_norm(
+            fourier,
+            weight=self.conditioner_norm_fourier_weight,
+            bias=self.conditioner_norm_fourier_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        fourier = ttnn.linear(
+            fourier,
+            self.conditioner_fourier_single_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        s = ttnn.add(s, fourier)
+        s = ttnn.add(s, self.conditioner_transition_0(s))
+        s = ttnn.add(s, self.conditioner_transition_1(s))
+        r_to_q = ttnn.linear(
+            r,
+            self.r_to_q_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        q = ttnn.add(q, r_to_q)
+        q = ttnn.reshape(q, (B * NW, W, -1))
+        c = ttnn.reshape(c, (B * NW, W, -1))
+        q = self.encoder(q, c, bias_encoder, keys_indexing)
+        q = ttnn.reshape(q, (B, NW * W, D))
+        a = ttnn.linear(
+            q,
+            self.atom_to_token_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        a = ttnn.relu(a)
+        a = ttnn.matmul(
+            atom_to_token_normed,
+            a,
+            transpose_a=True,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        s_to_a = ttnn.layer_norm(
+            s,
+            weight=self.s_to_a_norm_weight,
+            bias=self.s_to_a_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        s_to_a = ttnn.linear(
+            s_to_a,
+            self.s_to_a_linear_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        a = ttnn.add(a, s_to_a)
+        a = self.token_transformer(a, s, bias_token)
+        a = ttnn.layer_norm(
+            a,
+            weight=self.a_norm_weight,
+            bias=self.a_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        a_to_q = ttnn.linear(
+            a,
+            self.a_to_q_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        a_to_q = ttnn.matmul(
+            atom_to_token,
+            a_to_q,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        q = ttnn.add(q, a_to_q)
+        q = ttnn.reshape(q, (B * NW, W, -1))
+        c = ttnn.reshape(c, (B * NW, W, -1))
+        q = self.decoder(q, c, bias_decoder, keys_indexing)
+        q = ttnn.reshape(q, (B, NW * W, D))
+        r_update = ttnn.layer_norm(
+            q,
+            weight=self.feat_to_pos_norm_weight,
+            bias=self.feat_to_pos_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        r_update = ttnn.linear(
+            r_update,
+            self.feat_to_pos_linear_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        return r_update
+
+
 class TorchWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1204,15 +1435,10 @@ class PairformerModule(TorchWrapper):
         )
 
 
-class DiffusionTransformerModule(TorchWrapper):
-    def __init__(self, n_layers: int, dim: int, n_heads: int, atom_level: bool):
+class DiffusionModule(TorchWrapper):
+    def __init__(self):
         super().__init__()
-        self.n_layers = n_layers
-        self.dim = dim
-        self.n_heads = n_heads
-        self.atom_level = atom_level
-        self.bias = None
-        self.keys_indexing = None
+        self.first_forward_pass = True
 
     def _load_from_state_dict(
         self,
@@ -1224,40 +1450,43 @@ class DiffusionTransformerModule(TorchWrapper):
         unexpected_keys,
         error_msgs,
     ):
-        self.module = DiffusionTransformer(
-            self.n_layers,
-            self.dim,
-            self.n_heads,
-            self.atom_level,
+        self.module = Diffusion(
             filter_dict(state_dict, prefix[:-1]),
             self.compute_kernel_config,
         )
 
     def forward(
         self,
-        a: torch.Tensor,
-        s: torch.Tensor,
-        bias: torch.Tensor,
-        mask: torch.Tensor = None,
-        keys_indexing: torch.Tensor = None,
-        to_keys=None,
-        multiplicity: int = 1,
-        model_cache: torch.Tensor = None,
+        r: torch.Tensor,
+        times: torch.Tensor,
+        s_inputs: torch.Tensor,
+        s_trunk: torch.Tensor,
+        q: torch.Tensor,
+        c: torch.Tensor,
+        bias_encoder: torch.Tensor,
+        bias_token: torch.Tensor,
+        bias_decoder: torch.Tensor,
+        keys_indexing: torch.Tensor,
+        mask: torch.Tensor,
+        atom_to_token: torch.Tensor,
     ) -> torch.Tensor:
-        if self.bias is None:
-            self.bias = self._from_torch(bias.permute(3, 0, 1, 2))
-            self.bias = ttnn.multiply_(self.bias, (self.dim / self.n_heads) ** 0.5)
-            if not self.atom_level:
-                seq_len_padding = -self.bias.shape[-1] % 32
-                self.bias = ttnn.pad(
-                    self.bias,
-                    [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)],
-                    0,
-                )
-        if self.atom_level and self.keys_indexing is None:
+        W = 32
+        H = 128
+        B, N, _ = q.shape
+        NW = N // W
+        K = B * NW
+        TOKEN_TRANSFORMER_DIM = 2 * 384
+        TOKEN_TRANSFORMER_N_HEADS = 16
+        if self.first_forward_pass:
+            self.first_forward_pass = False
+            self.s_inputs = self._from_torch(s_inputs)
+            self.s_trunk = self._from_torch(s_trunk)
+            self.q = self._from_torch(q)
+            self.c = self._from_torch(c)
+
             self.keys_indexing = self._from_torch(keys_indexing)
+
             mask = self._from_torch(mask)
-            K, W = mask.shape
             mask = ttnn.reshape(mask, (2 * K, W // 2, -1))
             mask = ttnn.permute(mask, (1, 2, 0))
             mask = ttnn.matmul(
@@ -1269,16 +1498,52 @@ class DiffusionTransformerModule(TorchWrapper):
             mask = ttnn.permute(mask, (2, 0, 1))
             mask = ttnn.reshape(mask, (1, K, 1, -1))
             mask = (-1 * mask + 1) * -1e9
-            self.bias = ttnn.add(self.bias, mask)
-        x = self._to_torch(
+
+            bias = self._from_torch(bias_encoder)
+            bias = ttnn.reshape(bias, (B * NW, W, H, -1))
+            bias = ttnn.permute(bias, (3, 0, 1, 2))
+            self.bias_encoder = ttnn.add(bias, mask)
+
+            bias = self._from_torch(bias_decoder)
+            bias = ttnn.reshape(bias, (B * NW, W, H, -1))
+            bias = ttnn.permute(bias, (3, 0, 1, 2))
+            self.bias_decoder = ttnn.add(bias, mask)
+
+            bias = self._from_torch(bias_token)
+            bias = ttnn.multiply_(
+                bias, (TOKEN_TRANSFORMER_DIM / TOKEN_TRANSFORMER_N_HEADS) ** 0.5
+            )
+            bias = ttnn.permute(bias, (3, 0, 1, 2))
+            seq_len_padding = -bias.shape[-1] % 32
+            self.bias_token = ttnn.pad(
+                bias,
+                [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)],
+                0,
+            )
+
+            self.atom_to_token = self._from_torch(atom_to_token)
+            self.atom_to_token_normed = ttnn.multiply(
+                self.atom_to_token,
+                ttnn.reciprocal(
+                    ttnn.sum(self.atom_to_token, dim=1, keepdim=True) + 1e-6
+                ),
+            )
+        return self._to_torch(
             self.module(
-                self._from_torch(a),
-                self._from_torch(s),
-                self.bias,
+                self._from_torch(r),
+                self._from_torch(times),
+                self.s_inputs,
+                self.s_trunk,
+                self.q,
+                self.c,
+                self.bias_encoder,
+                self.bias_token,
+                self.bias_decoder,
                 self.keys_indexing,
+                self.atom_to_token,
+                self.atom_to_token_normed,
             )
         )
-        return x
 
 
 class MSAModule(TorchWrapper):
