@@ -423,7 +423,6 @@ class AtomAttentionEncoder(Module):
         structure_prediction=True,
         activation_checkpointing=False,
         transformer_post_layer_norm=False,
-        use_tenstorrent=False,
     ):
         super().__init__()
 
@@ -441,7 +440,6 @@ class AtomAttentionEncoder(Module):
             heads=atom_encoder_heads,
             activation_checkpointing=activation_checkpointing,
             post_layer_norm=transformer_post_layer_norm,
-            use_tenstorrent=use_tenstorrent,
         )
 
         self.atom_to_token_trans = nn.Sequential(
@@ -507,7 +505,6 @@ class AtomAttentionDecoder(Module):
         atom_decoder_heads=4,
         activation_checkpointing=False,
         transformer_post_layer_norm=False,
-        use_tenstorrent=False,
     ):
         super().__init__()
 
@@ -523,7 +520,6 @@ class AtomAttentionDecoder(Module):
             heads=atom_decoder_heads,
             activation_checkpointing=activation_checkpointing,
             post_layer_norm=transformer_post_layer_norm,
-            use_tenstorrent=use_tenstorrent,
         )
 
         if transformer_post_layer_norm:
