@@ -57,7 +57,6 @@ class DiffusionModule(Module):
         conditioning_transition_layers: int = 2,
         activation_checkpointing: bool = False,
         transformer_post_ln: bool = False,
-        use_tenstorrent: bool = False,
     ) -> None:
         super().__init__()
 
@@ -91,21 +90,13 @@ class DiffusionModule(Module):
         )
         init.final_init_(self.s_to_a_linear[1].weight)
 
-        self.token_transformer = (
-            tenstorrent.DiffusionTransformerModule(
-                n_layers=24,
-                dim=2 * 384,
-                n_heads=16,
-            )
-            if use_tenstorrent
-            else DiffusionTransformer(
-                dim=2 * token_s,
-                dim_single_cond=2 * token_s,
-                depth=token_transformer_depth,
-                heads=token_transformer_heads,
-                activation_checkpointing=activation_checkpointing,
-                # post_layer_norm=transformer_post_ln,
-            )
+        self.token_transformer = DiffusionTransformer(
+            dim=2 * token_s,
+            dim_single_cond=2 * token_s,
+            depth=token_transformer_depth,
+            heads=token_transformer_heads,
+            activation_checkpointing=activation_checkpointing,
+            # post_layer_norm=transformer_post_ln,
         )
 
         self.a_norm = nn.LayerNorm(
@@ -146,7 +137,6 @@ class DiffusionModule(Module):
                 s_trunk.repeat_interleave(multiplicity, 0),
                 s_inputs.repeat_interleave(multiplicity, 0),
             )
-
         # Sequence-local Atom Attention and aggregation to coarse-grained tokens
         a, q_skip, c_skip, to_keys = self.atom_attention_encoder(
             feats=feats,
@@ -208,16 +198,21 @@ class AtomDiffusion(Module):
         compile_score: bool = False,
         alignment_reverse_diff: bool = False,
         synchronize_sigmas: bool = False,
+        use_tenstorrent: bool = False,
     ):
         super().__init__()
-        self.score_model = DiffusionModule(
-            **score_model_args,
+        self.use_tenstorrent = use_tenstorrent
+        self.score_model = (
+            tenstorrent.DiffusionModule()
+            if use_tenstorrent
+            else DiffusionModule(
+                **score_model_args,
+            )
         )
         if compile_score:
             self.score_model = torch.compile(
                 self.score_model, dynamic=False, fullgraph=False
             )
-
         # parameters
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
@@ -245,7 +240,7 @@ class AtomDiffusion(Module):
 
     @property
     def device(self):
-        return next(self.score_model.parameters()).device
+        return self.zero.device
 
     def c_skip(self, sigma):
         return (self.sigma_data**2) / (sigma**2 + self.sigma_data**2)
@@ -272,10 +267,40 @@ class AtomDiffusion(Module):
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
-        r_update = self.score_model(
-            r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
-            times=self.c_noise(sigma),
-            **network_condition_kwargs,
+        r_noisy = self.c_in(padded_sigma) * noised_atom_coords
+        times = self.c_noise(sigma)
+
+        r_update = (
+            self.score_model(
+                r=r_noisy,
+                times=times,
+                s_inputs=network_condition_kwargs["s_inputs"],
+                s_trunk=network_condition_kwargs["s_trunk"],
+                q=network_condition_kwargs["diffusion_conditioning"]["q"],
+                c=network_condition_kwargs["diffusion_conditioning"]["c"],
+                bias_encoder=network_condition_kwargs["diffusion_conditioning"][
+                    "atom_enc_bias"
+                ],
+                bias_token=network_condition_kwargs["diffusion_conditioning"][
+                    "token_trans_bias"
+                ],
+                bias_decoder=network_condition_kwargs["diffusion_conditioning"][
+                    "atom_dec_bias"
+                ],
+                keys_indexing=network_condition_kwargs["diffusion_conditioning"][
+                    "to_keys"
+                ].keywords["indexing_matrix"],
+                mask=network_condition_kwargs["feats"]["atom_pad_mask"],
+                atom_to_token=network_condition_kwargs["feats"][
+                    "atom_to_token"
+                ],
+            )
+            if self.use_tenstorrent
+            else self.score_model(
+                r_noisy=r_noisy,
+                times=times,
+                **network_condition_kwargs,
+            )
         )
 
         denoised_coords = (
@@ -478,9 +503,11 @@ class AtomDiffusion(Module):
                     resample_indices = (
                         torch.multinomial(
                             resample_weights,
-                            resample_weights.shape[1]
-                            if step_idx < num_sampling_steps - 1
-                            else 1,
+                            (
+                                resample_weights.shape[1]
+                                if step_idx < num_sampling_steps - 1
+                                else 1
+                            ),
                             replacement=True,
                         )
                         + resample_weights.shape[1]

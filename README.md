@@ -5,7 +5,7 @@
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2](https://doi.org/10.1101/2025.06.14.659707)
 
 ## Introduction
-TT-Boltz is the Boltz-2 fork that runs on a single Tenstorrent Wormhole n150 or n300.
+TT-Boltz is the Boltz-2 fork that runs on a single Tenstorrent Blackhole or Wormhole.
 
 Boltz is a family of models for biomolecular interaction prediction. Boltz-1 was the first fully open source model to approach AlphaFold3 accuracy. Our latest work Boltz-2 is a new biomolecular foundation model that goes beyond AlphaFold3 and Boltz-1 by jointly modeling complex structures and binding affinities, a critical component towards accurate molecular design. Boltz-2 is the first deep learning model to approach the accuracy of physics-based free-energy perturbation (FEP) methods, while running 1000x faster — making accurate in silico screening practical for early-stage drug discovery.
 
@@ -25,7 +25,7 @@ python3 -m venv env
 source env/bin/activate
 ```
 ### Build TT-Metal from Source
-Build the latest release `v0.x.x`. Don't install tt-nn with `./create_venv.sh`.
+Don't install tt-nn with `./create_venv.sh`.
 
 [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
 ### Install TT-NN
@@ -39,18 +39,18 @@ pip install -e <path-to-tt-metal-repo>
 ```bash
 pip install -e .
 ```
-You can ignore the error about the pandas version.
+You can ignore the version warnings.
 ## Inference
 
 You can run inference using Boltz with:
 
 ```
-boltz predict input_path --use_msa_server --accelerator=tenstorrent
+boltz predict examples/prot.yaml --use_msa_server --override --accelerator=tenstorrent
 ```
 
-Pass `--accelerator=tenstorrent` to run Boltz-2 on Tenstorrent Wormhole. Boltz-1 is not supported on Tenstorrent hardware anymore.
+Pass `--accelerator=tenstorrent` to run Boltz-2 on Tenstorrent Blackhole or Wormhole. Boltz-1 is not supported on Tenstorrent hardware anymore.
 
-`input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
+The input path should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
 
 ### Binding Affinity Prediction
 There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. It's value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder. The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. More details on how to run affinity predictions and parse the output can be found in our [prediction instructions](docs/prediction.md).
@@ -61,8 +61,9 @@ We didn't even start writing low-level code yet and Tenstorrent Blackhole was ju
 |---|---|
 |AMD Ryzen 5 8600G|45|
 |Nvidia T4|9|
-|Tenstorrent Wormhole n300|4|
-|Nvidia RTX 4090|2|
+|Tenstorrent Wormhole n300|3|
+|Tenstorrent Blackhole p150|1.5|
+|Nvidia RTX 4090|1|
 
 ## Evaluation
 
