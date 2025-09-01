@@ -19,10 +19,10 @@ Below is the full schema (each section is described in detail afterward):
 sequences:
     - ENTITY_TYPE:
         id: CHAIN_ID 
-        sequence: SEQUENCE    # only for protein, dna, rna
+        sequence: SEQUENCE      # only for protein, dna, rna
         smiles: 'SMILES'        # only for ligand, exclusive with ccd
-        ccd: CCD              # only for ligand, exclusive with smiles
-        msa: MSA_PATH         # only for protein
+        ccd: CCD                # only for ligand, exclusive with smiles
+        msa: MSA_PATH           # only for protein
         modifications:
           - position: RES_IDX   # index of residue, starting from 1
             ccd: CCD            # CCD code of the modified residue
@@ -73,7 +73,7 @@ The sequences section has one entry per unique chain or molecule.
 For proteins:
 * By default, an `msa` must be provided.
 * If `--use_msa_server` is set, the MSA is auto-generated (so `msa` can be omitted).
-* To use a precomputed custom MSA, set `msa: MSA_PATH` pointing to a `.a3m` file. To indicate pairing keys across chains, use a CSV format instead of a3m with two columns: `sequence` (protein sequence) and `key` (a unique identifier for matching rows across chains).
+* To use a precomputed custom MSA, set `msa: MSA_PATH` pointing to a `.a3m` file. If you have more than one protein chain, use a CSV format instead of a3m with two columns: `sequence` (protein sequence) and `key` (a unique identifier for matching rows across chains). Sequences with the same key are mutually aligned.
 * To force single-sequence mode (not recommended, as it reduces accuracy), set `msa: empty`.
 
 The `modifications` field is optional and allows specification of modified residues in polymers (`protein`, `dna`, or `rna`).  
@@ -241,7 +241,7 @@ There are two main predictions in the affinity output: `affinity_pred_value` and
 
 The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. It's value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder.
 
-The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule (*note that this implies that it should only be used when comparing different active molecules, not inactives*). This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log(IC50)`, derived from an `IC50` measured in `μM`. Lower values indicate stronger predicted binding, for instance:
+The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule (*note that this implies that it should only be used when comparing different active molecules, not inactives*). This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log10(IC50)`, derived from an `IC50` measured in `μM`. Lower values indicate stronger predicted binding, for instance:
 - IC50 of $10^{-9}$ M $\longrightarrow$ our model outputs $-3$ (strong binder)
 - IC50 of $10^{-6}$ M $\longrightarrow$ our model outputs $0$ (moderate binder)
 - IC50 of $10^{-4}$ M $\longrightarrow$ our model outputs $2$ (weak binder / decoy)
