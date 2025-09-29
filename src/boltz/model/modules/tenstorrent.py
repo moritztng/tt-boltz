@@ -338,11 +338,24 @@ class AttentionPairBias(Module):
         self,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
-        s_kv: ttnn.Tensor = None,
+        keys_indexing: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
-        memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
         if not self.atom_level:
+            memory_config = None
             s_kv = s
+        else:
+            memory_config = ttnn.L1_MEMORY_CONFIG
+            K, W, D = s.shape
+            s_kv = ttnn.reshape(s, (2 * K, W // 2, -1))
+            s_kv = ttnn.permute(s_kv, (1, 2, 0))
+            s_kv = ttnn.matmul(
+                s_kv,
+                keys_indexing,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+            )
+            s_kv = ttnn.permute(s_kv, (2, 0, 1))
+            s_kv = ttnn.reshape(s_kv, (K, -1, D))
         q = ttnn.linear(
             s,
             self.q_weight,
@@ -816,19 +829,8 @@ class DiffusionTransformerLayer(Module):
         if not self.atom_level:
             b = self.attn_pair_bias(b, z)
         else:
-            K, W, D = b.shape
-            b_kv = ttnn.reshape(b, (2 * K, W // 2, -1))
-            b_kv = ttnn.permute(b_kv, (1, 2, 0))
-            b_kv = ttnn.matmul(
-                b_kv,
-                keys_indexing,
-                compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
-            )
-            b_kv = ttnn.permute(b_kv, (2, 0, 1))
-            b_kv = ttnn.reshape(b_kv, (K, -1, D))
-            b = self.attn_pair_bias(b, z, b_kv)
-        if not self.atom_level or not hasattr(self, "s_o"):
+            b = self.attn_pair_bias(b, z, keys_indexing)
+        if not hasattr(self, "s_o"):
             s_o = ttnn.linear(
                 s,
                 self.output_projection_weight,
