@@ -1238,6 +1238,28 @@ class Diffusion(Module):
         W = 32
         B, N, D = q.shape
         NW = N // W
+        r_to_q = ttnn.linear(
+            r,
+            self.r_to_q_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        q = ttnn.add(q, r_to_q)
+        q = ttnn.reshape(q, (B * NW, W, -1))
+        c = ttnn.reshape(c, (B * NW, W, -1))
+        q = self.encoder(q, c, bias_encoder, keys_indexing)
+        q = ttnn.reshape(q, (B, NW * W, D))
+        a = ttnn.linear(
+            q,
+            self.atom_to_token_weight,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        a = ttnn.relu(a)
+        a = ttnn.matmul(
+            atom_to_token_normed,
+            a,
+            transpose_a=True,
+            compute_kernel_config=self.compute_kernel_config,
+        )
         s = ttnn.concat([s_trunk, s_inputs], dim=-1)
         s = ttnn.layer_norm(
             s,
@@ -1275,28 +1297,6 @@ class Diffusion(Module):
         s = ttnn.add(s, fourier)
         s = ttnn.add(s, self.conditioner_transition_0(s))
         s = ttnn.add(s, self.conditioner_transition_1(s))
-        r_to_q = ttnn.linear(
-            r,
-            self.r_to_q_weight,
-            compute_kernel_config=self.compute_kernel_config,
-        )
-        q = ttnn.add(q, r_to_q)
-        q = ttnn.reshape(q, (B * NW, W, -1))
-        c = ttnn.reshape(c, (B * NW, W, -1))
-        q = self.encoder(q, c, bias_encoder, keys_indexing)
-        q = ttnn.reshape(q, (B, NW * W, D))
-        a = ttnn.linear(
-            q,
-            self.atom_to_token_weight,
-            compute_kernel_config=self.compute_kernel_config,
-        )
-        a = ttnn.relu(a)
-        a = ttnn.matmul(
-            atom_to_token_normed,
-            a,
-            transpose_a=True,
-            compute_kernel_config=self.compute_kernel_config,
-        )
         s_to_a = ttnn.layer_norm(
             s,
             weight=self.s_to_a_norm_weight,
