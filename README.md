@@ -56,7 +56,8 @@ The input path should point to a YAML file, or a directory of YAML files for bat
 There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. Its value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder. The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log10(IC50)`, derived from an `IC50` measured in `μM`. More details on how to run affinity predictions and parse the output can be found in our [prediction instructions](docs/prediction.md).
 
 ## Authentication to MSA Server
-
+When using the `--use_msa_server` option with a server that requires authentication, you can provide credentials in one of two ways. More information is available in our [prediction instructions](docs/prediction.md).
+ 
 ## Current Runtime
 We didn't even start writing low-level code yet and Tenstorrent Blackhole was just released. I'm confident we'll get to 2 minutes. 
 |Hardware|~Minutes|
@@ -64,12 +65,13 @@ We didn't even start writing low-level code yet and Tenstorrent Blackhole was ju
 |AMD Ryzen 5 8600G|45|
 |Nvidia T4|9|
 |Tenstorrent Wormhole n300|3|
-|Tenstorrent Blackhole p150|1.5|
+|Tenstorrent Blackhole p150|1|
 |Nvidia RTX 4090|1|
-
 ## Evaluation
 
-To encourage reproducibility and facilitate comparison with other models, we provide the evaluation scripts and predictions for Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset as well as CASP15. These datasets are created to contain biomolecules different from the training data and to benchmark the performance of these models we run them with the same input MSAs and same number  of recycling and diffusion steps. More details on these evaluations can be found in our [evaluation instructions](docs/evaluation.md).
+⚠️ **Coming soon: updated evaluation code for Boltz-2!**
+
+To encourage reproducibility and facilitate comparison with other models, on top of the existing Boltz-1 evaluation pipeline, we will soon provide the evaluation scripts and structural predictions for Boltz-2, Boltz-1, Chai-1 and AlphaFold3 on our test benchmark dataset, and our affinity predictions on the FEP+ benchmark, CASP16 and our MF-PCBA test set.
 
 ![Affinity test sets evaluations](docs/pearson_plot.png)
 ![Test set evaluations](docs/plot_test_boltz2.png)
