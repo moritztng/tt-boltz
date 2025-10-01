@@ -44,13 +44,12 @@ class Module:
         self,
         key: str,
         transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
-        dtype: ttnn.DataType = ttnn.bfloat16,
     ) -> ttnn.Tensor:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            dtype=ttnn.float32 if USE_FLOAT32 else dtype,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
         )
 
 
@@ -63,11 +62,11 @@ class TriangleMultiplication(Module):
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.ending = ending
-        self.in_norm_weight = self.torch_to_tt("norm_in.weight", dtype=ttnn.bfloat8_b)
-        self.in_norm_bias = self.torch_to_tt("norm_in.bias", dtype=ttnn.bfloat8_b)
-        self.out_norm_weight = self.torch_to_tt("norm_out.weight", dtype=ttnn.bfloat8_b)
-        self.out_norm_bias = self.torch_to_tt("norm_out.bias", dtype=ttnn.bfloat8_b)
-        self.out_p = self.torch_to_tt("p_out.weight", dtype=ttnn.bfloat8_b)
+        self.in_norm_weight = self.torch_to_tt("norm_in.weight")
+        self.in_norm_bias = self.torch_to_tt("norm_in.bias")
+        self.out_norm_weight = self.torch_to_tt("norm_out.weight")
+        self.out_norm_bias = self.torch_to_tt("norm_out.bias")
+        self.out_p = self.torch_to_tt("p_out.weight")
         self.gpg_weight = ttnn.from_torch(
             torch.cat(
                 [
@@ -84,7 +83,6 @@ class TriangleMultiplication(Module):
         )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
-        x = ttnn.typecast(x, ttnn.bfloat8_b)
         x_norm_in = ttnn.layer_norm(
             x,
             weight=self.in_norm_weight,
@@ -97,6 +95,7 @@ class TriangleMultiplication(Module):
             self.gpg_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         g_in, p_in, g_out = ttnn.experimental.nlp_create_qkv_heads_boltz(
@@ -107,7 +106,7 @@ class TriangleMultiplication(Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         g_in = ttnn.sigmoid_accurate(g_in)
-        x_pg_in = ttnn.multiply(p_in, g_in)
+        x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
         B, H, H, W = x_pg_in.shape
         seq_len_tiles = (H + 31) // 32
         core_grid = (10, 13) if is_blackhole() else (8, 8)
@@ -126,7 +125,6 @@ class TriangleMultiplication(Module):
             fused_activation=None,
             fuse_batch=False,
         )
-        x_pg_in = ttnn.typecast(x_pg_in, ttnn.bfloat16)
         for chunk_start in range(0, W // 2, TRIANGLE_MULT_CHUNK_SIZE):
             a_chunk = ttnn.slice(
                 x_pg_in,
@@ -138,6 +136,7 @@ class TriangleMultiplication(Module):
                 a_chunk, (0, 3) + ((2, 1) if self.ending else (1, 2))
             )
             a_chunk = ttnn.typecast(a_chunk, ttnn.bfloat8_b)
+            a_chunk = ttnn.reallocate(a_chunk)
             b_chunk = ttnn.slice(
                 x_pg_in,
                 [0, 0, 0, W // 2 + chunk_start],
@@ -148,18 +147,18 @@ class TriangleMultiplication(Module):
                 b_chunk, (0, 3) + ((1, 2) if self.ending else (2, 1))
             )
             b_chunk = ttnn.typecast(b_chunk, ttnn.bfloat8_b)
+            b_chunk = ttnn.reallocate(b_chunk)
             x_chunk = ttnn.matmul(
                 a_chunk,
                 b_chunk,
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
-                program_config=program_config,
                 dtype=ttnn.bfloat16,
+                program_config=program_config,
             )
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
             x_chunk = ttnn.permute(x_chunk, (0, 2, 3, 1))
-            x_chunk = ttnn.typecast(x_chunk, ttnn.bfloat8_b)
             if chunk_start == 0:
                 x = ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             else:
@@ -177,6 +176,7 @@ class TriangleMultiplication(Module):
             self.out_p,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.L1_MEMORY_CONFIG,
+            dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=10, x=11) if is_blackhole() else None,
         )
         g_out = ttnn.sigmoid_accurate(g_out[:, :, :, : W // 2])
