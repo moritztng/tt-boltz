@@ -1,7 +1,7 @@
 import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict
-from models.utility_functions import is_wormhole_b0, is_blackhole
+from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
