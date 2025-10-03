@@ -37,6 +37,7 @@ from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
 from boltz.model.modules import tenstorrent
+from time import time
 
 
 class Boltz2(LightningModule):
@@ -437,7 +438,10 @@ class Boltz2(LightningModule):
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
         ):
+            start_time = time()
             s_inputs = self.input_embedder(feats)
+            print("time", "boltz2", "embedder", time() - start_time)
+            start_time = time()
 
             # Initialize the sequence embeddings
             s_init = self.s_init(s_inputs)
@@ -461,6 +465,8 @@ class Boltz2(LightningModule):
             # Compute pairwise mask
             mask = feats["token_pad_mask"].float()
             pair_mask = mask[:, :, None] * mask[:, None, :]
+            print("time", "boltz2", "init tensors", time() - start_time)
+            start_time = time()
             if self.run_trunk_and_structure:
                 for i in range(recycling_steps + 1):
                     with torch.set_grad_enabled(
@@ -468,6 +474,7 @@ class Boltz2(LightningModule):
                         and self.structure_prediction_training
                         and (i == recycling_steps)
                     ):
+                        trunk_start_time = time()
                         # Issue with unused parameters in autocast
                         if (
                             self.training
@@ -479,7 +486,8 @@ class Boltz2(LightningModule):
                         # Apply recycling
                         s = s_init + self.s_recycle(self.s_norm(s))
                         z = z_init + self.z_recycle(self.z_norm(z))
-
+                        print("time", "boltz2", "preprocessing", time() - trunk_start_time)
+                        trunk_start_time = time()
                         # Compute pairwise stack
                         if self.use_templates:
                             if self.is_template_compiled and not self.training:
@@ -490,6 +498,8 @@ class Boltz2(LightningModule):
                             z = z + template_module(
                                 z, feats, pair_mask, use_kernels=self.use_kernels
                             )
+                        print("time", "boltz2", "template", time() - trunk_start_time)
+                        trunk_start_time = time()
 
                         if self.is_msa_compiled and not self.training:
                             msa_module = self.msa_module._orig_mod  # noqa: SLF001
@@ -499,6 +509,8 @@ class Boltz2(LightningModule):
                         z = z + msa_module(
                             z, s_inputs, feats, use_kernels=self.use_kernels
                         )
+                        print("time", "boltz2", "msa", time() - trunk_start_time)
+                        trunk_start_time = time()
 
                         # Revert to uncompiled version for validation
                         if self.is_pairformer_compiled and not self.training:
@@ -513,7 +525,9 @@ class Boltz2(LightningModule):
                             pair_mask=pair_mask,
                             use_kernels=self.use_kernels,
                         )
-
+            print("time", "boltz2", "pairformer", time() - start_time)
+            start_time = time()
+                
             pdistogram = self.distogram_module(z)
             dict_out = {
                 "pdistogram": pdistogram,
@@ -554,6 +568,8 @@ class Boltz2(LightningModule):
                     "atom_dec_bias": atom_dec_bias,
                     "token_trans_bias": token_trans_bias,
                 }
+                print("time", "boltz2", "diffusion conditioning", time() - start_time)
+                start_time = time()
 
                 with torch.autocast("cuda", enabled=False):
                     struct_out = self.structure_module.sample(
@@ -569,6 +585,8 @@ class Boltz2(LightningModule):
                     )
                     dict_out.update(struct_out)
 
+                print("time", "boltz2", "diffusion module", time() - start_time)
+                start_time = time()
                 if self.predict_bfactor:
                     pbfactor = self.bfactor_module(s)
                     dict_out["pbfactor"] = pbfactor
@@ -607,7 +625,7 @@ class Boltz2(LightningModule):
             elif self.training:
                 feats["coords"] = feats["coords"].squeeze(1)
                 assert len(feats["coords"].shape) == 3
-
+        start_time = time()
         if self.confidence_prediction:
             dict_out.update(
                 self.confidence_module(
@@ -630,6 +648,7 @@ class Boltz2(LightningModule):
                     use_kernels=self.use_kernels,
                 )
             )
+        print("time", "boltz2", "confidence", time() - start_time)
 
         if self.affinity_prediction:
             pad_token_mask = feats["token_pad_mask"][0]

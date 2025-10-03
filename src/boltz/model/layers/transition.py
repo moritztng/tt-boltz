@@ -4,6 +4,13 @@ from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
 
+from time import time
+import atexit
+total_time = 0
+def cleanup():
+    print("time", "module", "transition", total_time)
+atexit.register(cleanup)
+
 
 class Transition(nn.Module):
     """Perform a two-layer MLP."""
@@ -58,11 +65,14 @@ class Transition(nn.Module):
             The output data of shape (..., D)
 
         """
+        global total_time
+        start_time = time()
         x = self.norm(x)
 
         if chunk_size is None or self.training:
             x = self.silu(self.fc1(x)) * self.fc2(x)
             x = self.fc3(x)
+            total_time += time() - start_time
             return x
         else:
             # Compute in chunks
@@ -75,4 +85,5 @@ class Transition(nn.Module):
                     x_out = x_chunk @ fc3_slice.T
                 else:
                     x_out = x_out + x_chunk @ fc3_slice.T
+            total_time += time() - start_time
             return x_out

@@ -3,6 +3,13 @@ from torch import Tensor, nn
 
 from boltz.model.layers import initialize as init
 
+from time import time
+import atexit
+total_time = 0
+def cleanup():
+    print("time", "module", "triangle multiplication", total_time)
+atexit.register(cleanup)
+
 
 @torch.compiler.disable
 def kernel_triangular_mult(
@@ -34,7 +41,6 @@ def kernel_triangular_mult(
         g_out_weight=g_out_weight,
         eps=eps,
     )
-
 
 class TriangleMultiplicationOutgoing(nn.Module):
     """TriangleMultiplicationOutgoing."""
@@ -88,6 +94,8 @@ class TriangleMultiplicationOutgoing(nn.Module):
             The output data of shape (B, N, N, D)
 
         """
+        global total_time
+        start_time = time()
         if use_kernels:
             return kernel_triangular_mult(
                 x,
@@ -120,7 +128,7 @@ class TriangleMultiplicationOutgoing(nn.Module):
 
         # Output gating
         x = self.p_out(self.norm_out(x)) * self.g_out(x_in).sigmoid()
-
+        total_time += time() - start_time
         return x
 
 
@@ -176,6 +184,8 @@ class TriangleMultiplicationIncoming(nn.Module):
             The output data of shape (B, N, N, D)
 
         """
+        global total_time
+        start_time = time()
         if use_kernels:
             return kernel_triangular_mult(
                 x,
@@ -208,5 +218,5 @@ class TriangleMultiplicationIncoming(nn.Module):
 
         # Output gating
         x = self.p_out(self.norm_out(x)) * self.g_out(x_in).sigmoid()
-
+        total_time += time() - start_time
         return x

@@ -29,6 +29,12 @@ from boltz.model.layers.triangular_attention.utils import (
     permute_final_dims,
 )
 
+from time import time
+import atexit
+total_time = 0
+def cleanup():
+    print("time", "module", "triangle attention", total_time)
+atexit.register(cleanup)
 
 class TriangleAttention(nn.Module):
     """Implement Algorithm 12."""
@@ -131,6 +137,8 @@ class TriangleAttention(nn.Module):
             Output tensor of shape [*, I, J, C_in]
 
         """
+        global total_time
+        start_time = time()
         if mask is None:
             # [*, I, J]
             mask = x.new_ones(
@@ -175,7 +183,7 @@ class TriangleAttention(nn.Module):
 
         if not self.starting:
             x = x.transpose(-2, -3)
-
+        total_time += time() - start_time
         return x
 
 

@@ -16,6 +16,7 @@ from boltz.model.modules.trunkv2 import (
 from boltz.model.modules.utils import LinearNoBias
 
 from boltz.model.modules import tenstorrent
+from time import time
 
 
 class ConfidenceModule(nn.Module):
@@ -125,6 +126,7 @@ class ConfidenceModule(nn.Module):
         run_sequentially=False,
         use_kernels: bool = False,
     ):
+        start_time = time()
         if run_sequentially and multiplicity > 1:
             assert z.shape[0] == 1, "Not supported with batch size > 1"
             out_dicts = []
@@ -208,10 +210,14 @@ class ConfidenceModule(nn.Module):
 
         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
         pair_mask = mask[:, :, None] * mask[:, None, :]
+        print("confidence preprocessing", time() - start_time)
+        start_time = time()
 
         s_t, z_t = self.pairformer_stack(
             s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels
         )
+        print("confidence pairformer", time() - start_time)
+        start_time = time()
 
         # AF3 has residual connections, we remove them
         s = s_t
@@ -235,6 +241,7 @@ class ConfidenceModule(nn.Module):
                 pred_distogram_logits=pred_distogram_logits,
             )
         )
+        print("confidence postprocessing", time() - start_time)
         return out_dict
 
 

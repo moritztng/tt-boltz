@@ -33,6 +33,9 @@ from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz1 import Boltz1
 from boltz.model.models.boltz2 import Boltz2
 
+from time import time
+start_time = time()
+
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MOL_URL = "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar"
 
@@ -1314,6 +1317,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args = BoltzSteeringParams()
         steering_args.fk_steering = use_potentials
         steering_args.physical_guidance_update = use_potentials
+        global start_time
+        print("time", "main", "preprocessing", time() - start_time)
+        start_time = time()
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(
@@ -1330,6 +1336,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             use_tenstorrent = use_tenstorrent,
         )
         model_module.eval()
+        print("time", "main", "load model", time() - start_time)
+        start_time = time()
 
         # Compute structure predictions
         trainer.predict(
@@ -1337,6 +1345,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             datamodule=data_module,
             return_predictions=False,
         )
+        print("time", "main", "prediction", time() - start_time)
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):

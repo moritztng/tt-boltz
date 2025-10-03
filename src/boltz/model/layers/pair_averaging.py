@@ -3,6 +3,13 @@ from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
 
+from time import time
+import atexit
+total_time = 0
+def cleanup():
+    print("time", "module", "pair weighted averaging", total_time)
+atexit.register(cleanup)
+
 
 class PairWeightedAveraging(nn.Module):
     """Pair weighted averaging layer."""
@@ -67,6 +74,8 @@ class PairWeightedAveraging(nn.Module):
             The output sequence tensor (B, S, N, D)
 
         """
+        global total_time
+        start_time = time()
         # Compute layer norms
         m = self.norm_m(m)
         z = self.norm_z(z)
@@ -110,6 +119,7 @@ class PairWeightedAveraging(nn.Module):
                     o_out = o_chunks @ sliced_weight_proj_o.T
                 else:
                     o_out += o_chunks @ sliced_weight_proj_o.T
+            total_time += time() - start_time
             return o_out
         else:
             # Project input tensors
@@ -132,4 +142,5 @@ class PairWeightedAveraging(nn.Module):
             o = o.permute(0, 2, 3, 1, 4)
             o = o.reshape(*o.shape[:3], self.num_heads * self.c_h)
             o = self.proj_o(g * o)
+            total_time += time() - start_time
             return o

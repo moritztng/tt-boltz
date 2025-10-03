@@ -6,6 +6,13 @@ from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
 
+from time import time
+import atexit
+total_time = 0
+def cleanup():
+    print("time", "module", "attention pair bias", total_time)
+atexit.register(cleanup)
+
 
 class AttentionPairBias(nn.Module):
     """Attention pair bias layer."""
@@ -84,6 +91,8 @@ class AttentionPairBias(nn.Module):
             The output sequence tensor.
 
         """
+        global total_time
+        start_time = time()
         B = s.shape[0]
 
         # Compute projections
@@ -107,5 +116,5 @@ class AttentionPairBias(nn.Module):
             o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
         o = o.reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
-
+        total_time += time() - start_time
         return o

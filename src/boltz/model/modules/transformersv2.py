@@ -15,6 +15,15 @@ from boltz.model.modules.utils import LinearNoBias, SwiGLU, default
 
 from boltz.model.modules import tenstorrent
 
+from time import time
+import atexit
+total_time_adaln = 0
+total_time_cond_trans = 0
+def cleanup():
+    print("time", "module", "adaln", total_time_adaln)
+    print("time", "module", "conditioned transition", total_time_cond_trans)
+atexit.register(cleanup)
+
 
 class AdaLN(Module):
     """Algorithm 26"""
@@ -27,9 +36,12 @@ class AdaLN(Module):
         self.s_bias = LinearNoBias(dim_single_cond, dim)
 
     def forward(self, a, s):
+        global total_time_adaln
+        start_time = time()
         a = self.a_norm(a)
         s = self.s_norm(s)
         a = sigmoid(self.s_scale(s)) * a + self.s_bias(s)
+        total_time_adaln += time() - start_time
         return a
 
 
@@ -60,10 +72,12 @@ class ConditionedTransitionBlock(Module):
         a,  # Float['... d']
         s,
     ):  # -> Float['... d']:
+        global total_time_cond_trans
+        start_time = time()
         a = self.adaln(a, s)
         b = self.swish_gate(a) * self.a_to_b(a)
         a = self.output_projection(s) * self.b_to_a(b)
-
+        total_time_cond_trans += time() - start_time
         return a
 
 

@@ -3,6 +3,12 @@ from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
 
+from time import time
+import atexit
+total_time = 0
+def cleanup():
+    print("time", "module", "outer product mean", total_time)
+atexit.register(cleanup)
 
 class OuterProductMean(nn.Module):
     """Outer product mean layer."""
@@ -45,6 +51,8 @@ class OuterProductMean(nn.Module):
             The output tensor (B, N, N, c_out).
 
         """
+        global total_time
+        start_time = time()
         # Expand mask
         mask = mask.unsqueeze(-1).to(m)
 
@@ -85,6 +93,7 @@ class OuterProductMean(nn.Module):
                     z_out = z_out + z.to(m) @ sliced_weight_proj_o.T
 
             z_out = z_out + self.proj_o.bias  # add bias
+            total_time += time() - start_time
             return z_out
         else:
             mask = mask[:, :, None, :] * mask[:, :, :, None]
@@ -95,4 +104,5 @@ class OuterProductMean(nn.Module):
 
             # Project to output
             z = self.proj_o(z.to(m))
+            total_time += time() - start_time
             return z

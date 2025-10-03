@@ -3,15 +3,57 @@ from torch import nn
 from typing import Tuple, Callable, Dict
 from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
+from time import time
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
 USE_FLOAT32 = False
 
 device = None
+times_blocks = {
+    "pairformer": {
+        "triangle multiplication": 0,
+        "triangle attention": 0,
+        "transition_z": 0,
+        "transition_s": 0,
+        "attention_pair_bias": 0,
+    },
+    "msa": {
+        "pair_weighted_averaging": 0,
+        "msa_transition": 0,
+        "outer_product_mean": 0,
+        "pairformer": 0,
+    },
+    "diffusion": {
+        "atom_encoder": 0,
+        "token_transformer": 0,
+        "atom_decoder": 0,
+        "rest": 0,
+    },
+    "token_transformer": {
+        "adaln": 0,
+        "attn_pair_bias": 0,
+        "gating": 0,
+        "transition": 0,
+    },
+}
+times_modules = {
+    "tri_mul": 0,
+    "tri_att": 0,
+    "pair_bias": 0,
+    "transition": 0,
+    "adaln": 0,
+    "cond_trans": 0,
+    "outer_product_mean": 0,
+    "pair_avg": 0,
+}
+profile_blocks = False
+profile_modules = True
 
 
 def cleanup():
+    print(times_blocks)
+    print(times_modules)
     global device
     if device is not None:
         ttnn.close_device(device)
@@ -83,6 +125,9 @@ class TriangleMultiplication(Module):
         )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         x_norm_in = ttnn.layer_norm(
             x,
             weight=self.in_norm_weight,
@@ -181,6 +226,9 @@ class TriangleMultiplication(Module):
         )
         g_out = ttnn.sigmoid_accurate(g_out[:, :, :, : W // 2])
         x = ttnn.multiply_(p_out, g_out)
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["tri_mul"] += time() - start_time
         return x
 
 
@@ -219,6 +267,9 @@ class TriangleAttention(Module):
         )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
@@ -303,6 +354,474 @@ class TriangleAttention(Module):
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["tri_att"] += time() - start_time
+        return x
+
+
+TRIANGLE_ATTENTION_CHUNK_SIZE = 64
+
+
+class TriangleAttentionNaive(Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        ending: bool,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.ending = ending
+        self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
+        self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
+        self.bias_weight = self.torch_to_tt("linear.weight")
+        self.q_weight = self.torch_to_tt("linear_q.weight")
+        self.k_weight = self.torch_to_tt("linear_k.weight")
+        self.v_weight = self.torch_to_tt("linear_v.weight")
+        self.o_weight = self.torch_to_tt("linear_o.weight")
+        self.g_weight = self.torch_to_tt("linear_g.weight")
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
+        x = ttnn.reshape(x, tuple(x.shape)[1:])
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
+        x = ttnn.layer_norm(
+            x,
+            weight=self.layer_norm_weight,
+            bias=self.layer_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        triangle_bias = ttnn.linear(
+            x,
+            self.bias_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
+        )
+        triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
+        o_chunks = []
+        for chunk_start in range(0, x.shape[0], TRIANGLE_ATTENTION_CHUNK_SIZE):
+            x_chunk = x[
+                chunk_start : min(
+                    chunk_start + TRIANGLE_ATTENTION_CHUNK_SIZE, x.shape[0]
+                ),
+                :,
+                :,
+            ]
+            q = ttnn.linear(
+                x_chunk, self.q_weight, compute_kernel_config=self.compute_kernel_config
+            )
+            k = ttnn.linear(
+                x_chunk, self.k_weight, compute_kernel_config=self.compute_kernel_config
+            )
+            v = ttnn.linear(
+                x_chunk, self.v_weight, compute_kernel_config=self.compute_kernel_config
+            )
+            q = ttnn.permute(q, (2, 0, 1))
+            k = ttnn.permute(k, (2, 0, 1))
+            v = ttnn.permute(v, (2, 0, 1))
+            q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+            k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+            v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+            q = ttnn.permute(q, (0, 2, 3, 1))
+            k = ttnn.permute(k, (0, 2, 1, 3))
+            v = ttnn.permute(v, (0, 2, 3, 1))
+            a = ttnn.matmul(q, k, compute_kernel_config=self.compute_kernel_config)
+            a = ttnn.multiply(a, self.head_dim**-0.5)
+            a = ttnn.add(a, triangle_bias)
+            a = ttnn.softmax(
+                a,
+                dim=-1,
+                compute_kernel_config=self.compute_kernel_config,
+                numeric_stable=True,
+            )
+            o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
+            o_chunks.append(o)
+        o = ttnn.concat(o_chunks, dim=1)
+        o = ttnn.permute(o, (0, 3, 1, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
+        g = ttnn.linear(
+            x, self.g_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        g = ttnn.sigmoid_accurate(g)
+        o = ttnn.multiply(o, g)
+        x = ttnn.linear(
+            o, self.o_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
+        )
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))
+        x = ttnn.reshape(x, (1, *x.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["tri_att"] += time() - start_time
+        return x
+
+
+class TriangleAttentionFlash(Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        ending: bool,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.ending = ending
+        self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
+        self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
+        self.bias_weight = ttnn.multiply_(
+            self.torch_to_tt("linear.weight"), self.head_dim**0.5
+        )
+        self.q_weight = self.torch_to_tt("linear_q.weight")
+        self.k_weight = self.torch_to_tt("linear_k.weight")
+        self.v_weight = self.torch_to_tt("linear_v.weight")
+        self.o_weight = self.torch_to_tt("linear_o.weight")
+        self.g_weight = self.torch_to_tt("linear_g.weight")
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
+        x = ttnn.reshape(x, tuple(x.shape)[1:])
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
+        x = ttnn.layer_norm(
+            x,
+            weight=self.layer_norm_weight,
+            bias=self.layer_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        seq_len = x.shape[0]
+        padding = -seq_len % 256
+        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
+        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        triangle_bias = ttnn.linear(
+            x,
+            self.bias_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
+        )
+        triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
+        q = ttnn.linear(
+            x, self.q_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        k = ttnn.linear(
+            x, self.k_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        v = ttnn.linear(
+            x, self.v_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        q = ttnn.permute(q, (2, 0, 1))
+        k = ttnn.permute(k, (2, 0, 1))
+        v = ttnn.permute(v, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+        v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+        q = ttnn.permute(q, (0, 2, 3, 1))
+        k = ttnn.permute(k, (0, 2, 3, 1))
+        v = ttnn.permute(v, (0, 2, 3, 1))
+        for head in range(0, q.shape[0]):
+            head_q = q[head : head + 1, :, :, :]
+            head_k = k[head : head + 1, :, :, :]
+            head_v = v[head : head + 1, :, :, :]
+            head_triangle_bias = triangle_bias[head : head + 1, :, :, :]
+            head_o = ttnn.transformer.scaled_dot_product_attention(
+                head_q,
+                head_k,
+                head_v,
+                attn_mask=head_triangle_bias,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
+                    exp_approx_mode=False,
+                    q_chunk_size=256,
+                    k_chunk_size=256,
+                ),
+            )
+            if head == 0:
+                o = head_o
+            else:
+                o = ttnn.concat([o, head_o], dim=0)
+        o = ttnn.permute(o, (0, 3, 1, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
+        g = ttnn.linear(
+            x, self.g_weight, compute_kernel_config=self.compute_kernel_config
+        )
+        g = ttnn.sigmoid_accurate(g)
+        o = ttnn.multiply(o, g)
+        x = ttnn.linear(
+            o, self.o_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
+        )
+        x = x[:seq_len, :seq_len, :]
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))
+        x = ttnn.reshape(x, (1, *x.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["tri_att"] += time() - start_time
+        return x
+
+
+class TriangleAttentionFused(Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        ending: bool,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.ending = ending
+        self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
+        self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
+        self.bias_weight = ttnn.multiply_(
+            self.torch_to_tt("linear.weight"), self.head_dim**0.5
+        )
+        self.o_weight = self.torch_to_tt("linear_o.weight")
+        self.qkvg_weight = ttnn.from_torch(
+            torch.cat(
+                [
+                    self.state_dict["linear_q.weight"],
+                    self.state_dict["linear_k.weight"],
+                    self.state_dict["linear_v.weight"],
+                    self.state_dict["linear_g.weight"],
+                ],
+                dim=0,
+            ).t(),
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+        )
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
+        x = ttnn.reshape(x, tuple(x.shape)[1:])
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
+        x = ttnn.layer_norm(
+            x,
+            weight=self.layer_norm_weight,
+            bias=self.layer_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        seq_len = x.shape[0]
+        padding = -seq_len % 256
+        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
+        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        triangle_bias = ttnn.linear(
+            x,
+            self.bias_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
+        )
+        triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
+        qkvg = ttnn.linear(
+            x,
+            self.qkvg_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=12) if is_blackhole() else None,
+        )
+        split = self.head_dim * self.n_heads
+        q = qkvg[:, :, :split]
+        k = qkvg[:, :, split : 2 * split]
+        v = qkvg[:, :, 2 * split : 3 * split]
+        g = qkvg[:, :, 3 * split :]
+        q = ttnn.permute(q, (2, 0, 1))
+        k = ttnn.permute(k, (2, 0, 1))
+        v = ttnn.permute(v, (2, 0, 1))
+        q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
+        k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
+        v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
+        q = ttnn.permute(q, (0, 2, 3, 1))
+        k = ttnn.permute(k, (0, 2, 3, 1))
+        v = ttnn.permute(v, (0, 2, 3, 1))
+        for head in range(0, q.shape[0]):
+            head_q = q[head : head + 1, :, :, :]
+            head_k = k[head : head + 1, :, :, :]
+            head_v = v[head : head + 1, :, :, :]
+            head_triangle_bias = triangle_bias[head : head + 1, :, :, :]
+            head_o = ttnn.transformer.scaled_dot_product_attention(
+                head_q,
+                head_k,
+                head_v,
+                attn_mask=head_triangle_bias,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
+                    exp_approx_mode=False,
+                    q_chunk_size=256,
+                    k_chunk_size=256,
+                ),
+            )
+            if head == 0:
+                o = head_o
+            else:
+                o = ttnn.concat([o, head_o], dim=0)
+        o = ttnn.permute(o, (0, 3, 1, 2))
+        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+        o = ttnn.permute(o, (1, 2, 0))
+        g = ttnn.sigmoid_accurate(g)
+        o = ttnn.multiply(o, g)
+        x = ttnn.linear(
+            o, self.o_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
+        )
+        x = x[:seq_len, :seq_len, :]
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))
+        x = ttnn.reshape(x, (1, *x.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["tri_att"] += time() - start_time
+        return x
+
+class TriangleAttentionHeads(Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        ending: bool,
+        state_dict: dict,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.ending = ending
+        self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
+        self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
+        self.bias_weight = ttnn.multiply_(
+            self.torch_to_tt("linear.weight"), self.head_dim**0.5
+        )
+        self.o_weight = self.torch_to_tt("linear_o.weight")
+        self.qkvg_weight = ttnn.from_torch(
+            torch.cat(
+                [
+                    self.state_dict["linear_q.weight"],
+                    self.state_dict["linear_k.weight"],
+                    self.state_dict["linear_v.weight"],
+                    self.state_dict["linear_g.weight"],
+                ],
+                dim=0,
+            ).t(),
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+        )
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
+        x = ttnn.reshape(x, tuple(x.shape)[1:])
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
+        x = ttnn.layer_norm(
+            x,
+            weight=self.layer_norm_weight,
+            bias=self.layer_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        seq_len = x.shape[0]
+        padding = -seq_len % 256
+        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
+        triangle_bias = ttnn.linear(
+            x,
+            self.bias_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
+        )
+        triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
+        qkvg = ttnn.linear(
+            x,
+            self.qkvg_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=12) if is_blackhole() else None,
+        )
+        split_idx = 3 * self.head_dim * self.n_heads
+        qkv = qkvg[:, :, :split_idx]
+        g = qkvg[:, :, split_idx:]
+        del qkvg
+        qkv = ttnn.unsqueeze(qkv, 0)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads_boltz(
+            qkv,
+            num_heads=self.n_heads,
+            num_kv_heads=self.n_heads,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        for head in range(0, q.shape[0]):
+            head_q = q[head : head + 1, :, :, :]
+            head_k = k[head : head + 1, :, :, :]
+            head_v = v[head : head + 1, :, :, :]
+            head_triangle_bias = triangle_bias[head : head + 1, :, :, :]
+            head_o = ttnn.transformer.scaled_dot_product_attention(
+                head_q,
+                head_k,
+                head_v,
+                attn_mask=head_triangle_bias,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
+                    exp_approx_mode=False,
+                    q_chunk_size=256,
+                    k_chunk_size=256,
+                ),
+            )
+            if head == 0:
+                o = head_o
+            else:
+                o = ttnn.concat([o, head_o], dim=0)
+        o = ttnn.experimental.nlp_concat_heads_boltz(
+            o, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        o = ttnn.squeeze(o, 0)
+        g = ttnn.sigmoid_accurate(g)
+        o = ttnn.multiply(o, g)
+        x = ttnn.linear(
+            o, self.o_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
+        )
+        x = x[:seq_len, :seq_len, :]
+        if self.ending:
+            x = ttnn.permute(x, (1, 0, 2))
+        x = ttnn.reshape(x, (1, *x.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["tri_att"] += time() - start_time
         return x
 
 
@@ -340,6 +859,9 @@ class AttentionPairBias(Module):
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         if not self.atom_level:
             memory_config = None
             s_kv = s
@@ -474,6 +996,9 @@ class AttentionPairBias(Module):
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config
         )
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["pair_bias"] += time() - start_time
         return x
 
 
@@ -493,6 +1018,10 @@ class Transition(Module):
         self.chunking = chunking
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
+
         def f(x):
             x_norm = ttnn.layer_norm(
                 x,
@@ -548,6 +1077,9 @@ class Transition(Module):
                 else:
                     x_out = ttnn.concat([x_out, x_chunk], dim=1)
             x = x_out
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["transition"] += time() - start_time
         return x
 
 
@@ -605,6 +1137,9 @@ class PairformerLayer(Module):
     def __call__(
         self, s: ttnn.Tensor, z: ttnn.Tensor
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            start_time = time()
         z = ttnn.add(
             z,
             self.triangle_multiplication_start(z),
@@ -613,6 +1148,10 @@ class PairformerLayer(Module):
             z,
             self.triangle_multiplication_end(z),
         )
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["pairformer"]["triangle multiplication"] += time() - start_time
+            start_time = time()
         z = ttnn.add(
             z,
             self.triangle_attention_start(z),
@@ -621,8 +1160,18 @@ class PairformerLayer(Module):
             z,
             self.triangle_attention_end(z),
         )
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["pairformer"]["triangle attention"] += time() - start_time
+            start_time = time()
         z = ttnn.add(z, self.transition_z(z))
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["pairformer"]["transition_z"] += time() - start_time
         if self.transform_s:
+            if profile_blocks:
+                ttnn.synchronize_device(device)
+                start_time = time()
             s_norm = ttnn.layer_norm(
                 s,
                 weight=self.pre_norm_s_weight,
@@ -637,7 +1186,14 @@ class PairformerLayer(Module):
                     z,
                 ),
             )
+            if profile_blocks:
+                ttnn.synchronize_device(device)
+                times_blocks["pairformer"]["attention_pair_bias"] += time() - start_time
+                start_time = time()
             s = ttnn.add(s, self.transition_s(s))
+            if profile_blocks:
+                ttnn.synchronize_device(device)
+                times_blocks["pairformer"]["transition_s"] += time() - start_time
         return s, z
 
 
@@ -690,6 +1246,9 @@ class AdaLN(Module):
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
         if not USE_FLOAT32:
             a = ttnn.clone(a, dtype=ttnn.float32, memory_config=memory_config)
@@ -722,6 +1281,9 @@ class AdaLN(Module):
         )
         a = ttnn.multiply_(a, s_scale)
         a = ttnn.add_(a, s_bias)
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["adaln"] += time() - start_time
         return a
 
 
@@ -744,6 +1306,9 @@ class ConditionedTransitionBlock(Module):
         self.output_projection_bias = self.torch_to_tt("output_projection.0.bias")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
         a = self.adaln(a, s)
         a_swish = ttnn.linear(
@@ -783,6 +1348,9 @@ class ConditionedTransitionBlock(Module):
         if self.atom_level:
             ttnn.deallocate(b)
         a = ttnn.multiply_(s, b_a)
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["cond_trans"] += time() - start_time
         return a
 
 
@@ -825,11 +1393,26 @@ class DiffusionTransformerLayer(Module):
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor,
     ) -> ttnn.Tensor:
+        if profile_blocks and not self.atom_level:
+            ttnn.synchronize_device(device)
+            start_time = time()
         b = self.adaln(a, s)
+        if profile_blocks and not self.atom_level:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["token_transformer"]["adaln"] += (
+                time() - start_time
+            )
+            start_time = time()
         if not self.atom_level:
             b = self.attn_pair_bias(b, z)
         else:
             b = self.attn_pair_bias(b, z, keys_indexing)
+        if profile_blocks and not self.atom_level:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["token_transformer"]["attn_pair_bias"] += (
+                time() - start_time
+            )
+            start_time = time()
         if not hasattr(self, "s_o"):
             s_o = ttnn.linear(
                 s,
@@ -845,8 +1428,19 @@ class DiffusionTransformerLayer(Module):
             s_o = self.s_o
         b = ttnn.multiply(s_o, b)
         a = ttnn.add(a, b)
+        if profile_blocks and not self.atom_level:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["token_transformer"]["gating"] += (
+                time() - start_time
+            )
+            start_time = time()
         a_t = self.transition(a, s)
         a = ttnn.add(a, a_t)
+        if profile_blocks and not self.atom_level:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["token_transformer"]["transition"] += (
+                time() - start_time
+            )
         return a
 
 
@@ -906,6 +1500,9 @@ class PairWeightedAveraging(Module):
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
     def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         m = ttnn.reshape(m, tuple(m.shape)[1:])
         z = ttnn.reshape(z, tuple(z.shape)[1:])
         m = ttnn.layer_norm(
@@ -973,6 +1570,9 @@ class PairWeightedAveraging(Module):
             else:
                 o_out = ttnn.add(o_out, o)
         o_out = ttnn.reshape(o_out, (1, *o_out.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["pair_avg"] += time() - start_time
         return o_out
 
 
@@ -991,6 +1591,9 @@ class OuterProductMean(Module):
         self.o_bias = self.torch_to_tt("proj_o.bias")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            start_time = time()
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         m = ttnn.layer_norm(
             x,
@@ -1031,6 +1634,9 @@ class OuterProductMean(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         z = ttnn.reshape(z, (1, *z.shape))
+        if profile_modules:
+            ttnn.synchronize_device(device)
+            times_modules["outer_product_mean"] += time() - start_time
         return z
 
 
@@ -1071,10 +1677,28 @@ class MSALayer(Module):
     def __call__(
         self, z: ttnn.Tensor, m: ttnn.Tensor
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            start_time = time()
         m = ttnn.add(m, self.pair_weighted_averaging(m, z))
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["msa"]["pair_weighted_averaging"] += time() - start_time
+            start_time = time()
         m = ttnn.add(m, self.msa_transition(m))
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["msa"]["msa_transition"] += time() - start_time
+            start_time = time()
         z = ttnn.add(z, self.outer_product_mean(m))
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["msa"]["outer_product_mean"] += time() - start_time
+            start_time = time()
         z = self.pairformer_layer(None, z)[1]
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            times_blocks["msa"]["pairformer"] += time() - start_time
         return z, m
 
 
@@ -1235,6 +1859,9 @@ class Diffusion(Module):
         atom_to_token: ttnn.Tensor,
         atom_to_token_normed: ttnn.Tensor,
     ) -> ttnn.Tensor:
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            start_time = time()
         W = 32
         B, N, D = q.shape
         NW = N // W
@@ -1246,7 +1873,17 @@ class Diffusion(Module):
         q = ttnn.add(q, r_to_q)
         q = ttnn.reshape(q, (B * NW, W, -1))
         c = ttnn.reshape(c, (B * NW, W, -1))
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["rest"] += time() - start_time
+            start_time = time()
         q = self.encoder(q, c, bias_encoder, keys_indexing)
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["atom_encoder"] += (
+                time() - start_time
+            )
+            start_time = time()
         q = ttnn.reshape(q, (B, NW * W, D))
         a = ttnn.linear(
             q,
@@ -1310,7 +1947,17 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         a = ttnn.add(a, s_to_a)
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["rest"] += time() - start_time
+            start_time = time()
         a = self.token_transformer(a, s, bias_token)
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["token_transformer"] += (
+                time() - start_time
+            )
+            start_time = time()
         a = ttnn.layer_norm(
             a,
             weight=self.a_norm_weight,
@@ -1331,7 +1978,17 @@ class Diffusion(Module):
         q = ttnn.add(q, a_to_q)
         q = ttnn.reshape(q, (B * NW, W, -1))
         c = ttnn.reshape(c, (B * NW, W, -1))
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["rest"] += time() - start_time
+            start_time = time()
         q = self.decoder(q, c, bias_decoder, keys_indexing)
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["atom_decoder"] += (
+                time() - start_time
+            )
+            start_time = time()
         q = ttnn.reshape(q, (B, NW * W, D))
         r_update = ttnn.layer_norm(
             q,
@@ -1345,6 +2002,9 @@ class Diffusion(Module):
             self.feat_to_pos_linear_weight,
             compute_kernel_config=self.compute_kernel_config,
         )
+        if profile_blocks:
+            ttnn.synchronize_device(device)
+            globals()["times_blocks"]["diffusion"]["rest"] += time() - start_time
         return r_update
 
 
