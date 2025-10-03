@@ -172,6 +172,5 @@ layer_sizes.py
 notes.txt
 
 *.pt
-*.yaml
 *.pyi
 .vscode
