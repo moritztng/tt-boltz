@@ -34,8 +34,6 @@ from boltz.model.modules.utils import (
 )
 from boltz.model.potentials.potentials import get_potentials
 
-from boltz.model.modules import tenstorrent
-
 
 class DiffusionModule(Module):
     """Diffusion module"""
@@ -198,16 +196,10 @@ class AtomDiffusion(Module):
         compile_score: bool = False,
         alignment_reverse_diff: bool = False,
         synchronize_sigmas: bool = False,
-        use_tenstorrent: bool = False,
     ):
         super().__init__()
-        self.use_tenstorrent = use_tenstorrent
-        self.score_model = (
-            tenstorrent.DiffusionModule()
-            if use_tenstorrent
-            else DiffusionModule(
-                **score_model_args,
-            )
+        self.score_model = DiffusionModule(
+            **score_model_args,
         )
         if compile_score:
             self.score_model = torch.compile(
@@ -270,37 +262,10 @@ class AtomDiffusion(Module):
         r_noisy = self.c_in(padded_sigma) * noised_atom_coords
         times = self.c_noise(sigma)
 
-        r_update = (
-            self.score_model(
-                r=r_noisy,
-                times=times,
-                s_inputs=network_condition_kwargs["s_inputs"],
-                s_trunk=network_condition_kwargs["s_trunk"],
-                q=network_condition_kwargs["diffusion_conditioning"]["q"],
-                c=network_condition_kwargs["diffusion_conditioning"]["c"],
-                bias_encoder=network_condition_kwargs["diffusion_conditioning"][
-                    "atom_enc_bias"
-                ],
-                bias_token=network_condition_kwargs["diffusion_conditioning"][
-                    "token_trans_bias"
-                ],
-                bias_decoder=network_condition_kwargs["diffusion_conditioning"][
-                    "atom_dec_bias"
-                ],
-                keys_indexing=network_condition_kwargs["diffusion_conditioning"][
-                    "to_keys"
-                ].keywords["indexing_matrix"],
-                mask=network_condition_kwargs["feats"]["atom_pad_mask"],
-                atom_to_token=network_condition_kwargs["feats"][
-                    "atom_to_token"
-                ],
-            )
-            if self.use_tenstorrent
-            else self.score_model(
-                r_noisy=r_noisy,
-                times=times,
-                **network_condition_kwargs,
-            )
+        r_update = self.score_model(
+            r_noisy=r_noisy,
+            times=times,
+            **network_condition_kwargs,
         )
 
         denoised_coords = (
@@ -652,7 +617,9 @@ class AtomDiffusion(Module):
                 multiplicity, 0
             )
 
-            align_weights = denoised_atom_coords.new_ones(denoised_atom_coords.shape[:2])
+            align_weights = denoised_atom_coords.new_ones(
+                denoised_atom_coords.shape[:2]
+            )
             atom_type = (
                 torch.bmm(
                     feats["atom_to_token"].float(),

@@ -13,8 +13,6 @@ from torch.nn import (
 from boltz.model.layers.attentionv2 import AttentionPairBias
 from boltz.model.modules.utils import LinearNoBias, SwiGLU, default
 
-from boltz.model.modules import tenstorrent
-
 from time import time
 import atexit
 total_time_adaln = 0

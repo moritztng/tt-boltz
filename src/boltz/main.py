@@ -848,7 +848,7 @@ def cli() -> None:
 )
 @click.option(
     "--accelerator",
-    type=click.Choice(["gpu", "cpu", "tpu", "tenstorrent"]),
+    type=click.Choice(["gpu", "cpu", "tpu"]),
     help="The accelerator to use for prediction. Default is gpu.",
     default="gpu",
 )
@@ -1083,13 +1083,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
-    use_tenstorrent = False
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
         click.echo(msg)
-    elif accelerator == "tenstorrent":
-        use_tenstorrent = True
-        accelerator = "cpu"
     
 
     # Supress some lightning warnings
@@ -1333,7 +1329,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
-            use_tenstorrent = use_tenstorrent,
         )
         model_module.eval()
         print("time", "main", "load model", time() - start_time)
@@ -1414,7 +1409,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
             affinity_mw_correction=affinity_mw_correction,
-            use_tenstorrent=use_tenstorrent,
         )
         model_module.eval()
 

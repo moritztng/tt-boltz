@@ -17,8 +17,6 @@ from boltz.model.modules.encodersv2 import (
     FourierEmbedding,
 )
 
-from boltz.model.modules import tenstorrent
-
 
 class ContactConditioning(nn.Module):
     def __init__(self, token_z: int, cutoff_min: float, cutoff_max: float):
@@ -376,7 +374,6 @@ class TemplateV2Module(nn.Module):
         min_dist: float = 3.25,
         max_dist: float = 50.75,
         num_bins: int = 38,
-        use_tenstorrent: bool = False,
         **kwargs,
     ) -> None:
         """Initialize the template module.
@@ -391,7 +388,6 @@ class TemplateV2Module(nn.Module):
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.num_bins = num_bins
-        self.use_tenstorrent = use_tenstorrent
         self.relu = nn.ReLU()
         self.z_norm = nn.LayerNorm(token_z)
         self.v_norm = nn.LayerNorm(template_dim)
@@ -402,18 +398,14 @@ class TemplateV2Module(nn.Module):
             bias=False,
         )
         self.u_proj = nn.Linear(template_dim, token_z, bias=False)
-        self.pairformer = (
-            tenstorrent.PairformerModule(2, 32, 4, None, None, False)
-            if use_tenstorrent
-            else PairformerNoSeqModule(
-                template_dim,
-                num_blocks=template_blocks,
-                dropout=dropout,
-                pairwise_head_width=pairwise_head_width,
-                pairwise_num_heads=pairwise_num_heads,
-                post_layer_norm=post_layer_norm,
-                activation_checkpointing=activation_checkpointing,
-            )
+        self.pairformer = PairformerNoSeqModule(
+            template_dim,
+            num_blocks=template_blocks,
+            dropout=dropout,
+            pairwise_head_width=pairwise_head_width,
+            pairwise_num_heads=pairwise_num_heads,
+            post_layer_norm=post_layer_norm,
+            activation_checkpointing=activation_checkpointing,
         )
 
     def forward(
@@ -503,7 +495,7 @@ class TemplateV2Module(nn.Module):
         # Compute input projections
         v = self.z_proj(self.z_norm(z[:, None])) + a_tij
         v = v.view(B * T, *v.shape[2:])
-        v = v + (self.pairformer(None, v)[1] if self.use_tenstorrent else self.pairformer(v, pair_mask, use_kernels=use_kernels))
+        v = v + (self.pairformer(v, pair_mask, use_kernels=use_kernels))
         v = self.v_norm(v)
         v = v.view(B, T, *v.shape[1:])
 

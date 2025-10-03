@@ -36,7 +36,6 @@ from boltz.model.modules.trunkv2 import (
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
-from boltz.model.modules import tenstorrent
 from time import time
 
 
@@ -107,7 +106,6 @@ class Boltz2(LightningModule):
         checkpoint_diffusion_conditioning: bool = False,
         use_templates_v2: bool = False,
         use_kernels: bool = False,
-        use_tenstorrent: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["validators"])
@@ -117,7 +115,9 @@ class Boltz2(LightningModule):
 
         if validate_structure:
             # Late init at setup time
-            self.val_group_mapper = {}  # maps a dataset index to a validation group name
+            self.val_group_mapper = (
+                {}
+            )  # maps a dataset index to a validation group name
             self.validator_mapper = {}  # maps a dataset index to a validator
 
             # Validators for each dataset keep track of all metrics,
@@ -165,8 +165,6 @@ class Boltz2(LightningModule):
 
         # Kernels
         self.use_kernels = use_kernels
-
-        self.use_tenstorrent = use_tenstorrent
 
         # Input embeddings
         full_embedder_args = {
@@ -222,9 +220,7 @@ class Boltz2(LightningModule):
         self.use_templates = use_templates
         if use_templates:
             if use_templates_v2:
-                self.template_module = TemplateV2Module(
-                    token_z, use_tenstorrent=use_tenstorrent, **template_args
-                )
+                self.template_module = TemplateV2Module(token_z, **template_args)
             else:
                 self.template_module = TemplateModule(token_z, **template_args)
             if compile_templates:
@@ -235,20 +231,10 @@ class Boltz2(LightningModule):
                     fullgraph=False,
                 )
 
-        self.msa_module = (
-            tenstorrent.MSAModule(
-                n_blocks=4,
-                avg_head_dim=32,
-                avg_n_heads=8,
-                tri_att_head_dim=32,
-                tri_att_n_heads=4,
-            )
-            if self.use_tenstorrent
-            else MSAModule(
-                token_z=token_z,
-                token_s=token_s,
-                **msa_args,
-            )
+        self.msa_module = MSAModule(
+            token_z=token_z,
+            token_s=token_s,
+            **msa_args,
         )
         if compile_msa:
             self.is_msa_compiled = True
@@ -257,11 +243,7 @@ class Boltz2(LightningModule):
                 dynamic=False,
                 fullgraph=False,
             )
-        self.pairformer_module = (
-            tenstorrent.PairformerModule(64, 32, 4, 24, 16, True)
-            if use_tenstorrent
-            else PairformerModule(token_s, token_z, **pairformer_args)
-        )
+        self.pairformer_module = PairformerModule(token_s, token_z, **pairformer_args)
         if compile_pairformer:
             self.is_pairformer_compiled = True
             self.pairformer_module = torch.compile(
@@ -303,7 +285,6 @@ class Boltz2(LightningModule):
                 **score_model_args,
             },
             compile_score=compile_structure,
-            use_tenstorrent=use_tenstorrent,
             **diffusion_process_args,
         )
         self.distogram_module = DistogramModule(
@@ -334,7 +315,6 @@ class Boltz2(LightningModule):
                 cyclic_pos_enc=cyclic_pos_enc,
                 conditioning_cutoff_min=conditioning_cutoff_min,
                 conditioning_cutoff_max=conditioning_cutoff_max,
-                use_tenstorrent=use_tenstorrent,
                 **confidence_model_args,
             )
             if compile_confidence:
@@ -347,13 +327,11 @@ class Boltz2(LightningModule):
                 self.affinity_module1 = AffinityModule(
                     token_s,
                     token_z,
-                    use_tenstorrent=use_tenstorrent,
                     **affinity_model_args1,
                 )
                 self.affinity_module2 = AffinityModule(
                     token_s,
                     token_z,
-                    use_tenstorrent=use_tenstorrent,
                     **affinity_model_args2,
                 )
                 if compile_affinity:
@@ -367,7 +345,6 @@ class Boltz2(LightningModule):
                 self.affinity_module = AffinityModule(
                     token_s,
                     token_z,
-                    use_tenstorrent=use_tenstorrent,
                     **affinity_model_args,
                 )
                 if compile_affinity:
@@ -388,7 +365,8 @@ class Boltz2(LightningModule):
         """Set the model for training, validation and inference."""
         if stage == "predict" and not (
             torch.cuda.is_available()
-            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
+            and torch.cuda.get_device_properties(torch.device("cuda")).major
+            >= 8.0  # noqa: PLR2004
         ):
             self.use_kernels = False
 
@@ -486,12 +464,16 @@ class Boltz2(LightningModule):
                         # Apply recycling
                         s = s_init + self.s_recycle(self.s_norm(s))
                         z = z_init + self.z_recycle(self.z_norm(z))
-                        print("time", "boltz2", "preprocessing", time() - trunk_start_time)
+                        print(
+                            "time", "boltz2", "preprocessing", time() - trunk_start_time
+                        )
                         trunk_start_time = time()
                         # Compute pairwise stack
                         if self.use_templates:
                             if self.is_template_compiled and not self.training:
-                                template_module = self.template_module._orig_mod  # noqa: SLF001
+                                template_module = (
+                                    self.template_module._orig_mod
+                                )  # noqa: SLF001
                             else:
                                 template_module = self.template_module
 
@@ -514,7 +496,9 @@ class Boltz2(LightningModule):
 
                         # Revert to uncompiled version for validation
                         if self.is_pairformer_compiled and not self.training:
-                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                            pairformer_module = (
+                                self.pairformer_module._orig_mod
+                            )  # noqa: SLF001
                         else:
                             pairformer_module = self.pairformer_module
 
@@ -527,7 +511,7 @@ class Boltz2(LightningModule):
                         )
             print("time", "boltz2", "pairformer", time() - start_time)
             start_time = time()
-                
+
             pdistogram = self.distogram_module(z)
             dict_out = {
                 "pdistogram": pdistogram,
@@ -593,9 +577,9 @@ class Boltz2(LightningModule):
 
             if self.training and self.confidence_prediction:
                 assert len(feats["coords"].shape) == 4
-                assert feats["coords"].shape[1] == 1, (
-                    "Only one conformation is supported for confidence"
-                )
+                assert (
+                    feats["coords"].shape[1] == 1
+                ), "Only one conformation is supported for confidence"
 
             # Compute structure module
             if self.training and self.structure_prediction_training:
@@ -780,9 +764,9 @@ class Boltz2(LightningModule):
 
         return_dict = {}
 
-        assert batch["coords"].shape[0] == 1, (
-            f"Validation is not supported for batch sizes={batch['coords'].shape[0]}"
-        )
+        assert (
+            batch["coords"].shape[0] == 1
+        ), f"Validation is not supported for batch sizes={batch['coords'].shape[0]}"
 
         if symmetry_correction:
             true_coords = []
@@ -908,9 +892,9 @@ class Boltz2(LightningModule):
 
             # TODO remove once multiple conformers are supported
             K = true_coords.shape[1]
-            assert K == 1, (
-                f"Confidence_prediction is not supported for num_ensembles_val={K}."
-            )
+            assert (
+                K == 1
+            ), f"Confidence_prediction is not supported for num_ensembles_val={K}."
 
             # For now, just take the only conformer.
             true_coords = true_coords.squeeze(1)  # (S, L, 3)
@@ -1281,12 +1265,12 @@ class Boltz2(LightningModule):
             checkpoint["hyper_parameters"]["training_args"][
                 "diffusion_multiplicity"
             ] = self.training_args.diffusion_multiplicity
-            checkpoint["hyper_parameters"]["training_args"]["recycling_steps"] = (
-                self.training_args.recycling_steps
-            )
-            checkpoint["hyper_parameters"]["training_args"]["weight_decay"] = (
-                self.training_args.weight_decay
-            )
+            checkpoint["hyper_parameters"]["training_args"][
+                "recycling_steps"
+            ] = self.training_args.recycling_steps
+            checkpoint["hyper_parameters"]["training_args"][
+                "weight_decay"
+            ] = self.training_args.weight_decay
 
     def configure_callbacks(self) -> list[Callback]:
         """Configure model callbacks.

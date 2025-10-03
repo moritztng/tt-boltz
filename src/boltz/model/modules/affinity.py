@@ -7,8 +7,6 @@ from boltz.model.modules.encodersv2 import PairwiseConditioning
 from boltz.model.modules.transformersv2 import DiffusionTransformer
 from boltz.model.modules.utils import LinearNoBias
 
-from boltz.model.modules import tenstorrent
-
 
 class GaussianSmearing(torch.nn.Module):
     """Gaussian smearing."""
@@ -46,10 +44,8 @@ class AffinityModule(nn.Module):
         max_dist=22,
         use_cross_transformer: bool = False,
         groups: dict = {},
-        use_tenstorrent: bool = False,
     ):
         super().__init__()
-        self.use_tenstorrent = use_tenstorrent
         boundaries = torch.linspace(2, max_dist, num_dist_bins - 1)
         self.register_buffer("boundaries", boundaries)
         self.dist_bin_pairwise_embed = nn.Embedding(num_dist_bins, token_z)
@@ -66,13 +62,7 @@ class AffinityModule(nn.Module):
             dim_token_rel_pos_feats=token_z,
             num_transitions=2,
         )
-        self.pairformer_stack = (
-            tenstorrent.PairformerModule(
-                pairformer_args["num_blocks"], 32, 4, None, None, False
-            )
-            if use_tenstorrent
-            else PairformerNoSeqModule(token_z, **pairformer_args)
-        )
+        self.pairformer_stack = PairformerNoSeqModule(token_z, **pairformer_args)
         self.affinity_heads = AffinityHeadsTransformer(
             token_z,
             transformer_args["token_s"],
@@ -132,12 +122,8 @@ class AffinityModule(nn.Module):
             + rec_mask[:, :, None] * lig_mask[:, None, :]
             + lig_mask[:, :, None] * lig_mask[:, None, :]
         )
-        z = (
-            self.pairformer_stack(None, z)[1]
-            if self.use_tenstorrent
-            else self.pairformer_stack(
-                z=z, pair_mask=cross_pair_mask, use_kernels=use_kernels
-            )
+        z = self.pairformer_stack(
+            z=z, pair_mask=cross_pair_mask, use_kernels=use_kernels
         )
 
         out_dict = {}
