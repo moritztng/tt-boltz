@@ -1,0 +1,6 @@
+version: 1
+sequences:
+  - protein:
+      id: A
+      sequence: WAKNSKIPKFESEKIAIWHLWNFFDNIRDAKWSCDMAQLCYRDYQRLTPWVTRHPYAFINSDQS
+      msa: ./examples/msa/64.a3m
