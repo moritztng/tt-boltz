@@ -97,7 +97,7 @@ class TriangleMultiplicationOutgoing(nn.Module):
         global total_time
         start_time = time()
         if use_kernels:
-            return kernel_triangular_mult(
+            x = kernel_triangular_mult(
                 x,
                 direction="outgoing",
                 mask=mask,
@@ -111,6 +111,8 @@ class TriangleMultiplicationOutgoing(nn.Module):
                 g_out_weight=self.g_out.weight,
                 eps=1e-5,
             )
+            total_time += time() - start_time
+            return x
 
         # Input gating: D -> D
         x = self.norm_in(x)
@@ -187,7 +189,7 @@ class TriangleMultiplicationIncoming(nn.Module):
         global total_time
         start_time = time()
         if use_kernels:
-            return kernel_triangular_mult(
+            x = kernel_triangular_mult(
                 x,
                 direction="incoming",
                 mask=mask,
@@ -201,6 +203,8 @@ class TriangleMultiplicationIncoming(nn.Module):
                 g_out_weight=self.g_out.weight,
                 eps=1e-5,
             )
+            total_time += time() - start_time
+            return x
 
         # Input gating: D -> D
         x = self.norm_in(x)
