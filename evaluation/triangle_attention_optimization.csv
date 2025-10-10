@@ -1,0 +1,21 @@
+optimization,sequence_length,time
+Naive,128,3.617427110671997
+Naive,256,11.78993844985962
+Naive,512,50.695629358291626
+Naive,1024,237.65695071220398
+FlashAttention-2,128,7.8661088943481445
+FlashAttention-2,256,7.5264105796813965
+FlashAttention-2,512,30.621856689453125
+FlashAttention-2,1024,123.80133867263794
+Fused Linear Transformations,128,6.361052513122559
+Fused Linear Transformations,256,6.219510793685913
+Fused Linear Transformations,512,27.16549777984619
+Fused Linear Transformations,1024,134.17664098739624
+Kernel for creating/concatenating heads,128,2.721583366394043
+Kernel for creating/concatenating heads,256,2.3268063068389893
+Kernel for creating/concatenating heads,512,9.302849769592285
+Kernel for creating/concatenating heads,1024,58.169270277023315
+Blockfp8,128,1.6583106517791748
+Blockfp8,256,1.723905324935913
+Blockfp8,512,6.9176225662231445
+Blockfp8,1024,43.084015130996704
