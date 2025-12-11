@@ -133,7 +133,7 @@ class AffinityModule(nn.Module):
             + lig_mask[:, :, None] * lig_mask[:, None, :]
         )
         z = (
-            self.pairformer_stack(None, z)[1]
+            self.pairformer_stack(None, z, cross_pair_mask)[1]
             if self.use_tenstorrent
             else self.pairformer_stack(
                 z=z, pair_mask=cross_pair_mask, use_kernels=use_kernels

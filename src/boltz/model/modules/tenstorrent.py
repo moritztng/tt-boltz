@@ -82,7 +82,7 @@ class TriangleMultiplication(Module):
             dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
         )
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor = None) -> ttnn.Tensor:
         x_norm_in = ttnn.layer_norm(
             x,
             weight=self.in_norm_weight,
@@ -107,6 +107,9 @@ class TriangleMultiplication(Module):
         )
         g_in = ttnn.sigmoid_accurate(g_in)
         x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
+        if mask is not None:
+            mask = ttnn.unsqueeze(mask, -1)
+            x_pg_in = ttnn.multiply_(x_pg_in, mask)
         B, H, H, W = x_pg_in.shape
         seq_len_tiles = (H + 31) // 32
         core_grid = (10, 13) if is_blackhole() else (8, 8)
@@ -197,12 +200,11 @@ class TriangleAttention(Module):
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.ending = ending
+        self.scale = self.head_dim**0.5
         self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
         self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
-        self.bias_weight = ttnn.multiply_(
-            self.torch_to_tt("linear.weight"), self.head_dim**0.5
-        )
         self.o_weight = self.torch_to_tt("linear_o.weight")
+        self.bias_weight = ttnn.multiply_(self.torch_to_tt("linear.weight"), self.scale)
         self.qkvg_weight = ttnn.from_torch(
             torch.cat(
                 [
@@ -218,7 +220,7 @@ class TriangleAttention(Module):
             dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
         )
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
@@ -229,11 +231,13 @@ class TriangleAttention(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        use_optimized_path = mask is None
         seq_len = x.shape[0]
-        padding = -seq_len % 256
-        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
-        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        if use_optimized_path:
+            x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+            padding = -seq_len % 256
+            x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
@@ -241,8 +245,6 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
         )
-        triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
-        triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
         qkvg = ttnn.linear(
             x,
             self.qkvg_weight,
@@ -254,42 +256,72 @@ class TriangleAttention(Module):
         qkv = qkvg[:, :, :split_idx]
         g = qkvg[:, :, split_idx:]
         del qkvg
-        qkv = ttnn.unsqueeze(qkv, 0)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads_boltz(
-            qkv,
-            num_heads=self.n_heads,
-            num_kv_heads=self.n_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        o = []
-        for head in range(0, q.shape[0]):
-            head_q = q[head : head + 1, :, :, :]
-            head_k = k[head : head + 1, :, :, :]
-            head_v = v[head : head + 1, :, :, :]
-            head_triangle_bias = triangle_bias[head : head + 1, :, :, :]
-            head_o = ttnn.transformer.scaled_dot_product_attention(
-                head_q,
-                head_k,
-                head_v,
-                attn_mask=head_triangle_bias,
-                is_causal=False,
-                scale=self.head_dim**-0.5,
-                program_config=ttnn.SDPAProgramConfig(
-                    compute_with_storage_grid_size=(
-                        (13, 10) if is_blackhole() else (8, 8)
-                    ),
-                    exp_approx_mode=False,
-                    q_chunk_size=256,
-                    k_chunk_size=256,
-                ),
+        if use_optimized_path:
+            triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
+            triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
+            qkv = ttnn.unsqueeze(qkv, 0)
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads_boltz(
+                qkv,
+                num_heads=self.n_heads,
+                num_kv_heads=self.n_heads,
+                transpose_k_heads=False,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-            o.append(head_o)
-        o = ttnn.concat(o, dim=0)
-        o = ttnn.experimental.nlp_concat_heads_boltz(
-            o, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
-        o = ttnn.squeeze(o, 0)
+            o = []
+            for head in range(0, q.shape[0]):
+                head_q = q[head : head + 1, :, :, :]
+                head_k = k[head : head + 1, :, :, :]
+                head_v = v[head : head + 1, :, :, :]
+                head_bias = triangle_bias[head : head + 1, :, :, :]
+                head_o = ttnn.transformer.scaled_dot_product_attention(
+                    head_q,
+                    head_k,
+                    head_v,
+                    attn_mask=head_bias,
+                    is_causal=False,
+                    scale=self.scale**-1,
+                    program_config=ttnn.SDPAProgramConfig(
+                        compute_with_storage_grid_size=(
+                            (13, 10) if is_blackhole() else (8, 8)
+                        ),
+                        exp_approx_mode=False,
+                        q_chunk_size=256,
+                        k_chunk_size=256,
+                    ),
+                )
+                o.append(head_o)
+            o = ttnn.concat(o, dim=0)
+            o = ttnn.experimental.nlp_concat_heads_boltz(
+                o, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            o = ttnn.squeeze(o, 0)
+        else:
+            if self.ending:
+                mask = ttnn.permute(mask, (2, 0, 1))
+            else:
+                mask = ttnn.permute(mask, (1, 0, 2))
+            mask = (mask - 1) * 1e9
+            triangle_bias = ttnn.permute(triangle_bias, (2, 0, 1))
+            triangle_bias = ttnn.unsqueeze(triangle_bias, 1)
+            triangle_bias = ttnn.add(triangle_bias, mask)
+            qkv = ttnn.reshape(qkv, (seq_len, seq_len, 3 * self.n_heads, self.head_dim))
+            qkv = ttnn.permute(qkv, (2, 0, 1, 3))
+            q = qkv[0 : self.n_heads, :, :, :]
+            k = qkv[self.n_heads : 2 * self.n_heads, :, :, :]
+            v = qkv[2 * self.n_heads : 3 * self.n_heads, :, :, :]
+            a = ttnn.matmul(
+                q, k, transpose_b=True, compute_kernel_config=self.compute_kernel_config
+            )
+            a = ttnn.add_(a, triangle_bias)
+            a = ttnn.multiply_(a, self.scale**-1)
+            a = ttnn.softmax(
+                a,
+                dim=-1,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
+            o = ttnn.permute(o, (1, 2, 0, 3))
+            o = ttnn.reshape(o, (o.shape[0], o.shape[1], -1))
         g = ttnn.sigmoid_accurate(g)
         o = ttnn.multiply(o, g)
         x = ttnn.linear(
@@ -299,7 +331,8 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
         )
-        x = x[:seq_len, :seq_len, :]
+        if use_optimized_path:
+            x = x[:seq_len, :seq_len, :]
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
@@ -603,23 +636,23 @@ class PairformerLayer(Module):
             )
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor
+        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         z = ttnn.add(
             z,
-            self.triangle_multiplication_start(z),
+            self.triangle_multiplication_start(z, mask),
         )
         z = ttnn.add(
             z,
-            self.triangle_multiplication_end(z),
+            self.triangle_multiplication_end(z, mask),
         )
         z = ttnn.add(
             z,
-            self.triangle_attention_start(z),
+            self.triangle_attention_start(z, mask),
         )
         z = ttnn.add(
             z,
-            self.triangle_attention_end(z),
+            self.triangle_attention_end(z, mask),
         )
         z = ttnn.add(z, self.transition_z(z))
         if self.transform_s:
@@ -668,10 +701,10 @@ class Pairformer(Module):
         ]
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor
+        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         for block in self.blocks:
-            s, z = block(s, z)
+            s, z = block(s, z, mask)
         return s, z
 
 
@@ -1433,6 +1466,7 @@ class PairformerModule(TorchWrapper):
             for x in self.module(
                 self._from_torch(s) if s is not None else None,
                 self._from_torch(z),
+                self._from_torch(mask) if (mask is not None) and (s is None) else None,
             )
         )
 
