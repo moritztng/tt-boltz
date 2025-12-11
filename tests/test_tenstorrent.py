@@ -7,7 +7,10 @@ from boltz.model.modules.tenstorrent import (
 )
 from boltz.model.modules.trunkv2 import MSAModule as MSAModuleTorch
 from boltz.model.modules.diffusionv2 import DiffusionModule as DiffusionModuleTorch
-from boltz.model.layers.pairformer import PairformerModule as PairformerModuleTorch
+from boltz.model.layers.pairformer import (
+    PairformerModule as PairformerModuleTorch,
+    PairformerNoSeqModule as PairformerNoSeqModuleTorch,
+)
 from boltz.model.modules.encoders import get_indexing_matrix, single_to_keys
 from functools import partial
 
@@ -52,6 +55,41 @@ def test_pairformer(seq_len):
     s_tt, z_tt = pairformer(s, z, mask, pair_mask)
     s_torch, z_torch = pairformer_torch(s, z, mask, pair_mask)
     assert median_relative_error(s_tt, s_torch) < 1e-1, "s not accurate"
+    assert median_relative_error(z_tt, z_torch) < 1e-1, "z not accurate"
+
+
+@pytest.mark.parametrize("seq_len", [100, 500, 1000])
+def test_affinity_pairformer(seq_len):
+    state_dict = torch.load(
+        "/home/moritz/.boltz/boltz2_aff.ckpt",
+        map_location="cpu",
+        mmap=True,
+        weights_only=False,
+    )["state_dict"]
+    pairformer = PairformerModule(
+        n_blocks=4,
+        tri_att_head_dim=32,
+        tri_att_n_heads=4,
+        att_head_dim=None,
+        att_n_heads=None,
+        transform_s=False,
+    )
+    pairformer_torch = PairformerNoSeqModuleTorch(
+        token_z=128, num_blocks=4, v2=True
+    ).eval()
+    pairformer_state_dict = filter_dict(state_dict, "affinity_module1.pairformer_stack")
+    pairformer.load_state_dict(
+        pairformer_state_dict,
+        strict=False,
+    )
+    pairformer_torch.load_state_dict(pairformer_state_dict, strict=False)
+    z = 26 * torch.randn(1, seq_len, seq_len, 128)
+    mask = torch.ones(1, seq_len)
+    mask[0, : seq_len // 2] = 0
+    mask = mask[:, torch.randperm(seq_len)]
+    mask = mask[:, :, None] * mask[:, None, :]
+    z_tt = pairformer(None, z, mask)[1]
+    z_torch = pairformer_torch(z, pair_mask=mask)
     assert median_relative_error(z_tt, z_torch) < 1e-1, "z not accurate"
 
 
