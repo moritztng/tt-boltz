@@ -975,11 +975,10 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-
+            v = ttnn.permute(v, (0, 2, 1))
             o = ttnn.matmul(
                 v,
                 w,
-                transpose_a=True,
                 transpose_b=True,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
