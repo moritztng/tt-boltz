@@ -233,10 +233,8 @@ class TriangleAttention(Module):
         use_optimized_path = mask is None
         seq_len = x.shape[0]
         if use_optimized_path:
-            x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
             padding = -seq_len % 256
             x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
-            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
