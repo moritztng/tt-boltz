@@ -90,13 +90,12 @@ class TriangleMultiplication(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        gpg_in = ttnn.linear(
+        gpg_in = ttnn.experimental.minimal_matmul(
             x_norm_in,
             self.gpg_weight,
-            compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat8_b,
-            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+            compute_kernel_config=self.compute_kernel_config,
         )
         g_in, p_in, g_out = ttnn.experimental.nlp_create_qkv_heads_boltz(
             gpg_in,
@@ -250,7 +249,6 @@ class TriangleAttention(Module):
             self.qkvg_weight,
             compute_kernel_config=self.compute_kernel_config,
             dtype=ttnn.bfloat8_b,
-            core_grid=ttnn.CoreGrid(y=10, x=12) if is_blackhole() else None,
         )
         split_idx = 3 * self.head_dim * self.n_heads
         qkv = qkvg[:, :, :split_idx]
