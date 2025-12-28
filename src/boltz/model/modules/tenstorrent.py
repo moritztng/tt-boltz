@@ -244,9 +244,9 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
         )
-        qkvg = ttnn.linear(
-            x,
-            self.qkvg_weight,
+        qkvg = ttnn.experimental.minimal_matmul(
+            input_tensor=x,
+            weight_tensor=self.qkvg_weight,
             compute_kernel_config=self.compute_kernel_config,
             dtype=ttnn.bfloat8_b,
         )
