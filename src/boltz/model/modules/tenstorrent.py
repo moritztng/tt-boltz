@@ -265,30 +265,22 @@ class TriangleAttention(Module):
                 transpose_k_heads=False,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-            o = []
-            for head in range(0, q.shape[0]):
-                head_q = q[head : head + 1, :, :, :]
-                head_k = k[head : head + 1, :, :, :]
-                head_v = v[head : head + 1, :, :, :]
-                head_bias = triangle_bias[head : head + 1, :, :, :]
-                head_o = ttnn.transformer.scaled_dot_product_attention(
-                    head_q,
-                    head_k,
-                    head_v,
-                    attn_mask=head_bias,
-                    is_causal=False,
-                    scale=self.scale**-1,
-                    program_config=ttnn.SDPAProgramConfig(
-                        compute_with_storage_grid_size=(
-                            (13, 10) if is_blackhole() else (8, 8)
-                        ),
-                        exp_approx_mode=False,
-                        q_chunk_size=256,
-                        k_chunk_size=256,
+            o = ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=triangle_bias,
+                is_causal=False,
+                scale=self.scale**-1,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
                     ),
-                )
-                o.append(head_o)
-            o = ttnn.concat(o, dim=0)
+                    exp_approx_mode=False,
+                    q_chunk_size=256,
+                    k_chunk_size=256,
+                ),
+            )
             o = ttnn.experimental.nlp_concat_heads_boltz(
                 o, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
