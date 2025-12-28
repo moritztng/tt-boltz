@@ -1384,7 +1384,7 @@ class TorchWrapper(nn.Module):
                 )
             device = ttnn.open_device(**args)
             device.enable_program_cache()
-        self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+        self.compute_kernel_config = ttnn.types.BlackholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
