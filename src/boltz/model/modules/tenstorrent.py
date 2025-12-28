@@ -73,7 +73,7 @@ class TriangleMultiplication(Module):
                     self.state_dict["g_in.weight"],
                     self.state_dict["p_in.weight"],
                     self.state_dict["g_out.weight"],
-                    torch.zeros_like(torch.zeros_like(self.state_dict["g_out.weight"])),
+                    torch.zeros_like(self.state_dict["g_out.weight"]),
                 ],
                 dim=0,
             ).t(),
