@@ -366,17 +366,17 @@ class AttentionPairBias(Module):
             s_kv = s
         else:
             memory_config = ttnn.L1_MEMORY_CONFIG
-            K, W, D = s.shape
-            s_kv = ttnn.reshape(s, (2 * K, W // 2, -1))
-            s_kv = ttnn.permute(s_kv, (1, 2, 0))
+            B, K, W, D = s.shape
+            s_kv = ttnn.reshape(s, (B, 2 * K, W // 2, -1))
+            s_kv = ttnn.permute(s_kv, (0, 2, 3, 1))
             s_kv = ttnn.matmul(
                 s_kv,
                 keys_indexing,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-            s_kv = ttnn.permute(s_kv, (2, 0, 1))
-            s_kv = ttnn.reshape(s_kv, (K, -1, D))
+            s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
+            s_kv = ttnn.reshape(s_kv, (B, K, -1, D))
         q = ttnn.linear(
             s,
             self.q_weight,
@@ -396,15 +396,21 @@ class AttentionPairBias(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
         )
-        q = ttnn.permute(q, (2, 0, 1))
-        k = ttnn.permute(k, (2, 0, 1))
-        v = ttnn.permute(v, (2, 0, 1))
+        perm = (3, 0, 1, 2) if self.atom_level else (2, 0, 1)
+        q = ttnn.permute(q, perm)
+        k = ttnn.permute(k, perm)
+        v = ttnn.permute(v, perm)
         q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
         k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
         v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-        q = ttnn.permute(q, (0, 2, 3, 1))
-        k = ttnn.permute(k, (0, 2) + ((1, 3) if self.atom_level else (3, 1)))
-        v = ttnn.permute(v, (0, 2, 3, 1))
+        if self.atom_level:
+            perm_qv = (2, 0, 3, 4, 1)
+            perm_k = (2, 0, 3, 1, 4)
+            q, v = ttnn.permute(q, perm_qv), ttnn.permute(v, perm_qv)
+            k = ttnn.permute(k, perm_k)
+        else:
+            perm = (0, 2, 3, 1)
+            q, k, v = ttnn.permute(q, perm), ttnn.permute(k, perm), ttnn.permute(v, perm)
         if not self.atom_level:
             seq_len = s.shape[1]
             seq_len_padding = -seq_len % 32
@@ -479,9 +485,14 @@ class AttentionPairBias(Module):
             )
             ttnn.deallocate(a)
             ttnn.deallocate(v)
-        o = ttnn.permute(o, (0, 3, 1, 2))
-        o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
-        o = ttnn.permute(o, (1, 2, 0))
+        if self.atom_level:
+            o = ttnn.permute(o, (0, 1, 4, 2, 3))
+            o = ttnn.reshape(o, (B, -1, *tuple(o.shape)[3:]))
+            o = ttnn.permute(o, (0, 2, 3, 1))
+        else:
+            o = ttnn.permute(o, (0, 3, 1, 2))
+            o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
+            o = ttnn.permute(o, (1, 2, 0))
         g = ttnn.linear(
             s,
             self.g_weight,
@@ -775,7 +786,7 @@ class ConditionedTransitionBlock(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         dim = int(a_swish.shape[-1] / 2)
-        a_swish, gates = a_swish[:, :, :dim], a_swish[:, :, dim:]
+        a_swish, gates = a_swish[..., :dim], a_swish[..., dim:]
         gates = ttnn.silu(gates)
         a_swish = ttnn.multiply_(gates, a_swish)
         a_b = ttnn.linear(
@@ -1266,8 +1277,8 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         q = ttnn.add(q, r_to_q)
-        q = ttnn.reshape(q, (B * NW, W, -1))
-        c = ttnn.reshape(c, (B * NW, W, -1))
+        q = ttnn.reshape(q, (B, NW, W, -1))
+        c = ttnn.reshape(c, (B, NW, W, -1))
         q = self.encoder(q, c, bias_encoder, keys_indexing)
         q = ttnn.reshape(q, (B, NW * W, D))
         a = ttnn.linear(
@@ -1277,11 +1288,12 @@ class Diffusion(Module):
         )
         a = ttnn.relu(a)
         a = ttnn.matmul(
-            atom_to_token_normed,
             a,
+            atom_to_token_normed,
             transpose_a=True,
             compute_kernel_config=self.compute_kernel_config,
         )
+        a = ttnn.permute(a, (0, 2, 1))
         s = ttnn.concat([s_trunk, s_inputs], dim=-1)
         s = ttnn.layer_norm(
             s,
@@ -1296,6 +1308,7 @@ class Diffusion(Module):
             bias=self.conditioner_embed_bias,
             compute_kernel_config=self.compute_kernel_config,
         )
+        times = ttnn.unsqueeze(times, 1)
         fourier = ttnn.linear(
             times,
             self.conditioner_fourier_embed_weight,
@@ -1316,6 +1329,7 @@ class Diffusion(Module):
             self.conditioner_fourier_single_weight,
             compute_kernel_config=self.compute_kernel_config,
         )
+        fourier = ttnn.unsqueeze(fourier, 1)
         s = ttnn.add(s, fourier)
         s = ttnn.add(s, self.conditioner_transition_0(s))
         s = ttnn.add(s, self.conditioner_transition_1(s))
@@ -1345,14 +1359,17 @@ class Diffusion(Module):
             self.a_to_q_weight,
             compute_kernel_config=self.compute_kernel_config,
         )
+        a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         a_to_q = ttnn.matmul(
-            atom_to_token,
             a_to_q,
+            atom_to_token,
+            transpose_b=True,
             compute_kernel_config=self.compute_kernel_config,
         )
+        a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
-        q = ttnn.reshape(q, (B * NW, W, -1))
-        c = ttnn.reshape(c, (B * NW, W, -1))
+        q = ttnn.reshape(q, (B, NW, W, -1))
+        c = ttnn.reshape(c, (B, NW, W, -1))
         q = self.decoder(q, c, bias_decoder, keys_indexing)
         q = ttnn.reshape(q, (B, NW * W, D))
         r_update = ttnn.layer_norm(
@@ -1506,8 +1523,8 @@ class DiffusionModule(TorchWrapper):
             self.first_forward_pass = False
             self.s_inputs = self._from_torch(s_inputs)
             self.s_trunk = self._from_torch(s_trunk)
-            self.q = self._from_torch(q)
-            self.c = self._from_torch(c)
+            self.q = self._from_torch(q if r.shape[0] == q.shape[0] else torch.repeat_interleave(q, r.shape[0], dim=0))
+            self.c = self._from_torch(c if r.shape[0] == c.shape[0] else torch.repeat_interleave(c, r.shape[0], dim=0))
 
             self.keys_indexing = self._from_torch(keys_indexing)
 
