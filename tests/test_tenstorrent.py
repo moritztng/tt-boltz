@@ -105,8 +105,9 @@ def test_diffusion():
         diffusion_state_dict,
         strict=False,
     )
-    r_noisy = torch.randn(1, 928, 3)
-    times = torch.randn(1)
+    diffusion_samples=1
+    r_noisy = torch.randn(diffusion_samples, 928, 3)
+    times = torch.randn(diffusion_samples)
     s_inputs = torch.randn(1, 117, 384)
     s_trunk = torch.randn(1, 117, 384)
     q = torch.randn(1, 928, 128)
@@ -153,6 +154,7 @@ def test_diffusion():
             "ref_pos": torch.randn(1, 928, 3),
             "token_pad_mask": mask_token,
         },
+        multiplicity=diffusion_samples,
     )
     assert (
         median_relative_error(r_update, r_update_torch) < 1e-1
