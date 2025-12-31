@@ -1575,7 +1575,7 @@ class DiffusionModule(TorchWrapper):
                 bias, (TOKEN_TRANSFORMER_DIM / TOKEN_TRANSFORMER_N_HEADS) ** 0.5
             )
             bias = ttnn.permute(bias, (3, 0, 1, 2))
-            seq_len_padding = -bias.shape[-1] % 32
+            seq_len_padding = -bias.shape[-1] % 64
             self.bias_token = ttnn.pad(
                 bias,
                 [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)],
