@@ -104,7 +104,7 @@ class TriangleMultiplication(Module):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        g_in = ttnn.sigmoid_accurate(g_in)
+        g_in = ttnn.sigmoid_accurate(g_in, fast_and_approximate_mode=True)
         x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
         if mask is not None:
             mask = ttnn.unsqueeze(mask, -1)
@@ -310,8 +310,8 @@ class TriangleAttention(Module):
             o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
             o = ttnn.permute(o, (1, 2, 0, 3))
             o = ttnn.reshape(o, (o.shape[0], o.shape[1], -1))
-        g = ttnn.sigmoid_accurate(g)
-        o = ttnn.multiply(o, g)
+        g = ttnn.sigmoid(g, fast_and_approximate_mode=True)
+        o = ttnn.multiply_(o, g)
         x = ttnn.linear(
             o,
             self.o_weight,
@@ -764,7 +764,7 @@ class AdaLN(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
         )
-        s_scale = ttnn.sigmoid_accurate(s_scale)
+        s_scale = ttnn.sigmoid(s_scale, fast_and_approximate_mode=True)
         s_bias = ttnn.linear(
             s,
             self.s_bias_weight,
@@ -824,7 +824,7 @@ class ConditionedTransitionBlock(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
         )
-        s = ttnn.sigmoid_accurate(s)
+        s = ttnn.sigmoid(s, fast_and_approximate_mode=True)
         b_a = ttnn.linear(
             b,
             self.b_to_a_weight,
@@ -889,7 +889,7 @@ class DiffusionTransformerLayer(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-            s_o = ttnn.sigmoid_accurate(s_o)
+            s_o = ttnn.sigmoid(s_o, fast_and_approximate_mode=True)
             if self.atom_level:
                 self.s_o = s_o
         else:
@@ -1009,7 +1009,7 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-            g = ttnn.sigmoid_accurate(g)
+            g = ttnn.sigmoid(g, fast_and_approximate_mode=True)
             o = ttnn.multiply(o, g)
             del g
             o = ttnn.linear(
