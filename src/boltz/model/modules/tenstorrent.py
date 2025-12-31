@@ -305,6 +305,7 @@ class TriangleAttention(Module):
                 a,
                 dim=-1,
                 compute_kernel_config=self.compute_kernel_config,
+                numeric_stable=True,
             )
             o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
             o = ttnn.permute(o, (1, 2, 0, 3))
