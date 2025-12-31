@@ -165,8 +165,7 @@ class TriangleMultiplication(Module):
                 x = ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             else:
                 x = ttnn.concat([x, x_chunk], dim=-1)
-            ttnn.deallocate(x_chunk)
-        x_norm_out = ttnn.layer_norm(
+        x = ttnn.layer_norm(
             x,
             weight=self.out_norm_weight,
             bias=self.out_norm_bias,
@@ -174,7 +173,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         p_out = ttnn.linear(
-            x_norm_out,
+            x,
             self.out_p,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.L1_MEMORY_CONFIG,
@@ -249,8 +248,8 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
         )
         split_idx = 3 * self.head_dim * self.n_heads
-        qkv = qkvg[:, :, :split_idx]
-        g = qkvg[:, :, split_idx:]
+        qkv = qkvg[..., :split_idx]
+        g = qkvg[..., split_idx:]
         del qkvg
         if use_optimized_path:
             triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
