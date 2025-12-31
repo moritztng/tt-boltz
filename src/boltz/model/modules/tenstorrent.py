@@ -104,7 +104,7 @@ class TriangleMultiplication(Module):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        g_in = ttnn.sigmoid_accurate(g_in, fast_and_approximate_mode=True)
+        g_in = ttnn.sigmoid(g_in, fast_and_approximate_mode=True)
         x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
         if mask is not None:
             mask = ttnn.unsqueeze(mask, -1)
@@ -181,7 +181,7 @@ class TriangleMultiplication(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=10, x=11) if is_blackhole() else None,
         )
-        g_out = ttnn.sigmoid_accurate(g_out[:, :, :, : W // 2])
+        g_out = ttnn.sigmoid(g_out[:, :, :, : W // 2], fast_and_approximate_mode=True)
         x = ttnn.multiply_(p_out, g_out)
         return x
 
