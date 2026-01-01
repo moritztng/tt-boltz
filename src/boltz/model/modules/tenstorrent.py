@@ -291,9 +291,7 @@ class TriangleAttention(Module):
             triangle_bias = ttnn.add(triangle_bias, mask)
             qkv = ttnn.reshape(qkv, (seq_len, seq_len, 3 * self.n_heads, self.head_dim))
             qkv = ttnn.permute(qkv, (2, 0, 1, 3))
-            q = qkv[0 : self.n_heads, :, :, :]
-            k = qkv[self.n_heads : 2 * self.n_heads, :, :, :]
-            v = qkv[2 * self.n_heads : 3 * self.n_heads, :, :, :]
+            q, k, v = ttnn.chunk(qkv, chunks=3, dim=0)
             a = ttnn.matmul(
                 q, k, transpose_b=True, compute_kernel_config=self.compute_kernel_config
             )
@@ -582,19 +580,10 @@ class Transition(Module):
         if not self.chunking:
             x = f(x)
         else:
-            for chunk_start in range(0, x.shape[1], TRANSITION_CHUNK_SIZE):
-                x_chunk = x[
-                    :,
-                    chunk_start : min(chunk_start + TRANSITION_CHUNK_SIZE, x.shape[1]),
-                    :,
-                    :,
-                ]
-                x_chunk = f(x_chunk)
-                if chunk_start == 0:
-                    x_out = x_chunk
-                else:
-                    x_out = ttnn.concat([x_out, x_chunk], dim=1)
-            x = x_out
+            n_chunks = (x.shape[1] + TRANSITION_CHUNK_SIZE - 1) // TRANSITION_CHUNK_SIZE
+            chunks = ttnn.chunk(x, chunks=n_chunks, dim=1)
+            x_chunks = [f(chunk) for chunk in chunks]
+            x = ttnn.concat(x_chunks, dim=1)
         return x
 
 
@@ -799,9 +788,7 @@ class ConditionedTransitionBlock(Module):
             memory_config=memory_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        dim = int(a_swish.shape[-1] / 2)
-        a_swish, gates = a_swish[..., :dim], a_swish[..., dim:]
-        gates = ttnn.silu(gates)
+        a_swish, gates = ttnn.chunk(a_swish, chunks=2, dim=-1)
         a_swish = ttnn.multiply_(gates, a_swish, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
         a_b = ttnn.linear(
             a,
@@ -819,7 +806,6 @@ class ConditionedTransitionBlock(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
         )
-        s = ttnn.sigmoid(s, fast_and_approximate_mode=True)
         b_a = ttnn.linear(
             b,
             self.b_to_a_weight,
