@@ -104,8 +104,7 @@ class TriangleMultiplication(Module):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        g_in = ttnn.sigmoid(g_in, fast_and_approximate_mode=True)
-        x_pg_in = ttnn.multiply(p_in, g_in, dtype=ttnn.bfloat16)
+        x_pg_in = ttnn.multiply_(p_in, g_in, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         if mask is not None:
             mask = ttnn.unsqueeze(mask, -1)
             x_pg_in = ttnn.multiply_(x_pg_in, mask)
@@ -180,8 +179,7 @@ class TriangleMultiplication(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=10, x=11) if is_blackhole() else None,
         )
-        g_out = ttnn.sigmoid(g_out[:, :, :, : W // 2], fast_and_approximate_mode=True)
-        x = ttnn.multiply_(p_out, g_out)
+        x = ttnn.multiply_(p_out, g_out[:, :, :, : W // 2], input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         return x
 
 
@@ -310,8 +308,7 @@ class TriangleAttention(Module):
             o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
             o = ttnn.permute(o, (1, 2, 0, 3))
             o = ttnn.reshape(o, (o.shape[0], o.shape[1], -1))
-        g = ttnn.sigmoid(g, fast_and_approximate_mode=True)
-        o = ttnn.multiply_(o, g)
+        o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         x = ttnn.linear(
             o,
             self.o_weight,
@@ -518,8 +515,7 @@ class AttentionPairBias(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.L1_MEMORY_CONFIG if self.atom_level else None,
         )
-        g = ttnn.sigmoid(g, fast_and_approximate_mode=True)
-        o = ttnn.multiply_(o, g)
+        o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         if self.atom_level:
             ttnn.deallocate(g)
         x = ttnn.linear(
@@ -764,14 +760,13 @@ class AdaLN(Module):
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
         )
-        s_scale = ttnn.sigmoid(s_scale, fast_and_approximate_mode=True)
         s_bias = ttnn.linear(
             s,
             self.s_bias_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
         )
-        a = ttnn.multiply_(a, s_scale)
+        a = ttnn.multiply_(a, s_scale, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         a = ttnn.add_(a, s_bias)
         return a
 
@@ -807,7 +802,7 @@ class ConditionedTransitionBlock(Module):
         dim = int(a_swish.shape[-1] / 2)
         a_swish, gates = a_swish[..., :dim], a_swish[..., dim:]
         gates = ttnn.silu(gates)
-        a_swish = ttnn.multiply_(gates, a_swish)
+        a_swish = ttnn.multiply_(gates, a_swish, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
         a_b = ttnn.linear(
             a,
             self.a_to_b_weight,
@@ -833,7 +828,7 @@ class ConditionedTransitionBlock(Module):
         )
         if self.atom_level:
             ttnn.deallocate(b)
-        a = ttnn.multiply_(s, b_a)
+        a = ttnn.multiply_(s, b_a, input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID])
         return a
 
 
@@ -888,8 +883,8 @@ class DiffusionTransformerLayer(Module):
                 bias=self.output_projection_bias,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+                activation="sigmoid",
             )
-            s_o = ttnn.sigmoid(s_o, fast_and_approximate_mode=True)
             if self.atom_level:
                 self.s_o = s_o
         else:
@@ -1009,8 +1004,7 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-            g = ttnn.sigmoid(g, fast_and_approximate_mode=True)
-            o = ttnn.multiply(o, g)
+            o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
             del g
             o = ttnn.linear(
                 o,
@@ -1304,8 +1298,8 @@ class Diffusion(Module):
             q,
             self.atom_to_token_weight,
             compute_kernel_config=self.compute_kernel_config,
+            activation="relu",
         )
-        a = ttnn.relu(a)
         a = ttnn.matmul(
             a,
             atom_to_token_normed,
