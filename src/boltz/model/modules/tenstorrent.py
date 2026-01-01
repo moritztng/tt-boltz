@@ -721,9 +721,9 @@ class AdaLN(Module):
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
         memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
-        if not USE_FLOAT32:
-            a = ttnn.clone(a, dtype=ttnn.float32, memory_config=memory_config)
-            s = ttnn.clone(s, dtype=ttnn.float32, memory_config=memory_config)
+        if self.atom_level:
+            a = ttnn.to_memory_config(a, memory_config=memory_config)
+            s = ttnn.to_memory_config(s, memory_config=memory_config)
         a = ttnn.layer_norm(
             a, epsilon=1e-5, compute_kernel_config=self.compute_kernel_config
         )
@@ -733,9 +733,6 @@ class AdaLN(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        if not USE_FLOAT32:
-            a = ttnn.clone(a, dtype=ttnn.bfloat16, memory_config=memory_config)
-            s = ttnn.clone(s, dtype=ttnn.bfloat16, memory_config=memory_config)
         s_scale = ttnn.linear(
             s,
             self.s_scale_weight,
