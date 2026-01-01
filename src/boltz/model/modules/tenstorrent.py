@@ -560,14 +560,13 @@ class Transition(Module):
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             ttnn.deallocate(x_norm)
-            x = ttnn.multiply(x_1, x_2, memory_config=ttnn.L1_MEMORY_CONFIG)
-            ttnn.deallocate(x_1)
+            x = ttnn.multiply_(x_1, x_2)
             ttnn.deallocate(x_2)
             x = ttnn.linear(
                 x,
                 self.fc3_weight,
                 compute_kernel_config=self.compute_kernel_config,
-                dtype=ttnn.bfloat16,
+                dtype=ttnn.bfloat8_b,
                 core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
             )
             return x
