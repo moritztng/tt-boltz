@@ -126,24 +126,18 @@ class TriangleMultiplication(Module):
             fused_activation=None,
             fuse_batch=False,
         )
-        for chunk_start in range(0, W // 2, TRIANGLE_MULT_CHUNK_SIZE):
-            a_chunk = ttnn.slice(
-                x_pg_in,
-                [0, 0, 0, chunk_start],
-                [B, H, H, chunk_start + TRIANGLE_MULT_CHUNK_SIZE],
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
+        n_chunks = W // 2 // TRIANGLE_MULT_CHUNK_SIZE
+        ab_chunks = ttnn.chunk(x_pg_in, chunks=2 * n_chunks, dim=3)
+        for i in range(n_chunks):
+            a_chunk = ab_chunks[i]
+            b_chunk = ab_chunks[i + n_chunks]
+            a_chunk = ttnn.to_memory_config(a_chunk, memory_config=ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat16)
             a_chunk = ttnn.permute(
                 a_chunk, (0, 3) + ((2, 1) if self.ending else (1, 2))
             )
             a_chunk = ttnn.typecast(a_chunk, ttnn.bfloat8_b)
             a_chunk = ttnn.reallocate(a_chunk)
-            b_chunk = ttnn.slice(
-                x_pg_in,
-                [0, 0, 0, W // 2 + chunk_start],
-                [B, H, H, W // 2 + chunk_start + TRIANGLE_MULT_CHUNK_SIZE],
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
+            b_chunk = ttnn.to_memory_config(b_chunk, memory_config=ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat16)
             b_chunk = ttnn.permute(
                 b_chunk, (0, 3) + ((1, 2) if self.ending else (2, 1))
             )
@@ -154,16 +148,17 @@ class TriangleMultiplication(Module):
                 b_chunk,
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
-                dtype=ttnn.bfloat16,
                 program_config=program_config,
+                dtype=ttnn.bfloat16,
             )
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
             x_chunk = ttnn.permute(x_chunk, (0, 2, 3, 1))
-            if chunk_start == 0:
+            if i == 0:
                 x = ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             else:
                 x = ttnn.concat([x, x_chunk], dim=-1)
+            ttnn.deallocate(x_chunk)
         x = ttnn.layer_norm(
             x,
             weight=self.out_norm_weight,
