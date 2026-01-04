@@ -25,21 +25,17 @@ python3 -m venv env
 source env/bin/activate
 ```
 ### Build TT-Metal from Source
-Don't install tt-nn with `./create_venv.sh`.
-
 [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
-### Install TT-NN
+### Install TT-NN into the Virtual Environment
+From the `tt-metal` directory:
 ```bash
-pip config set global.extra-index-url https://download.pytorch.org/whl/cpu
-pip install setuptools wheel==0.45.1
-pip install -r <path-to-tt-metal-repo>/tt_metal/python_env/requirements-dev.txt
-pip install -e <path-to-tt-metal-repo>
+PYTHON_ENV_DIR=<path_to_your_env_directory> ./create_venv.sh
 ```
-### Install TT-Boltz
+### Install TT-Boltz into the Virtual Environment
+From the `tt-boltz` directory:
 ```bash
 pip install -e .
 ```
-You can ignore the version warnings.
 ## Inference
 
 You can run inference using Boltz with:
@@ -59,14 +55,14 @@ There are two main predictions in the affinity output: `affinity_pred_value` and
 When using the `--use_msa_server` option with a server that requires authentication, you can provide credentials in one of two ways. More information is available in our [prediction instructions](docs/prediction.md).
  
 ## Current Runtime
-We didn't even start writing low-level code yet and Tenstorrent Blackhole was just released. I'm confident we'll get to 2 minutes. 
+Total inference runtime for a protein with 686 amino acids.
 |Hardware|~Minutes|
 |---|---|
 |AMD Ryzen 5 8600G|45|
 |Nvidia T4|9|
 |Tenstorrent Wormhole n300|3|
 |Tenstorrent Blackhole p150|1|
-|Nvidia RTX 4090|1|
+|Nvidia RTX 5090|1|
 ## Evaluation
 
 ⚠️ **Coming soon: updated evaluation code for Boltz-2!**
