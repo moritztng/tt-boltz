@@ -97,13 +97,7 @@ class TriangleMultiplication(Module):
             dtype=ttnn.bfloat8_b,
             compute_kernel_config=self.compute_kernel_config,
         )
-        g_in, p_in, g_out = ttnn.experimental.nlp_create_qkv_heads_boltz(
-            gpg_in,
-            num_heads=1,
-            num_kv_heads=1,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        g_in, p_in, g_out = ttnn.chunk(gpg_in, chunks=3, dim=-1)
         x_pg_in = ttnn.multiply_(p_in, g_in, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         if mask is not None:
             mask = ttnn.unsqueeze(mask, -1)
