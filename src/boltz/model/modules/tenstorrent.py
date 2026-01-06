@@ -82,12 +82,16 @@ class TriangleMultiplication(Module):
                         g_in_t[:, i * chunk_size : (i + 1) * chunk_size],
                         g_in_t[
                             :,
-                            (i + self.n_pairs) * chunk_size : (i + self.n_pairs + 1) * chunk_size,
+                            (i + self.n_pairs)
+                            * chunk_size : (i + self.n_pairs + 1)
+                            * chunk_size,
                         ],
                         p_in_t[:, i * chunk_size : (i + 1) * chunk_size],
                         p_in_t[
                             :,
-                            (i + self.n_pairs) * chunk_size : (i + self.n_pairs + 1) * chunk_size,
+                            (i + self.n_pairs)
+                            * chunk_size : (i + self.n_pairs + 1)
+                            * chunk_size,
                         ],
                     ],
                     dim=1,
@@ -147,11 +151,16 @@ class TriangleMultiplication(Module):
             gp_in_fused = ttnn.experimental.minimal_matmul(
                 x_norm_in,
                 self.gp_in_weight_fused_chunks[i],
-                memory_config=ttnn.L1_MEMORY_CONFIG,
+                memory_config=(
+                    ttnn.L1_MEMORY_CONFIG if H <= 700 else ttnn.DRAM_MEMORY_CONFIG
+                ),
                 dtype=ttnn.bfloat8_b,
                 compute_kernel_config=self.compute_kernel_config,
             )
             g_in_a, g_in_b, p_in_a, p_in_b = ttnn.chunk(gp_in_fused, chunks=4, dim=-1)
+            if H > 700:
+                p_in_a = ttnn.to_memory_config(p_in_a, ttnn.L1_MEMORY_CONFIG)
+                p_in_b = ttnn.to_memory_config(p_in_b, ttnn.L1_MEMORY_CONFIG)
             ttnn.deallocate(gp_in_fused)
             a_chunk = ttnn.multiply_(
                 p_in_a, g_in_a, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID]
@@ -171,19 +180,20 @@ class TriangleMultiplication(Module):
             b_chunk = self._transform_chunk(
                 b_chunk, (0, 3) + ((1, 2) if self.ending else (2, 1))
             )
-            x_chunk = ttnn.permute(
-                ttnn.matmul(
-                    a_chunk,
-                    b_chunk,
-                    compute_kernel_config=self.compute_kernel_config,
-                    memory_config=ttnn.L1_MEMORY_CONFIG,
-                    program_config=program_config,
-                    dtype=ttnn.bfloat16,
-                ),
-                (0, 2, 3, 1),
+            x_chunk = ttnn.matmul(
+                a_chunk,
+                b_chunk,
+                compute_kernel_config=self.compute_kernel_config,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                program_config=program_config,
+                dtype=ttnn.bfloat16,
             )
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
+            x_chunk = ttnn.permute(
+                x_chunk,
+                (0, 2, 3, 1),
+            )
             x = (
                 ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
                 if i == 0
