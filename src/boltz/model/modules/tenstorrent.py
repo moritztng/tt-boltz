@@ -1570,7 +1570,7 @@ class DiffusionModule(TorchWrapper):
             self.q = self._from_torch(q if r.shape[0] == q.shape[0] else torch.repeat_interleave(q, r.shape[0], dim=0))
             self.c = self._from_torch(c if r.shape[0] == c.shape[0] else torch.repeat_interleave(c, r.shape[0], dim=0))
 
-            self.keys_indexing = self._from_torch(keys_indexing)
+            self.keys_indexing = self._from_torch(keys_indexing, dtype=ttnn.bfloat4_b)
 
             mask = self._from_torch(mask)
             mask = ttnn.reshape(mask, (2 * K, W // 2, -1))
