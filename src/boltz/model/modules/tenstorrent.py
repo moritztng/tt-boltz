@@ -1450,12 +1450,14 @@ class TorchWrapper(nn.Module):
             packer_l1_acc=True,
         )
 
-    def _from_torch(self, x: torch.Tensor) -> ttnn.Tensor:
+    def _from_torch(self, x: torch.Tensor, dtype=None) -> ttnn.Tensor:
+        if dtype is None:
+            dtype = ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16
         return ttnn.from_torch(
             x,
             device=device,
             layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+            dtype=dtype,
         )
 
     def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
