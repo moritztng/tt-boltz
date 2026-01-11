@@ -44,12 +44,15 @@ class Module:
         self,
         key: str,
         transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
+        dtype=None,
     ) -> ttnn.Tensor:
+        if dtype is None:
+            dtype = ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+            dtype=dtype,
         )
 
 
