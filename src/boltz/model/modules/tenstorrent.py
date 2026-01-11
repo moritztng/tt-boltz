@@ -5,7 +5,7 @@ from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-TRANSITION_CHUNK_SIZE = 64
+TRANSITION_CHUNK_SIZE = 128
 USE_FLOAT32 = False
 
 device = None
@@ -572,7 +572,6 @@ class AttentionPairBias(Module):
 class Transition(Module):
     def __init__(
         self,
-        chunking: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
@@ -582,7 +581,6 @@ class Transition(Module):
         self.fc1_weight = self.torch_to_tt("fc1.weight")
         self.fc2_weight = self.torch_to_tt("fc2.weight")
         self.fc3_weight = self.torch_to_tt("fc3.weight")
-        self.chunking = chunking
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         def f(x):
@@ -614,16 +612,17 @@ class Transition(Module):
             ttnn.deallocate(x_norm)
             x = ttnn.multiply_(x_1, x_2)
             ttnn.deallocate(x_2)
-            x = ttnn.linear(
+            x_dram = ttnn.linear(
                 x,
                 self.fc3_weight,
                 compute_kernel_config=self.compute_kernel_config,
                 dtype=ttnn.bfloat8_b,
                 core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-            return x
-
-        if not self.chunking:
+            ttnn.deallocate(x)
+            return x_dram
+        if len(x.shape) < 4:
             x = f(x)
         else:
             n_chunks = (x.shape[1] + TRANSITION_CHUNK_SIZE - 1) // TRANSITION_CHUNK_SIZE
@@ -667,7 +666,7 @@ class PairformerLayer(Module):
             compute_kernel_config,
         )
         self.transition_z = Transition(
-            True, filter_dict(state_dict, "transition_z"), compute_kernel_config
+            filter_dict(state_dict, "transition_z"), compute_kernel_config
         )
         if transform_s:
             self.pre_norm_s_weight = self.torch_to_tt("pre_norm_s.weight")
@@ -681,7 +680,7 @@ class PairformerLayer(Module):
                 compute_kernel_config,
             )
             self.transition_s = Transition(
-                False, filter_dict(state_dict, "transition_s"), compute_kernel_config
+                filter_dict(state_dict, "transition_s"), compute_kernel_config
             )
 
     def __call__(
@@ -1121,7 +1120,7 @@ class MSALayer(Module):
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.msa_transition = Transition(
-            True, filter_dict(state_dict, "msa_transition"), compute_kernel_config
+            filter_dict(state_dict, "msa_transition"), compute_kernel_config
         )
         self.pair_weighted_averaging = PairWeightedAveraging(
             head_dim=avg_head_dim,
@@ -1233,12 +1232,10 @@ class Diffusion(Module):
             "single_conditioner.fourier_to_single.weight"
         )
         self.conditioner_transition_0 = Transition(
-            False,
             filter_dict(state_dict, "single_conditioner.transitions.0"),
             compute_kernel_config,
         )
         self.conditioner_transition_1 = Transition(
-            False,
             filter_dict(state_dict, "single_conditioner.transitions.1"),
             compute_kernel_config,
         )
