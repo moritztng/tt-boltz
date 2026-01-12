@@ -1198,6 +1198,7 @@ class MSA(Module):
             m,
             self.msa_weight,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         m = ttnn.add(
             m,
@@ -1205,6 +1206,7 @@ class MSA(Module):
                 emb,
                 self.s_weight,
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             ),
         )
         for block in self.blocks:
@@ -1329,6 +1331,7 @@ class Diffusion(Module):
             r,
             self.r_to_q_weight,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         q = ttnn.add(q, r_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
@@ -1340,6 +1343,7 @@ class Diffusion(Module):
             self.atom_to_token_weight,
             compute_kernel_config=self.compute_kernel_config,
             activation="relu",
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         a = ttnn.matmul(
             a,
@@ -1361,6 +1365,7 @@ class Diffusion(Module):
             self.conditioner_embed_weight,
             bias=self.conditioner_embed_bias,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         times = ttnn.unsqueeze(times, 1)
         fourier = ttnn.linear(
@@ -1368,6 +1373,7 @@ class Diffusion(Module):
             self.conditioner_fourier_embed_weight,
             bias=self.conditioner_fourier_embed_bias,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         fourier = ttnn.multiply(fourier, 2 * pi)
         fourier = ttnn.cos(fourier)
@@ -1382,6 +1388,7 @@ class Diffusion(Module):
             fourier,
             self.conditioner_fourier_single_weight,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         fourier = ttnn.unsqueeze(fourier, 1)
         s = ttnn.add(s, fourier)
@@ -1398,6 +1405,7 @@ class Diffusion(Module):
             s_to_a,
             self.s_to_a_linear_weight,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         a = ttnn.add(a, s_to_a)
         a = self.token_transformer(a, s, bias_token)
@@ -1412,6 +1420,7 @@ class Diffusion(Module):
             a,
             self.a_to_q_weight,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         a_to_q = ttnn.matmul(
@@ -1437,6 +1446,7 @@ class Diffusion(Module):
             r_update,
             self.feat_to_pos_linear_weight,
             compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         return r_update
 
