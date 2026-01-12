@@ -1457,7 +1457,6 @@ class TorchWrapper(nn.Module):
         self.module = None
         global device
         if device is None:
-            ttnn.device.EnablePersistentKernelCache()  # be careful, can lead to bugs when profiling etc.
             args = {"device_id": 0}
             if is_wormhole_b0():
                 args["dispatch_core_config"] = ttnn.DispatchCoreConfig(
