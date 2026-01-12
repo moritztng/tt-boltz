@@ -817,49 +817,61 @@ class ConditionedTransitionBlock(Module):
         self.adaln = AdaLN(
             atom_level, filter_dict(state_dict, "adaln"), compute_kernel_config
         )
-        self.swish_weight = self.torch_to_tt("swish_gate.0.weight")
+        swish_chunk, gates_chunk = torch.chunk(self.state_dict["swish_gate.0.weight"], chunks=2, dim=0)
+        self.swish_weight, self.gates_weight = [
+            ttnn.from_torch(chunk.t(), layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.bfloat16)
+            for chunk in [swish_chunk, gates_chunk]
+        ]
         self.a_to_b_weight = self.torch_to_tt("a_to_b.weight")
         self.b_to_a_weight = self.torch_to_tt("b_to_a.weight")
         self.output_projection_weight = self.torch_to_tt("output_projection.0.weight")
         self.output_projection_bias = self.torch_to_tt("output_projection.0.bias")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
-        memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
         a = self.adaln(a, s)
         a_swish = ttnn.linear(
             a,
             self.swish_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=memory_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        a_swish, gates = ttnn.chunk(a_swish, chunks=2, dim=-1)
+        gates = ttnn.linear(
+            a,
+            self.gates_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+        )
         a_swish = ttnn.multiply_(gates, a_swish, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
         a_b = ttnn.linear(
             a,
             self.a_to_b_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=memory_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
+        ttnn.deallocate(a)
         b = ttnn.multiply_(a_swish, a_b)
-        if self.atom_level:
-            ttnn.deallocate(a_b)
+        ttnn.deallocate(a_b)
         s = ttnn.linear(
             s,
             self.output_projection_weight,
             bias=self.output_projection_bias,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=memory_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         b_a = ttnn.linear(
             b,
             self.b_to_a_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=memory_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        if self.atom_level:
-            ttnn.deallocate(b)
+        ttnn.deallocate(b)
         a = ttnn.multiply_(s, b_a, input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID])
+        ttnn.deallocate(b_a)
         return a
 
 
