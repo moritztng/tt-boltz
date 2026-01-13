@@ -383,10 +383,15 @@ class AttentionPairBias(Module):
         self.compute_pair_bias = compute_pair_bias
         self.atom_level = atom_level 
         if atom_level:
-            self.q_weight = self.torch_to_tt("proj_q.weight")
-            self.q_bias = self.torch_to_tt("proj_q.bias")
-            self.k_weight = self.torch_to_tt("proj_k.weight")
-            self.v_weight = self.torch_to_tt("proj_v.weight")
+            self.q_weight = self.torch_to_tt("proj_q.weight", dtype=ttnn.bfloat8_b)
+            self.q_bias = self.torch_to_tt("proj_q.bias", dtype=ttnn.bfloat8_b)
+            kv_weight = torch.cat([self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
+            self.kv_weight = ttnn.from_torch(
+                kv_weight.t(),
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
+            )
         else:
             qkv_weight = torch.cat([self.state_dict["proj_q.weight"], self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
             head_dim_padding = -head_dim % 32
@@ -427,13 +432,12 @@ class AttentionPairBias(Module):
         keys_indexing: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
         if not self.atom_level:
-            seq_len = s.shape[1]
-            seq_len_padding = -seq_len % 64
             qkv = ttnn.linear(
-                ttnn.pad(s, [(0, 0), (0, seq_len_padding), (0, 0)], 0),
+                s,
                 self.qkv_weight,
                 bias=self.qkv_bias,
                 compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             qkv = ttnn.unsqueeze(qkv, 0)
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -442,9 +446,6 @@ class AttentionPairBias(Module):
                 num_kv_heads=self.n_heads,
                 transpose_k_heads=False,
             )
-            q = ttnn.permute(q, (1, 0, 2, 3))
-            k = ttnn.permute(k, (1, 0, 2, 3))
-            v = ttnn.permute(v, (1, 0, 2, 3))
             if self.compute_pair_bias:
                 z = ttnn.layer_norm(
                     z,
@@ -459,10 +460,7 @@ class AttentionPairBias(Module):
                     compute_kernel_config=self.compute_kernel_config,
                     core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
                 )
-                z = ttnn.permute(z, (3, 0, 1, 2))
-                z = ttnn.pad(
-                    z, [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)], 0
-                )
+                z = ttnn.permute(z, (0, 3, 1, 2))
             o = ttnn.transformer.scaled_dot_product_attention(
                 q,
                 k,
@@ -479,11 +477,12 @@ class AttentionPairBias(Module):
                     k_chunk_size=64,
                 ),
             )
-            o = o[:, :, :seq_len, :self.head_dim]
-            o = ttnn.permute(o, (0, 3, 1, 2))
-            o = ttnn.reshape(o, (-1, *tuple(o.shape)[2:]))
-            o = ttnn.permute(o, (1, 2, 0))
+            o = o[:, :, :, :self.head_dim]
+            o = ttnn.permute(o, (0, 1, 3, 2))
+            o = ttnn.reshape(o, (o.shape[0], -1, o.shape[3]))
+            o = ttnn.permute(o, (0, 2, 1))
         else:
+            s = ttnn.to_memory_config(s, ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat8_b)
             B, K, W, D = s.shape
             s_kv = ttnn.reshape(s, (B, 2 * K, W // 2, -1))
             s_kv = ttnn.permute(s_kv, (0, 2, 3, 1))
@@ -495,74 +494,64 @@ class AttentionPairBias(Module):
             )
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
             s_kv = ttnn.reshape(s_kv, (B, K, -1, D))
-            q = ttnn.linear(
-                s,
-                self.q_weight,
-                bias=self.q_bias,
-                compute_kernel_config=self.compute_kernel_config,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
+
+            z = ttnn.typecast(z, ttnn.bfloat8_b)
+            
+            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, memory_config=ttnn.L1_MEMORY_CONFIG, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
+            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, memory_config=ttnn.L1_MEMORY_CONFIG, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
+            
+            q = ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT)
+            q = ttnn.pad(q, [[0, 0], [0, 0], [0, 96], [0, 0]], 0.0)
+            q = ttnn.to_layout(q, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat8_b)
+
+            _, K, S_kv, _ = q.shape
+            
+            q = ttnn.reshape(q, (K, 1, S_kv, -1))
+            kv = ttnn.reshape(kv, (K, 1, S_kv, -1))
+
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                q,
+                kv,
+                num_heads=self.n_heads,
+                num_kv_heads=self.n_heads,
+                transpose_k_heads=False,
             )
-            k = ttnn.linear(
-                s_kv,
-                self.k_weight,
-                compute_kernel_config=self.compute_kernel_config,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
-            v = ttnn.linear(
-                s_kv,
-                self.v_weight,
-                compute_kernel_config=self.compute_kernel_config,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
-            perm = (3, 0, 1, 2)
-            q = ttnn.permute(q, perm)
-            k = ttnn.permute(k, perm)
-            v = ttnn.permute(v, perm)
-            q = ttnn.reshape(q, (self.n_heads, self.head_dim, *tuple(q.shape)[1:]))
-            k = ttnn.reshape(k, (self.n_heads, self.head_dim, *tuple(k.shape)[1:]))
-            v = ttnn.reshape(v, (self.n_heads, self.head_dim, *tuple(v.shape)[1:]))
-            perm_qv = (2, 0, 3, 4, 1)
-            perm_k = (2, 0, 3, 1, 4)
-            q, v = ttnn.permute(q, perm_qv), ttnn.permute(v, perm_qv)
-            k = ttnn.permute(k, perm_k)
-            a = ttnn.matmul(
+            
+            q = q[:, :, :32, :]
+            
+            o_4d = ttnn.transformer.scaled_dot_product_attention(
                 q,
                 k,
-                compute_kernel_config=self.compute_kernel_config,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
-            ttnn.deallocate(q)
-            ttnn.deallocate(k)
-            a = ttnn.multiply_(a, self.head_dim**-0.5)
-            a = ttnn.add_(a, z)
-            a = ttnn.softmax(
-                a,
-                dim=-1,
-                compute_kernel_config=self.compute_kernel_config,
-                numeric_stable=True,
-            )
-            o = ttnn.matmul(
-                a,
                 v,
-                compute_kernel_config=self.compute_kernel_config,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
+                attn_mask=z,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
+                    exp_approx_mode=False,
+                    q_chunk_size=32,
+                    k_chunk_size=128,
+                ),
             )
-            ttnn.deallocate(a)
-            ttnn.deallocate(v)
-            o = ttnn.permute(o, (0, 1, 4, 2, 3))
-            o = ttnn.reshape(o, (B, -1, *tuple(o.shape)[3:]))
-            o = ttnn.permute(o, (0, 2, 3, 1))
+            o = ttnn.experimental.nlp_concat_heads(o_4d, memory_config=ttnn.L1_MEMORY_CONFIG)
+            o = ttnn.squeeze(o, 1)
+            o = ttnn.unsqueeze(o, 0)        
         g = ttnn.linear(
             s,
             self.g_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=ttnn.L1_MEMORY_CONFIG if self.atom_level else None,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
+        o = ttnn.typecast(o, ttnn.bfloat16)
+        o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID], dtype=ttnn.bfloat8_b)
         if self.atom_level:
             ttnn.deallocate(g)
         x = ttnn.linear(
-            o, self.o_weight, compute_kernel_config=self.compute_kernel_config
+            o, self.o_weight, compute_kernel_config=self.compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         return x
 
@@ -963,9 +952,9 @@ class DiffusionTransformer(Module):
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
-        dim = z.shape[0] // len(self.layers)
+        dim = z.shape[1] // len(self.layers)
         for i, layer in enumerate(self.layers):
-            a = layer(a, s, z[i * dim : (i + 1) * dim, :, :, :], keys_indexing)
+            a = layer(a, s, z[:, i * dim : (i + 1) * dim, :, :], keys_indexing)
         return a
 
 
@@ -1598,30 +1587,30 @@ class DiffusionModule(TorchWrapper):
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             mask = ttnn.permute(mask, (2, 0, 1))
-            mask = ttnn.reshape(mask, (1, K, 1, -1))
+            mask = ttnn.reshape(mask, (K, 1, 1, -1))
             mask = (-1 * mask + 1) * -1e9
 
             bias = self._from_torch(bias_encoder)
             bias = ttnn.reshape(bias, (B * NW, W, H, -1))
-            bias = ttnn.permute(bias, (3, 0, 1, 2))
-            self.bias_encoder = ttnn.add(bias, mask)
+            bias = ttnn.permute(bias, (0, 3, 1, 2))
+            bias = ttnn.add(bias, mask)
+            self.bias_encoder = ttnn.multiply_(
+                bias, 32 ** 0.5
+            )
 
             bias = self._from_torch(bias_decoder)
             bias = ttnn.reshape(bias, (B * NW, W, H, -1))
-            bias = ttnn.permute(bias, (3, 0, 1, 2))
-            self.bias_decoder = ttnn.add(bias, mask)
+            bias = ttnn.permute(bias, (0, 3, 1, 2))
+            bias = ttnn.add(bias, mask)
+            self.bias_decoder = ttnn.multiply_(
+                bias, 32 ** 0.5
+            )
 
             bias = self._from_torch(bias_token)
             bias = ttnn.multiply_(
                 bias, (TOKEN_TRANSFORMER_DIM / TOKEN_TRANSFORMER_N_HEADS) ** 0.5
             )
-            bias = ttnn.permute(bias, (3, 0, 1, 2))
-            seq_len_padding = -bias.shape[-1] % 64
-            self.bias_token = ttnn.pad(
-                bias,
-                [(0, 0), (0, 0), (0, seq_len_padding), (0, seq_len_padding)],
-                0,
-            )
+            self.bias_token = ttnn.permute(bias, (0, 3, 1, 2))
 
             self.atom_to_token = self._from_torch(atom_to_token)
             self.atom_to_token_normed = ttnn.multiply(
