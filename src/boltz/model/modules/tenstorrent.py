@@ -278,10 +278,6 @@ class TriangleAttention(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         use_optimized_path = mask is None
-        seq_len = x.shape[0]
-        if use_optimized_path:
-            padding = -seq_len % 256
-            x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
@@ -301,9 +297,9 @@ class TriangleAttention(Module):
         del qkvg
         if use_optimized_path:
             triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
-            triangle_bias = ttnn.permute(triangle_bias, (3, 0, 1, 2))
-            qkv = ttnn.unsqueeze(qkv, 0)
-            q, k, v = ttnn.experimental.nlp_create_qkv_heads_boltz(
+            triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
+            qkv = ttnn.unsqueeze(qkv, 1)
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 qkv,
                 num_heads=self.n_heads,
                 num_kv_heads=self.n_heads,
@@ -326,10 +322,10 @@ class TriangleAttention(Module):
                     k_chunk_size=256,
                 ),
             )
-            o = ttnn.experimental.nlp_concat_heads_boltz(
+            o = ttnn.experimental.nlp_concat_heads(
                 o, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
-            o = ttnn.squeeze(o, 0)
+            o = ttnn.squeeze(o, 1)
         else:
             if self.ending:
                 mask = ttnn.permute(mask, (2, 0, 1))
@@ -339,6 +335,7 @@ class TriangleAttention(Module):
             triangle_bias = ttnn.permute(triangle_bias, (2, 0, 1))
             triangle_bias = ttnn.unsqueeze(triangle_bias, 1)
             triangle_bias = ttnn.add(triangle_bias, mask)
+            seq_len = qkv.shape[0]
             qkv = ttnn.reshape(qkv, (seq_len, seq_len, 3 * self.n_heads, self.head_dim))
             qkv = ttnn.permute(qkv, (2, 0, 1, 3))
             q, k, v = ttnn.chunk(qkv, chunks=3, dim=0)
@@ -364,8 +361,6 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
         )
-        if use_optimized_path:
-            x = x[:seq_len, :seq_len, :]
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
