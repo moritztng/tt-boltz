@@ -759,6 +759,7 @@ class AdaLN(Module):
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
         memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
+        core_grid = ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None
         if self.atom_level:
             a = ttnn.to_memory_config(a, memory_config=memory_config)
             s = ttnn.to_memory_config(s, memory_config=memory_config)
@@ -777,15 +778,19 @@ class AdaLN(Module):
             bias=self.s_scale_bias,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
+            core_grid=core_grid,
         )
         s_bias = ttnn.linear(
             s,
             self.s_bias_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
+            core_grid=core_grid,
         )
         a = ttnn.multiply_(a, s_scale, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
+        ttnn.deallocate(s_scale)
         a = ttnn.add_(a, s_bias)
+        ttnn.deallocate(s_bias)
         return a
 
 
