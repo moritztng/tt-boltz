@@ -6,7 +6,6 @@ from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 128
-USE_FLOAT32 = False
 
 device = None
 
@@ -46,13 +45,11 @@ class Module:
         transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
         dtype=None,
     ) -> ttnn.Tensor:
-        if dtype is None:
-            dtype = ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            dtype=dtype,
+            dtype=ttnn.bfloat16 if dtype is None else dtype,
         )
 
 
@@ -101,7 +98,7 @@ class TriangleMultiplication(Module):
                 ),
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+                dtype=ttnn.bfloat16,
             )
             for i in range(self.n_pairs)
         ]
@@ -263,7 +260,7 @@ class TriangleAttention(Module):
             ).t(),
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
+            dtype=ttnn.bfloat8_b,
         )
 
     def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor = None) -> ttnn.Tensor:
@@ -403,7 +400,7 @@ class AttentionPairBias(Module):
                 qkv_weight.t(),
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+                dtype=ttnn.bfloat16,
             )
             q_bias = self.state_dict["proj_q.bias"]
             q_bias = q_bias.reshape(self.n_heads, head_dim)
@@ -414,7 +411,7 @@ class AttentionPairBias(Module):
                 qkv_bias,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16,
+                dtype=ttnn.bfloat16,
             )
         self.g_weight = self.torch_to_tt("proj_g.weight")
         if compute_pair_bias:
@@ -439,7 +436,7 @@ class AttentionPairBias(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
-            qkv = ttnn.unsqueeze(qkv, 0)
+            qkv = ttnn.unsqueeze(qkv, 1)
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 qkv,
                 num_heads=self.n_heads,
@@ -1461,7 +1458,7 @@ class TorchWrapper(nn.Module):
 
     def _from_torch(self, x: torch.Tensor, dtype=None) -> ttnn.Tensor:
         if dtype is None:
-            dtype = ttnn.float32 if USE_FLOAT32 else ttnn.bfloat16
+            dtype = ttnn.bfloat16
         return ttnn.from_torch(
             x,
             device=device,
