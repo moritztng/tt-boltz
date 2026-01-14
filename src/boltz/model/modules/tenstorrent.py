@@ -437,7 +437,7 @@ class AttentionPairBias(Module):
                 bias=self.qkv_bias,
                 compute_kernel_config=self.compute_kernel_config,
             )
-            qkv = ttnn.unsqueeze(qkv, 0)
+            qkv = ttnn.unsqueeze(qkv, 1)
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 qkv,
                 num_heads=self.n_heads,
