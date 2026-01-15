@@ -274,7 +274,6 @@ class TriangleAttention(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
-        use_optimized_path = mask is None
         triangle_bias = ttnn.linear(
             x,
             self.bias_weight,
@@ -292,64 +291,38 @@ class TriangleAttention(Module):
         qkv = qkvg[..., :split_idx]
         g = qkvg[..., split_idx:]
         del qkvg
-        if use_optimized_path:
-            triangle_bias = ttnn.reshape(triangle_bias, (1, *triangle_bias.shape))
-            triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
-            qkv = ttnn.unsqueeze(qkv, 1)
-            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-                qkv,
-                num_heads=self.n_heads,
-                num_kv_heads=self.n_heads,
-                transpose_k_heads=False,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            o = ttnn.transformer.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=triangle_bias,
-                is_causal=False,
-                scale=self.scale**-1,
-                program_config=ttnn.SDPAProgramConfig(
-                    compute_with_storage_grid_size=(
-                        (13, 10) if is_blackhole() else (8, 8)
-                    ),
-                    exp_approx_mode=False,
-                    q_chunk_size=256,
-                    k_chunk_size=256,
-                ),
-            )
-            o = ttnn.experimental.nlp_concat_heads(
-                o, memory_config=ttnn.DRAM_MEMORY_CONFIG
-            )
-            o = ttnn.squeeze(o, 1)
-        else:
-            if self.ending:
-                mask = ttnn.permute(mask, (2, 0, 1))
-            else:
-                mask = ttnn.permute(mask, (1, 0, 2))
-            mask = (mask - 1) * 1e9
-            triangle_bias = ttnn.permute(triangle_bias, (2, 0, 1))
-            triangle_bias = ttnn.unsqueeze(triangle_bias, 1)
+        triangle_bias = ttnn.unsqueeze(triangle_bias, 0)
+        triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
+        if mask is not None:
+            mask = ttnn.permute(mask, (2, 0, 1) if self.ending else (1, 0, 2))
+            mask = ttnn.unsqueeze(mask, 2) * 1e9 - 1e9
             triangle_bias = ttnn.add(triangle_bias, mask)
-            seq_len = qkv.shape[0]
-            qkv = ttnn.reshape(qkv, (seq_len, seq_len, 3 * self.n_heads, self.head_dim))
-            qkv = ttnn.permute(qkv, (2, 0, 1, 3))
-            q, k, v = ttnn.chunk(qkv, chunks=3, dim=0)
-            a = ttnn.matmul(
-                q, k, transpose_b=True, compute_kernel_config=self.compute_kernel_config
-            )
-            a = ttnn.add_(a, triangle_bias)
-            a = ttnn.multiply_(a, self.scale**-1)
-            a = ttnn.softmax(
-                a,
-                dim=-1,
-                compute_kernel_config=self.compute_kernel_config,
-                numeric_stable=True,
-            )
-            o = ttnn.matmul(a, v, compute_kernel_config=self.compute_kernel_config)
-            o = ttnn.permute(o, (1, 2, 0, 3))
-            o = ttnn.reshape(o, (o.shape[0], o.shape[1], -1))
+        qkv = ttnn.unsqueeze(qkv, 1)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv,
+            num_heads=self.n_heads,
+            num_kv_heads=self.n_heads,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        o = ttnn.transformer.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=triangle_bias,
+            is_causal=False,
+            scale=self.scale**-1,
+            program_config=ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=(
+                    (13, 10) if is_blackhole() else (8, 8)
+                ),
+                exp_approx_mode=False,
+                q_chunk_size=256,
+                k_chunk_size=256,
+            ),
+        )
+        o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        o = ttnn.squeeze(o, 1)
         o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         x = ttnn.linear(
             o,
