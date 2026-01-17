@@ -1575,6 +1575,9 @@ class DiffusionModule(TorchWrapper):
                 bias, 32 ** 0.5
             )
 
+            seq_len = bias_token.shape[1]
+            padding = -seq_len % 32
+            bias_token = torch.nn.functional.pad(bias_token, (0, 0, 0, padding, 0, padding), value=0)
             bias = self._from_torch(bias_token)
             bias = ttnn.multiply_(
                 bias, (TOKEN_TRANSFORMER_DIM / TOKEN_TRANSFORMER_N_HEADS) ** 0.5
