@@ -636,7 +636,7 @@ class PairformerLayer(Module):
             )
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None
+        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None, mask_padded: ttnn.Tensor = None
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         z = ttnn.add(
             z,
@@ -648,11 +648,11 @@ class PairformerLayer(Module):
         )
         z = ttnn.add(
             z,
-            self.triangle_attention_start(z, mask),
+            self.triangle_attention_start(z, mask_padded),
         )
         z = ttnn.add(
             z,
-            self.triangle_attention_end(z, mask),
+            self.triangle_attention_end(z, mask_padded),
         )
         z = ttnn.add(z, self.transition_z(z))
         if self.transform_s:
@@ -701,10 +701,10 @@ class Pairformer(Module):
         ]
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None
+        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None, mask_padded: ttnn.Tensor = None
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         for block in self.blocks:
-            s, z = block(s, z, mask)
+            s, z = block(s, z, mask, mask_padded)
         return s, z
 
 
@@ -1447,6 +1447,7 @@ class PairformerModule(TorchWrapper):
         att_head_dim: int,
         att_n_heads: int,
         transform_s: bool,
+        use_mask: bool = False,
     ):
         super().__init__()
         self.n_blocks = n_blocks
@@ -1455,6 +1456,7 @@ class PairformerModule(TorchWrapper):
         self.att_head_dim = att_head_dim
         self.att_n_heads = att_n_heads
         self.transform_s = transform_s
+        self.use_mask = use_mask
 
     def _load_from_state_dict(
         self,
@@ -1485,12 +1487,19 @@ class PairformerModule(TorchWrapper):
         pair_mask: torch.Tensor = None,
         use_kernels: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pair_mask_tt = None
+        pair_mask_padded_tt = None
+        if self.use_mask:
+            pair_mask_tt = self._from_torch(pair_mask)
+            padding = -pair_mask.shape[1] % 32
+            pair_mask_padded_tt = self._from_torch(torch.nn.functional.pad(pair_mask, (0, padding, 0, padding), value=0))
         return tuple(
             self._to_torch(x) if x is not None else None
             for x in self.module(
                 self._from_torch(s) if s is not None else None,
                 self._from_torch(z),
-                self._from_torch(mask) if (mask is not None) and (s is None) else None,
+                pair_mask_tt,
+                pair_mask_padded_tt,
             )
         )
 
