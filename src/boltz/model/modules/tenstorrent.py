@@ -364,7 +364,7 @@ class AttentionPairBias(Module):
                 kv_weight.t(),
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=ttnn.float32 if USE_FLOAT32 else ttnn.bfloat8_b,
+                dtype=ttnn.bfloat8_b,
             )
         else:
             qkv_weight = torch.cat([self.state_dict["proj_q.weight"], self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
