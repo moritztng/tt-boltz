@@ -461,7 +461,7 @@ class AttentionPairBias(Module):
             o = ttnn.permute(o, (0, 2, 1))
         else:
             s = ttnn.to_memory_config(s, ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat8_b)
-            B, K, W, D = s.shape
+            B, K, W, D_S = s.shape
             s_kv = ttnn.reshape(s, (B, 2 * K, W // 2, -1))
             s_kv = ttnn.permute(s_kv, (0, 2, 3, 1))
             s_kv = ttnn.matmul(
@@ -471,7 +471,7 @@ class AttentionPairBias(Module):
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
-            s_kv = ttnn.reshape(s_kv, (B, K, -1, D))
+            s_kv = ttnn.reshape(s_kv, (B, K, -1, D_S))
 
             z = ttnn.typecast(z, ttnn.bfloat8_b)
             
@@ -481,41 +481,26 @@ class AttentionPairBias(Module):
             q = ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT)
             q = ttnn.pad(q, [[0, 0], [0, 0], [0, 96], [0, 0]], 0.0)
             q = ttnn.to_layout(q, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat8_b)
-
-            _, K, S_kv, _ = q.shape
-            
-            q = ttnn.reshape(q, (K, 1, S_kv, -1))
-            kv = ttnn.reshape(kv, (K, 1, S_kv, -1))
-
-            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-                q,
-                kv,
-                num_heads=self.n_heads,
-                num_kv_heads=self.n_heads,
-                transpose_k_heads=False,
-            )
-            
+            q = ttnn.reshape(q, (B * K, 1, 128, -1))
+            kv = ttnn.reshape(kv, (B * K, 1, 128, -1))
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(q, kv, num_heads=self.n_heads, num_kv_heads=self.n_heads, transpose_k_heads=False)
+            _, H, S, D_Q = q.shape
+            q = ttnn.reshape(q, (B, K * H, S, D_Q))
+            k = ttnn.reshape(k, (B, K * H, S, D_Q))
+            v = ttnn.reshape(v, (B, K * H, S, D_Q))
             q = q[:, :, :32, :]
-            
-            o_4d = ttnn.transformer.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=z,
-                is_causal=False,
-                scale=self.head_dim**-0.5,
+            z = ttnn.reshape(z, (1, -1, z.shape[2], z.shape[3]))
+            o = ttnn.transformer.scaled_dot_product_attention(
+                q, k, v, attn_mask=z, is_causal=False, scale=self.head_dim**-0.5,
                 program_config=ttnn.SDPAProgramConfig(
-                    compute_with_storage_grid_size=(
-                        (13, 10) if is_blackhole() else (8, 8)
-                    ),
-                    exp_approx_mode=False,
-                    q_chunk_size=32,
-                    k_chunk_size=128,
+                    compute_with_storage_grid_size=((13, 10) if is_blackhole() else (8, 8)),
+                    exp_approx_mode=False, q_chunk_size=32, k_chunk_size=128,
                 ),
             )
-            o = ttnn.experimental.nlp_concat_heads(o_4d, memory_config=ttnn.L1_MEMORY_CONFIG)
+            o = ttnn.reshape(o, (B * K, H, W, D_Q))
+            o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.L1_MEMORY_CONFIG)
             o = ttnn.squeeze(o, 1)
-            o = ttnn.unsqueeze(o, 0)        
+            o = ttnn.reshape(o, (B, K, W, D_S))
         g = ttnn.linear(
             s,
             self.g_weight,
