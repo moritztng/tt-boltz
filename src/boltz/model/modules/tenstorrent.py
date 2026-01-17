@@ -406,6 +406,9 @@ class AttentionPairBias(Module):
         keys_indexing: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
         if not self.atom_level:
+            seq_len = s.shape[1]
+            padding = -seq_len % 32
+            s = ttnn.pad(s, [(0, 0), (0, padding), (0, 0)], 0)
             qkv = ttnn.linear(
                 s,
                 self.qkv_weight,
@@ -434,6 +437,7 @@ class AttentionPairBias(Module):
                     compute_kernel_config=self.compute_kernel_config,
                     core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
                 )
+                z = ttnn.pad(z, [(0, 0), (0, padding), (0, padding), (0, 0)], 0)
                 z = ttnn.permute(z, (0, 3, 1, 2))
             o = ttnn.transformer.scaled_dot_product_attention(
                 q,
@@ -527,6 +531,8 @@ class AttentionPairBias(Module):
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
+        if not self.atom_level:
+            x = x[:, :seq_len, :]
         return x
 
 
