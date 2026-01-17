@@ -265,6 +265,9 @@ class TriangleAttention(Module):
 
     def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
+        seq_len = x.shape[0]
+        padding = -seq_len % 32
+        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
         x = ttnn.layer_norm(
@@ -317,7 +320,7 @@ class TriangleAttention(Module):
                     (13, 10) if is_blackhole() else (8, 8)
                 ),
                 exp_approx_mode=False,
-                q_chunk_size=256,
+                q_chunk_size=256, # CAN CAUSE ACCURACY ISSUES IN TEMPLATE MODULE
                 k_chunk_size=256,
             ),
         )
@@ -331,6 +334,7 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
         )
+        x = x[:seq_len, :seq_len, :]
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
