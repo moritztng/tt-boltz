@@ -68,7 +68,7 @@ class AffinityModule(nn.Module):
         )
         self.pairformer_stack = (
             tenstorrent.PairformerModule(
-                pairformer_args["num_blocks"], 32, 4, None, None, False
+                pairformer_args["num_blocks"], 32, 4, None, None, False, use_mask=True
             )
             if use_tenstorrent
             else PairformerNoSeqModule(token_z, **pairformer_args)
@@ -133,7 +133,7 @@ class AffinityModule(nn.Module):
             + lig_mask[:, :, None] * lig_mask[:, None, :]
         )
         z = (
-            self.pairformer_stack(None, z, cross_pair_mask)[1]
+            self.pairformer_stack(None, z, pair_mask=cross_pair_mask)[1]
             if self.use_tenstorrent
             else self.pairformer_stack(
                 z=z, pair_mask=cross_pair_mask, use_kernels=use_kernels
