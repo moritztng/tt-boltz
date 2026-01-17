@@ -404,7 +404,7 @@ class TemplateV2Module(nn.Module):
         self.u_proj = nn.Linear(template_dim, token_z, bias=False)
         self.pairformer = (
             tenstorrent.PairformerModule(2, 32, 4, None, None, False)
-            if use_tenstorrent
+            if self.use_tenstorrent
             else PairformerNoSeqModule(
                 template_dim,
                 num_blocks=template_blocks,
