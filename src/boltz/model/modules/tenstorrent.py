@@ -5,7 +5,7 @@ from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-TRANSITION_CHUNK_SIZE = 128
+TRANSITION_CHUNK_SIZE = 64
 
 device = None
 
@@ -158,9 +158,6 @@ class TriangleMultiplication(Module):
                 compute_kernel_config=self.compute_kernel_config,
             )
             g_in_a, g_in_b, p_in_a, p_in_b = ttnn.chunk(gp_in_fused, chunks=4, dim=-1)
-            if H > 700:
-                p_in_a = ttnn.to_memory_config(p_in_a, ttnn.L1_MEMORY_CONFIG)
-                p_in_b = ttnn.to_memory_config(p_in_b, ttnn.L1_MEMORY_CONFIG)
             ttnn.deallocate(gp_in_fused)
             a_chunk = ttnn.multiply_(
                 p_in_a, g_in_a, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID]
@@ -544,6 +541,7 @@ class Transition(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )
+            ttnn.reallocate(x_norm)
             x_1 = ttnn.linear(
                 x_norm,
                 self.fc1_weight,
