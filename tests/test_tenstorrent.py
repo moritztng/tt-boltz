@@ -52,7 +52,7 @@ def test_template_pairformer(seq_len):
 
 @pytest.mark.parametrize("seq_len", [100, 500])
 def test_affinity_pairformer(seq_len):
-    tt, ref = PairformerModule(4, 32, 4, None, None, transform_s=False), PairformerNoSeqModuleTorch(128, 4, v2=True).eval()
+    tt, ref = PairformerModule(4, 32, 4, None, None, transform_s=False, use_mask=True), PairformerNoSeqModuleTorch(128, 4, v2=True).eval()
     load(tt, ref, STATE_AFF, "affinity_module1.pairformer_stack")
 
     z = 26 * torch.randn(1, seq_len, seq_len, 128)
