@@ -541,7 +541,6 @@ class Transition(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )
-            ttnn.reallocate(x_norm)
             x_1 = ttnn.linear(
                 x_norm,
                 self.fc1_weight,
