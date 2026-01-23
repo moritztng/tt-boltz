@@ -126,21 +126,22 @@ The `confidence_*.json` file contains:
 
 ```json
 {
-    "confidence_score": 0.84,      # Overall confidence (0-1, higher is better)
-    "ptm": 0.84,                   # Predicted TM-score for complex
-    "iptm": 0.82,                  # Interface TM-score
-    "complex_plddt": 0.84,         # Average per-residue confidence
-    "chains_ptm": {                # Per-chain TM-scores
+    "confidence_score": 0.84,
+    "ptm": 0.84,
+    "iptm": 0.82,
+    "complex_plddt": 0.84,
+    "chains_ptm": {
         "0": 0.85,
         "1": 0.83
     }
 }
 ```
 
-**Interpretation:**
-- Scores range 0-1 (higher = better)
-- `confidence_score` = 0.8 × `complex_plddt` + 0.2 × `iptm`
-- Models are ranked by `confidence_score`
+- `confidence_score`: Overall confidence (0-1, higher is better), calculated as 0.8 × `complex_plddt` + 0.2 × `iptm`. Models are ranked by this score
+- `ptm`: Predicted TM-score for complex (0-1)
+- `iptm`: Interface TM-score (0-1)
+- `complex_plddt`: Average per-residue confidence (0-1)
+- `chains_ptm`: Per-chain TM-scores (0-1)
 
 ### Affinity Predictions
 
@@ -148,33 +149,19 @@ The `affinity_*.json` file contains:
 
 ```json
 {
-    "affinity_pred_value": 2.47,           # log10(IC50) in μM
-    "affinity_probability_binary": 0.41,   # Probability of binding (0-1)
-    "affinity_pred_value1": 2.55,          # Individual model predictions
-    "affinity_pred_value2": 2.19
+    "affinity_pred_value": 2.47,
+    "affinity_probability_binary": 0.41,
+    "affinity_pred_value1": 2.55,
+    "affinity_pred_value2": 2.19,
+    "affinity_probability_binary1": 0.50,
+    "affinity_probability_binary2": 0.42
 }
 ```
 
-**Two Different Metrics:**
-
-1. **`affinity_probability_binary`** (0-1): Use for **hit discovery**
-   - Probability that ligand is a binder
-   - Higher = more likely to bind
-   - Use to filter binders from decoys
-
-2. **`affinity_pred_value`**: Use for **ligand optimization**
-   - `log10(IC50)` where IC50 is in μM
-   - Lower = stronger binding
-   - Only compare between known active molecules
-   - Examples:
-     - `-3` = IC50 of 10⁻⁹ M (strong binder)
-     - `0` = IC50 of 10⁻⁶ M (moderate binder)
-     - `2` = IC50 of 10⁻⁴ M (weak binder)
-
-**Convert to pIC50 (kcal/mol):**
-```
-pIC50 = (6 - affinity_pred_value) × 1.364
-```
+- `affinity_probability_binary`: Probability of binding (0-1). Use for hit discovery (higher = more likely to bind)
+- `affinity_pred_value`: Predicted binding affinity as log10(IC50) in μM. Use for ligand optimization (lower = stronger binding). Only compare between known active molecules
+- `affinity_pred_value1`, `affinity_pred_value2`: Individual model predictions for binding affinity
+- `affinity_probability_binary1`, `affinity_probability_binary2`: Individual model predictions for binding probability
 
 ## Advanced Usage
 
