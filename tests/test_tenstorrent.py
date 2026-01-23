@@ -2,11 +2,10 @@ import pytest
 import torch
 from functools import partial
 
-from boltz.model.modules.tenstorrent import filter_dict, PairformerModule, MSAModule, DiffusionModule
-from boltz.model.modules.trunkv2 import MSAModule as MSAModuleTorch
-from boltz.model.modules.diffusionv2 import DiffusionModule as DiffusionModuleTorch
-from boltz.model.layers.pairformer import PairformerModule as PairformerModuleTorch, PairformerNoSeqModule as PairformerNoSeqModuleTorch
-from boltz.model.modules.encoders import get_indexing_matrix, single_to_keys
+from tt_boltz.tenstorrent import filter_dict, PairformerModule, MSAModule, DiffusionModule
+from tt_boltz.reference import MSAModule as MSAModuleTorch, DiffusionModule as DiffusionModuleTorch
+from tt_boltz.reference import PairformerModule as PairformerModuleTorch, PairformerNoSeqModule as PairformerNoSeqModuleTorch
+from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
 
 torch.set_grad_enabled(False)
 torch.manual_seed(893)
