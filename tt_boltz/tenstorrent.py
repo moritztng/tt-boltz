@@ -5,7 +5,7 @@ from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-TRANSITION_CHUNK_SIZE = 64
+TRANSITION_CHUNK_SIZE = 128
 
 device = None
 
