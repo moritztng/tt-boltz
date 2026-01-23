@@ -23,7 +23,19 @@ source env/bin/activate
 ```
 
 ### Build TT-Metal from Source
-[Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
+When following the [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md), you **must** use a different clone command to checkout the `boltz` branch:
+
+**❌ Do NOT use the standard clone command from the installation guide:**
+```bash
+git clone https://github.com/tenstorrent/tt-metal.git --recurse-submodules
+```
+
+**✅ Instead, use this command to clone the `boltz` branch:**
+```bash
+git clone https://github.com/tenstorrent/tt-metal.git --branch boltz --recurse-submodules
+```
+
+Then continue with the rest of the installation guide.
 
 ### Install TT-NN into the Virtual Environment
 From the `tt-metal` directory:
