@@ -1,1 +1,0 @@
-Please see our [data processing instructions](../../docs/training.md).
