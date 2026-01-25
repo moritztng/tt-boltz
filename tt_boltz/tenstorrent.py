@@ -5,7 +5,7 @@ from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-TRANSITION_CHUNK_SIZE = 128
+TRANSITION_CHUNK_SIZE = 64
 
 device = None
 
@@ -574,10 +574,13 @@ class Transition(Module):
         if len(x.shape) < 4:
             x = f(x)
         else:
-            n_chunks = (x.shape[1] + TRANSITION_CHUNK_SIZE - 1) // TRANSITION_CHUNK_SIZE
-            chunks = ttnn.chunk(x, chunks=n_chunks, dim=1)
-            x_chunks = [f(chunk) for chunk in chunks]
-            x = ttnn.concat(x_chunks, dim=1)
+            size, pad = x.shape[1], (-x.shape[1]) % TRANSITION_CHUNK_SIZE
+            if pad:
+                x = ttnn.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)), 0)
+            chunks = ttnn.chunk(x, x.shape[1] // TRANSITION_CHUNK_SIZE, dim=1)
+            x = ttnn.concat([f(chunk) for chunk in chunks], dim=1)
+            if pad:
+                x = x[:, :size, :, :]
         return x
 
 
