@@ -1,5 +1,7 @@
 import pytest
 import torch
+import os
+from pathlib import Path
 from functools import partial
 
 from tt_boltz.tenstorrent import filter_dict, PairformerModule, MSAModule, DiffusionModule
@@ -10,8 +12,9 @@ from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
 torch.set_grad_enabled(False)
 torch.manual_seed(893)
 
-STATE = torch.load("/home/moritz/.boltz/boltz2_conf.ckpt", map_location="cpu", mmap=True, weights_only=False)["state_dict"]
-STATE_AFF = torch.load("/home/moritz/.boltz/boltz2_aff.ckpt", map_location="cpu", mmap=True, weights_only=False)["state_dict"]
+CACHE = Path(os.environ.get("BOLTZ_CACHE", "~/.boltz")).expanduser()
+STATE = torch.load(CACHE / "boltz2_conf.ckpt", map_location="cpu", mmap=True, weights_only=False)["state_dict"]
+STATE_AFF = torch.load(CACHE / "boltz2_aff.ckpt", map_location="cpu", mmap=True, weights_only=False)["state_dict"]
 
 
 def load(tt, ref, state, key, strict=False):
@@ -99,7 +102,7 @@ def test_diffusion(n_tokens, n_atoms, n_pairs, n_samples):
     check(r_tt, r_ref, tol=0.12)
 
 
-@pytest.mark.parametrize("seq_len", [100, 500])
+@pytest.mark.parametrize("seq_len", [100, 500, 1000])
 @pytest.mark.parametrize("n_sequences", [100])
 def test_msa(seq_len, n_sequences):
 
