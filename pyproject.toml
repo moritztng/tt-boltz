@@ -27,6 +27,7 @@ dependencies = [
     "tqdm",
     "pytest",
     "omegaconf",
+    "flask",
 ]
 
 [project.scripts]

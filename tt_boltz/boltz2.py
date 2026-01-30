@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import time
 from abc import ABC, abstractmethod
 from functools import partial
 from math import exp, pi, sqrt
@@ -4022,6 +4023,7 @@ class AtomDiffusion(Module):
         multiplicity=1,
         max_parallel_samples=None,
         steering_args=None,
+        progress_callback=None,
         **network_condition_kwargs,
     ):
         if steering_args is not None and (
@@ -4071,9 +4073,13 @@ class AtomDiffusion(Module):
 
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
-            random_R, random_tr = compute_random_augmentation(
-                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
-            )
+            if self.coordinate_augmentation_inference:
+                random_R, random_tr = compute_random_augmentation(
+                    multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
+                )
+            else:
+                random_R = torch.eye(3, device=atom_coords.device, dtype=atom_coords.dtype).repeat(multiplicity, 1, 1)
+                random_tr = torch.zeros((multiplicity, 1, 3), device=atom_coords.device, dtype=atom_coords.dtype)
             atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
             atom_coords = (
                 torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
@@ -4251,6 +4257,13 @@ class AtomDiffusion(Module):
             )
 
             atom_coords = atom_coords_next
+            
+            # Report progress with optional intermediate coordinates for visualization
+            if progress_callback:
+                coords = None
+                if (step_idx + 1) % 5 == 0:
+                    coords = atom_coords_denoised[0].clone()
+                progress_callback("diffusion", step_idx + 1, num_sampling_steps, coords)
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 
@@ -5137,6 +5150,7 @@ class Boltz2(nn.Module):
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
+        progress_callback=None,
     ) -> dict[str, Tensor]:
         if self.trace:
             print("[boltz2] forward: input_embedder")
@@ -5167,6 +5181,8 @@ class Boltz2(nn.Module):
         pair_mask = mask[:, :, None] * mask[:, None, :]
         if self.run_trunk_and_structure:
             for i in range(recycling_steps + 1):
+                if progress_callback:
+                    progress_callback("recycling", i + 1, recycling_steps + 1, None)
                 # Apply recycling
                 s = s_init + self.s_recycle(self.s_norm(s))
                 z = z_init + self.z_recycle(self.z_norm(z))
@@ -5251,6 +5267,7 @@ class Boltz2(nn.Module):
                     max_parallel_samples=max_parallel_samples,
                     steering_args=self.steering_args,
                     diffusion_conditioning=diffusion_conditioning,
+                    progress_callback=progress_callback,
                 )
                 dict_out.update(struct_out)
 
@@ -5463,13 +5480,15 @@ class Boltz2(nn.Module):
         model.load_state_dict(new_state_dict, strict=strict)
         return model
 
-    def predict_step(self, batch: dict[str, Tensor]) -> dict:
+    def predict_step(self, batch: dict[str, Tensor], progress_callback=None) -> dict:
         """Run prediction on a single batch.
         
         Parameters
         ----------
         batch : dict[str, Tensor]
             The input batch.
+        progress_callback : callable, optional
+            Callback function for progress updates. Called with (stage, step, total).
             
         Returns
         -------
@@ -5477,6 +5496,8 @@ class Boltz2(nn.Module):
             The prediction dictionary.
         """
         try:
+            # Profile forward pass timing
+            start_time = time.perf_counter()
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
@@ -5484,7 +5505,10 @@ class Boltz2(nn.Module):
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["max_parallel_samples"],
                 run_confidence_sequentially=True,
+                progress_callback=progress_callback,
             )
+            forward_time = time.perf_counter() - start_time
+            print(f"Forward pass time: {forward_time:.4f} seconds")
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
                 for key in self.predict_args["keys_dict_batch"]:
