@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TT-Boltz | Protein Structure Prediction</title>
+    
+    <!-- Mol* Viewer -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/molstar@4.0.0/build/viewer/molstar.css">
+    <script src="https://cdn.jsdelivr.net/npm/molstar@4.0.0/build/viewer/molstar.js"></script>
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-tertiary: #1a1a24;
+            --accent: #00d4aa;
+            --accent-dim: #00d4aa33;
+            --accent-glow: #00d4aa66;
+            --text-primary: #f0f0f5;
+            --text-secondary: #8888a0;
+            --text-dim: #5555667;
+            --error: #ff4466;
+            --warning: #ffaa00;
+            --border: #2a2a3a;
+            --radius: 12px;
+            --radius-sm: 8px;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        /* Subtle animated background */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(ellipse at 20% 20%, var(--accent-dim) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, #4400ff15 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        /* Header */
+        header {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .logo {
+            width: 200px;
+            height: auto;
+        }
+        
+        .header-text {
+            flex: 1;
+            text-align: center;
+            padding-right: 200px; /* Balance the logo width */
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            line-height: 1.1;
+            margin-bottom: 0.75rem;
+        }
+        
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1rem;
+            font-weight: 400;
+        }
+        
+        /* Main layout */
+        main {
+            display: grid;
+            grid-template-columns: 1fr 1.5fr;
+            gap: 2rem;
+            flex: 1;
+        }
+        
+        @media (max-width: 1000px) {
+            main {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Panels */
+        .panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        
+        .panel-header {
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .panel-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+        
+        .panel-content {
+            padding: 1.25rem;
+        }
+        
+        /* Input panel */
+        .input-panel {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .sequence-input {
+            width: 100%;
+            min-height: 200px;
+            padding: 1rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            resize: vertical;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        
+        .sequence-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-dim);
+        }
+        
+        .sequence-input::placeholder {
+            color: var(--text-dim);
+        }
+        
+        .input-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 0.75rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        
+        .char-count {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .char-count.warning {
+            color: var(--warning);
+        }
+        
+        .char-count.error {
+            color: var(--error);
+        }
+        
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.5rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+            border: none;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-primary);
+        }
+        
+        .btn-primary:hover:not(:disabled) {
+            background: #00eebb;
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+        
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+        
+        .btn-secondary:hover {
+            background: var(--border);
+        }
+        
+        .btn-sm {
+            padding: 0.4rem 0.8rem;
+            font-size: 0.8rem;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+        
+        .actions .btn-primary {
+            flex: 1;
+        }
+        
+        /* Progress section */
+        .progress-section {
+            margin-top: 1.5rem;
+            display: none;
+        }
+        
+        .progress-section.visible {
+            display: block;
+        }
+        
+        .progress-bar-container {
+            height: 6px;
+            background: var(--bg-tertiary);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), #00eebb);
+            border-radius: 3px;
+            transition: width 0.3s ease-out;
+            width: 0%;
+        }
+        
+        .progress-status {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-size: 0.9rem;
+        }
+        
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .progress-stage {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        
+        .progress-detail {
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+        
+        /* Results section */
+        .results-section {
+            margin-top: 1.5rem;
+            display: none;
+        }
+        
+        .results-section.visible {
+            display: block;
+        }
+        
+        .confidence-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.75rem;
+        }
+        
+        .confidence-item {
+            background: var(--bg-tertiary);
+            padding: 0.875rem;
+            border-radius: var(--radius-sm);
+            text-align: center;
+        }
+        
+        .confidence-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--accent);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .confidence-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        /* Marketing phrase */
+        .marketing-phrase {
+            margin-top: 2rem;
+            padding: 1rem;
+            text-align: center;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--accent-dim);
+        }
+        
+        .marketing-phrase p {
+            color: var(--accent);
+            font-size: 1rem;
+            font-weight: 600;
+            line-height: 1.4;
+            margin: 0;
+        }
+        
+        .marketing-phrase .contact-cta {
+            margin-top: 0.5rem;
+            font-weight: 700;
+        }
+        
+        /* Contact info */
+        .contact-info {
+            margin-top: 1.5rem;
+        }
+        
+        .contact-qr-group {
+            display: flex;
+            gap: 2rem;
+            justify-content: center;
+            margin-bottom: 1rem;
+        }
+        
+        .contact-qr {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .contact-qr img {
+            width: 70px;
+            height: 70px;
+            border-radius: 8px;
+            background: white;
+            padding: 4px;
+        }
+        
+        .contact-qr span {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            text-align: center;
+        }
+        
+        .contact-email {
+            text-align: center;
+        }
+        
+        .contact-email span {
+            color: var(--text-dim);
+            font-size: 0.8rem;
+        }
+        
+        /* Viewer panel */
+        .viewer-panel {
+            display: flex;
+            flex-direction: column;
+            min-height: 500px;
+        }
+        
+        .viewer-panel .panel-content {
+            flex: 1;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        #viewer-container {
+            flex: 1;
+            min-height: 400px;
+            background: var(--bg-tertiary);
+            position: relative;
+        }
+        
+        .viewer-placeholder {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            text-align: center;
+            padding: 2rem;
+        }
+        
+        .viewer-placeholder svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 1rem;
+            opacity: 0.3;
+        }
+        
+        .viewer-placeholder p {
+            font-size: 0.9rem;
+            max-width: 300px;
+            line-height: 1.5;
+        }
+        
+        .viewer-placeholder.hidden {
+            display: none;
+        }
+        
+        /* Error message */
+        .error-message {
+            background: #ff446620;
+            border: 1px solid #ff446640;
+            color: var(--error);
+            padding: 1rem;
+            border-radius: var(--radius-sm);
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            display: none;
+        }
+        
+        .error-message.visible {
+            display: block;
+        }
+        
+        /* Example sequences */
+        .examples {
+            margin-top: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .examples-title {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        
+        .example-btns {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+        
+        /* Footer */
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <img src="/static/logo.png" alt="TT-Boltz Logo" class="logo">
+            <div class="header-text">
+                <h1>TT-Boltz</h1>
+                <p class="subtitle">Biomolecular structure prediction with Boltz-2 on Tenstorrent hardware</p>
+            </div>
+        </header>
+        
+        <main>
+            <!-- Input Panel -->
+            <div class="panel input-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Amino Acid Sequence</span>
+                </div>
+                <div class="panel-content">
+                    <textarea 
+                        id="sequence-input" 
+                        class="sequence-input" 
+                        placeholder="Enter amino acid sequence (e.g., MVTPEGNVSLVDES...)"
+                        spellcheck="false"
+                        autocomplete="off"
+                        maxlength="5000"
+                    ></textarea>
+                    
+                    <div class="input-meta">
+                        <span class="char-count" id="char-count">0 residues</span>
+                        <span id="validation-status"></span>
+                    </div>
+                    
+                    <div class="actions">
+                        <button class="btn btn-primary" id="predict-btn" disabled>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                            </svg>
+                            Predict Structure
+                        </button>
+                        <button class="btn btn-secondary" id="clear-btn">Clear</button>
+                    </div>
+                    
+                    <div class="examples">
+                        <div class="examples-title">Try an example:</div>
+                        <div class="example-btns">
+                            <button class="btn btn-secondary btn-sm" data-example="hemoglobin">Hemoglobin (141 aa)</button>
+                            <button class="btn btn-secondary btn-sm" data-example="lysozyme">Lysozyme (129 aa)</button>
+                            <button class="btn btn-secondary btn-sm" data-example="ubiquitin">Ubiquitin (76 aa)</button>
+                            <button class="btn btn-secondary btn-sm" data-example="insulin">Insulin A (21 aa)</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Progress -->
+                    <div class="progress-section" id="progress-section">
+                        <div class="progress-bar-container">
+                            <div class="progress-bar" id="progress-bar"></div>
+                        </div>
+                        <div class="progress-status">
+                            <div class="spinner"></div>
+                            <span class="progress-stage" id="progress-stage">Initializing...</span>
+                            <span class="progress-detail" id="progress-detail"></span>
+                        </div>
+                    </div>
+                    
+                    <!-- Error -->
+                    <div class="error-message" id="error-message"></div>
+                    
+                    <!-- Results -->
+                    <div class="results-section" id="results-section">
+                        <div class="confidence-grid">
+                            <div class="confidence-item">
+                                <div class="confidence-value" id="conf-score">-</div>
+                                <div class="confidence-label">Confidence</div>
+                            </div>
+                            <div class="confidence-item">
+                                <div class="confidence-value" id="conf-plddt">-</div>
+                                <div class="confidence-label">pLDDT</div>
+                            </div>
+                            <div class="confidence-item">
+                                <div class="confidence-value" id="conf-ptm">-</div>
+                                <div class="confidence-label">pTM</div>
+                            </div>
+                            <div class="confidence-item">
+                                <div class="confidence-value" id="conf-length">-</div>
+                                <div class="confidence-label">Residues</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Marketing Phrase -->
+                    <div class="marketing-phrase">
+                        <p>Blistering speed. Low cost. Open.</p>
+                        <p class="contact-cta">Contact us.</p>
+                    </div>
+                    
+                    <!-- Contact Info -->
+                    <div class="contact-info">
+                        <div class="contact-qr-group">
+                            <div class="contact-qr">
+                                <img src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=https://github.com/moritztng/tt-boltz" alt="QR Code to GitHub">
+                                <span>TT-Boltz GitHub repo</span>
+                            </div>
+                            <div class="contact-qr">
+                                <img src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=https://www.linkedin.com/in/moritzthuening/" alt="QR Code to LinkedIn">
+                                <span>Ping me on LinkedIn</span>
+                            </div>
+                        </div>
+                        <div class="contact-email">
+                            <span>mthuening@tenstorrent.com</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Viewer Panel -->
+            <div class="panel viewer-panel">
+                <div class="panel-header">
+                    <span class="panel-title">3D Structure</span>
+                </div>
+                <div class="panel-content">
+                    <div id="viewer-container">
+                        <div class="viewer-placeholder" id="viewer-placeholder">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                                <path d="M2 17l10 5 10-5"></path>
+                                <path d="M2 12l10 5 10-5"></path>
+                            </svg>
+                            <p>Enter an amino acid sequence and click "Predict Structure" to see the 3D protein model</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script>
+        // Example sequences
+        const EXAMPLES = {
+            hemoglobin: 'VLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSHGSAQVKGHGKKVADALTNAVAHVDDMPNALSALSDLHAHKLRVDPVNFKLLSHCLLVTLAAHLPAEFTPAVHASLDKFLASVSTVLTSKYR',
+            lysozyme: 'KVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAKFESNFNTQATNRNTDGSTDYGILQINSRWWCNDGRTPGSRNLCNIPCSALLSSDITASVNCAKKIVSDGNGMNAWVAWRNRCKGTDVQAWIRGCRL',
+            ubiquitin: 'MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG',
+            insulin: 'GIVEQCCTSICSLYQLENYCN'
+        };
+        
+        // DOM elements
+        const sequenceInput = document.getElementById('sequence-input');
+        const charCount = document.getElementById('char-count');
+        const predictBtn = document.getElementById('predict-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const progressSection = document.getElementById('progress-section');
+        const progressBar = document.getElementById('progress-bar');
+        const progressStage = document.getElementById('progress-stage');
+        const progressDetail = document.getElementById('progress-detail');
+        const errorMessage = document.getElementById('error-message');
+        const resultsSection = document.getElementById('results-section');
+        const viewerPlaceholder = document.getElementById('viewer-placeholder');
+        
+        let viewer = null;
+        let currentCif = null;
+        let isPredicting = false;  // Prevent multiple simultaneous predictions
+        
+        // Valid amino acid characters
+        const VALID_AA = new Set('ACDEFGHIKLMNPQRSTVWY');
+        const MIN_LENGTH = 10;
+        const MAX_LENGTH = 1024;
+        
+        // Clean sequence: remove all non-letter characters and uppercase
+        function cleanSequence(seq) {
+            if (typeof seq !== 'string') return '';
+            return seq.replace(/[^A-Za-z]/g, '').toUpperCase();
+        }
+        
+        // Validate sequence
+        function validateSequence(seq) {
+            const cleaned = cleanSequence(seq);
+            
+            if (cleaned.length === 0) return { valid: false, error: 'Empty sequence' };
+            if (cleaned.length < MIN_LENGTH) return { valid: false, error: `Too short (min ${MIN_LENGTH})` };
+            if (cleaned.length > MAX_LENGTH) return { valid: false, error: `Too long (max ${MAX_LENGTH})` };
+            
+            const invalid = [...cleaned].filter(c => !VALID_AA.has(c));
+            if (invalid.length > 0) {
+                const uniqueInvalid = [...new Set(invalid)].slice(0, 5).join(', ');
+                return { valid: false, error: `Invalid characters: ${uniqueInvalid}` };
+            }
+            
+            return { valid: true, length: cleaned.length };
+        }
+        
+        // Update character count
+        function updateCharCount() {
+            const cleaned = cleanSequence(sequenceInput.value);
+            const result = validateSequence(cleaned);
+            
+            charCount.textContent = `${cleaned.length} residues`;
+            charCount.className = 'char-count';
+            
+            if (cleaned.length > 0) {
+                if (!result.valid) {
+                    charCount.classList.add('error');
+                    charCount.textContent += ` — ${result.error}`;
+                } else if (cleaned.length > 1500) {
+                    charCount.classList.add('warning');
+                }
+            }
+            
+            // Disable button if invalid or prediction in progress
+            predictBtn.disabled = !result.valid || isPredicting;
+        }
+        
+        // Initialize Mol* viewer
+        async function initViewer() {
+            const container = document.getElementById('viewer-container');
+            
+            viewer = await molstar.Viewer.create(container, {
+                layoutIsExpanded: false,
+                layoutShowControls: false,
+                layoutShowRemoteState: false,
+                layoutShowSequence: false,
+                layoutShowLog: false,
+                layoutShowLeftPanel: false,
+                viewportShowExpand: false,
+                viewportShowSelectionMode: false,
+                viewportShowAnimation: false,
+                collapseLeftPanel: true,
+                collapseRightPanel: true,
+            });
+        }
+        
+        // Load structure into viewer
+        async function loadStructure(cifContent, isFinal = false) {
+            viewerPlaceholder.classList.add('hidden');
+            const container = document.getElementById('viewer-container');
+            
+            // Create viewer once
+            if (!viewer) {
+                viewer = await molstar.Viewer.create(container, {
+                    layoutIsExpanded: false,
+                    layoutShowControls: false,
+                    layoutShowRemoteState: false,
+                    layoutShowSequence: false,
+                    layoutShowLog: false,
+                    layoutShowLeftPanel: false,
+                    viewportShowExpand: false,
+                    viewportShowSelectionMode: false,
+                    viewportShowAnimation: false,
+                    collapseLeftPanel: true,
+                    collapseRightPanel: true,
+                });
+            } else {
+                // Clear previous structures
+                await viewer.plugin.managers.structure.hierarchy.remove(
+                    viewer.plugin.managers.structure.hierarchy.current.structures
+                );
+            }
+            
+            const data = await viewer.plugin.builders.data.rawData({ data: cifContent }, { state: { isGhost: false } });
+            const trajectory = await viewer.plugin.builders.structure.parseTrajectory(data, 'mmcif');
+            const model = await viewer.plugin.builders.structure.createModel(trajectory);
+            const structure = await viewer.plugin.builders.structure.createStructure(model);
+            
+            const reprOptions = isFinal 
+                ? { type: 'cartoon', color: 'plddt-confidence' }
+                : { type: 'cartoon', color: 'uniform', colorParams: { value: 0x00D4AA } };
+            
+            await viewer.plugin.builders.structure.representation.addRepresentation(structure, reprOptions);
+        }
+        
+        // Run prediction
+        async function predict() {
+            // Prevent multiple simultaneous predictions
+            if (isPredicting) {
+                showError('A prediction is already in progress');
+                return;
+            }
+            
+            const sequence = cleanSequence(sequenceInput.value);
+            
+            // Final validation before submission
+            const validation = validateSequence(sequence);
+            if (!validation.valid) {
+                showError(validation.error);
+                return;
+            }
+            
+            // Lock prediction
+            isPredicting = true;
+            
+            // Reset UI
+            errorMessage.classList.remove('visible');
+            resultsSection.classList.remove('visible');
+            progressSection.classList.add('visible');
+            progressBar.style.width = '0%';
+            predictBtn.disabled = true;
+            predictBtn.textContent = 'Predicting...';
+            
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 min timeout
+                
+                const response = await fetch('/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sequence }),
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                // Handle non-OK responses
+                if (!response.ok) {
+                    let errorMsg = 'Prediction failed';
+                    try {
+                        const errorData = await response.json();
+                        errorMsg = errorData.message || errorMsg;
+                    } catch {
+                        // Ignore JSON parse errors
+                    }
+                    showError(errorMsg);
+                    return;
+                }
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // Keep incomplete line in buffer
+                    
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        
+                        try {
+                            const event = JSON.parse(line);
+                            handleEvent(event);
+                        } catch (e) {
+                            // Skip malformed lines silently
+                        }
+                    }
+                }
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    showError('Request timed out. Please try again.');
+                } else {
+                    showError('Connection error. Please try again.');
+                }
+            } finally {
+                isPredicting = false;
+                predictBtn.disabled = false;
+                predictBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                    </svg>
+                    Predict Structure
+                `;
+                updateCharCount(); // Re-enable button if sequence is valid
+            }
+        }
+        
+        // Handle streaming event
+        function handleEvent(event) {
+            if (event.type === 'progress') {
+                updateProgress(event);
+            } else if (event.type === 'intermediate') {
+                updateProgress(event);
+                if (event.cif) {
+                    loadStructure(event.cif);
+                }
+            } else if (event.type === 'complete') {
+                handleComplete(event);
+            } else if (event.type === 'error') {
+                showError(event.message);
+            }
+        }
+        
+        // Update progress UI
+        function updateProgress(event) {
+            const stageNames = {
+                'setup': 'Setting up',
+                'msa': 'Generating MSA',
+                'preprocess': 'Preprocessing',
+                'model': 'Loading model',
+                'inference': 'Predicting',
+                'recycling': 'Pairformer',
+                'diffusion': 'Folding',
+                'postprocess': 'Processing results'
+            };
+            
+            progressStage.textContent = stageNames[event.stage] || event.stage;
+            progressDetail.textContent = event.message || '';
+            
+            // Calculate overall progress
+            let progress = 0;
+            if (event.stage === 'setup') progress = 5;
+            else if (event.stage === 'msa') progress = 10 + (event.step / event.total) * 15;
+            else if (event.stage === 'preprocess') progress = 25;
+            else if (event.stage === 'model') progress = 30;
+            else if (event.stage === 'recycling') progress = 35 + (event.step / event.total) * 15;
+            else if (event.stage === 'diffusion') progress = 50 + (event.step / event.total) * 45;
+            else if (event.stage === 'postprocess') progress = 95;
+            
+            progressBar.style.width = `${progress}%`;
+        }
+        
+        // Handle completion
+        function handleComplete(event) {
+            progressSection.classList.remove('visible');
+            resultsSection.classList.add('visible');
+            progressBar.style.width = '100%';
+            
+            // Update confidence metrics
+            const conf = event.confidence || {};
+            document.getElementById('conf-score').textContent = 
+                conf.confidence_score ? conf.confidence_score.toFixed(2) : '-';
+            document.getElementById('conf-plddt').textContent = 
+                conf.complex_plddt ? conf.complex_plddt.toFixed(2) : '-';
+            document.getElementById('conf-ptm').textContent = 
+                conf.ptm ? conf.ptm.toFixed(2) : '-';
+            document.getElementById('conf-length').textContent = 
+                event.sequence_length || '-';
+            
+            // Load final structure with pLDDT coloring
+            if (event.cif) {
+                currentCif = event.cif;
+                loadStructure(event.cif, true);
+            }
+        }
+        
+        // Show error
+        function showError(message) {
+            progressSection.classList.remove('visible');
+            // Sanitize error message - only show safe text, limit length
+            const safeMessage = typeof message === 'string' 
+                ? message.slice(0, 200).replace(/[<>&"']/g, '') 
+                : 'An error occurred';
+            errorMessage.textContent = safeMessage;
+            errorMessage.classList.add('visible');
+        }
+        
+        // Download CIF file
+        function downloadCif() {
+            if (!currentCif) return;
+            
+            const blob = new Blob([currentCif], { type: 'chemical/x-mmcif' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'structure.cif';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+        
+        // Event listeners
+        sequenceInput.addEventListener('input', updateCharCount);
+        predictBtn.addEventListener('click', predict);
+        clearBtn.addEventListener('click', () => {
+            if (isPredicting) return; // Don't clear during prediction
+            sequenceInput.value = '';
+            updateCharCount();
+            errorMessage.classList.remove('visible');
+            progressSection.classList.remove('visible');
+            resultsSection.classList.remove('visible');
+        });
+        
+        // Limit paste content to prevent huge inputs
+        sequenceInput.addEventListener('paste', (e) => {
+            const pastedText = (e.clipboardData || window.clipboardData).getData('text');
+            if (pastedText.length > MAX_LENGTH * 2) {
+                e.preventDefault();
+                sequenceInput.value = pastedText.slice(0, MAX_LENGTH * 2);
+                updateCharCount();
+            }
+        });
+        
+        // Example buttons
+        document.querySelectorAll('[data-example]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const name = btn.dataset.example;
+                if (EXAMPLES[name]) {
+                    sequenceInput.value = EXAMPLES[name];
+                    updateCharCount();
+                }
+            });
+        });
+        
+        // Initialize
+        updateCharCount();
+    </script>
+</body>
+</html>
+
