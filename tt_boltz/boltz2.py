@@ -4675,7 +4675,7 @@ class AffinityModule(nn.Module):
         _, _, PairformerNoSeqModule_, _ = _get_pytorch_modules()
         self.pairformer_stack = (
             tenstorrent.PairformerModule(
-                pairformer_args["num_blocks"], 32, 4, None, None, False, True
+                pairformer_args["num_blocks"], 32, 4, None, None, False, affinity=True
             )
             if use_tenstorrent
             else PairformerNoSeqModule_(token_z, **pairformer_args)
@@ -5138,6 +5138,12 @@ class Boltz2(nn.Module):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
+        # Reset cached static data so masks/biases are recomputed for this protein
+        if self.use_tenstorrent:
+            for m in self.modules():
+                if hasattr(m, 'reset_static_cache'):
+                    m.reset_static_cache()
+
         if self.trace:
             print("[boltz2] forward: input_embedder")
         

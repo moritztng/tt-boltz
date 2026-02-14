@@ -9,6 +9,9 @@ TRANSITION_CHUNK_SIZE = 64
 
 device = None
 
+PAIRFORMER_PAD_MULTIPLE = 64  # Pad token dim to this multiple to avoid kernel recompilation
+MSA_PAD_MULTIPLE = 1024  # Pad MSA dim to this multiple to avoid kernel recompilation
+MAX_ATOMS_PER_TOKEN = 14  # Upper bound on atoms per residue (Trp=14); ties atom bucket to seq_len bucket
 
 def cleanup():
     global device
@@ -146,13 +149,14 @@ class TriangleMultiplication(Module):
             fused_activation=None,
             fuse_batch=False,
         )
-        mask_unsqueezed = ttnn.unsqueeze(mask, -1) if mask is not None else None
+        # Unsqueeze mask once before chunk loop (mask is [1,S,S] or [1,S])
+        mask_u = ttnn.unsqueeze(mask, -1) if mask is not None else None
         for i in range(self.n_pairs):
             gp_in_fused = ttnn.experimental.minimal_matmul(
                 x_norm_in,
                 self.gp_in_weight_fused_chunks[i],
                 memory_config=(
-                    ttnn.L1_MEMORY_CONFIG if H <= 700 else ttnn.DRAM_MEMORY_CONFIG
+                    ttnn.L1_MEMORY_CONFIG if H <= 710 else ttnn.DRAM_MEMORY_CONFIG
                 ),
                 dtype=ttnn.bfloat8_b,
                 compute_kernel_config=self.compute_kernel_config,
@@ -167,9 +171,8 @@ class TriangleMultiplication(Module):
             )
             ttnn.deallocate(g_in_a)
             ttnn.deallocate(g_in_b)
-            if mask_unsqueezed:
-                a_chunk = ttnn.multiply_(a_chunk, mask_unsqueezed)
-                b_chunk = ttnn.multiply_(b_chunk, mask_unsqueezed)
+            if mask_u is not None:
+                a_chunk = ttnn.multiply_(a_chunk, mask_u)
 
             a_chunk = self._transform_chunk(
                 a_chunk, (0, 3) + ((2, 1) if self.ending else (1, 2))
@@ -260,11 +263,8 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
         )
 
-    def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor = None) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, attn_mask: ttnn.Tensor = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
-        seq_len = x.shape[0]
-        padding = -seq_len % 32
-        x = ttnn.pad(x, [(0, padding), (0, padding), (0, 0)], 0)
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
         x = ttnn.layer_norm(
@@ -278,7 +278,7 @@ class TriangleAttention(Module):
             x,
             self.bias_weight,
             compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.bfloat8_b,
+            dtype=ttnn.bfloat16,
             core_grid=ttnn.CoreGrid(y=9, x=12) if is_blackhole() else None,
         )
         qkvg = ttnn.experimental.minimal_matmul(
@@ -293,10 +293,9 @@ class TriangleAttention(Module):
         del qkvg
         triangle_bias = ttnn.unsqueeze(triangle_bias, 0)
         triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
-        if mask is not None:
-            mask = ttnn.permute(mask, (2, 0, 1) if self.ending else (1, 0, 2))
-            mask = ttnn.unsqueeze(mask, 2) * 1e9 - 1e9
-            triangle_bias = ttnn.add(triangle_bias, mask)
+        if attn_mask is not None:
+            # Precomputed additive mask (4D [1,1,1,S] or [S,1,1,S] from Pairformer)
+            triangle_bias = ttnn.add(triangle_bias, attn_mask)
         qkv = ttnn.unsqueeze(qkv, 1)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv,
@@ -331,7 +330,6 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat8_b,
             core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
         )
-        x = x[:seq_len, :seq_len, :]
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
@@ -401,11 +399,9 @@ class AttentionPairBias(Module):
         s: ttnn.Tensor,
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor = None,
+        seq_mask: ttnn.Tensor = None,
     ) -> ttnn.Tensor:
         if not self.atom_level:
-            seq_len = s.shape[1]
-            padding = -seq_len % 32
-            s = ttnn.pad(s, [(0, 0), (0, padding), (0, 0)], 0)
             qkv = ttnn.linear(
                 s,
                 self.qkv_weight,
@@ -434,8 +430,9 @@ class AttentionPairBias(Module):
                     compute_kernel_config=self.compute_kernel_config,
                     core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
                 )
-                z = ttnn.pad(z, [(0, 0), (0, padding), (0, padding), (0, 0)], 0)
                 z = ttnn.permute(z, (0, 3, 1, 2))
+            if seq_mask is not None:
+                z = ttnn.add_(z, seq_mask)
             o = ttnn.transformer.scaled_dot_product_attention(
                 q,
                 k,
@@ -469,8 +466,6 @@ class AttentionPairBias(Module):
             )
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
             s_kv = ttnn.reshape(s_kv, (B, K, -1, D_S))
-
-            z = ttnn.typecast(z, ttnn.bfloat8_b)
             
             q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, memory_config=ttnn.L1_MEMORY_CONFIG, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
             kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, memory_config=ttnn.L1_MEMORY_CONFIG, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
@@ -513,8 +508,6 @@ class AttentionPairBias(Module):
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        if not self.atom_level:
-            x = x[:, :seq_len, :]
         return x
 
 
@@ -636,7 +629,8 @@ class PairformerLayer(Module):
             )
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None, mask_padded: ttnn.Tensor = None
+        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None,
+        attn_mask_start: ttnn.Tensor = None, attn_mask_end: ttnn.Tensor = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         z = ttnn.add(
             z,
@@ -648,11 +642,11 @@ class PairformerLayer(Module):
         )
         z = ttnn.add(
             z,
-            self.triangle_attention_start(z, mask_padded),
+            self.triangle_attention_start(z, attn_mask_start),
         )
         z = ttnn.add(
             z,
-            self.triangle_attention_end(z, mask_padded),
+            self.triangle_attention_end(z, attn_mask_end),
         )
         z = ttnn.add(z, self.transition_z(z))
         if self.transform_s:
@@ -668,6 +662,7 @@ class PairformerLayer(Module):
                 self.attention_pair_bias(
                     s_norm,
                     z,
+                    seq_mask=attn_mask_start,  # same as end for non-affinity
                 ),
             )
             s = ttnn.add(s, self.transition_s(s))
@@ -701,10 +696,11 @@ class Pairformer(Module):
         ]
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None, mask_padded: ttnn.Tensor = None
+        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None,
+        attn_mask_start: ttnn.Tensor = None, attn_mask_end: ttnn.Tensor = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         for block in self.blocks:
-            s, z = block(s, z, mask, mask_padded)
+            s, z = block(s, z, mask, attn_mask_start, attn_mask_end)
         return s, z
 
 
@@ -947,7 +943,7 @@ class PairWeightedAveraging(Module):
         self.z_weight = self.torch_to_tt("proj_z.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
-    def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor, attn_mask: ttnn.Tensor = None) -> ttnn.Tensor:
         m = ttnn.reshape(m, tuple(m.shape)[1:])
         z = ttnn.reshape(z, tuple(z.shape)[1:])
         m = ttnn.layer_norm(
@@ -972,6 +968,8 @@ class PairWeightedAveraging(Module):
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             b = ttnn.permute(b, (2, 0, 1))
+            if attn_mask is not None:
+                b = ttnn.add_(b, ttnn.reshape(attn_mask, (1, 1, attn_mask.shape[-1])))
             w = ttnn.softmax(
                 b,
                 dim=-1,
@@ -1030,7 +1028,7 @@ class OuterProductMean(Module):
         self.o_weight = self.torch_to_tt("proj_o.weight")
         self.o_bias = self.torch_to_tt("proj_o.bias")
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, msa_mask: ttnn.Tensor = None, n_msa: int = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         m = ttnn.layer_norm(
             x,
@@ -1051,6 +1049,8 @@ class OuterProductMean(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
+        if msa_mask is not None:
+            a = ttnn.multiply_(a, msa_mask)
         S, I, C = a.shape
         _, J, D = b.shape
         a = ttnn.permute(a, (1, 2, 0))
@@ -1064,7 +1064,7 @@ class OuterProductMean(Module):
         z = ttnn.reshape(z, (I, C * D, J))
         z = ttnn.to_layout(z, ttnn.TILE_LAYOUT)
         z = ttnn.permute(z, (0, 2, 1))
-        z = ttnn.multiply(z, 1 / S)
+        z = ttnn.multiply_(z, 1 / (n_msa if n_msa is not None else S))
         z = ttnn.linear(
             z,
             self.o_weight,
@@ -1111,12 +1111,20 @@ class MSALayer(Module):
         )
 
     def __call__(
-        self, z: ttnn.Tensor, m: ttnn.Tensor
+        self,
+        z: ttnn.Tensor,
+        m: ttnn.Tensor,
+        mask: ttnn.Tensor,
+        attn_mask: ttnn.Tensor,
+        msa_mask: ttnn.Tensor,
+        n_msa: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        m = ttnn.add(m, self.pair_weighted_averaging(m, z))
+        m = ttnn.add(m, self.pair_weighted_averaging(m, z, attn_mask))
         m = ttnn.add(m, self.msa_transition(m))
-        z = ttnn.add(z, self.outer_product_mean(m))
-        z = self.pairformer_layer(None, z)[1]
+        z = ttnn.add(z, self.outer_product_mean(m, msa_mask, n_msa))
+        z = self.pairformer_layer(
+            None, z, mask=mask, attn_mask_start=attn_mask, attn_mask_end=attn_mask,
+        )[1]
         return z, m
 
 
@@ -1146,7 +1154,16 @@ class MSA(Module):
             for i in range(n_blocks)
         ]
 
-    def __call__(self, z: ttnn.Tensor, m: ttnn.Tensor, emb: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(
+        self,
+        z: ttnn.Tensor,
+        m: ttnn.Tensor,
+        emb: ttnn.Tensor,
+        mask: ttnn.Tensor,
+        attn_mask: ttnn.Tensor,
+        msa_mask: ttnn.Tensor,
+        n_msa: int,
+    ) -> ttnn.Tensor:
         m = ttnn.linear(
             m,
             self.msa_weight,
@@ -1163,7 +1180,7 @@ class MSA(Module):
             ),
         )
         for block in self.blocks:
-            z, m = block(z, m)
+            z, m = block(z, m, mask, attn_mask, msa_mask, n_msa)
         return z
 
 
@@ -1209,7 +1226,6 @@ class Diffusion(Module):
             filter_dict(state_dict, "single_conditioner.transitions.1"),
             compute_kernel_config,
         )
-        self.a_norm_bias = self.torch_to_tt("a_norm.bias")
         self.r_to_q_weight = self.torch_to_tt(
             "atom_attention_encoder.r_to_q_trans.weight"
         )
@@ -1280,6 +1296,23 @@ class Diffusion(Module):
         W = 32
         B, N, D = q.shape
         NW = N // W
+        if not hasattr(self, '_s_conditioned'):
+            s = ttnn.concat([s_trunk, s_inputs], dim=-1)
+            s = ttnn.layer_norm(
+                s,
+                weight=self.conditioner_norm_weight,
+                bias=self.conditioner_norm_bias,
+                epsilon=1e-5,
+                compute_kernel_config=self.compute_kernel_config,
+            )
+            self._s_conditioned = ttnn.linear(
+                s,
+                self.conditioner_embed_weight,
+                bias=self.conditioner_embed_bias,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+            )
+            self._c_reshaped = ttnn.reshape(c, (B, NW, W, -1))
         r_to_q = ttnn.linear(
             r,
             self.r_to_q_weight,
@@ -1288,8 +1321,7 @@ class Diffusion(Module):
         )
         q = ttnn.add(q, r_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
-        c = ttnn.reshape(c, (B, NW, W, -1))
-        q = self.encoder(q, c, bias_encoder, keys_indexing)
+        q = self.encoder(q, self._c_reshaped, bias_encoder, keys_indexing)
         q = ttnn.reshape(q, (B, NW * W, D))
         a = ttnn.linear(
             q,
@@ -1305,21 +1337,6 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         a = ttnn.permute(a, (0, 2, 1))
-        s = ttnn.concat([s_trunk, s_inputs], dim=-1)
-        s = ttnn.layer_norm(
-            s,
-            weight=self.conditioner_norm_weight,
-            bias=self.conditioner_norm_bias,
-            epsilon=1e-5,
-            compute_kernel_config=self.compute_kernel_config,
-        )
-        s = ttnn.linear(
-            s,
-            self.conditioner_embed_weight,
-            bias=self.conditioner_embed_bias,
-            compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
-        )
         times = ttnn.unsqueeze(times, 1)
         fourier = ttnn.linear(
             times,
@@ -1344,7 +1361,7 @@ class Diffusion(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         fourier = ttnn.unsqueeze(fourier, 1)
-        s = ttnn.add(s, fourier)
+        s = ttnn.add(self._s_conditioned, fourier)
         s = ttnn.add(s, self.conditioner_transition_0(s))
         s = ttnn.add(s, self.conditioner_transition_1(s))
         s_to_a = ttnn.layer_norm(
@@ -1385,8 +1402,7 @@ class Diffusion(Module):
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
-        c = ttnn.reshape(c, (B, NW, W, -1))
-        q = self.decoder(q, c, bias_decoder, keys_indexing)
+        q = self.decoder(q, self._c_reshaped, bias_decoder, keys_indexing)
         q = ttnn.reshape(q, (B, NW * W, D))
         r_update = ttnn.layer_norm(
             q,
@@ -1437,6 +1453,13 @@ class TorchWrapper(nn.Module):
     def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
         return torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
 
+    def reset_static_cache(self):
+        """Reset cached static data so it is recomputed on the next forward pass.
+
+        Call between proteins when input dimensions change.
+        """
+        self._first_forward_pass = True
+
 
 class PairformerModule(TorchWrapper):
     def __init__(
@@ -1447,7 +1470,7 @@ class PairformerModule(TorchWrapper):
         att_head_dim: int,
         att_n_heads: int,
         transform_s: bool,
-        use_mask: bool = False,
+        affinity: bool = False,
     ):
         super().__init__()
         self.n_blocks = n_blocks
@@ -1456,7 +1479,8 @@ class PairformerModule(TorchWrapper):
         self.att_head_dim = att_head_dim
         self.att_n_heads = att_n_heads
         self.transform_s = transform_s
-        self.use_mask = use_mask
+        self.affinity = affinity
+        self._first_forward_pass = True
 
     def _load_from_state_dict(
         self,
@@ -1487,27 +1511,57 @@ class PairformerModule(TorchWrapper):
         pair_mask: torch.Tensor = None,
         use_kernels: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        pair_mask_tt = None
-        pair_mask_padded_tt = None
-        if self.use_mask:
-            pair_mask_tt = self._from_torch(pair_mask)
-            padding = -pair_mask.shape[1] % 32
-            pair_mask_padded_tt = self._from_torch(torch.nn.functional.pad(pair_mask, (0, padding, 0, padding), value=0))
-        return tuple(
-            self._to_torch(x) if x is not None else None
-            for x in self.module(
-                self._from_torch(s) if s is not None else None,
-                self._from_torch(z),
-                pair_mask_tt,
-                pair_mask_padded_tt,
-            )
+        seq_len = z.shape[1]
+        pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
+
+        if pad:
+            z = torch.nn.functional.pad(z, (0, 0, 0, pad, 0, pad))
+            if s is not None:
+                s = torch.nn.functional.pad(s, (0, 0, 0, pad))
+
+        # Compute masks (once, reused across forward calls)
+        if self._first_forward_pass:
+            if self.affinity:
+                # Affinity: cross-chain pair_mask, separate start/end additive masks
+                if pad:
+                    pair_mask = torch.nn.functional.pad(pair_mask, (0, pad, 0, pad))
+                self._mask_tt = self._from_torch(pair_mask)
+                self._attn_mask_start_tt = self._from_torch(pair_mask.permute(1, 0, 2).unsqueeze(2) * 1e9 - 1e9)
+                self._attn_mask_end_tt = self._from_torch(pair_mask.permute(2, 0, 1).unsqueeze(2) * 1e9 - 1e9)
+            elif mask is not None or pad:
+                # Non-affinity: 1D mask → additive [1,1,1,S], pair_mask [1,S,S] for TriangleMul
+                mask_1d = mask if mask is not None else z.new_ones(1, seq_len)
+                if pad:
+                    mask_1d = torch.nn.functional.pad(mask_1d, (0, pad))
+                    if pair_mask is not None:
+                        pair_mask = torch.nn.functional.pad(pair_mask, (0, pad, 0, pad))
+                self._mask_tt = self._from_torch(pair_mask if pair_mask is not None else mask_1d)
+                attn_mask = self._from_torch((1 - mask_1d).unsqueeze(1).unsqueeze(1) * -1e9)
+                self._attn_mask_start_tt = attn_mask
+                self._attn_mask_end_tt = attn_mask
+            else:
+                self._mask_tt = None
+                self._attn_mask_start_tt = None
+                self._attn_mask_end_tt = None
+            self._first_forward_pass = False
+
+        s_out, z_out = self.module(
+            self._from_torch(s) if s is not None else None,
+            self._from_torch(z),
+            self._mask_tt,
+            self._attn_mask_start_tt,
+            self._attn_mask_end_tt,
         )
+
+        s_result = self._to_torch(s_out)[:, :seq_len, :] if s_out is not None else None
+        z_result = self._to_torch(z_out)[:, :seq_len, :seq_len, :]
+        return s_result, z_result
 
 
 class DiffusionModule(TorchWrapper):
     def __init__(self):
         super().__init__()
-        self.first_forward_pass = True
+        self._first_forward_pass = True
 
     def _load_from_state_dict(
         self,
@@ -1546,76 +1600,127 @@ class DiffusionModule(TorchWrapper):
         K = B * NW
         TOKEN_TRANSFORMER_DIM = 2 * 384
         TOKEN_TRANSFORMER_N_HEADS = 16
-        if self.first_forward_pass:
-            self.first_forward_pass = False
-            self.s_inputs = self._from_torch(s_inputs)
-            self.s_trunk = self._from_torch(s_trunk)
-            self.q = self._from_torch(q if r.shape[0] == q.shape[0] else torch.repeat_interleave(q, r.shape[0], dim=0))
-            self.c = self._from_torch(c if r.shape[0] == c.shape[0] else torch.repeat_interleave(c, r.shape[0], dim=0))
 
-            self.keys_indexing = self._from_torch(keys_indexing, dtype=ttnn.bfloat4_b)
+        seq_len = s_inputs.shape[1]
+        token_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
+        padded_seq = seq_len + token_pad
+        N_padded = padded_seq * MAX_ATOMS_PER_TOKEN
+        assert N <= N_padded, f"N={N} exceeds max {N_padded} for padded_seq={padded_seq}. Increase MAX_ATOMS_PER_TOKEN."
+        atom_pad = N_padded - N
+        NW_padded = N_padded // W
+        K_padded = B * NW_padded
 
+        # Compute all static data once (everything except r and times is constant across diffusion steps)
+        if self._first_forward_pass:
+            if token_pad:
+                s_inputs = torch.nn.functional.pad(s_inputs, (0, 0, 0, token_pad))
+                s_trunk = torch.nn.functional.pad(s_trunk, (0, 0, 0, token_pad))
+            self._s_inputs = self._from_torch(s_inputs)
+            self._s_trunk = self._from_torch(s_trunk)
+
+            q_pt = q if r.shape[0] == q.shape[0] else torch.repeat_interleave(q, r.shape[0], dim=0)
+            c_pt = c if r.shape[0] == c.shape[0] else torch.repeat_interleave(c, r.shape[0], dim=0)
+            if atom_pad:
+                q_pt = torch.nn.functional.pad(q_pt, (0, 0, 0, atom_pad))
+                c_pt = torch.nn.functional.pad(c_pt, (0, 0, 0, atom_pad))
+            self._q = self._from_torch(q_pt)
+            self._c = self._from_torch(c_pt)
+
+            if atom_pad:
+                ki_pad_rows = 2 * NW_padded - keys_indexing.shape[0]
+                ki_pad_cols = 8 * NW_padded - keys_indexing.shape[1]
+                keys_indexing = torch.nn.functional.pad(keys_indexing, (0, ki_pad_cols, 0, ki_pad_rows))
+            self._keys_indexing = self._from_torch(keys_indexing, dtype=ttnn.bfloat4_b)
+
+            if atom_pad:
+                mask = torch.nn.functional.pad(mask, (0, atom_pad))
             mask = self._from_torch(mask)
-            mask = ttnn.reshape(mask, (2 * K, W // 2, -1))
+            mask = ttnn.reshape(mask, (2 * K_padded, W // 2, -1))
             mask = ttnn.permute(mask, (1, 2, 0))
             mask = ttnn.matmul(
                 mask,
-                self.keys_indexing,
+                self._keys_indexing,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             mask = ttnn.permute(mask, (2, 0, 1))
-            mask = ttnn.reshape(mask, (K, 1, 1, -1))
+            mask = ttnn.reshape(mask, (K_padded, 1, 1, -1))
+            # Additive mask: 0 → valid, -1e9 → padded (bfloat16 for -1e9 precision)
             mask = (-1 * mask + 1) * -1e9
 
+            if atom_pad:
+                bias_encoder = torch.nn.functional.pad(bias_encoder, (0, 0, 0, 0, 0, 0, 0, NW_padded - NW))
             bias = self._from_torch(bias_encoder)
-            bias = ttnn.reshape(bias, (B * NW, W, H, -1))
+            bias = ttnn.reshape(bias, (B * NW_padded, W, H, -1))
             bias = ttnn.permute(bias, (0, 3, 1, 2))
-            bias = ttnn.add(bias, mask)
-            self.bias_encoder = ttnn.multiply_(
-                bias, 32 ** 0.5
-            )
+            bias = ttnn.add_(bias, mask)
+            self._bias_encoder = ttnn.multiply_(bias, 32 ** 0.5)
 
+            if atom_pad:
+                bias_decoder = torch.nn.functional.pad(bias_decoder, (0, 0, 0, 0, 0, 0, 0, NW_padded - NW))
             bias = self._from_torch(bias_decoder)
-            bias = ttnn.reshape(bias, (B * NW, W, H, -1))
+            bias = ttnn.reshape(bias, (B * NW_padded, W, H, -1))
             bias = ttnn.permute(bias, (0, 3, 1, 2))
-            bias = ttnn.add(bias, mask)
-            self.bias_decoder = ttnn.multiply_(
-                bias, 32 ** 0.5
-            )
+            bias = ttnn.add_(bias, mask)
+            self._bias_decoder = ttnn.multiply_(bias, 32 ** 0.5)
 
-            seq_len = bias_token.shape[1]
-            padding = -seq_len % 32
-            bias_token = torch.nn.functional.pad(bias_token, (0, 0, 0, padding, 0, padding), value=0)
+            if token_pad:
+                bias_token = torch.nn.functional.pad(bias_token, (0, 0, 0, token_pad, 0, token_pad))
             bias = self._from_torch(bias_token)
             bias = ttnn.multiply_(
                 bias, (TOKEN_TRANSFORMER_DIM / TOKEN_TRANSFORMER_N_HEADS) ** 0.5
             )
-            self.bias_token = ttnn.permute(bias, (0, 3, 1, 2))
+            self._bias_token = ttnn.permute(bias, (0, 3, 1, 2))
+            if token_pad:
+                # Fuse additive padding mask into token bias (bfloat16 for -1e9)
+                seq_mask = torch.zeros(1, 1, 1, padded_seq)
+                seq_mask[..., seq_len:] = -1e9
+                self._bias_token = ttnn.add_(self._bias_token, self._from_torch(seq_mask))
 
-            self.atom_to_token = self._from_torch(atom_to_token)
-            self.atom_to_token_normed = ttnn.multiply(
-                self.atom_to_token,
+            if atom_pad or token_pad:
+                atom_to_token = torch.nn.functional.pad(atom_to_token, (0, token_pad, 0, atom_pad))
+            self._atom_to_token = self._from_torch(atom_to_token)
+            self._atom_to_token_normed = ttnn.multiply(
+                self._atom_to_token,
                 ttnn.reciprocal(
-                    ttnn.sum(self.atom_to_token, dim=1, keepdim=True) + 1e-6
+                    ttnn.sum(self._atom_to_token, dim=1, keepdim=True) + 1e-6
                 ),
             )
-        return self._to_torch(
+
+            self._atom_pad = atom_pad
+            self._first_forward_pass = False
+
+        if self._atom_pad:
+            r = torch.nn.functional.pad(r, (0, 0, 0, self._atom_pad))
+
+        result = self._to_torch(
             self.module(
                 self._from_torch(r),
                 self._from_torch(times),
-                self.s_inputs,
-                self.s_trunk,
-                self.q,
-                self.c,
-                self.bias_encoder,
-                self.bias_token,
-                self.bias_decoder,
-                self.keys_indexing,
-                self.atom_to_token,
-                self.atom_to_token_normed,
+                self._s_inputs,
+                self._s_trunk,
+                self._q,
+                self._c,
+                self._bias_encoder,
+                self._bias_token,
+                self._bias_decoder,
+                self._keys_indexing,
+                self._atom_to_token,
+                self._atom_to_token_normed,
             )
         )
+        result = result[:, :N, :]
+        return result
+
+    def reset_static_cache(self):
+        super().reset_static_cache()
+        if self.module is not None:
+            for attr in ('_s_conditioned', '_c_reshaped'):
+                if hasattr(self.module, attr):
+                    delattr(self.module, attr)
+            for layer in self.module.encoder.layers + self.module.decoder.layers:
+                if hasattr(layer, 's_o'):
+                    delattr(layer, 's_o')
 
 
 class MSAModule(TorchWrapper):
@@ -1633,6 +1738,7 @@ class MSAModule(TorchWrapper):
         self.avg_n_heads = avg_n_heads
         self.tri_att_head_dim = tri_att_head_dim
         self.tri_att_n_heads = tri_att_n_heads
+        self._first_forward_pass = True
 
     def _load_from_state_dict(
         self,
@@ -1670,10 +1776,53 @@ class MSAModule(TorchWrapper):
             ],
             dim=-1,
         )
-        return self._to_torch(
+
+        seq_len = z.shape[1]
+        n_msa = m.shape[1]
+        seq_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
+        msa_pad = (-n_msa) % MSA_PAD_MULTIPLE
+
+        if seq_pad:
+            z = torch.nn.functional.pad(z, (0, 0, 0, seq_pad, 0, seq_pad))
+            emb = torch.nn.functional.pad(emb, (0, 0, 0, seq_pad))
+        if seq_pad or msa_pad:
+            m = torch.nn.functional.pad(m, (0, 0, 0, seq_pad, 0, msa_pad))
+
+        # Compute masks (once, reused across forward calls)
+        if self._first_forward_pass:
+            if seq_pad:
+                padded_seq = seq_len + seq_pad
+                mask_1d = z.new_ones(1, padded_seq)
+                mask_1d[:, seq_len:] = 0.0
+                # 2D mask for TriangleMultiplication (row + column masking)
+                self._mask_tt = self._from_torch(mask_1d.unsqueeze(-1) * mask_1d.unsqueeze(1))
+                # 4D additive mask for TriangleAttention (bfloat16 for -1e9)
+                self._attn_mask_tt = self._from_torch((1 - mask_1d).unsqueeze(1).unsqueeze(1) * -1e9)
+            else:
+                self._mask_tt = None
+                self._attn_mask_tt = None
+            if msa_pad:
+                padded_msa = n_msa + msa_pad
+                msa_mask = z.new_zeros(padded_msa, 1, 1)
+                msa_mask[:n_msa] = 1.0
+                self._msa_mask_tt = self._from_torch(msa_mask)
+                self._n_msa = n_msa
+            else:
+                self._msa_mask_tt = None
+                self._n_msa = None
+            self._first_forward_pass = False
+
+        z_out = self._to_torch(
             self.module(
                 self._from_torch(z),
                 self._from_torch(m),
                 self._from_torch(emb),
+                self._mask_tt,
+                self._attn_mask_tt,
+                self._msa_mask_tt,
+                self._n_msa,
             )
         )
+
+        z_out = z_out[:, :seq_len, :seq_len, :]
+        return z_out
