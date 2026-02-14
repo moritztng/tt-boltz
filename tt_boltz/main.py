@@ -582,5 +582,151 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         print(f"Affinity failed: {failed}")
 
 
+@cli.command()
+@click.option("--max_seq", default=1024, type=int, help="Maximum sequence length to warm up")
+@click.option("--max_msa", default=8192, type=int, help="Maximum MSA depth to warm up")
+@click.option("--n_samples", default=1, type=int, help="Diffusion batch (multiplicity)")
+@click.option("--cache", default=lambda: os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
+def warmup(max_seq, max_msa, n_samples, cache):
+    """Pre-compile all ttnn kernels for Boltz-2 inference.
+
+    Exercises each TT module at every possible bucketed input shape so the
+    device program cache is fully populated before real predictions begin.
+    """
+    import gc
+    import time
+
+    from tt_boltz.tenstorrent import (
+        filter_dict, PairformerModule, MSAModule, DiffusionModule,
+        PAIRFORMER_PAD_MULTIPLE as SEQ_PAD, MSA_PAD_MULTIPLE as MSA_PAD,
+        MAX_ATOMS_PER_TOKEN,
+    )
+    from tt_boltz.boltz2 import get_indexing_matrix
+
+    torch.set_grad_enabled(False)
+
+    seq_bk = list(range(SEQ_PAD, max_seq + 1, SEQ_PAD))
+    msa_bk = list(range(MSA_PAD, max_msa + 1, MSA_PAD))
+
+    click.echo(f"seq  buckets ({SEQ_PAD}): {seq_bk}")
+    click.echo(f"msa  buckets ({MSA_PAD}): {msa_bk}")
+    click.echo("Loading checkpoint …")
+
+    state = torch.load(
+        Path(cache) / "boltz2_conf.ckpt",
+        map_location="cpu", mmap=True, weights_only=False,
+    )["state_dict"]
+
+    total = time.time()
+
+    # ── 1. Pairformer (with s, z=128) ─────────────────────────────────────
+    # Covers main trunk (64 blocks) + confidence (8 blocks).  Also pre-caches
+    # every TriAttn/TriMult/Transition kernel reused by MSA's internal
+    # PairformerLayer.  Using seq-1 triggers padding so mask-related ttnn ops
+    # (ttnn.multiply_ in TriMult, ttnn.add in TriAttn/AttentionPairBias)
+    # are compiled.  Passing mask= mirrors real inference (Boltz2.forward
+    # always supplies a mask to the main pairformer).
+    click.echo(f"\n[1/4] Pairformer (z=128) — {len(seq_bk)} buckets")
+    pf = PairformerModule(2, 32, 4, 24, 16, True)
+    pf.load_state_dict(filter_dict(state, "pairformer_module"), strict=False)
+    for seq in seq_bk:
+        t = time.time()
+        pf.reset_static_cache()
+        actual = seq - 1  # non-aligned → triggers mask compilation
+        pf(torch.randn(1, actual, 384),
+           torch.randn(1, actual, actual, 128),
+           mask=torch.ones(1, actual))
+        click.echo(f"  seq={actual:>5}→pad {seq:>5}  {time.time()-t:5.1f}s")
+    del pf; gc.collect()
+
+    # ── 2. Template Pairformer (no s, z=64) ───────────────────────────────
+    # TemplateV2Module uses PairformerModule(2, 32, 4, None, None, False)
+    # with z_dim=64 (template_dim).  Different z_dim means different weight
+    # shapes for TriAttn/TriMult/Transition — must be compiled separately.
+    # No s tensor, no AttentionPairBias (transform_s=False).
+    click.echo(f"\n[2/4] Template Pairformer (z=64) — {len(seq_bk)} buckets")
+    pf_tpl = PairformerModule(2, 32, 4, None, None, False)
+    pf_tpl.load_state_dict(filter_dict(state, "template_module.pairformer"), strict=False)
+    for seq in seq_bk:
+        t = time.time()
+        pf_tpl.reset_static_cache()
+        actual = seq - 1  # non-aligned → triggers mask compilation
+        pf_tpl(None, torch.randn(1, actual, actual, 64))
+        click.echo(f"  seq={actual:>5}→pad {seq:>5}  {time.time()-t:5.1f}s")
+    del pf_tpl; gc.collect()
+
+    # ── 3. MSA ────────────────────────────────────────────────────────────
+    # PairWeightedAveraging and OuterProductMean have matmul shapes that
+    # depend on both seq_len AND n_msa, so the full grid is required.
+    # Using seq-1 triggers padding so TriMult/TriAttn mask ops inside the
+    # MSA's internal PairformerLayer are compiled.
+    n = len(seq_bk) * len(msa_bk)
+    click.echo(f"\n[3/4] MSA — {n} combos ({len(seq_bk)} seq × {len(msa_bk)} msa)")
+    msa = MSAModule(4, 32, 8, 32, 4)
+    msa.load_state_dict(filter_dict(state, "msa_module"), strict=True)
+    for seq in seq_bk:
+        actual_seq = seq - 1  # non-aligned → triggers mask compilation
+        for n_msa_val in msa_bk:
+            actual_msa = n_msa_val - 1
+            t = time.time()
+            msa.reset_static_cache()
+            try:
+                feats = {
+                    "msa": torch.randint(33, (1, actual_msa, actual_seq)),
+                    "has_deletion": torch.zeros(1, actual_msa, actual_seq, dtype=torch.bool),
+                    "deletion_value": torch.zeros(1, actual_msa, actual_seq),
+                    "msa_paired": torch.zeros(1, actual_msa, actual_seq),
+                    "msa_mask": torch.ones(1, actual_msa, actual_seq),
+                    "token_pad_mask": torch.ones(1, actual_seq),
+                }
+                msa(torch.randn(1, actual_seq, actual_seq, 128),
+                    torch.ones(1, actual_seq, 384), feats)
+                click.echo(f"  seq={actual_seq:>5}→{seq:>5} msa={actual_msa:>5}→{n_msa_val:>5}  {time.time()-t:5.1f}s")
+            except Exception as e:
+                click.echo(f"  seq={actual_seq:>5}→{seq:>5} msa={actual_msa:>5}→{n_msa_val:>5}  SKIP ({type(e).__name__})")
+    del msa; gc.collect()
+
+    # ── 4. Diffusion ──────────────────────────────────────────────────────
+    # Atom count = padded_seq × MAX_ATOMS_PER_TOKEN (always divisible by 32).
+    # Unique ops: windowed atom attention, token-level transformer, conditioning.
+    # A fresh DiffusionModule is needed per bucket because ttnn reshape/permute
+    # operations inside Diffusion.__call__ can mutate cached tensor metadata,
+    # causing shape mismatches when reused at a different bucket size.
+    # Using seq-1 for token-level inputs triggers token_pad → token_seq_mask
+    # (additive attention mask in the token transformer) is compiled.
+    B = n_samples
+    W, H = 32, 128
+    diff_sd = filter_dict(state, "structure_module.score_model")
+    click.echo(f"\n[4/4] Diffusion — {len(seq_bk)} buckets (n_samples={B})")
+    for seq in seq_bk:
+        actual_seq = seq - 1          # triggers token_pad → token_seq_mask compiled
+        N = seq * MAX_ATOMS_PER_TOKEN  # atom count at full bucket (atom_pad=0)
+        NW = N // W
+        t = time.time()
+        try:
+            diff = DiffusionModule()
+            diff.load_state_dict(diff_sd, strict=False)
+            diff(
+                torch.randn(B, N, 3),
+                torch.randn(B),
+                torch.randn(1, actual_seq, 384),               # s_inputs: non-aligned
+                torch.randn(1, actual_seq, 384),               # s_trunk:  non-aligned
+                torch.randn(1, N, 128),
+                torch.randn(1, N, 128),
+                torch.randn(1, NW, W, H, 12),
+                torch.randn(1, actual_seq, actual_seq, 384),   # bias_token: non-aligned
+                torch.randn(1, NW, W, H, 12),
+                get_indexing_matrix(NW, W, H, "cpu"),
+                torch.ones(1, N),
+                torch.ones(1, N, actual_seq),                  # atom_to_token: non-aligned
+            )
+            click.echo(f"  seq={actual_seq:>5}→{seq:>5} atoms={N:>6}  {time.time()-t:5.1f}s")
+        except Exception as e:
+            click.echo(f"  seq={actual_seq:>5}→{seq:>5} atoms={N:>6}  SKIP ({type(e).__name__})")
+        del diff; gc.collect()
+
+    click.echo(f"\nDone — {time.time()-total:.0f}s total")
+
+
 if __name__ == "__main__":
     cli()
