@@ -584,14 +584,17 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
 @cli.command()
 @click.option("--max_seq", default=1024, type=int, help="Maximum sequence length to warm up")
-@click.option("--max_msa", default=8192, type=int, help="Maximum MSA depth to warm up")
+@click.option("--max_msa", default=16384, type=int, help="Maximum MSA depth to warm up (const.max_msa_seqs)")
 @click.option("--n_samples", default=1, type=int, help="Diffusion batch (multiplicity)")
 @click.option("--cache", default=lambda: os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
 def warmup(max_seq, max_msa, n_samples, cache):
     """Pre-compile all ttnn kernels for Boltz-2 inference.
 
-    Exercises each TT module at every possible bucketed input shape so the
-    device program cache is fully populated before real predictions begin.
+    Exercises each TT module at every bucketed input shape so the device
+    program cache is fully populated before real predictions begin.
+
+    Each module uses a single block/layer since all blocks within a module
+    share identical kernel shapes — one pass compiles the full set.
     """
     import gc
     import time
@@ -619,53 +622,49 @@ def warmup(max_seq, max_msa, n_samples, cache):
 
     total = time.time()
 
-    # ── 1. Pairformer (with s, z=128) ─────────────────────────────────────
-    # Covers main trunk (64 blocks) + confidence (8 blocks).  Also pre-caches
-    # every TriAttn/TriMult/Transition kernel reused by MSA's internal
-    # PairformerLayer.  Using seq-1 triggers padding so mask-related ttnn ops
-    # (ttnn.multiply_ in TriMult, ttnn.add in TriAttn/AttentionPairBias)
-    # are compiled.  Passing mask= mirrors real inference (Boltz2.forward
-    # always supplies a mask to the main pairformer).
+    # ── 1. Pairformer (z=128, with s) ─────────────────────────────────────
+    # Covers trunk (64 blocks) + confidence (8 blocks).  Also pre-caches
+    # TriAttn/TriMult/Transition kernels reused by MSA's PairformerLayer.
+    # seq-1 forces padding → mask ops (multiply_ in TriMult, add in TriAttn)
+    # are compiled.  1 block is sufficient: all blocks share kernel shapes.
     click.echo(f"\n[1/4] Pairformer (z=128) — {len(seq_bk)} buckets")
-    pf = PairformerModule(2, 32, 4, 24, 16, True)
+    pf = PairformerModule(1, 32, 4, 24, 16, True)
     pf.load_state_dict(filter_dict(state, "pairformer_module"), strict=False)
     for seq in seq_bk:
         t = time.time()
         pf.reset_static_cache()
-        actual = seq - 1  # non-aligned → triggers mask compilation
+        actual = seq - 1
         pf(torch.randn(1, actual, 384),
            torch.randn(1, actual, actual, 128),
            mask=torch.ones(1, actual))
-        click.echo(f"  seq={actual:>5}→pad {seq:>5}  {time.time()-t:5.1f}s")
+        click.echo(f"  seq={actual:>5}→{seq:>5}  {time.time()-t:5.1f}s")
     del pf; gc.collect()
 
-    # ── 2. Template Pairformer (no s, z=64) ───────────────────────────────
-    # TemplateV2Module uses PairformerModule(2, 32, 4, None, None, False)
-    # with z_dim=64 (template_dim).  Different z_dim means different weight
-    # shapes for TriAttn/TriMult/Transition — must be compiled separately.
-    # No s tensor, no AttentionPairBias (transform_s=False).
+    # ── 2. Template Pairformer (z=64, no s) ───────────────────────────────
+    # z_dim=64 gives different weight shapes → separate compilation needed.
+    # No AttentionPairBias (transform_s=False).  1 block sufficient.
     click.echo(f"\n[2/4] Template Pairformer (z=64) — {len(seq_bk)} buckets")
-    pf_tpl = PairformerModule(2, 32, 4, None, None, False)
+    pf_tpl = PairformerModule(1, 32, 4, None, None, False)
     pf_tpl.load_state_dict(filter_dict(state, "template_module.pairformer"), strict=False)
     for seq in seq_bk:
         t = time.time()
         pf_tpl.reset_static_cache()
-        actual = seq - 1  # non-aligned → triggers mask compilation
+        actual = seq - 1
         pf_tpl(None, torch.randn(1, actual, actual, 64))
-        click.echo(f"  seq={actual:>5}→pad {seq:>5}  {time.time()-t:5.1f}s")
+        click.echo(f"  seq={actual:>5}→{seq:>5}  {time.time()-t:5.1f}s")
     del pf_tpl; gc.collect()
 
     # ── 3. MSA ────────────────────────────────────────────────────────────
-    # PairWeightedAveraging and OuterProductMean have matmul shapes that
-    # depend on both seq_len AND n_msa, so the full grid is required.
-    # Using seq-1 triggers padding so TriMult/TriAttn mask ops inside the
-    # MSA's internal PairformerLayer are compiled.
+    # PairWeightedAveraging and OuterProductMean matmul shapes depend on
+    # both seq_len AND n_msa → full grid required.  1 layer sufficient:
+    # all MSA layers share kernel shapes.  TriAttn/TriMult kernels inside
+    # MSA's PairformerLayer are cache hits from step 1.
     n = len(seq_bk) * len(msa_bk)
     click.echo(f"\n[3/4] MSA — {n} combos ({len(seq_bk)} seq × {len(msa_bk)} msa)")
-    msa = MSAModule(4, 32, 8, 32, 4)
-    msa.load_state_dict(filter_dict(state, "msa_module"), strict=True)
+    msa = MSAModule(1, 32, 8, 32, 4)
+    msa.load_state_dict(filter_dict(state, "msa_module"), strict=False)
     for seq in seq_bk:
-        actual_seq = seq - 1  # non-aligned → triggers mask compilation
+        actual_seq = seq - 1
         for n_msa_val in msa_bk:
             actual_msa = n_msa_val - 1
             t = time.time()
@@ -687,20 +686,17 @@ def warmup(max_seq, max_msa, n_samples, cache):
     del msa; gc.collect()
 
     # ── 4. Diffusion ──────────────────────────────────────────────────────
-    # Atom count = padded_seq × MAX_ATOMS_PER_TOKEN (always divisible by 32).
-    # Unique ops: windowed atom attention, token-level transformer, conditioning.
-    # A fresh DiffusionModule is needed per bucket because ttnn reshape/permute
-    # operations inside Diffusion.__call__ can mutate cached tensor metadata,
-    # causing shape mismatches when reused at a different bucket size.
-    # Using seq-1 for token-level inputs triggers token_pad → token_seq_mask
-    # (additive attention mask in the token transformer) is compiled.
+    # Atom count = padded_seq × MAX_ATOMS_PER_TOKEN.  Encoder/decoder each
+    # have 3 layers that split bias dim 12→4 per layer — layer count cannot
+    # be reduced (different per-layer shapes).  Fresh module per bucket:
+    # ttnn reshape/permute can mutate cached tensor metadata.
     B = n_samples
     W, H = 32, 128
     diff_sd = filter_dict(state, "structure_module.score_model")
     click.echo(f"\n[4/4] Diffusion — {len(seq_bk)} buckets (n_samples={B})")
     for seq in seq_bk:
-        actual_seq = seq - 1          # triggers token_pad → token_seq_mask compiled
-        N = seq * MAX_ATOMS_PER_TOKEN  # atom count at full bucket (atom_pad=0)
+        actual_seq = seq - 1
+        N = seq * MAX_ATOMS_PER_TOKEN
         NW = N // W
         t = time.time()
         try:
@@ -709,16 +705,16 @@ def warmup(max_seq, max_msa, n_samples, cache):
             diff(
                 torch.randn(B, N, 3),
                 torch.randn(B),
-                torch.randn(1, actual_seq, 384),               # s_inputs: non-aligned
-                torch.randn(1, actual_seq, 384),               # s_trunk:  non-aligned
+                torch.randn(1, actual_seq, 384),
+                torch.randn(1, actual_seq, 384),
                 torch.randn(1, N, 128),
                 torch.randn(1, N, 128),
                 torch.randn(1, NW, W, H, 12),
-                torch.randn(1, actual_seq, actual_seq, 384),   # bias_token: non-aligned
+                torch.randn(1, actual_seq, actual_seq, 384),
                 torch.randn(1, NW, W, H, 12),
                 get_indexing_matrix(NW, W, H, "cpu"),
                 torch.ones(1, N),
-                torch.ones(1, N, actual_seq),                  # atom_to_token: non-aligned
+                torch.ones(1, N, actual_seq),
             )
             click.echo(f"  seq={actual_seq:>5}→{seq:>5} atoms={N:>6}  {time.time()-t:5.1f}s")
         except Exception as e:
