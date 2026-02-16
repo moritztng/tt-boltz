@@ -59,6 +59,8 @@ Predict protein structures with automatic MSA generation:
 tt-boltz predict examples/prot.yaml --use_msa_server --override
 ```
 
+`predict` accepts either a single YAML/FASTA file or a directory containing many input files.
+
 **Key Options:**
 - `--use_msa_server`: Automatically generate MSAs (required if no MSA provided)
 - `--override`: Re-run from scratch, ignoring cached files
@@ -109,23 +111,26 @@ properties:
 
 ```
 boltz_results_prot/
-├── predictions/
-│   └── prot/
-│       ├── prot_model_0.cif          # Predicted structure (ranked by confidence)
-│       ├── confidence_prot_model_0.json
-│       ├── affinity_prot.json        # (if affinity prediction enabled)
-│       ├── pae_prot_model_0.npz      # Predicted aligned error
-│       ├── pde_prot_model_0.npz      # Predicted distance error
-│       └── plddt_prot_model_0.npz    # Per-residue confidence
-└── processed/                         # Cached preprocessing data
+├── msa/
+│   ├── prot_0.csv                    # Cached MSA
+│   └── ...                           # MSA generation intermediates
+├── structures/
+│   ├── prot.cif                      # Best-ranked predicted structure
+│   └── prot_model_1.cif              # Additional samples (if diffusion_samples > 1)
+├── results.json                      # One entry per target with confidence/affinity metrics
+├── prot_pae.npz                      # (optional, --write_pae)
+├── prot_pde.npz                      # (optional, --write_pde)
+└── prot_embeddings.npz               # (optional, --write_embeddings)
 ```
 
 ### Confidence Scores
 
-The `confidence_*.json` file contains:
+Each target entry in `results.json` contains confidence metrics:
 
 ```json
 {
+    "id": "prot",
+    "status": "ok",
     "confidence_score": 0.84,
     "ptm": 0.84,
     "iptm": 0.82,
@@ -133,6 +138,10 @@ The `confidence_*.json` file contains:
     "chains_ptm": {
         "0": 0.85,
         "1": 0.83
+    },
+    "pair_chains_iptm": {
+        "0": {"0": 0.85, "1": 0.72},
+        "1": {"0": 0.82, "1": 0.83}
     }
 }
 ```
@@ -142,10 +151,11 @@ The `confidence_*.json` file contains:
 - `iptm`: Interface TM-score (0-1)
 - `complex_plddt`: Average per-residue confidence (0-1)
 - `chains_ptm`: Per-chain TM-scores (0-1)
+- `pair_chains_iptm`: Per-chain-pair interface TM-scores (0-1)
 
 ### Affinity Predictions
 
-The `affinity_*.json` file contains:
+For affinity targets, the same `results.json` entry also contains:
 
 ```json
 {
@@ -276,7 +286,7 @@ tt-boltz predict ... --use_msa_server
 **API Key Authentication:**
 ```bash
 export MSA_API_KEY_VALUE=your-api-key
-tt-boltz predict ... --use_msa_server --api_key_header X-API-Key
+tt-boltz predict ... --use_msa_server
 ```
 
 ## Performance
