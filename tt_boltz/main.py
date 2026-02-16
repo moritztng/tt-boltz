@@ -268,6 +268,9 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
             i: {j: round(pci[i][j][best_idx].item(), 6) for j in pci[i]}
             for i in pci
         }
+        metrics["chains_ptm"] = {
+            i: round(pci[i][i][best_idx].item(), 6) for i in pci if i in pci[i]
+        }
 
     # Optional large outputs
     if write_pae and "pae" in pred:
