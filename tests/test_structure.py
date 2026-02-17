@@ -45,7 +45,10 @@ def generate_chain_matchings(pred_chains, truth_chains):
 
 def compute_rmsd(protein_name: str, model_idx: int = 0):
     """Compute RMSD with optimal chain matching."""
-    pred_file = Path(f"boltz_results_{protein_name}/predictions/{protein_name}/{protein_name}_model_{model_idx}.cif")
+    if model_idx == 0:
+        pred_file = Path(f"boltz_results_{protein_name}/structures/{protein_name}.cif")
+    else:
+        pred_file = Path(f"boltz_results_{protein_name}/structures/{protein_name}_model_{model_idx}.cif")
     truth_file = Path(f"examples/ground_truth_structures/{protein_name}.cif")
     
     if not pred_file.exists():
