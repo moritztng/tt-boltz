@@ -535,8 +535,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     results = [] if override or not results_path.exists() else json.loads(results_path.read_text())
 
     # =====================================================================
-    # TT path: one worker process per device, shared kernel cache.
-    # 1 device or N devices — same code path.
+    # TT path — reuses _predict_worker for all cases:
+    #   1 device  → call worker directly (no subprocess overhead)
+    #   N devices → one subprocess per card, shared kernel cache
     # =====================================================================
     if use_tt:
         worker_cfg = {
@@ -550,25 +551,33 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
         }
-        file_buckets = [files[i::n_devices] for i in range(n_devices)]
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
-        procs = []
-        for i, bucket in enumerate(file_buckets):
-            if bucket:
-                p = ctx.Process(target=_predict_worker,
-                                args=(i, [str(x) for x in bucket], worker_cfg, q))
-                p.start()
-                procs.append(p)
         failed = 0
-        for _ in procs:
+
+        if n_devices == 1:
+            os.environ["TT_VISIBLE_DEVICES"] = "0"
+            _predict_worker(0, [str(x) for x in files], worker_cfg, q)
             msg = q.get()
             results.extend(msg.get("results", []))
-            failed += msg.get("failed", 0)
-            if not msg.get("ok"):
-                click.echo(f"Worker error: {msg.get('error', '?')}")
-        for p in procs:
-            p.join()
+            failed = msg.get("failed", 0)
+        else:
+            file_buckets = [files[i::n_devices] for i in range(n_devices)]
+            procs = []
+            for i, bucket in enumerate(file_buckets):
+                if bucket:
+                    p = ctx.Process(target=_predict_worker,
+                                    args=(i, [str(x) for x in bucket], worker_cfg, q))
+                    p.start()
+                    procs.append(p)
+            for _ in procs:
+                msg = q.get()
+                results.extend(msg.get("results", []))
+                failed += msg.get("failed", 0)
+                if not msg.get("ok"):
+                    click.echo(f"Worker error: {msg.get('error', '?')}")
+            for p in procs:
+                p.join()
 
     # =====================================================================
     # CPU / GPU path: inline, single process
