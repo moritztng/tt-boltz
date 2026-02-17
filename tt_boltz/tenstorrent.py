@@ -7,16 +7,37 @@ from math import pi
 TRIANGLE_MULT_CHUNK_SIZE = 32
 TRANSITION_CHUNK_SIZE = 64
 
-device = None
+_device = None
 
 PAIRFORMER_PAD_MULTIPLE = 64  # Pad token dim to this multiple to avoid kernel recompilation
 MSA_PAD_MULTIPLE = 1024  # Pad MSA dim to this multiple to avoid kernel recompilation
 MAX_ATOMS_PER_TOKEN = 14  # Upper bound on atoms per residue (Trp=14); ties atom bucket to seq_len bucket
 
+
+def get_device():
+    """Open (or return cached) TT device 0.
+
+    For multi-device setups each worker process sets TT_VISIBLE_DEVICES
+    before any ttnn call so that its single physical card appears as
+    logical device 0.  All workers share the default on-disk kernel cache.
+    """
+    global _device
+    if _device is None:
+        kw = {"device_id": 0}
+        if is_wormhole_b0():
+            kw["dispatch_core_config"] = ttnn.DispatchCoreConfig(
+                ttnn.device.DispatchCoreType.ETH, ttnn.DispatchCoreAxis.ROW
+            )
+        _device = ttnn.open_device(**kw)
+        _device.enable_program_cache()
+    return _device
+
+
 def cleanup():
-    global device
-    if device is not None:
-        ttnn.close_device(device)
+    global _device
+    if _device is not None:
+        ttnn.close_device(_device)
+        _device = None
 
 
 atexit.register(cleanup)
@@ -41,6 +62,7 @@ class Module:
     ):
         self.state_dict = state_dict
         self.compute_kernel_config = compute_kernel_config
+        self.device = get_device()
 
     def torch_to_tt(
         self,
@@ -51,7 +73,7 @@ class Module:
         return ttnn.from_torch(
             transform(self.state_dict[key]),
             layout=ttnn.TILE_LAYOUT,
-            device=device,
+            device=self.device,
             dtype=ttnn.bfloat16 if dtype is None else dtype,
         )
 
@@ -100,7 +122,7 @@ class TriangleMultiplication(Module):
                     dim=1,
                 ),
                 layout=ttnn.TILE_LAYOUT,
-                device=device,
+                device=self.device,
                 dtype=ttnn.bfloat16,
             )
             for i in range(self.n_pairs)
@@ -259,7 +281,7 @@ class TriangleAttention(Module):
                 dim=0,
             ).t(),
             layout=ttnn.TILE_LAYOUT,
-            device=device,
+            device=self.device,
             dtype=ttnn.bfloat8_b,
         )
 
@@ -358,7 +380,7 @@ class AttentionPairBias(Module):
             self.kv_weight = ttnn.from_torch(
                 kv_weight.t(),
                 layout=ttnn.TILE_LAYOUT,
-                device=device,
+                device=self.device,
                 dtype=ttnn.bfloat8_b,
             )
         else:
@@ -371,7 +393,7 @@ class AttentionPairBias(Module):
             self.qkv_weight = ttnn.from_torch(
                 qkv_weight.t(),
                 layout=ttnn.TILE_LAYOUT,
-                device=device,
+                device=self.device,
                 dtype=ttnn.bfloat16,
             )
             q_bias = self.state_dict["proj_q.bias"]
@@ -382,7 +404,7 @@ class AttentionPairBias(Module):
             self.qkv_bias = ttnn.from_torch(
                 qkv_bias,
                 layout=ttnn.TILE_LAYOUT,
-                device=device,
+                device=self.device,
                 dtype=ttnn.bfloat16,
             )
         self.g_weight = self.torch_to_tt("proj_g.weight")
@@ -768,7 +790,7 @@ class ConditionedTransitionBlock(Module):
         )
         swish_chunk, gates_chunk = torch.chunk(self.state_dict["swish_gate.0.weight"], chunks=2, dim=0)
         self.swish_weight, self.gates_weight = [
-            ttnn.from_torch(chunk.t(), layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.bfloat16)
+            ttnn.from_torch(chunk.t(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
             for chunk in [swish_chunk, gates_chunk]
         ]
         self.a_to_b_weight = self.torch_to_tt("a_to_b.weight")
@@ -1424,15 +1446,7 @@ class TorchWrapper(nn.Module):
     def __init__(self):
         super().__init__()
         self.module = None
-        global device
-        if device is None:
-            args = {"device_id": 0}
-            if is_wormhole_b0():
-                args["dispatch_core_config"] = ttnn.DispatchCoreConfig(
-                    ttnn.device.DispatchCoreType.ETH, ttnn.DispatchCoreAxis.ROW
-                )
-            device = ttnn.open_device(**args)
-            device.enable_program_cache()
+        self.tt_device = get_device()
         self.compute_kernel_config = ttnn.types.BlackholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
@@ -1445,7 +1459,7 @@ class TorchWrapper(nn.Module):
             dtype = ttnn.bfloat16
         return ttnn.from_torch(
             x,
-            device=device,
+            device=self.tt_device,
             layout=ttnn.TILE_LAYOUT,
             dtype=dtype,
         )
