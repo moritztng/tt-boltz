@@ -1,6 +1,7 @@
 """Boltz-2 structure prediction CLI."""
 
 import json
+import multiprocessing as mp
 import os
 import random
 import tarfile
@@ -291,6 +292,94 @@ def _save_results(results: list[dict], path: Path) -> None:
     tmp.rename(path)
 
 
+def _predict_worker(device_id, file_paths, cfg, queue):
+    """Worker process: run predictions on one TT device.
+
+    Each worker is pinned to a single physical card via TT_VISIBLE_DEVICES.
+    All workers share the same on-disk kernel cache (no TT_METAL_CACHE override).
+    """
+    try:
+        os.environ["TT_VISIBLE_DEVICES"] = str(device_id)
+        torch_device = torch.device("cpu")
+        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
+        ccd = load_canonicals(Path(cfg["mol_dir"]))
+        prepare = partial(
+            prepare_features, ccd=ccd, mol_dir=Path(cfg["mol_dir"]),
+            msa_dir=Path(cfg["msa_dir"]), tokenizer=tokenizer, featurizer=featurizer,
+            use_msa=cfg["use_msa_server"], msa_url=cfg["msa_server_url"],
+            msa_strategy=cfg["msa_pairing_strategy"], msa_user=cfg["msa_server_username"],
+            msa_pass=cfg["msa_server_password"], api_key=cfg["api_key_value"],
+            max_msa=cfg["max_msa_seqs"],
+        )
+
+        click.echo(f"[dev {device_id}] loading model...")
+        t0 = time.time()
+        model = Boltz2.load_from_checkpoint(
+            cfg["conf_ckpt"], **cfg["conf_kwargs"],
+        ).eval().to(torch_device)
+        click.echo(f"[dev {device_id}] model loaded in {time.time()-t0:.1f}s")
+
+        results, affinity_items, failed = [], [], 0
+        struct_dir = Path(cfg["struct_dir"])
+
+        for p in file_paths:
+            path = Path(p)
+            row = {"id": path.stem, "status": "failed"}
+            t0 = time.time()
+            try:
+                feats, input_struct = prepare(path, method=cfg["method"])
+                batch = to_batch(feats, torch_device)
+                with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                    pred = model.predict_step(batch)
+                metrics, best = write_result(
+                    pred, batch, input_struct, struct_dir,
+                    cfg["output_format"], cfg["write_pae"], cfg["write_pde"], cfg["write_embeddings"],
+                )
+                if metrics:
+                    row.update(metrics)
+                    row["status"] = "ok"
+                    row["runtime_s"] = round(time.time() - t0, 1)
+                    click.echo(f"[dev {device_id}] {path.stem} {row['runtime_s']}s")
+                    if feats["record"].affinity and best is not None:
+                        affinity_items.append((path, best))
+                else:
+                    row["error"] = "prediction exception"
+                    failed += 1
+            except Exception as e:
+                traceback.print_exc()
+                row["error"] = str(e)[:200]
+                failed += 1
+            results.append(row)
+
+        if affinity_items:
+            click.echo(f"[dev {device_id}] loading affinity model...")
+            aff_model = Boltz2.load_from_checkpoint(
+                cfg["aff_ckpt"], **cfg["aff_kwargs"],
+            ).eval().to(torch_device)
+            rows_by_id = {r["id"]: r for r in results}
+            aff_keys = ["affinity_pred_value", "affinity_probability_binary",
+                        "affinity_pred_value1", "affinity_probability_binary1",
+                        "affinity_pred_value2", "affinity_probability_binary2"]
+            for path, pred_struct in affinity_items:
+                try:
+                    feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
+                    batch = to_batch(feats, torch_device)
+                    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                        pred = aff_model.predict_step(batch)
+                    if not pred["exception"] and path.stem in rows_by_id:
+                        for ak in aff_keys:
+                            if ak in pred:
+                                rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
+                except Exception as e:
+                    traceback.print_exc()
+                    click.echo(f"[dev {device_id}] affinity failed {path.stem}: {e}")
+
+        queue.put({"ok": True, "results": results, "failed": failed})
+    except Exception as e:
+        traceback.print_exc()
+        queue.put({"ok": False, "error": str(e), "results": [], "failed": len(file_paths)})
+
+
 @click.group()
 def cli(): pass
 
@@ -329,13 +418,15 @@ def cli(): pass
 @click.option("--sampling_steps_affinity", default=200, type=int)
 @click.option("--diffusion_samples_affinity", default=5, type=int)
 @click.option("--affinity_checkpoint", type=click.Path(exists=True), default=None)
+@click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_server_url, msa_pairing_strategy,
             msa_server_username, msa_server_password, api_key_value, use_potentials,
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
-            sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint):
+            sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
+            num_devices):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -395,117 +486,159 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         click.echo("All predictions complete")
         return
 
-    device = torch.device("cuda:0" if accelerator == "gpu" and torch.cuda.is_available() else "cpu")
+    torch_device = torch.device("cuda:0" if accelerator == "gpu" and torch.cuda.is_available() else "cpu")
 
-    click.echo(f"Predicting {len(files)} structures")
-    tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
-    ccd = load_canonicals(mol_dir)
+    # Detect TT devices via filesystem (no ttnn import — avoids PCIe lock in parent)
+    if use_tt:
+        import glob as _glob
+        n_available = len(_glob.glob("/dev/tenstorrent/[0-9]*"))
+        n_devices = min(num_devices, n_available) if num_devices > 0 else n_available
+        n_devices = max(1, min(n_devices, len(files)))
+    else:
+        n_devices = 1
 
-    prepare = partial(prepare_features,
-        ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir, tokenizer=tokenizer, featurizer=featurizer,
-        use_msa=use_msa_server, msa_url=msa_server_url, msa_strategy=msa_pairing_strategy,
-        msa_user=msa_server_username, msa_pass=msa_server_password, api_key=api_key_value,
-        max_msa=max_msa_seqs)
+    click.echo(f"Predicting {len(files)} structures on {n_devices} device(s)")
 
-    model = Boltz2.load_from_checkpoint(
-        checkpoint or cache / "boltz2_conf.ckpt",
+    # --- Model kwargs (built once, shared by single- and multi-device paths) ---
+    conf_ckpt = str(checkpoint or cache / "boltz2_conf.ckpt")
+    aff_ckpt = str(affinity_checkpoint or cache / "boltz2_aff.ckpt")
+
+    _diffusion = {"step_scale": step_scale or 1.5, "gamma_0": 0.8, "gamma_min": 1.0,
+                  "noise_scale": 1.003, "rho": 7, "sigma_min": 0.0001, "sigma_max": 160.0,
+                  "sigma_data": 16.0, "P_mean": -1.2, "P_std": 1.5,
+                  "coordinate_augmentation": True, "alignment_reverse_diff": True,
+                  "synchronize_sigmas": True}
+    _pairformer = {"num_blocks": 64, "num_heads": 16, "dropout": 0.0, "v2": True}
+    _msa = {"subsample_msa": subsample_msa, "num_subsampled_msa": num_subsampled_msa,
+            "use_paired_feature": True}
+
+    conf_kwargs = dict(
         predict_args={"recycling_steps": recycling_steps, "sampling_steps": sampling_steps,
-                     "diffusion_samples": diffusion_samples, "max_parallel_samples": max_parallel_samples},
-        diffusion_process_args={"step_scale": step_scale or 1.5, "gamma_0": 0.8, "gamma_min": 1.0,
-                                "noise_scale": 1.003, "rho": 7, "sigma_min": 0.0001, "sigma_max": 160.0,
-                                "sigma_data": 16.0, "P_mean": -1.2, "P_std": 1.5,
-                                "coordinate_augmentation": True, "alignment_reverse_diff": True,
-                                "synchronize_sigmas": True},
-        pairformer_args={"num_blocks": 64, "num_heads": 16, "dropout": 0.0, "v2": True},
-        msa_args={"subsample_msa": subsample_msa, "num_subsampled_msa": num_subsampled_msa, "use_paired_feature": True},
+                      "diffusion_samples": diffusion_samples, "max_parallel_samples": max_parallel_samples},
+        diffusion_process_args=_diffusion, pairformer_args=_pairformer, msa_args=_msa,
         steering_args={"fk_steering": use_potentials, "physical_guidance_update": use_potentials,
-                      "contact_guidance_update": True, "num_particles": 3, "fk_lambda": 4.0,
-                      "fk_resampling_interval": 3, "num_gd_steps": 20},
+                       "contact_guidance_update": True, "num_particles": 3, "fk_lambda": 4.0,
+                       "fk_resampling_interval": 3, "num_gd_steps": 20},
         use_kernels=not no_kernels, use_tenstorrent=use_tt, trace=trace,
-    ).eval().to(device)
+    )
+    aff_kwargs = dict(
+        predict_args={"recycling_steps": 5, "sampling_steps": sampling_steps_affinity,
+                      "diffusion_samples": diffusion_samples_affinity, "max_parallel_samples": 1},
+        diffusion_process_args=_diffusion, pairformer_args=_pairformer, msa_args=_msa,
+        steering_args={"fk_steering": False, "physical_guidance_update": False,
+                       "contact_guidance_update": False, "num_particles": 3, "fk_lambda": 4.0,
+                       "fk_resampling_interval": 3, "num_gd_steps": 20},
+        affinity_mw_correction=affinity_mw_correction, use_tenstorrent=use_tt, trace=trace,
+    )
 
-    # Results — JSON array, rewritten after each prediction for crash-safety
     results_path = out / "results.json"
     results = [] if override or not results_path.exists() else json.loads(results_path.read_text())
 
-    affinity_queue = []
-    failed = 0
+    # =====================================================================
+    # TT path: one worker process per device, shared kernel cache.
+    # 1 device or N devices — same code path.
+    # =====================================================================
+    if use_tt:
+        worker_cfg = {
+            "conf_ckpt": conf_ckpt, "aff_ckpt": aff_ckpt,
+            "conf_kwargs": conf_kwargs, "aff_kwargs": aff_kwargs,
+            "mol_dir": str(mol_dir), "msa_dir": str(msa_dir), "struct_dir": str(struct_dir),
+            "method": method, "output_format": output_format,
+            "write_pae": write_pae, "write_pde": write_pde, "write_embeddings": write_embeddings,
+            "use_msa_server": use_msa_server, "msa_server_url": msa_server_url,
+            "msa_pairing_strategy": msa_pairing_strategy,
+            "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
+            "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+        }
+        file_buckets = [files[i::n_devices] for i in range(n_devices)]
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        procs = []
+        for i, bucket in enumerate(file_buckets):
+            if bucket:
+                p = ctx.Process(target=_predict_worker,
+                                args=(i, [str(x) for x in bucket], worker_cfg, q))
+                p.start()
+                procs.append(p)
+        failed = 0
+        for _ in procs:
+            msg = q.get()
+            results.extend(msg.get("results", []))
+            failed += msg.get("failed", 0)
+            if not msg.get("ok"):
+                click.echo(f"Worker error: {msg.get('error', '?')}")
+        for p in procs:
+            p.join()
 
-    for path in tqdm(files, desc="Predicting"):
+    # =====================================================================
+    # CPU / GPU path: inline, single process
+    # =====================================================================
+    else:
+        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
+        ccd = load_canonicals(mol_dir)
+        prepare = partial(prepare_features, ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir,
+                          tokenizer=tokenizer, featurizer=featurizer,
+                          use_msa=use_msa_server, msa_url=msa_server_url,
+                          msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
+                          msa_pass=msa_server_password, api_key=api_key_value, max_msa=max_msa_seqs)
+
+        click.echo("Loading model...")
         t0 = time.time()
-        row = {"id": path.stem, "status": "failed"}
-        try:
-            feats, input_struct = prepare(path, method=method)
-            batch_data = to_batch(feats, device)
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                pred = model.predict_step(batch_data)
+        model = Boltz2.load_from_checkpoint(conf_ckpt, **conf_kwargs).eval().to(torch_device)
+        click.echo(f"Model loaded in {time.time()-t0:.1f}s")
 
-            metrics, best_struct = write_result(pred, batch_data, input_struct, struct_dir,
-                                                output_format, write_pae, write_pde, write_embeddings)
-            if metrics:
-                row.update(metrics)
-                row["status"] = "ok"
-                row["runtime_s"] = round(time.time() - t0, 1)
-                if feats["record"].affinity and best_struct is not None:
-                    affinity_queue.append((path, best_struct))
-            else:
-                row["error"] = "prediction exception"
-                failed += 1
-        except Exception as e:
-            traceback.print_exc()
-            row["error"] = str(e)[:200]
-            failed += 1
-
-        results.append(row)
-        _save_results(results, results_path)
-
-    click.echo(f"Structure prediction: {len(files) - failed} ok, {failed} failed")
-
-    # Affinity pass (separate model)
-    if affinity_queue:
-        click.echo(f"Predicting affinity for {len(affinity_queue)} targets")
-
-        aff_model = Boltz2.load_from_checkpoint(
-            affinity_checkpoint or cache / "boltz2_aff.ckpt",
-            predict_args={"recycling_steps": 5, "sampling_steps": sampling_steps_affinity,
-                         "diffusion_samples": diffusion_samples_affinity, "max_parallel_samples": 1},
-            diffusion_process_args={"step_scale": step_scale or 1.5, "gamma_0": 0.8, "gamma_min": 1.0,
-                                    "noise_scale": 1.003, "rho": 7, "sigma_min": 0.0001, "sigma_max": 160.0,
-                                    "sigma_data": 16.0, "P_mean": -1.2, "P_std": 1.5,
-                                    "coordinate_augmentation": True, "alignment_reverse_diff": True,
-                                    "synchronize_sigmas": True},
-            pairformer_args={"num_blocks": 64, "num_heads": 16, "dropout": 0.0, "v2": True},
-            msa_args={"subsample_msa": subsample_msa, "num_subsampled_msa": num_subsampled_msa, "use_paired_feature": True},
-            steering_args={"fk_steering": False, "physical_guidance_update": False, "contact_guidance_update": False,
-                          "num_particles": 3, "fk_lambda": 4.0, "fk_resampling_interval": 3, "num_gd_steps": 20},
-            affinity_mw_correction=affinity_mw_correction, use_tenstorrent=use_tt, trace=trace,
-        ).eval().to(device)
-
-        results_by_id = {r["id"]: r for r in results}
-        aff_keys = ["affinity_pred_value", "affinity_probability_binary",
-                    "affinity_pred_value1", "affinity_probability_binary1",
-                    "affinity_pred_value2", "affinity_probability_binary2"]
-
-        for path, pred_struct in tqdm(affinity_queue, desc="Affinity"):
+        affinity_queue = []
+        failed = 0
+        for path in files:
+            row = {"id": path.stem, "status": "failed"}
+            t0 = time.time()
             try:
-                feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
-                batch_data = to_batch(feats, device)
-                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    pred = aff_model.predict_step(batch_data)
-
-                if not pred["exception"]:
-                    rid = path.stem
-                    if rid in results_by_id:
-                        for ak in aff_keys:
-                            if ak in pred:
-                                results_by_id[rid][ak] = round(pred[ak].item(), 6)
+                feats, input_struct = prepare(path, method=method)
+                batch = to_batch(feats, torch_device)
+                with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                    pred = model.predict_step(batch)
+                metrics, best = write_result(pred, batch, input_struct, struct_dir,
+                                             output_format, write_pae, write_pde, write_embeddings)
+                if metrics:
+                    row.update(metrics)
+                    row["status"] = "ok"
+                    row["runtime_s"] = round(time.time() - t0, 1)
+                    click.echo(f"  {path.stem} — {row['runtime_s']}s")
+                    if feats["record"].affinity and best is not None:
+                        affinity_queue.append((path, best))
+                else:
+                    row["error"] = "prediction exception"
+                    failed += 1
             except Exception as e:
                 traceback.print_exc()
-                click.echo(f"Affinity failed {path.stem}: {e}")
+                row["error"] = str(e)[:200]
+                failed += 1
+            results.append(row)
+        del model
 
-        _save_results(results, results_path)
+        if affinity_queue:
+            click.echo(f"Predicting affinity for {len(affinity_queue)} targets...")
+            aff_model = Boltz2.load_from_checkpoint(aff_ckpt, **aff_kwargs).eval().to(torch_device)
+            rows_by_id = {r["id"]: r for r in results}
+            aff_keys = ["affinity_pred_value", "affinity_probability_binary",
+                        "affinity_pred_value1", "affinity_probability_binary1",
+                        "affinity_pred_value2", "affinity_probability_binary2"]
+            for path, pred_struct in affinity_queue:
+                try:
+                    feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
+                    batch = to_batch(feats, torch_device)
+                    with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                        pred = aff_model.predict_step(batch)
+                    if not pred["exception"] and path.stem in rows_by_id:
+                        for ak in aff_keys:
+                            if ak in pred:
+                                rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
+                except Exception as e:
+                    traceback.print_exc()
+                    click.echo(f"Affinity failed {path.stem}: {e}")
 
-    click.echo(f"Done. Results: {results_path}")
+    _save_results(results, results_path)
+    click.echo(f"Done: {len(files) - failed} ok, {failed} failed — {results_path}")
 
 
 @cli.command()
