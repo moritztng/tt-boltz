@@ -5,7 +5,8 @@ from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-TRANSITION_CHUNK_SIZE = 64
+TRANSITION_CHUNK_SIZE_0 = 64
+TRANSITION_CHUNK_SIZE_1 = 1024
 
 _device = None
 
@@ -130,7 +131,7 @@ class TriangleMultiplication(Module):
         self.g_out_weight = self.torch_to_tt("g_out.weight")
         self.out_p_weight = self.torch_to_tt("p_out.weight")
 
-    def _transform_chunk(self, chunk, permute_dims):
+    def _transform_chunk(self, chunk, permute_dims, memory_config):
         old = chunk
         for op, *args in [
             (ttnn.typecast, ttnn.bfloat16),
@@ -138,7 +139,7 @@ class TriangleMultiplication(Module):
             (ttnn.typecast, ttnn.bfloat8_b),
             (ttnn.reallocate,),
         ]:
-            chunk = op(chunk, *args) if args else op(chunk)
+            chunk = op(chunk, *args, memory_config=memory_config)
             ttnn.deallocate(old)
             old = chunk
         return chunk
@@ -152,6 +153,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         H = x_norm_in.shape[1]
+        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > 704 else ttnn.L1_MEMORY_CONFIG
         seq_len_tiles, core_grid = (H + 31) // 32, (
             (10, 13) if is_blackhole() else (8, 8)
         )
@@ -177,9 +179,7 @@ class TriangleMultiplication(Module):
             gp_in_fused = ttnn.experimental.minimal_matmul(
                 x_norm_in,
                 self.gp_in_weight_fused_chunks[i],
-                memory_config=(
-                    ttnn.L1_MEMORY_CONFIG if H <= 710 else ttnn.DRAM_MEMORY_CONFIG
-                ),
+                memory_config=memory_config,
                 dtype=ttnn.bfloat8_b,
                 compute_kernel_config=self.compute_kernel_config,
             )
@@ -197,25 +197,22 @@ class TriangleMultiplication(Module):
                 a_chunk = ttnn.multiply_(a_chunk, mask_u)
 
             a_chunk = self._transform_chunk(
-                a_chunk, (0, 3) + ((2, 1) if self.ending else (1, 2))
+                a_chunk, (0, 3) + ((2, 1) if self.ending else (1, 2)), memory_config=memory_config,
             )
             b_chunk = self._transform_chunk(
-                b_chunk, (0, 3) + ((1, 2) if self.ending else (2, 1))
+                b_chunk, (0, 3) + ((1, 2) if self.ending else (2, 1)), memory_config=memory_config,
             )
             x_chunk = ttnn.matmul(
                 a_chunk,
                 b_chunk,
                 compute_kernel_config=self.compute_kernel_config,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
+                memory_config=memory_config,
                 program_config=program_config,
                 dtype=ttnn.bfloat16,
             )
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
-            x_chunk = ttnn.permute(
-                x_chunk,
-                (0, 2, 3, 1),
-            )
+            x_chunk = ttnn.permute(x_chunk, (0, 2, 3, 1), memory_config=memory_config)
             x = (
                 ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
                 if i == 0
@@ -476,7 +473,7 @@ class AttentionPairBias(Module):
             o = ttnn.reshape(o, (o.shape[0], -1, o.shape[3]))
             o = ttnn.permute(o, (0, 2, 1))
         else:
-            s = ttnn.to_memory_config(s, ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat8_b)
+            s = ttnn.typecast(s, ttnn.bfloat8_b)
             B, K, W, D_S = s.shape
             s_kv = ttnn.reshape(s, (B, 2 * K, W // 2, -1))
             s_kv = ttnn.permute(s_kv, (0, 2, 3, 1))
@@ -489,8 +486,8 @@ class AttentionPairBias(Module):
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
             s_kv = ttnn.reshape(s_kv, (B, K, -1, D_S))
             
-            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, memory_config=ttnn.L1_MEMORY_CONFIG, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
-            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, memory_config=ttnn.L1_MEMORY_CONFIG, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
+            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
+            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
             
             q = ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT)
             q = ttnn.pad(q, [[0, 0], [0, 0], [0, 96], [0, 0]], 0.0)
@@ -512,14 +509,13 @@ class AttentionPairBias(Module):
                 ),
             )
             o = ttnn.reshape(o, (B * K, H, W, D_Q))
-            o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.L1_MEMORY_CONFIG)
+            o = ttnn.experimental.nlp_concat_heads(o)
             o = ttnn.squeeze(o, 1)
             o = ttnn.reshape(o, (B, K, W, D_S))
         g = ttnn.linear(
             s,
             self.g_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=ttnn.L1_MEMORY_CONFIG if self.atom_level else None,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         o = ttnn.typecast(o, ttnn.bfloat16)
@@ -547,7 +543,7 @@ class Transition(Module):
         self.fc3_weight = self.torch_to_tt("fc3.weight")
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
-        def f(x):
+        def swiglu(x):
             x_norm = ttnn.layer_norm(
                 x,
                 weight=self.norm_weight,
@@ -586,16 +582,18 @@ class Transition(Module):
             )
             ttnn.deallocate(x)
             return x_dram
+
+        def chunked_swiglu(x):
+            if x.shape[2] <= TRANSITION_CHUNK_SIZE_1:
+                return swiglu(x)
+            chunks = ttnn.chunk(x, 2, dim=2)
+            return ttnn.concat([swiglu(chunk) for chunk in chunks], dim=2)
+
         if len(x.shape) < 4:
-            x = f(x)
+            x = swiglu(x)
         else:
-            size, pad = x.shape[1], (-x.shape[1]) % TRANSITION_CHUNK_SIZE
-            if pad:
-                x = ttnn.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)), 0)
-            chunks = ttnn.chunk(x, x.shape[1] // TRANSITION_CHUNK_SIZE, dim=1)
-            x = ttnn.concat([f(chunk) for chunk in chunks], dim=1)
-            if pad:
-                x = x[:, :size, :, :]
+            chunks = ttnn.chunk(x, x.shape[1] // TRANSITION_CHUNK_SIZE_0, dim=1)
+            x = ttnn.concat([chunked_swiglu(chunk) for chunk in chunks], dim=1)
         return x
 
 
