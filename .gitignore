@@ -13,6 +13,7 @@ env/
 
 # Project outputs
 boltz_results_*/
+eval_data/
 generated/
 
 # IDE
