@@ -319,7 +319,7 @@ def _predict_worker(device_id, file_paths, cfg, queue):
         ).eval().to(torch_device)
         click.echo(f"[dev {device_id}] model loaded in {time.time()-t0:.1f}s")
 
-        results, affinity_items, failed = [], [], 0
+        results, affinity_items = [], []
         struct_dir = Path(cfg["struct_dir"])
 
         for p in file_paths:
@@ -342,13 +342,9 @@ def _predict_worker(device_id, file_paths, cfg, queue):
                     click.echo(f"[dev {device_id}] {path.stem} {row['runtime_s']}s")
                     if feats["record"].affinity and best is not None:
                         affinity_items.append((path, best))
-                else:
-                    row["error"] = "prediction exception"
-                    failed += 1
             except Exception as e:
                 traceback.print_exc()
-                row["error"] = str(e)[:200]
-                failed += 1
+                raise
             results.append(row)
 
         if affinity_items:
@@ -374,6 +370,7 @@ def _predict_worker(device_id, file_paths, cfg, queue):
                     traceback.print_exc()
                     click.echo(f"[dev {device_id}] affinity failed {path.stem}: {e}")
 
+        failed = sum(1 for r in results if r["status"] == "failed")
         queue.put({"ok": True, "results": results, "failed": failed})
     except Exception as e:
         traceback.print_exc()
@@ -597,7 +594,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         click.echo(f"Model loaded in {time.time()-t0:.1f}s")
 
         affinity_queue = []
-        failed = 0
         for path in files:
             row = {"id": path.stem, "status": "failed"}
             t0 = time.time()
@@ -615,13 +611,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     click.echo(f"  {path.stem} — {row['runtime_s']}s")
                     if feats["record"].affinity and best is not None:
                         affinity_queue.append((path, best))
-                else:
-                    row["error"] = "prediction exception"
-                    failed += 1
             except Exception as e:
                 traceback.print_exc()
-                row["error"] = str(e)[:200]
-                failed += 1
+                raise
             results.append(row)
         del model
 
