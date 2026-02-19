@@ -567,7 +567,7 @@ class Transition(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 dtype=ttnn.bfloat8_b,
-                core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
+                core_grid=ttnn.CoreGrid(y=10, x=12) if is_blackhole() else None,
             )
             ttnn.deallocate(x_norm)
             x = ttnn.multiply_(x_1, x_2)
