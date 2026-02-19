@@ -471,7 +471,7 @@ class AttentionPairBias(Module):
             o = ttnn.reshape(o, (o.shape[0], -1, o.shape[3]))
             o = ttnn.permute(o, (0, 2, 1))
         else:
-            s = ttnn.typecast(s, ttnn.bfloat8_b)
+            s = ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat8_b)
             B, K, W, D_S = s.shape
             s_kv = ttnn.reshape(s, (B, 2 * K, W // 2, -1))
             s_kv = ttnn.permute(s_kv, (0, 2, 3, 1))
@@ -764,6 +764,7 @@ class AdaLN(Module):
         ttnn.deallocate(s_scale)
         a = ttnn.add_(a, s_bias)
         ttnn.deallocate(s_bias)
+        a = ttnn.to_memory_config(a, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         return a
 
 
