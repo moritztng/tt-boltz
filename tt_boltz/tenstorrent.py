@@ -5,8 +5,6 @@ from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-TRANSITION_CHUNK_SIZE_0 = 64
-TRANSITION_CHUNK_SIZE_1 = 1024
 
 _device = None
 
@@ -583,17 +581,12 @@ class Transition(Module):
             ttnn.deallocate(x)
             return x_dram
 
-        def chunked_swiglu(x):
-            if x.shape[2] <= TRANSITION_CHUNK_SIZE_1:
-                return swiglu(x)
-            chunks = ttnn.chunk(x, 2, dim=2)
-            return ttnn.concat([swiglu(chunk) for chunk in chunks], dim=2)
-
         if len(x.shape) < 4:
             x = swiglu(x)
         else:
-            chunks = ttnn.chunk(x, x.shape[1] // TRANSITION_CHUNK_SIZE_0, dim=1)
-            x = ttnn.concat([chunked_swiglu(chunk) for chunk in chunks], dim=1)
+            chunk_size = 64 if x.shape[2] * x.shape[3] <= 768 * 128 else 32
+            chunks = ttnn.chunk(x, x.shape[1] // chunk_size, dim=1)
+            x = ttnn.concat([swiglu(chunk) for chunk in chunks], dim=1)
         return x
 
 
