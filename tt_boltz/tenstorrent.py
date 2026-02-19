@@ -802,14 +802,12 @@ class ConditionedTransitionBlock(Module):
             a,
             self.swish_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         gates = ttnn.linear(
             a,
             self.gates_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         a_swish = ttnn.multiply_(gates, a_swish, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
@@ -817,7 +815,6 @@ class ConditionedTransitionBlock(Module):
             a,
             self.a_to_b_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         ttnn.deallocate(a)
@@ -828,14 +825,12 @@ class ConditionedTransitionBlock(Module):
             self.output_projection_weight,
             bias=self.output_projection_bias,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         b_a = ttnn.linear(
             b,
             self.b_to_a_weight,
             compute_kernel_config=self.compute_kernel_config,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
         ttnn.deallocate(b)
