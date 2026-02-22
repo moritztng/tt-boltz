@@ -28,6 +28,7 @@ from tt_boltz.data.tokenize import Boltz2Tokenizer
 from tt_boltz.data.types import Coords, Input, Interface
 from tt_boltz.data.write import to_mmcif, to_pdb
 from tt_boltz.boltz2 import Boltz2
+from tt_boltz.progress import ProgressDisplay, make_progress_fn
 
 URLS = {
     "mols": "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar",
@@ -292,12 +293,37 @@ def _save_results(results: list[dict], path: Path) -> None:
     tmp.rename(path)
 
 
-def _predict_worker(device_id, file_paths, cfg, queue):
+def _predict_worker(device_id, file_paths, cfg, queue, progress_queue=None,
+                     is_subprocess=False):
     """Worker process: run predictions on one TT device.
 
     Each worker is pinned to a single physical card via TT_VISIBLE_DEVICES.
     All workers share the same on-disk kernel cache (no TT_METAL_CACHE override).
     """
+    def _pq(event, **kw):
+        if progress_queue:
+            try:
+                progress_queue.put_nowait({"dev": device_id, "event": event, **kw})
+            except Exception:
+                pass
+
+    # Silence all output so it doesn't corrupt the Rich Live display.
+    # In subprocesses we redirect both stdout+stderr at the OS fd level
+    # (catches C++ library noise too). In the main process we only redirect
+    # Python stdout — Rich needs stderr there.
+    if progress_queue:
+        import sys as _sys
+        _devnull = open(os.devnull, "w")
+        _sys.stdout = _devnull
+        if is_subprocess:
+            _sys.stderr = _devnull
+            _dn_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(_dn_fd, 1)   # fd 1 = stdout  (C++ prints)
+            os.dup2(_dn_fd, 2)   # fd 2 = stderr  (C++ warnings/logs)
+            os.close(_dn_fd)
+
+    _pq("init", assigned=len(file_paths))
+    results = []
     try:
         os.environ["TT_VISIBLE_DEVICES"] = str(device_id)
         torch_device = torch.device("cpu")
@@ -312,25 +338,32 @@ def _predict_worker(device_id, file_paths, cfg, queue):
             max_msa=cfg["max_msa_seqs"],
         )
 
-        click.echo(f"[dev {device_id}] loading model...")
+        _pq("loading")
         t0 = time.time()
         model = Boltz2.load_from_checkpoint(
             cfg["conf_ckpt"], **cfg["conf_kwargs"],
         ).eval().to(torch_device)
-        click.echo(f"[dev {device_id}] model loaded in {time.time()-t0:.1f}s")
+        if progress_queue:
+            model.progress_fn = make_progress_fn(progress_queue, device_id)
+        else:
+            click.echo(f"[dev {device_id}] model loaded in {time.time()-t0:.1f}s")
 
-        results, affinity_items = [], []
+        affinity_items = []
         struct_dir = Path(cfg["struct_dir"])
 
         for p in file_paths:
             path = Path(p)
             row = {"id": path.stem, "status": "failed"}
             t0 = time.time()
+            _pq("start", name=path.stem)
             try:
+                _pq("stage", stage="msa")
                 feats, input_struct = prepare(path, method=cfg["method"])
+                _pq("stage", stage="saving")
                 batch = to_batch(feats, torch_device)
                 with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                     pred = model.predict_step(batch)
+                _pq("stage", stage="saving")
                 metrics, best = write_result(
                     pred, batch, input_struct, struct_dir,
                     cfg["output_format"], cfg["write_pae"], cfg["write_pde"], cfg["write_embeddings"],
@@ -339,16 +372,17 @@ def _predict_worker(device_id, file_paths, cfg, queue):
                     row.update(metrics)
                     row["status"] = "ok"
                     row["runtime_s"] = round(time.time() - t0, 1)
-                    click.echo(f"[dev {device_id}] {path.stem} {row['runtime_s']}s")
                     if feats["record"].affinity and best is not None:
                         affinity_items.append((path, best))
             except Exception as e:
                 traceback.print_exc()
-                click.echo(f"[dev {device_id}] {path.stem} FAILED: {e}")
+                row["error"] = str(e)[:80]
+            elapsed = round(time.time() - t0, 1)
+            _pq("done", name=path.stem, time=elapsed, status=row["status"],
+                error=row.get("error", ""))
             results.append(row)
 
         if affinity_items:
-            click.echo(f"[dev {device_id}] loading affinity model...")
             aff_model = Boltz2.load_from_checkpoint(
                 cfg["aff_ckpt"], **cfg["aff_kwargs"],
             ).eval().to(torch_device)
@@ -368,7 +402,6 @@ def _predict_worker(device_id, file_paths, cfg, queue):
                                 rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
                 except Exception as e:
                     traceback.print_exc()
-                    click.echo(f"[dev {device_id}] affinity failed {path.stem}: {e}")
 
         failed = sum(1 for r in results if r["status"] == "failed")
         queue.put({"ok": True, "results": results, "failed": failed})
@@ -495,6 +528,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         n_devices = 1
 
     click.echo(f"Predicting {len(files)} structures on {n_devices} device(s)")
+    click.echo("")
+    click.echo("")
+    click.echo("")
 
     # --- Model kwargs (built once, shared by single- and multi-device paths) ---
     conf_ckpt = str(checkpoint or cache / "boltz2_conf.ckpt")
@@ -548,95 +584,125 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
         }
+        import sys as _sys
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
+        pq = ctx.Queue()
         failed = 0
 
-        if n_devices == 1:
-            os.environ["TT_VISIBLE_DEVICES"] = "0"
-            _predict_worker(0, [str(x) for x in files], worker_cfg, q)
-            msg = q.get()
-            results.extend(msg.get("results", []))
-            failed = msg.get("failed", 0)
-        else:
-            file_buckets = [files[i::n_devices] for i in range(n_devices)]
-            procs = []
-            for i, bucket in enumerate(file_buckets):
-                if bucket:
-                    p = ctx.Process(target=_predict_worker,
-                                    args=(i, [str(x) for x in bucket], worker_cfg, q))
-                    p.start()
-                    procs.append(p)
-            for _ in procs:
+        display = ProgressDisplay(pq, total=len(files), n_devices=n_devices)
+        display.start()
+
+        try:
+            if n_devices == 1:
+                # Worker runs in main process; its stdout redirect is restored
+                # after display.stop() below
+                os.environ["TT_VISIBLE_DEVICES"] = "0"
+                _predict_worker(0, [str(x) for x in files], worker_cfg, q, pq)
                 msg = q.get()
                 results.extend(msg.get("results", []))
-                failed += msg.get("failed", 0)
-                if not msg.get("ok"):
-                    click.echo(f"Worker error: {msg.get('error', '?')}")
-            for p in procs:
-                p.join()
+                failed = msg.get("failed", 0)
+            else:
+                file_buckets = [files[i::n_devices] for i in range(n_devices)]
+                procs = []
+                for i, bucket in enumerate(file_buckets):
+                    if bucket:
+                        p = ctx.Process(target=_predict_worker,
+                                        args=(i, [str(x) for x in bucket], worker_cfg, q, pq, True))
+                        p.start()
+                        procs.append(p)
+                for _ in procs:
+                    msg = q.get()
+                    results.extend(msg.get("results", []))
+                    failed += msg.get("failed", 0)
+                for p in procs:
+                    p.join()
+        finally:
+            _sys.stdout = _sys.__stdout__  # restore (worker may have redirected)
+            display.stop()
 
     # =====================================================================
-    # CPU / GPU path: inline, single process
+    # CPU / GPU path: inline, single process (with progress display)
     # =====================================================================
     else:
-        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
-        ccd = load_canonicals(mol_dir)
-        prepare = partial(prepare_features, ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir,
-                          tokenizer=tokenizer, featurizer=featurizer,
-                          use_msa=use_msa_server, msa_url=msa_server_url,
-                          msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
-                          msa_pass=msa_server_password, api_key=api_key_value, max_msa=max_msa_seqs)
+        import sys as _sys
+        from queue import Queue as ThreadQueue
+        pq = ThreadQueue()
+        display = ProgressDisplay(pq, total=len(files), n_devices=1)
+        display.start()
+        pq.put({"dev": 0, "event": "init", "assigned": len(files)})
 
-        click.echo("Loading model...")
-        t0 = time.time()
-        model = Boltz2.load_from_checkpoint(conf_ckpt, **conf_kwargs).eval().to(torch_device)
-        click.echo(f"Model loaded in {time.time()-t0:.1f}s")
+        # Suppress stray stdout (Rich display uses stderr)
+        _saved_stdout = _sys.stdout
+        _sys.stdout = open(os.devnull, "w")
 
-        affinity_queue = []
-        for path in files:
-            row = {"id": path.stem, "status": "failed"}
-            t0 = time.time()
-            try:
-                feats, input_struct = prepare(path, method=method)
-                batch = to_batch(feats, torch_device)
-                with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
-                    pred = model.predict_step(batch)
-                metrics, best = write_result(pred, batch, input_struct, struct_dir,
-                                             output_format, write_pae, write_pde, write_embeddings)
-                if metrics:
-                    row.update(metrics)
-                    row["status"] = "ok"
-                    row["runtime_s"] = round(time.time() - t0, 1)
-                    click.echo(f"  {path.stem} — {row['runtime_s']}s")
-                    if feats["record"].affinity and best is not None:
-                        affinity_queue.append((path, best))
-            except Exception as e:
-                traceback.print_exc()
-                click.echo(f"  {path.stem} FAILED: {e}")
-            results.append(row)
-        del model
+        try:
+            tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
+            ccd = load_canonicals(mol_dir)
+            prepare = partial(prepare_features, ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir,
+                              tokenizer=tokenizer, featurizer=featurizer,
+                              use_msa=use_msa_server, msa_url=msa_server_url,
+                              msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
+                              msa_pass=msa_server_password, api_key=api_key_value, max_msa=max_msa_seqs)
 
-        if affinity_queue:
-            click.echo(f"Predicting affinity for {len(affinity_queue)} targets...")
-            aff_model = Boltz2.load_from_checkpoint(aff_ckpt, **aff_kwargs).eval().to(torch_device)
-            rows_by_id = {r["id"]: r for r in results}
-            aff_keys = ["affinity_pred_value", "affinity_probability_binary",
-                        "affinity_pred_value1", "affinity_probability_binary1",
-                        "affinity_pred_value2", "affinity_probability_binary2"]
-            for path, pred_struct in affinity_queue:
+            pq.put({"dev": 0, "event": "loading"})
+            model = Boltz2.load_from_checkpoint(conf_ckpt, **conf_kwargs).eval().to(torch_device)
+            model.progress_fn = make_progress_fn(pq, 0)
+
+            affinity_queue = []
+            failed = 0
+            for path in files:
+                row = {"id": path.stem, "status": "failed"}
+                t0 = time.time()
+                pq.put({"dev": 0, "event": "start", "name": path.stem})
                 try:
-                    feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
+                    pq.put({"dev": 0, "event": "stage", "stage": "msa"})
+                    feats, input_struct = prepare(path, method=method)
                     batch = to_batch(feats, torch_device)
                     with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
-                        pred = aff_model.predict_step(batch)
-                    if not pred["exception"] and path.stem in rows_by_id:
-                        for ak in aff_keys:
-                            if ak in pred:
-                                rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
+                        pred = model.predict_step(batch)
+                    pq.put({"dev": 0, "event": "stage", "stage": "saving"})
+                    metrics, best = write_result(pred, batch, input_struct, struct_dir,
+                                                 output_format, write_pae, write_pde, write_embeddings)
+                    if metrics:
+                        row.update(metrics)
+                        row["status"] = "ok"
+                        row["runtime_s"] = round(time.time() - t0, 1)
+                        if feats["record"].affinity and best is not None:
+                            affinity_queue.append((path, best))
                 except Exception as e:
                     traceback.print_exc()
-                    click.echo(f"Affinity failed {path.stem}: {e}")
+                    row["error"] = str(e)[:80]
+                elapsed = round(time.time() - t0, 1)
+                if row["status"] != "ok":
+                    failed += 1
+                pq.put({"dev": 0, "event": "done", "name": path.stem,
+                        "time": elapsed, "status": row["status"],
+                        "error": row.get("error", "")})
+                results.append(row)
+            del model
+
+            if affinity_queue:
+                aff_model = Boltz2.load_from_checkpoint(aff_ckpt, **aff_kwargs).eval().to(torch_device)
+                rows_by_id = {r["id"]: r for r in results}
+                aff_keys = ["affinity_pred_value", "affinity_probability_binary",
+                            "affinity_pred_value1", "affinity_probability_binary1",
+                            "affinity_pred_value2", "affinity_probability_binary2"]
+                for path, pred_struct in affinity_queue:
+                    try:
+                        feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
+                        batch = to_batch(feats, torch_device)
+                        with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                            pred = aff_model.predict_step(batch)
+                        if not pred["exception"] and path.stem in rows_by_id:
+                            for ak in aff_keys:
+                                if ak in pred:
+                                    rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
+                    except Exception as e:
+                        traceback.print_exc()
+        finally:
+            _sys.stdout = _saved_stdout
+            display.stop()
 
     _save_results(results, results_path)
     click.echo(f"Done: {len(files) - failed} ok, {failed} failed — {results_path}")
