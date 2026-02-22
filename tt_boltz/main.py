@@ -344,7 +344,7 @@ def _predict_worker(device_id, file_paths, cfg, queue):
                         affinity_items.append((path, best))
             except Exception as e:
                 traceback.print_exc()
-                raise
+                click.echo(f"[dev {device_id}] {path.stem} FAILED: {e}")
             results.append(row)
 
         if affinity_items:
@@ -374,7 +374,7 @@ def _predict_worker(device_id, file_paths, cfg, queue):
         queue.put({"ok": True, "results": results, "failed": failed})
     except Exception as e:
         traceback.print_exc()
-        queue.put({"ok": False, "error": str(e), "results": [], "failed": len(file_paths)})
+        queue.put({"ok": False, "error": str(e), "results": results, "failed": len(file_paths)})
 
 
 @click.group()
@@ -613,7 +613,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         affinity_queue.append((path, best))
             except Exception as e:
                 traceback.print_exc()
-                raise
+                click.echo(f"  {path.stem} FAILED: {e}")
             results.append(row)
         del model
 
