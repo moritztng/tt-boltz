@@ -114,7 +114,7 @@ class ProgressDisplay:
             self._drain()
             if self._live:
                 self._live.update(self._render())
-            time.sleep(0.25)
+            self._stop.wait(0.25)
 
     def _drain(self):
         while True:
@@ -268,6 +268,67 @@ class ProgressDisplay:
             parts.extend(log_lines)
 
         return Group(*parts)
+
+
+class NullDisplay:
+    """No-op display — used when neither Rich nor debug logging is wanted."""
+    def __init__(self, queue, **_kw): self.queue = queue
+    def start(self): pass
+    def stop(self):
+        # drain silently so the queue doesn't block
+        while True:
+            try: self.queue.get_nowait()
+            except Exception: break
+
+    def __enter__(self): return self
+    def __exit__(self, *_): self.stop()
+
+
+class DebugDisplay:
+    """Drop-in replacement for ProgressDisplay that prints simple text lines.
+
+    Same start()/stop() interface so callers don't need to branch.
+    Runs a background thread that drains the queue, just like ProgressDisplay.
+    """
+
+    def __init__(self, queue, **_kw):
+        self.queue = queue
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._drain()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._drain()
+            self._stop.wait(0.25)
+
+    def _drain(self):
+        while True:
+            try:
+                ev = self.queue.get_nowait()
+            except (Empty, EOFError):
+                break
+            dev = ev.get("dev", 0)
+            kind = ev["event"]
+            if kind == "loading":
+                print(f"[dev {dev}] loading model…", flush=True)
+            elif kind == "start":
+                print(f"[dev {dev}] {ev.get('name', '?')}", flush=True)
+            elif kind == "stage":
+                s, step, total = ev.get("stage", ""), ev.get("step", 0), ev.get("total", 0)
+                print(f"[dev {dev}]   {s} {step}/{total}" if total else f"[dev {dev}]   {s}", flush=True)
+            elif kind == "done":
+                sym = "✓" if ev.get("status") == "ok" else "✗"
+                print(f"[dev {dev}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.0f}s", flush=True)
 
 
 def make_progress_fn(queue, device_id: int):

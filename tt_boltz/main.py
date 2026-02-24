@@ -1,5 +1,12 @@
 """Boltz-2 structure prediction CLI."""
 
+# Suppress noisy ttnn/loguru output before any import pulls in ttnn.
+# These are defaults — --debug mode removes them so everything is visible.
+import os as _os, sys as _sys
+if "--debug" not in _sys.argv:
+    _os.environ.setdefault("LOGURU_LEVEL", "WARNING")
+    _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
+
 import json
 import multiprocessing as mp
 import os
@@ -28,7 +35,7 @@ from tt_boltz.data.tokenize import Boltz2Tokenizer
 from tt_boltz.data.types import Coords, Input, Interface
 from tt_boltz.data.write import to_mmcif, to_pdb
 from tt_boltz.boltz2 import Boltz2
-from tt_boltz.progress import ProgressDisplay, make_progress_fn
+from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay, make_progress_fn
 
 URLS = {
     "mols": "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar",
@@ -293,29 +300,28 @@ def _save_results(results: list[dict], path: Path) -> None:
     tmp.rename(path)
 
 
-def _predict_worker(device_id, file_paths, cfg, queue, progress_queue=None,
-                     is_subprocess=False):
+def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
+                     suppress_output=True):
     """Worker process: run predictions on one TT device.
 
     Each worker is pinned to a single physical card via TT_VISIBLE_DEVICES.
     All workers share the same on-disk kernel cache (no TT_METAL_CACHE override).
     """
     def _pq(event, **kw):
-        if progress_queue:
-            try:
-                progress_queue.put_nowait({"dev": device_id, "event": event, **kw})
-            except Exception:
-                pass
+        try:
+            progress_queue.put_nowait({"dev": device_id, "event": event, **kw})
+        except Exception:
+            pass
 
     # Silence all output so it doesn't corrupt the Rich Live display.
     # In subprocesses we redirect both stdout+stderr at the OS fd level
     # (catches C++ library noise too). In the main process we only redirect
     # Python stdout — Rich needs stderr there.
-    if progress_queue:
+    if suppress_output:
         import sys as _sys
         _devnull = open(os.devnull, "w")
         _sys.stdout = _devnull
-        if is_subprocess:
+        if device_id > 0:  # subprocesses
             _sys.stderr = _devnull
             _dn_fd = os.open(os.devnull, os.O_WRONLY)
             os.dup2(_dn_fd, 1)   # fd 1 = stdout  (C++ prints)
@@ -339,14 +345,10 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue=None,
         )
 
         _pq("loading")
-        t0 = time.time()
         model = Boltz2.load_from_checkpoint(
             cfg["conf_ckpt"], **cfg["conf_kwargs"],
         ).eval().to(torch_device)
-        if progress_queue:
-            model.progress_fn = make_progress_fn(progress_queue, device_id)
-        else:
-            click.echo(f"[dev {device_id}] model loaded in {time.time()-t0:.1f}s")
+        model.progress_fn = make_progress_fn(progress_queue, device_id)
 
         affinity_items = []
         struct_dir = Path(cfg["struct_dir"])
@@ -449,6 +451,8 @@ def cli(): pass
 @click.option("--diffusion_samples_affinity", default=5, type=int)
 @click.option("--affinity_checkpoint", type=click.Path(exists=True), default=None)
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
+@click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
+@click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_server_url, msa_pairing_strategy,
@@ -456,7 +460,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
-            num_devices):
+            num_devices, debug, log):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -527,7 +531,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     else:
         n_devices = 1
 
-    click.echo(f"Predicting {len(files)} structures on {n_devices} device(s)")
+
     click.echo("")
     click.echo("")
     click.echo("")
@@ -587,18 +591,19 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         import sys as _sys
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
-        pq = ctx.Queue()
         failed = 0
 
-        display = ProgressDisplay(pq, total=len(files), n_devices=n_devices)
+        pq = ctx.Queue()
+        suppress = not debug
+        display = (ProgressDisplay(pq, total=len(files), n_devices=n_devices) if not debug
+                   else DebugDisplay(pq) if log else NullDisplay(pq))
         display.start()
 
         try:
             if n_devices == 1:
-                # Worker runs in main process; its stdout redirect is restored
-                # after display.stop() below
                 os.environ["TT_VISIBLE_DEVICES"] = "0"
-                _predict_worker(0, [str(x) for x in files], worker_cfg, q, pq)
+                _predict_worker(0, [str(x) for x in files], worker_cfg, q, pq,
+                                suppress_output=suppress)
                 msg = q.get()
                 results.extend(msg.get("results", []))
                 failed = msg.get("failed", 0)
@@ -608,7 +613,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 for i, bucket in enumerate(file_buckets):
                     if bucket:
                         p = ctx.Process(target=_predict_worker,
-                                        args=(i, [str(x) for x in bucket], worker_cfg, q, pq, True))
+                                        args=(i, [str(x) for x in bucket], worker_cfg, q, pq),
+                                        kwargs={"suppress_output": suppress})
                         p.start()
                         procs.append(p)
                 for _ in procs:
@@ -618,7 +624,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 for p in procs:
                     p.join()
         finally:
-            _sys.stdout = _sys.__stdout__  # restore (worker may have redirected)
+            _sys.stdout = _sys.__stdout__
             display.stop()
 
     # =====================================================================
@@ -626,25 +632,27 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     # =====================================================================
     else:
         import sys as _sys
+
+        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
+        ccd = load_canonicals(mol_dir)
+        prepare = partial(prepare_features, ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir,
+                          tokenizer=tokenizer, featurizer=featurizer,
+                          use_msa=use_msa_server, msa_url=msa_server_url,
+                          msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
+                          msa_pass=msa_server_password, api_key=api_key_value, max_msa=max_msa_seqs)
+
         from queue import Queue as ThreadQueue
         pq = ThreadQueue()
-        display = ProgressDisplay(pq, total=len(files), n_devices=1)
+        display = (ProgressDisplay(pq, total=len(files), n_devices=1) if not debug
+                   else DebugDisplay(pq) if log else NullDisplay(pq))
         display.start()
         pq.put({"dev": 0, "event": "init", "assigned": len(files)})
 
-        # Suppress stray stdout (Rich display uses stderr)
         _saved_stdout = _sys.stdout
-        _sys.stdout = open(os.devnull, "w")
+        if not debug:
+            _sys.stdout = open(os.devnull, "w")
 
         try:
-            tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
-            ccd = load_canonicals(mol_dir)
-            prepare = partial(prepare_features, ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir,
-                              tokenizer=tokenizer, featurizer=featurizer,
-                              use_msa=use_msa_server, msa_url=msa_server_url,
-                              msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
-                              msa_pass=msa_server_password, api_key=api_key_value, max_msa=max_msa_seqs)
-
             pq.put({"dev": 0, "event": "loading"})
             model = Boltz2.load_from_checkpoint(conf_ckpt, **conf_kwargs).eval().to(torch_device)
             model.progress_fn = make_progress_fn(pq, 0)
@@ -705,7 +713,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             display.stop()
 
     _save_results(results, results_path)
-    click.echo(f"Done: {len(files) - failed} ok, {failed} failed — {results_path}")
+    click.echo(f"\nDone: {len(files) - failed} ok, {failed} failed — {results_path}")
 
 
 @cli.command()
