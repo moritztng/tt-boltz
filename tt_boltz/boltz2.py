@@ -4022,6 +4022,7 @@ class AtomDiffusion(Module):
         multiplicity=1,
         max_parallel_samples=None,
         steering_args=None,
+        progress_fn=None,
         **network_condition_kwargs,
     ):
         if steering_args is not None and (
@@ -4070,7 +4071,10 @@ class AtomDiffusion(Module):
         atom_coords_denoised = None
 
         # gradually denoise
+        _n_steps = len(sigmas_and_gammas)
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+            if progress_fn and step_idx % 10 == 0:
+                progress_fn("diffusion", step=step_idx, total=_n_steps)
             random_R, random_tr = compute_random_augmentation(
                 multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
             )
@@ -4900,6 +4904,7 @@ class Boltz2(nn.Module):
             "trace": trace,
         }
         self.trace = trace
+        self.progress_fn = None  # optional callback: fn(stage, step=0, total=0)
 
         # Inference configuration
         self.predict_args = predict_args
@@ -5144,6 +5149,10 @@ class Boltz2(nn.Module):
                 if hasattr(m, 'reset_static_cache'):
                     m.reset_static_cache()
 
+        _pfn = self.progress_fn
+        if _pfn:
+            _pfn("trunk", step=0, total=recycling_steps + 1)
+
         if self.trace:
             print("[boltz2] forward: input_embedder")
         
@@ -5173,6 +5182,8 @@ class Boltz2(nn.Module):
         pair_mask = mask[:, :, None] * mask[:, None, :]
         if self.run_trunk_and_structure:
             for i in range(recycling_steps + 1):
+                if _pfn:
+                    _pfn("trunk", step=i, total=recycling_steps + 1)
                 # Apply recycling
                 s = s_init + self.s_recycle(self.s_norm(s))
                 z = z_init + self.z_recycle(self.z_norm(z))
@@ -5225,6 +5236,8 @@ class Boltz2(nn.Module):
         }
 
         if self.run_trunk_and_structure and not self.skip_run_structure:
+            if _pfn:
+                _pfn("diffusion", step=0, total=num_sampling_steps or self.structure_module.num_sampling_steps)
             if self.trace:
                 print("[boltz2] diffusion_conditioning")
             q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
@@ -5257,6 +5270,7 @@ class Boltz2(nn.Module):
                     max_parallel_samples=max_parallel_samples,
                     steering_args=self.steering_args,
                     diffusion_conditioning=diffusion_conditioning,
+                    progress_fn=_pfn,
                 )
                 dict_out.update(struct_out)
 
@@ -5265,6 +5279,8 @@ class Boltz2(nn.Module):
                 dict_out["pbfactor"] = pbfactor
 
         if self.confidence_prediction:
+            if _pfn:
+                _pfn("confidence")
             if self.trace:
                 print("[boltz2] confidence_module")
             dict_out.update(

@@ -25,6 +25,7 @@ dependencies = [
     "scikit-learn",
     "chembl_structure_pipeline",
     "tqdm",
+    "rich",
     "pytest",
     "omegaconf",
 ]
