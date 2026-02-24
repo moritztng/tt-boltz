@@ -65,6 +65,8 @@ tt-boltz predict examples/prot.yaml --use_msa_server --override
 - `--use_msa_server`: Automatically generate MSAs (required if no MSA provided)
 - `--override`: Re-run from scratch, ignoring cached files
 - `--accelerator=tenstorrent`: Use Tenstorrent hardware (default, or use `cpu`/`gpu`)
+- `--debug`: Show all raw output from the hardware and libraries instead of the progress display
+- `--debug --log`: Same as `--debug`, but also print what each device is currently working on
 
 ### Binding Affinity Prediction
 
