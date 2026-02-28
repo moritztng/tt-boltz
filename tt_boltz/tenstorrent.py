@@ -255,11 +255,13 @@ class TriangleAttention(Module):
         ending: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+        affinity: bool = False,
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.ending = ending
+        self.affinity = affinity
         self.scale = self.head_dim**0.5
         self.layer_norm_weight = self.torch_to_tt("layer_norm.weight")
         self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
@@ -310,35 +312,46 @@ class TriangleAttention(Module):
         del qkvg
         triangle_bias = ttnn.unsqueeze(triangle_bias, 0)
         triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
-        if attn_mask is not None:
-            # Precomputed additive mask (4D [1,1,1,S] or [S,1,1,S] from Pairformer)
-            triangle_bias = ttnn.add(triangle_bias, attn_mask)
-        qkv = ttnn.unsqueeze(qkv, 1)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv,
-            num_heads=self.n_heads,
-            num_kv_heads=self.n_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        o = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=triangle_bias,
-            is_causal=False,
-            scale=self.scale**-1,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=(
-                    (13, 10) if is_blackhole() else (8, 8)
+
+        def attend(qkv_in, bias):
+            qkv_in = ttnn.unsqueeze(qkv_in, 1)
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                qkv_in, num_heads=self.n_heads, num_kv_heads=self.n_heads,
+                transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            o = ttnn.transformer.scaled_dot_product_attention(
+                q, k, v, attn_mask=bias, is_causal=False, scale=self.scale**-1,
+                program_config=ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=(
+                        (13, 10) if is_blackhole() else (8, 8)
+                    ),
+                    exp_approx_mode=False,
+                    q_chunk_size=256,  # CAN CAUSE ACCURACY ISSUES IN TEMPLATE MODULE
+                    k_chunk_size=256,
                 ),
-                exp_approx_mode=False,
-                q_chunk_size=256, # CAN CAUSE ACCURACY ISSUES IN TEMPLATE MODULE
-                k_chunk_size=256,
-            ),
-        )
-        o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        o = ttnn.squeeze(o, 1)
+            )
+            o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            return ttnn.squeeze(o, 1)
+
+        S = qkv.shape[0]
+        if self.affinity and S > 1500:
+            chunk_sz = 1500
+            n_ch = -(-S // chunk_sz)
+            mask_chunks = ttnn.chunk(attn_mask, n_ch, dim=0)
+            qkv_chunks = ttnn.chunk(qkv, n_ch, dim=0)
+            o_parts = []
+            for i in range(n_ch):
+                bias = ttnn.add(triangle_bias, mask_chunks[i])
+                o_parts.append(attend(qkv_chunks[i], bias))
+                ttnn.deallocate(bias)
+            ttnn.deallocate(qkv)
+            o = ttnn.concat(o_parts, dim=0)
+            del o_parts
+        else:
+            if attn_mask is not None:
+                triangle_bias = ttnn.add_(triangle_bias, attn_mask)
+            o = attend(qkv, triangle_bias)
+
         o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         x = ttnn.linear(
             o,
@@ -582,12 +595,19 @@ class Transition(Module):
             return x_dram
 
         if len(x.shape) < 4:
-            x = swiglu(x)
-        else:
-            chunk_size = 64 if x.shape[2] * x.shape[3] <= 768 * 128 else 32
-            chunks = ttnn.chunk(x, x.shape[1] // chunk_size, dim=1)
-            x = ttnn.concat([swiglu(chunk) for chunk in chunks], dim=1)
-        return x
+            return swiglu(x)
+
+        H, W = x.shape[1], x.shape[2]
+        chunk_h = 64 if W * x.shape[3] <= 768 * 128 else 32
+        max_w = 1800
+        chunks = ttnn.chunk(x, -(-H // chunk_h), dim=1)
+        if W <= max_w:
+            return ttnn.concat([swiglu(c) for c in chunks], dim=1)
+        result = []
+        for c in chunks:
+            subs = ttnn.chunk(c, -(-W // max_w), dim=2)
+            result.append(ttnn.concat([swiglu(s) for s in subs], dim=2))
+        return ttnn.concat(result, dim=1)
 
 
 class PairformerLayer(Module):
@@ -600,6 +620,7 @@ class PairformerLayer(Module):
         transform_s: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+        affinity: bool = False,
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.transform_s = transform_s
@@ -615,6 +636,7 @@ class PairformerLayer(Module):
             False,
             filter_dict(state_dict, "tri_att_start", "mha."),
             compute_kernel_config,
+            affinity=affinity,
         )
         self.triangle_attention_end = TriangleAttention(
             tri_att_head_dim,
@@ -622,6 +644,7 @@ class PairformerLayer(Module):
             True,
             filter_dict(state_dict, "tri_att_end", "mha."),
             compute_kernel_config,
+            affinity=affinity,
         )
         self.transition_z = Transition(
             filter_dict(state_dict, "transition_z"), compute_kernel_config
@@ -645,23 +668,23 @@ class PairformerLayer(Module):
         self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None,
         attn_mask_start: ttnn.Tensor = None, attn_mask_end: ttnn.Tensor = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        z = ttnn.add(
+        z = ttnn.add_(
             z,
             self.triangle_multiplication_start(z, mask),
         )
-        z = ttnn.add(
+        z = ttnn.add_(
             z,
             self.triangle_multiplication_end(z, mask),
         )
-        z = ttnn.add(
+        z = ttnn.add_(
             z,
             self.triangle_attention_start(z, attn_mask_start),
         )
-        z = ttnn.add(
+        z = ttnn.add_(
             z,
             self.triangle_attention_end(z, attn_mask_end),
         )
-        z = ttnn.add(z, self.transition_z(z))
+        z = ttnn.add_(z, self.transition_z(z))
         if self.transform_s:
             s_norm = ttnn.layer_norm(
                 s,
@@ -670,7 +693,7 @@ class PairformerLayer(Module):
                 epsilon=1e-5,
                 compute_kernel_config=self.compute_kernel_config,
             )
-            s = ttnn.add(
+            s = ttnn.add_(
                 s,
                 self.attention_pair_bias(
                     s_norm,
@@ -678,7 +701,7 @@ class PairformerLayer(Module):
                     seq_mask=attn_mask_start,  # same as end for non-affinity
                 ),
             )
-            s = ttnn.add(s, self.transition_s(s))
+            s = ttnn.add_(s, self.transition_s(s))
         return s, z
 
 
@@ -693,6 +716,7 @@ class Pairformer(Module):
         transform_s: bool,
         state_dict: dict,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+        affinity: bool = False,
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.blocks = [
@@ -704,6 +728,7 @@ class Pairformer(Module):
                 transform_s,
                 filter_dict(state_dict, f"layers.{i}"),
                 compute_kernel_config,
+                affinity=affinity,
             )
             for i in range(n_blocks)
         ]
@@ -1058,29 +1083,41 @@ class OuterProductMean(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
+        ttnn.deallocate(m)
         if msa_mask is not None:
             a = ttnn.multiply_(a, msa_mask)
         S, I, C = a.shape
         _, J, D = b.shape
-        a = ttnn.permute(a, (1, 2, 0))
-        a = ttnn.reshape(a, (-1, S))
+        a = ttnn.permute(a, (1, 2, 0))  # (I, C, S)
         b = ttnn.permute(b, (2, 1, 0))
         b = ttnn.to_layout(b, ttnn.ROW_MAJOR_LAYOUT)
         b = ttnn.reshape(b, (-1, S))
         b = ttnn.to_layout(b, ttnn.TILE_LAYOUT)
-        z = ttnn.matmul(a, b, transpose_b=True, compute_kernel_config=self.compute_kernel_config)
-        z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
-        z = ttnn.reshape(z, (I, C * D, J))
-        z = ttnn.to_layout(z, ttnn.TILE_LAYOUT)
-        z = ttnn.permute(z, (0, 2, 1))
-        z = ttnn.multiply_(z, 1 / (n_msa if n_msa is not None else S))
-        z = ttnn.linear(
-            z,
-            self.o_weight,
-            bias=self.o_bias,
-            compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
-        )
+
+        def outer_product_mean(a_in):
+            rows = a_in.shape[0]
+            a_flat = ttnn.reshape(a_in, (rows * C, S))
+            z = ttnn.matmul(a_flat, b, transpose_b=True, compute_kernel_config=self.compute_kernel_config)
+            z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
+            z = ttnn.reshape(z, (rows, C * D, J))
+            z = ttnn.to_layout(z, ttnn.TILE_LAYOUT)
+            z = ttnn.permute(z, (0, 2, 1))
+            z = ttnn.multiply_(z, 1 / (n_msa if n_msa is not None else S))
+            return ttnn.linear(z, self.o_weight, bias=self.o_bias,
+                               compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None)
+
+        if I > 1800:
+            a_chunks = ttnn.chunk(a, -(-I // 512), dim=0)
+            ttnn.deallocate(a)
+            parts = [outer_product_mean(ac) for ac in a_chunks]
+            del a_chunks
+            ttnn.deallocate(b)
+            z = ttnn.concat(parts, dim=0)
+            del parts
+        else:
+            z = outer_product_mean(a)
+            ttnn.deallocate(a)
+            ttnn.deallocate(b)
         z = ttnn.reshape(z, (1, *z.shape))
         return z
 
@@ -1128,12 +1165,35 @@ class MSALayer(Module):
         msa_mask: ttnn.Tensor,
         n_msa: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        m = ttnn.add(m, self.pair_weighted_averaging(m, z, attn_mask))
-        m = ttnn.add(m, self.msa_transition(m))
-        z = ttnn.add(z, self.outer_product_mean(m, msa_mask, n_msa))
+        S = m.shape[2]
+        if S > 1500:
+            z = ttnn.reallocate(z)
+            N_msa = m.shape[1]
+            n_ch = -(-N_msa // 512)
+            m_chunks = ttnn.chunk(m, n_ch, dim=1)
+            ttnn.deallocate(m)
+            msk_chunks = ttnn.chunk(msa_mask, n_ch, dim=0) if msa_mask is not None else [None] * n_ch
+            for i in range(n_ch):
+                mc = m_chunks[i]
+                mc = ttnn.add_(mc, self.pair_weighted_averaging(mc, z, attn_mask))
+                mc = ttnn.add_(mc, self.msa_transition(mc))
+                ttnn.deallocate(m_chunks[i])
+                m_chunks[i] = mc
+                z = ttnn.add_(z, self.outer_product_mean(mc, msk_chunks[i], n_msa))
+            m = ttnn.concat(m_chunks, dim=1)
+            for c in m_chunks:
+                ttnn.deallocate(c)
+            del m_chunks
+            m = ttnn.reallocate(m)
+        else:
+            m = ttnn.add_(m, self.pair_weighted_averaging(m, z, attn_mask))
+            m = ttnn.add_(m, self.msa_transition(m))
+            z = ttnn.add_(z, self.outer_product_mean(m, msa_mask, n_msa))
+
         z = self.pairformer_layer(
             None, z, mask=mask, attn_mask_start=attn_mask, attn_mask_end=attn_mask,
         )[1]
+
         return z, m
 
 
@@ -1179,7 +1239,7 @@ class MSA(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        m = ttnn.add(
+        m = ttnn.add_(
             m,
             ttnn.linear(
                 emb,
@@ -1502,6 +1562,7 @@ class PairformerModule(TorchWrapper):
             self.transform_s,
             filter_dict(state_dict, prefix[:-1]),
             self.compute_kernel_config,
+            affinity=self.affinity,
         )
 
     def forward(
