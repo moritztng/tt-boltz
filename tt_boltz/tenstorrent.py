@@ -4,7 +4,13 @@ from typing import Tuple, Callable, Dict
 from models.common.utility_functions import is_wormhole_b0, is_blackhole
 from math import pi
 
+USE_BLOCKFP8 = False
+
 TRIANGLE_MULT_CHUNK_SIZE = 32
+
+
+def _dtype():
+    return ttnn.bfloat8_b if USE_BLOCKFP8 else ttnn.bfloat16
 
 _device = None
 
@@ -131,12 +137,17 @@ class TriangleMultiplication(Module):
 
     def _transform_chunk(self, chunk, permute_dims, memory_config):
         old = chunk
-        for op, *args in [
-            (ttnn.typecast, ttnn.bfloat16),
-            (ttnn.permute, permute_dims),
-            (ttnn.typecast, ttnn.bfloat8_b),
-            (ttnn.reallocate,),
-        ]:
+        for op, *args in (
+            [
+                (ttnn.typecast, ttnn.bfloat16),
+                (ttnn.permute, permute_dims),
+                (ttnn.typecast, ttnn.bfloat8_b),
+                (ttnn.reallocate,),
+            ] if USE_BLOCKFP8 else [
+                (ttnn.permute, permute_dims),
+                (ttnn.reallocate,),
+            ]
+        ):
             chunk = op(chunk, *args, memory_config=memory_config)
             ttnn.deallocate(old)
             old = chunk
@@ -151,7 +162,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         H = x_norm_in.shape[1]
-        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > 704 else ttnn.L1_MEMORY_CONFIG
+        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > (704 if USE_BLOCKFP8 else 352) else ttnn.L1_MEMORY_CONFIG
         seq_len_tiles, core_grid = (H + 31) // 32, (
             (10, 13) if is_blackhole() else (8, 8)
         )
@@ -178,7 +189,7 @@ class TriangleMultiplication(Module):
                 x_norm_in,
                 self.gp_in_weight_fused_chunks[i],
                 memory_config=memory_config,
-                dtype=ttnn.bfloat8_b,
+                dtype=_dtype(),
                 compute_kernel_config=self.compute_kernel_config,
             )
             g_in_a, g_in_b, p_in_a, p_in_b = ttnn.chunk(gp_in_fused, chunks=4, dim=-1)
@@ -229,7 +240,7 @@ class TriangleMultiplication(Module):
             x,
             self.out_p_weight,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat8_b,
+            dtype=_dtype(),
             compute_kernel_config=self.compute_kernel_config,
             core_grid=core_grid_opt,
         )
@@ -237,7 +248,7 @@ class TriangleMultiplication(Module):
             x_norm_in,
             self.g_out_weight,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat8_b,
+            dtype=_dtype(),
             compute_kernel_config=self.compute_kernel_config,
             core_grid=core_grid_opt,
         )
@@ -279,7 +290,7 @@ class TriangleAttention(Module):
             ).t(),
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
-            dtype=ttnn.bfloat8_b,
+            dtype=_dtype(),
         )
 
     def __call__(self, x: ttnn.Tensor, attn_mask: ttnn.Tensor = None) -> ttnn.Tensor:
@@ -304,7 +315,7 @@ class TriangleAttention(Module):
             input_tensor=x,
             weight_tensor=self.qkvg_weight,
             compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.bfloat8_b,
+            dtype=_dtype(),
         )
         split_idx = 3 * self.head_dim * self.n_heads
         qkv = qkvg[..., :split_idx]
@@ -357,7 +368,7 @@ class TriangleAttention(Module):
             o,
             self.o_weight,
             compute_kernel_config=self.compute_kernel_config,
-            dtype=ttnn.bfloat8_b,
+            dtype=_dtype(),
             core_grid=ttnn.CoreGrid(y=6, x=12) if is_blackhole() else None,
         )
         if self.ending:
@@ -382,14 +393,14 @@ class AttentionPairBias(Module):
         self.compute_pair_bias = compute_pair_bias
         self.atom_level = atom_level 
         if atom_level:
-            self.q_weight = self.torch_to_tt("proj_q.weight", dtype=ttnn.bfloat8_b)
-            self.q_bias = self.torch_to_tt("proj_q.bias", dtype=ttnn.bfloat8_b)
+            self.q_weight = self.torch_to_tt("proj_q.weight", dtype=_dtype())
+            self.q_bias = self.torch_to_tt("proj_q.bias", dtype=_dtype())
             kv_weight = torch.cat([self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
             self.kv_weight = ttnn.from_torch(
                 kv_weight.t(),
                 layout=ttnn.TILE_LAYOUT,
                 device=self.device,
-                dtype=ttnn.bfloat8_b,
+                dtype=_dtype(),
             )
         else:
             qkv_weight = torch.cat([self.state_dict["proj_q.weight"], self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
@@ -484,7 +495,7 @@ class AttentionPairBias(Module):
             o = ttnn.reshape(o, (o.shape[0], -1, o.shape[3]))
             o = ttnn.permute(o, (0, 2, 1))
         else:
-            s = ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat8_b)
+            s = ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG, dtype=_dtype())
             B, K, W, D_S = s.shape
             s_kv = ttnn.reshape(s, (B, 2 * K, W // 2, -1))
             s_kv = ttnn.permute(s_kv, (0, 2, 3, 1))
@@ -497,12 +508,12 @@ class AttentionPairBias(Module):
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
             s_kv = ttnn.reshape(s_kv, (B, K, -1, D_S))
             
-            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
-            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=ttnn.bfloat8_b)
+            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=_dtype())
+            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None, dtype=_dtype())
             
             q = ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT)
             q = ttnn.pad(q, [[0, 0], [0, 0], [0, 96], [0, 0]], 0.0)
-            q = ttnn.to_layout(q, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat8_b)
+            q = ttnn.to_layout(q, ttnn.TILE_LAYOUT, dtype=_dtype())
             q = ttnn.reshape(q, (B * K, 1, 128, -1))
             kv = ttnn.reshape(kv, (B * K, 1, 128, -1))
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(q, kv, num_heads=self.n_heads, num_kv_heads=self.n_heads, transpose_k_heads=False)
@@ -529,8 +540,9 @@ class AttentionPairBias(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
         )
-        o = ttnn.typecast(o, ttnn.bfloat16)
-        o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID], dtype=ttnn.bfloat8_b)
+        if USE_BLOCKFP8:
+            o = ttnn.typecast(o, ttnn.bfloat16)
+        o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID], dtype=_dtype())
         if self.atom_level:
             ttnn.deallocate(g)
         x = ttnn.linear(
@@ -569,7 +581,7 @@ class Transition(Module):
                 activation="silu",
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
-                dtype=ttnn.bfloat8_b,
+                dtype=_dtype(),
                 core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None,
             )
             x_2 = ttnn.linear(
@@ -577,7 +589,7 @@ class Transition(Module):
                 self.fc2_weight,
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
-                dtype=ttnn.bfloat8_b,
+                dtype=_dtype(),
                 core_grid=ttnn.CoreGrid(y=10, x=12) if is_blackhole() else None,
             )
             ttnn.deallocate(x_norm)
@@ -587,7 +599,7 @@ class Transition(Module):
                 x,
                 self.fc3_weight,
                 compute_kernel_config=self.compute_kernel_config,
-                dtype=ttnn.bfloat8_b,
+                dtype=_dtype(),
                 core_grid=ttnn.CoreGrid(y=8, x=11) if is_blackhole() else None,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
@@ -598,7 +610,7 @@ class Transition(Module):
             return swiglu(x)
 
         H, W = x.shape[1], x.shape[2]
-        chunk_h = 64 if W * x.shape[3] <= 768 * 128 else 32
+        chunk_h = (64 if USE_BLOCKFP8 else 32) if W * x.shape[3] <= 768 * 128 else (32 if USE_BLOCKFP8 else 16)
         max_w = 1800
         chunks = ttnn.chunk(x, -(-H // chunk_h), dim=1)
         if W <= max_w:
@@ -1177,8 +1189,6 @@ class MSALayer(Module):
                 mc = m_chunks[i]
                 mc = ttnn.add_(mc, self.pair_weighted_averaging(mc, z, attn_mask))
                 mc = ttnn.add_(mc, self.msa_transition(mc))
-                ttnn.deallocate(m_chunks[i])
-                m_chunks[i] = mc
                 z = ttnn.add_(z, self.outer_product_mean(mc, msk_chunks[i], n_msa))
             m = ttnn.concat(m_chunks, dim=1)
             for c in m_chunks:
