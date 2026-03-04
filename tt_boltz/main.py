@@ -300,6 +300,17 @@ def _save_results(results: list[dict], path: Path) -> None:
     tmp.rename(path)
 
 
+def _append_result(row: dict, path: Path) -> None:
+    """Append one result row to results.json atomically.
+
+    Safe for concurrent workers: reads existing, merges, writes via rename.
+    """
+    existing = json.loads(path.read_text()) if path.exists() else []
+    existing = [r for r in existing if r["id"] != row["id"]]
+    existing.append(row)
+    _save_results(existing, path)
+
+
 def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
                      suppress_output=True):
     """Worker process: run predictions on one TT device.
@@ -383,6 +394,9 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
             _pq("done", name=path.stem, time=elapsed, status=row["status"],
                 error=row.get("error", ""))
             results.append(row)
+            if "results_path" in cfg:
+                try: _append_result(row, Path(cfg["results_path"]))
+                except Exception: pass
 
         if affinity_items:
             aff_model = Boltz2.load_from_checkpoint(
@@ -587,6 +601,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+            "results_path": str(results_path),
         }
         import sys as _sys
         ctx = mp.get_context("spawn")
@@ -688,6 +703,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         "time": elapsed, "status": row["status"],
                         "error": row.get("error", "")})
                 results.append(row)
+                _save_results(results, results_path)
             del model
 
             if affinity_queue:
