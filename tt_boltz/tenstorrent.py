@@ -7,7 +7,7 @@ from math import pi
 USE_BLOCKFP8 = False
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
-
+SEQ_LEN_MORE_CHUNKING = 1536
 
 def _dtype():
     return ttnn.bfloat8_b if USE_BLOCKFP8 else ttnn.bfloat16
@@ -345,22 +345,21 @@ class TriangleAttention(Module):
             return ttnn.squeeze(o, 1)
 
         S = qkv.shape[0]
-        if self.affinity and S > 1500:
-            chunk_sz = 1500
-            n_ch = -(-S // chunk_sz)
-            mask_chunks = ttnn.chunk(attn_mask, n_ch, dim=0)
-            qkv_chunks = ttnn.chunk(qkv, n_ch, dim=0)
-            o_parts = []
-            for i in range(n_ch):
-                bias = ttnn.add(triangle_bias, mask_chunks[i])
-                o_parts.append(attend(qkv_chunks[i], bias))
+        if self.affinity and S > SEQ_LEN_MORE_CHUNKING:
+            parts = []
+            for s in range(0, S, 1024):
+                bias = ttnn.add(triangle_bias, attn_mask[s:min(s+1024, S), :, :])
+                parts.append(attend(qkv[s:min(s+1024, S), :, :, :], bias))
                 ttnn.deallocate(bias)
             ttnn.deallocate(qkv)
-            o = ttnn.concat(o_parts, dim=0)
-            del o_parts
+            ttnn.deallocate(triangle_bias)
+            o = ttnn.concat(parts, dim=0)
+            for p in parts:
+                ttnn.deallocate(p)
+            del parts
         else:
             if attn_mask is not None:
-                triangle_bias = ttnn.add_(triangle_bias, attn_mask)
+                triangle_bias = ttnn.add(triangle_bias, attn_mask)
             o = attend(qkv, triangle_bias)
 
         o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
@@ -611,15 +610,13 @@ class Transition(Module):
 
         H, W = x.shape[1], x.shape[2]
         chunk_h = (64 if USE_BLOCKFP8 else 32) if W * x.shape[3] <= 768 * 128 else (32 if USE_BLOCKFP8 else 16)
-        max_w = 1800
         chunks = ttnn.chunk(x, -(-H // chunk_h), dim=1)
-        if W <= max_w:
+        if W <= SEQ_LEN_MORE_CHUNKING:
             return ttnn.concat([swiglu(c) for c in chunks], dim=1)
-        result = []
-        for c in chunks:
-            subs = ttnn.chunk(c, -(-W // max_w), dim=2)
-            result.append(ttnn.concat([swiglu(s) for s in subs], dim=2))
-        return ttnn.concat(result, dim=1)
+        return ttnn.concat([
+            ttnn.concat([swiglu(c[:, :, w:min(w+1024, W), :]) for w in range(0, W, 1024)], dim=2)
+            for c in chunks
+        ], dim=1)
 
 
 class PairformerLayer(Module):
@@ -1118,11 +1115,9 @@ class OuterProductMean(Module):
             return ttnn.linear(z, self.o_weight, bias=self.o_bias,
                                compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13) if is_blackhole() else None)
 
-        if I > 1800:
-            a_chunks = ttnn.chunk(a, -(-I // 512), dim=0)
+        if I > SEQ_LEN_MORE_CHUNKING:
+            parts = [outer_product_mean(a[i:min(i+512, I), :, :]) for i in range(0, I, 512)]
             ttnn.deallocate(a)
-            parts = [outer_product_mean(ac) for ac in a_chunks]
-            del a_chunks
             ttnn.deallocate(b)
             z = ttnn.concat(parts, dim=0)
             del parts
@@ -1178,22 +1173,20 @@ class MSALayer(Module):
         n_msa: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         S = m.shape[2]
-        if S > 1500:
+        if S > SEQ_LEN_MORE_CHUNKING:
             z = ttnn.reallocate(z)
-            N_msa = m.shape[1]
-            n_ch = -(-N_msa // 512)
-            m_chunks = ttnn.chunk(m, n_ch, dim=1)
-            ttnn.deallocate(m)
-            msk_chunks = ttnn.chunk(msa_mask, n_ch, dim=0) if msa_mask is not None else [None] * n_ch
-            for i in range(n_ch):
-                mc = m_chunks[i]
+            chunks = []
+            N = m.shape[1]
+            for s in range(0, N, 512):
+                mc = m[:, s:min(s+512, N), :]
+                msk = msa_mask[s:min(s+512, N), :] if msa_mask is not None else None
                 mc = ttnn.add_(mc, self.pair_weighted_averaging(mc, z, attn_mask))
                 mc = ttnn.add_(mc, self.msa_transition(mc))
-                z = ttnn.add_(z, self.outer_product_mean(mc, msk_chunks[i], n_msa))
-            m = ttnn.concat(m_chunks, dim=1)
-            for c in m_chunks:
-                ttnn.deallocate(c)
-            del m_chunks
+                z = ttnn.add_(z, self.outer_product_mean(mc, msk, n_msa))
+                chunks.append(mc)
+            ttnn.deallocate(m)
+            m = ttnn.concat(chunks, dim=1)
+            del chunks
             m = ttnn.reallocate(m)
         else:
             m = ttnn.add_(m, self.pair_weighted_averaging(m, z, attn_mask))
