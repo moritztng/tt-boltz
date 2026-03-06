@@ -261,16 +261,18 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
         else:
             (out_dir / f"{record.id}_model_{model_rank}.{fmt}").write_text(write_fn(new_struct, plddt, True))
 
-    # All confidence metrics from best model
     best_idx = next(i for i, r in rank.items() if r == 0)
+    num_samples = pred["coords"].shape[0]
     metrics = {}
 
     scalar_keys = ["confidence_score", "ptm", "iptm", "ligand_iptm", "protein_iptm",
                    "complex_plddt", "complex_iplddt", "complex_pde", "complex_ipde"]
-    for k in scalar_keys:
-        metrics[k] = round(pred[k][best_idx].item(), 6) if k in pred else 0.0
 
-    # Per-chain-pair iPTM (nested dict, natural in JSON)
+    def _scalars(idx):
+        return {k: round(pred[k][idx].item(), 6) if k in pred else 0.0 for k in scalar_keys}
+
+    metrics.update(_scalars(best_idx))
+
     if "pair_chains_iptm" in pred:
         pci = pred["pair_chains_iptm"]
         metrics["pair_chains_iptm"] = {
@@ -280,6 +282,10 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
         metrics["chains_ptm"] = {
             i: round(pci[i][i][best_idx].item(), 6) for i in pci if i in pci[i]
         }
+
+    if num_samples > 1:
+        idx_by_rank = sorted(rank, key=rank.get)
+        metrics["all_runs"] = [{"rank": rank[i], **_scalars(i)} for i in idx_by_rank]
 
     # Optional large outputs
     if write_pae and "pae" in pred:
