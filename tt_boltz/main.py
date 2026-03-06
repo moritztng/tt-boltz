@@ -7,6 +7,7 @@ if "--debug" not in _sys.argv:
     _os.environ.setdefault("LOGURU_LEVEL", "WARNING")
     _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
 
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -103,7 +104,8 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      max_msa, method=None, affinity=False, pred_structure=None):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
-    Only MSA CSV files touch disk (cached in msa_dir).
+    MSA CSV files are cached in msa_dir by sequence hash — the same
+    protein sequence is never searched twice across any input file or run.
     Returns (features_dict, input_structure).
     """
     suffix = path.suffix.lower()
@@ -117,18 +119,19 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
     record = target.record
     struct = pred_structure if pred_structure is not None else target.structure
 
-    # Identify protein chains needing MSA
+    # Identify protein chains needing MSA, keyed by sequence hash for global caching
     to_gen = {}
     for chain in record.chains:
         if chain.mol_type == const.chain_type_ids["PROTEIN"] and chain.msa_id == 0:
-            msa_name = f"{record.id}_{chain.entity_id}"
-            to_gen[msa_name] = target.sequences[chain.entity_id]
-            chain.msa_id = str(msa_dir / f"{msa_name}.csv")
+            seq = target.sequences[chain.entity_id]
+            seq_hash = hashlib.sha256(seq.encode()).hexdigest()[:16]
+            chain.msa_id = str(msa_dir / f"{seq_hash}.csv")
+            if not Path(chain.msa_id).exists():
+                to_gen[seq_hash] = seq
         elif chain.msa_id == 0:
             chain.msa_id = -1
 
-    # Generate MSA if not cached
-    if to_gen and not all((msa_dir / f"{k}.csv").exists() for k in to_gen):
+    if to_gen:
         if not use_msa:
             raise RuntimeError("Missing MSAs, use --use_msa_server")
         compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
@@ -489,9 +492,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     \b
     Output:
         boltz_results_<name>/
-            msa/            # cached MSA CSVs
             structures/     # one CIF per complex (pLDDT in B-factors)
             results.json    # all confidence metrics + affinity
+        ~/.boltz/msa/       # global MSA cache (keyed by sequence hash)
     """
     use_tt = accelerator == "tenstorrent"
     if use_tt: accelerator = "cpu"
@@ -519,7 +522,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     data = Path(data).expanduser()
     out = Path(out_dir).expanduser() / f"boltz_results_{data.stem}"
-    msa_dir = out / "msa"
+    msa_dir = cache / "msa"
     struct_dir = out / "structures"
     msa_dir.mkdir(parents=True, exist_ok=True)
     struct_dir.mkdir(parents=True, exist_ok=True)

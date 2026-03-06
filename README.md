@@ -113,9 +113,6 @@ properties:
 
 ```
 boltz_results_prot/
-├── msa/
-│   ├── prot_0.csv                    # Cached MSA
-│   └── ...                           # MSA generation intermediates
 ├── structures/
 │   ├── prot.cif                      # Best-ranked predicted structure
 │   └── prot_model_1.cif              # Additional samples (if diffusion_samples > 1)
@@ -124,6 +121,8 @@ boltz_results_prot/
 ├── prot_pde.npz                      # (optional, --write_pde)
 └── prot_embeddings.npz               # (optional, --write_embeddings)
 ```
+
+MSA results are cached globally in `~/.boltz/msa/`, keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs.
 
 ### Confidence Scores
 
