@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz is the Boltz-2 implementation for inference on a single Tenstorrent Blackhole or Wormhole.
+TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card (e.g. QuietBox with 4 cards) configurations.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
