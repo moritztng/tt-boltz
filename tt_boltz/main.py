@@ -226,6 +226,13 @@ def to_batch(feats: dict, device: torch.device) -> dict:
     return batch
 
 
+def _atomic_write(path: Path, content: str):
+    """Write file atomically via tmp+rename to prevent corruption on crash."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.rename(path)
+
+
 def write_result(pred, batch, input_struct, out_dir, fmt,
                  write_pae=False, write_pde=False, write_embeddings=False):
     """Write CIF/PDB structure files. Return (metrics_dict, best_structure).
@@ -260,9 +267,9 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
 
         if model_rank == 0:
             best_struct = new_struct
-            (out_dir / f"{record.id}.{fmt}").write_text(write_fn(new_struct, plddt, True))
+            _atomic_write(out_dir / f"{record.id}.{fmt}", write_fn(new_struct, plddt, True))
         else:
-            (out_dir / f"{record.id}_model_{model_rank}.{fmt}").write_text(write_fn(new_struct, plddt, True))
+            _atomic_write(out_dir / f"{record.id}_model_{model_rank}.{fmt}", write_fn(new_struct, plddt, True))
 
     best_idx = next(i for i, r in rank.items() if r == 0)
     num_samples = pred["coords"].shape[0]
