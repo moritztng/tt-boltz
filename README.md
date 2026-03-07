@@ -122,7 +122,7 @@ boltz_results_prot/
 └── prot_embeddings.npz               # (optional, --write_embeddings)
 ```
 
-MSA results are cached globally in `~/.boltz/msa/`, keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs.
+MSA results are cached in `<out_dir>/msa/` (default `./msa/`), keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs.
 
 ### Confidence Scores
 

@@ -75,7 +75,7 @@ def download_all(cache: Path) -> None:
 
 def compute_msa(seqs: dict[str, str], target_id: str, msa_dir: Path, url: str, strategy: str,
                 username: str = None, password: str = None, api_key: str = None) -> None:
-    """Generate MSAs for protein sequences."""
+    """Generate MSAs for protein sequences via ColabFold server."""
     click.echo(f"MSA for {target_id} ({len(seqs)} sequences)")
     headers = {"Content-Type": "application/json", "X-API-Key": api_key} if api_key else None
     seqs_list = list(seqs.values())
@@ -491,10 +491,10 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     \b
     Output:
+        msa/                # MSA cache (keyed by sequence hash, shared across runs)
         boltz_results_<name>/
             structures/     # one CIF per complex (pLDDT in B-factors)
             results.json    # all confidence metrics + affinity
-        ~/.boltz/msa/       # global MSA cache (keyed by sequence hash)
     """
     use_tt = accelerator == "tenstorrent"
     if use_tt: accelerator = "cpu"
@@ -522,7 +522,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     data = Path(data).expanduser()
     out = Path(out_dir).expanduser() / f"boltz_results_{data.stem}"
-    msa_dir = cache / "msa"
+    msa_dir = Path(out_dir).expanduser() / "msa"
     struct_dir = out / "structures"
     msa_dir.mkdir(parents=True, exist_ok=True)
     struct_dir.mkdir(parents=True, exist_ok=True)
