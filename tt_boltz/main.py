@@ -481,6 +481,7 @@ def cli(): pass
 @click.option("--diffusion_samples_affinity", default=5, type=int)
 @click.option("--affinity_checkpoint", type=click.Path(exists=True), default=None)
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
+@click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use (e.g. '0,2')")
 @click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
@@ -490,7 +491,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
-            num_devices, debug, log):
+            num_devices, device_ids, debug, log):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -555,10 +556,17 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     # Detect TT devices via filesystem (no ttnn import — avoids PCIe lock in parent)
     if use_tt:
         import glob as _glob
-        n_available = len(_glob.glob("/dev/tenstorrent/[0-9]*"))
-        n_devices = min(num_devices, n_available) if num_devices > 0 else n_available
-        n_devices = max(1, min(n_devices, len(files)))
+        all_devices = sorted(int(p.rsplit("/", 1)[-1]) for p in _glob.glob("/dev/tenstorrent/[0-9]*"))
+        if device_ids:
+            devices = [int(d.strip()) for d in device_ids.split(",")]
+        elif num_devices > 0:
+            devices = all_devices[:num_devices]
+        else:
+            devices = all_devices
+        devices = devices[:len(files)]
+        n_devices = max(1, len(devices))
     else:
+        devices = [0]
         n_devices = 1
 
 
@@ -632,8 +640,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
         try:
             if n_devices == 1:
-                os.environ["TT_VISIBLE_DEVICES"] = "0"
-                _predict_worker(0, [str(x) for x in files], worker_cfg, q, pq,
+                os.environ["TT_VISIBLE_DEVICES"] = str(devices[0])
+                _predict_worker(devices[0], [str(x) for x in files], worker_cfg, q, pq,
                                 suppress_output=suppress)
                 msg = q.get()
                 results.extend(msg.get("results", []))
@@ -644,7 +652,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 for i, bucket in enumerate(file_buckets):
                     if bucket:
                         p = ctx.Process(target=_predict_worker,
-                                        args=(i, [str(x) for x in bucket], worker_cfg, q, pq),
+                                        args=(devices[i], [str(x) for x in bucket], worker_cfg, q, pq),
                                         kwargs={"suppress_output": suppress})
                         p.start()
                         procs.append(p)
