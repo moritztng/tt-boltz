@@ -257,6 +257,8 @@ templates:
 | `--use_msa_server` | `False` | Auto-generate MSAs |
 | `--use_potentials` | `False` | Apply physical constraints |
 | `--affinity_mw_correction` | `False` | Apply MW correction to affinity |
+| `--num_devices` | `0` | Number of TT devices (0=all available) |
+| `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
 
 **Affinity-Specific Options:**
 
