@@ -125,7 +125,8 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
         if chain.mol_type == const.chain_type_ids["PROTEIN"] and chain.msa_id == 0:
             seq = target.sequences[chain.entity_id]
             seq_hash = hashlib.sha256(seq.encode()).hexdigest()[:16]
-            chain.msa_id = str(msa_dir / f"{seq_hash}.csv")
+            a3m = msa_dir / f"{seq_hash}.a3m"
+            chain.msa_id = str(a3m) if a3m.exists() else str(msa_dir / f"{seq_hash}.csv")
             if not Path(chain.msa_id).exists():
                 to_gen[seq_hash] = seq
         elif chain.msa_id == 0:
