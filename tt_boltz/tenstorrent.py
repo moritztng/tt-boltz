@@ -272,13 +272,12 @@ class TriangleAttention(Module):
         self.layer_norm_bias = self.torch_to_tt("layer_norm.bias")
         self.o_weight = self.torch_to_tt("linear_o.weight")
         self.bias_weight = ttnn.multiply_(self.torch_to_tt("linear.weight"), self.scale)
-        self.qkvg_weight = ttnn.from_torch(
+        self.qkv_weight = ttnn.from_torch(
             torch.cat(
                 [
                     self.state_dict["linear_q.weight"],
                     self.state_dict["linear_k.weight"],
                     self.state_dict["linear_v.weight"],
-                    self.state_dict["linear_g.weight"],
                 ],
                 dim=0,
             ).t(),
@@ -286,6 +285,7 @@ class TriangleAttention(Module):
             device=self.device,
             dtype=_dtype(),
         )
+        self.g_weight = self.torch_to_tt("linear_g.weight", dtype=_dtype())
 
     def __call__(self, x: ttnn.Tensor, attn_mask: ttnn.Tensor = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
@@ -305,16 +305,19 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat16,
             core_grid=ttnn.CoreGrid(y=9, x=12),
         )
-        qkvg = ttnn.experimental.minimal_matmul(
+        qkv = ttnn.experimental.minimal_matmul(
             input_tensor=x,
-            weight_tensor=self.qkvg_weight,
+            weight_tensor=self.qkv_weight,
             compute_kernel_config=self.compute_kernel_config,
             dtype=_dtype(),
         )
-        split_idx = 3 * self.head_dim * self.n_heads
-        qkv = qkvg[..., :split_idx]
-        g = qkvg[..., split_idx:]
-        del qkvg
+        g = ttnn.experimental.minimal_matmul(
+            input_tensor=x,
+            weight_tensor=self.g_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=_dtype(),
+        )
+        ttnn.deallocate(x)
         triangle_bias = ttnn.unsqueeze(triangle_bias, 0)
         triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
 
@@ -339,12 +342,20 @@ class TriangleAttention(Module):
             return ttnn.squeeze(o, 1)
 
         S = qkv.shape[0]
-        if self.affinity and S > SEQ_LEN_MORE_CHUNKING:
+        need_chunk = S > SEQ_LEN_MORE_CHUNKING and (self.affinity or not USE_BLOCKFP8)
+        if need_chunk:
+            if not self.affinity and attn_mask is not None:
+                triangle_bias = ttnn.add(triangle_bias, attn_mask)
+            chunk = 1024 if USE_BLOCKFP8 else 512
             parts = []
-            for s in range(0, S, 1024):
-                bias = ttnn.add(triangle_bias, attn_mask[s:min(s+1024, S), :, :])
-                parts.append(attend(qkv[s:min(s+1024, S), :, :, :], bias))
-                ttnn.deallocate(bias)
+            for s in range(0, S, chunk):
+                end = min(s + chunk, S)
+                if self.affinity:
+                    bias = ttnn.add(triangle_bias, attn_mask[s:end, :, :])
+                    parts.append(attend(qkv[s:end, :, :], bias))
+                    ttnn.deallocate(bias)
+                else:
+                    parts.append(attend(qkv[s:end, :, :], triangle_bias))
             ttnn.deallocate(qkv)
             ttnn.deallocate(triangle_bias)
             o = ttnn.concat(parts, dim=0)
@@ -355,8 +366,11 @@ class TriangleAttention(Module):
             if attn_mask is not None:
                 triangle_bias = ttnn.add(triangle_bias, attn_mask)
             o = attend(qkv, triangle_bias)
+            ttnn.deallocate(qkv)
+            ttnn.deallocate(triangle_bias)
 
         o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
+        ttnn.deallocate(g)
         x = ttnn.linear(
             o,
             self.o_weight,
