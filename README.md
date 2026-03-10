@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz is the Boltz-2 implementation for inference on a single Tenstorrent Blackhole or Wormhole.
+TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card (e.g. QuietBox with 4 cards) configurations.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -113,9 +113,6 @@ properties:
 
 ```
 boltz_results_prot/
-├── msa/
-│   ├── prot_0.csv                    # Cached MSA
-│   └── ...                           # MSA generation intermediates
 ├── structures/
 │   ├── prot.cif                      # Best-ranked predicted structure
 │   └── prot_model_1.cif              # Additional samples (if diffusion_samples > 1)
@@ -124,6 +121,8 @@ boltz_results_prot/
 ├── prot_pde.npz                      # (optional, --write_pde)
 └── prot_embeddings.npz               # (optional, --write_embeddings)
 ```
+
+MSA results are cached in `<out_dir>/msa/` (default `./msa/`), keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs.
 
 ### Confidence Scores
 
@@ -258,6 +257,8 @@ templates:
 | `--use_msa_server` | `False` | Auto-generate MSAs |
 | `--use_potentials` | `False` | Apply physical constraints |
 | `--affinity_mw_correction` | `False` | Apply MW correction to affinity |
+| `--num_devices` | `0` | Number of TT devices (0=all available) |
+| `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
 
 **Affinity-Specific Options:**
 
