@@ -7,6 +7,7 @@ if "--debug" not in _sys.argv:
     _os.environ.setdefault("LOGURU_LEVEL", "WARNING")
     _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
 
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -74,7 +75,7 @@ def download_all(cache: Path) -> None:
 
 def compute_msa(seqs: dict[str, str], target_id: str, msa_dir: Path, url: str, strategy: str,
                 username: str = None, password: str = None, api_key: str = None) -> None:
-    """Generate MSAs for protein sequences."""
+    """Generate MSAs for protein sequences via ColabFold server."""
     click.echo(f"MSA for {target_id} ({len(seqs)} sequences)")
     headers = {"Content-Type": "application/json", "X-API-Key": api_key} if api_key else None
     seqs_list = list(seqs.values())
@@ -103,7 +104,8 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      max_msa, method=None, affinity=False, pred_structure=None):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
-    Only MSA CSV files touch disk (cached in msa_dir).
+    MSA CSV files are cached in msa_dir by sequence hash — the same
+    protein sequence is never searched twice across any input file or run.
     Returns (features_dict, input_structure).
     """
     suffix = path.suffix.lower()
@@ -117,18 +119,20 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
     record = target.record
     struct = pred_structure if pred_structure is not None else target.structure
 
-    # Identify protein chains needing MSA
+    # Identify protein chains needing MSA, keyed by sequence hash for global caching
     to_gen = {}
     for chain in record.chains:
         if chain.mol_type == const.chain_type_ids["PROTEIN"] and chain.msa_id == 0:
-            msa_name = f"{record.id}_{chain.entity_id}"
-            to_gen[msa_name] = target.sequences[chain.entity_id]
-            chain.msa_id = str(msa_dir / f"{msa_name}.csv")
+            seq = target.sequences[chain.entity_id]
+            seq_hash = hashlib.sha256(seq.encode()).hexdigest()[:16]
+            a3m = msa_dir / f"{seq_hash}.a3m"
+            chain.msa_id = str(a3m) if a3m.exists() else str(msa_dir / f"{seq_hash}.csv")
+            if not Path(chain.msa_id).exists():
+                to_gen[seq_hash] = seq
         elif chain.msa_id == 0:
             chain.msa_id = -1
 
-    # Generate MSA if not cached
-    if to_gen and not all((msa_dir / f"{k}.csv").exists() for k in to_gen):
+    if to_gen:
         if not use_msa:
             raise RuntimeError("Missing MSAs, use --use_msa_server")
         compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
@@ -223,6 +227,13 @@ def to_batch(feats: dict, device: torch.device) -> dict:
     return batch
 
 
+def _atomic_write(path: Path, content: str):
+    """Write file atomically via tmp+rename to prevent corruption on crash."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.rename(path)
+
+
 def write_result(pred, batch, input_struct, out_dir, fmt,
                  write_pae=False, write_pde=False, write_embeddings=False):
     """Write CIF/PDB structure files. Return (metrics_dict, best_structure).
@@ -257,20 +268,22 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
 
         if model_rank == 0:
             best_struct = new_struct
-            (out_dir / f"{record.id}.{fmt}").write_text(write_fn(new_struct, plddt, True))
+            _atomic_write(out_dir / f"{record.id}.{fmt}", write_fn(new_struct, plddt, True))
         else:
-            (out_dir / f"{record.id}_model_{model_rank}.{fmt}").write_text(write_fn(new_struct, plddt, True))
+            _atomic_write(out_dir / f"{record.id}_model_{model_rank}.{fmt}", write_fn(new_struct, plddt, True))
 
-    # All confidence metrics from best model
     best_idx = next(i for i, r in rank.items() if r == 0)
+    num_samples = pred["coords"].shape[0]
     metrics = {}
 
     scalar_keys = ["confidence_score", "ptm", "iptm", "ligand_iptm", "protein_iptm",
                    "complex_plddt", "complex_iplddt", "complex_pde", "complex_ipde"]
-    for k in scalar_keys:
-        metrics[k] = round(pred[k][best_idx].item(), 6) if k in pred else 0.0
 
-    # Per-chain-pair iPTM (nested dict, natural in JSON)
+    def _scalars(idx):
+        return {k: round(pred[k][idx].item(), 6) if k in pred else 0.0 for k in scalar_keys}
+
+    metrics.update(_scalars(best_idx))
+
     if "pair_chains_iptm" in pred:
         pci = pred["pair_chains_iptm"]
         metrics["pair_chains_iptm"] = {
@@ -280,6 +293,10 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
         metrics["chains_ptm"] = {
             i: round(pci[i][i][best_idx].item(), 6) for i in pci if i in pci[i]
         }
+
+    if num_samples > 1:
+        idx_by_rank = sorted(rank, key=rank.get)
+        metrics["all_runs"] = [{"rank": rank[i], **_scalars(i)} for i in idx_by_rank]
 
     # Optional large outputs
     if write_pae and "pae" in pred:
@@ -298,6 +315,17 @@ def _save_results(results: list[dict], path: Path) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(results, indent=2))
     tmp.rename(path)
+
+
+def _append_result(row: dict, path: Path) -> None:
+    """Append one result row to results.json atomically.
+
+    Safe for concurrent workers: reads existing, merges, writes via rename.
+    """
+    existing = json.loads(path.read_text()) if path.exists() else []
+    existing = [r for r in existing if r["id"] != row["id"]]
+    existing.append(row)
+    _save_results(existing, path)
 
 
 def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
@@ -383,6 +411,9 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
             _pq("done", name=path.stem, time=elapsed, status=row["status"],
                 error=row.get("error", ""))
             results.append(row)
+            if "results_path" in cfg:
+                try: _append_result(row, Path(cfg["results_path"]))
+                except Exception: pass
 
         if affinity_items:
             aff_model = Boltz2.load_from_checkpoint(
@@ -451,6 +482,7 @@ def cli(): pass
 @click.option("--diffusion_samples_affinity", default=5, type=int)
 @click.option("--affinity_checkpoint", type=click.Path(exists=True), default=None)
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
+@click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use (e.g. '0,2')")
 @click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
@@ -460,7 +492,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
-            num_devices, debug, log):
+            num_devices, device_ids, debug, log):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -468,8 +500,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     \b
     Output:
+        msa/                # MSA cache (keyed by sequence hash, shared across runs)
         boltz_results_<name>/
-            msa/            # cached MSA CSVs
             structures/     # one CIF per complex (pLDDT in B-factors)
             results.json    # all confidence metrics + affinity
     """
@@ -499,7 +531,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     data = Path(data).expanduser()
     out = Path(out_dir).expanduser() / f"boltz_results_{data.stem}"
-    msa_dir = out / "msa"
+    msa_dir = Path(out_dir).expanduser() / "msa"
     struct_dir = out / "structures"
     msa_dir.mkdir(parents=True, exist_ok=True)
     struct_dir.mkdir(parents=True, exist_ok=True)
@@ -525,10 +557,17 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     # Detect TT devices via filesystem (no ttnn import — avoids PCIe lock in parent)
     if use_tt:
         import glob as _glob
-        n_available = len(_glob.glob("/dev/tenstorrent/[0-9]*"))
-        n_devices = min(num_devices, n_available) if num_devices > 0 else n_available
-        n_devices = max(1, min(n_devices, len(files)))
+        all_devices = sorted(int(p.rsplit("/", 1)[-1]) for p in _glob.glob("/dev/tenstorrent/[0-9]*"))
+        if device_ids:
+            devices = [int(d.strip()) for d in device_ids.split(",")]
+        elif num_devices > 0:
+            devices = all_devices[:num_devices]
+        else:
+            devices = all_devices
+        devices = devices[:len(files)]
+        n_devices = max(1, len(devices))
     else:
+        devices = [0]
         n_devices = 1
 
 
@@ -587,6 +626,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+            "results_path": str(results_path),
         }
         import sys as _sys
         ctx = mp.get_context("spawn")
@@ -601,8 +641,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
         try:
             if n_devices == 1:
-                os.environ["TT_VISIBLE_DEVICES"] = "0"
-                _predict_worker(0, [str(x) for x in files], worker_cfg, q, pq,
+                os.environ["TT_VISIBLE_DEVICES"] = str(devices[0])
+                _predict_worker(devices[0], [str(x) for x in files], worker_cfg, q, pq,
                                 suppress_output=suppress)
                 msg = q.get()
                 results.extend(msg.get("results", []))
@@ -613,7 +653,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 for i, bucket in enumerate(file_buckets):
                     if bucket:
                         p = ctx.Process(target=_predict_worker,
-                                        args=(i, [str(x) for x in bucket], worker_cfg, q, pq),
+                                        args=(devices[i], [str(x) for x in bucket], worker_cfg, q, pq),
                                         kwargs={"suppress_output": suppress})
                         p.start()
                         procs.append(p)
@@ -688,6 +728,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         "time": elapsed, "status": row["status"],
                         "error": row.get("error", "")})
                 results.append(row)
+                _save_results(results, results_path)
             del model
 
             if affinity_queue:
