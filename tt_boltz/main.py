@@ -121,10 +121,11 @@ def _find_colabfold_search() -> str:
 
 
 def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
-                        db_path: str) -> None:
+                        db_path: str, num_threads: int = 0) -> None:
     """Generate MSAs locally via colabfold_search against a local database."""
     click.echo(f"MSA for {target_id} ({len(seqs)} sequences, offline)")
     colabfold_bin = _find_colabfold_search()
+    threads = num_threads if num_threads > 0 else (os.cpu_count() or 1)
     tmp = msa_dir / f"_offline_tmp_{os.getpid()}"
     tmp.mkdir(exist_ok=True)
     try:
@@ -137,7 +138,7 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
         result = subprocess.run(
             [colabfold_bin, str(fasta), db_path, str(a3m_out),
              "--use-env", "0", "--use-templates", "0",
-             "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1)],
+             "--db-load-mode", "2", "--threads", str(threads)],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -154,8 +155,8 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
 
 def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      use_msa, msa_url, msa_strategy, msa_user, msa_pass, api_key,
-                     max_msa, msa_db_path=None, method=None, affinity=False,
-                     pred_structure=None):
+                     max_msa, msa_db_path=None, msa_threads=0, method=None,
+                     affinity=False, pred_structure=None):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
     MSA files are cached in msa_dir by sequence hash — the same
@@ -188,7 +189,7 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
 
     if to_gen:
         if msa_db_path:
-            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path)
+            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path, num_threads=msa_threads)
         elif use_msa:
             compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
         else:
@@ -432,6 +433,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
             msa_strategy=cfg["msa_pairing_strategy"], msa_user=cfg["msa_server_username"],
             msa_pass=cfg["msa_server_password"], api_key=cfg["api_key_value"],
             max_msa=cfg["max_msa_seqs"], msa_db_path=cfg.get("msa_db_path"),
+            msa_threads=cfg.get("msa_threads", 0),
         )
 
         _pq("loading")
@@ -689,6 +691,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+            "msa_threads": max(1, (os.cpu_count() or 1) // n_devices),
             "results_path": str(results_path),
         }
         import sys as _sys
