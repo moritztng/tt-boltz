@@ -193,6 +193,11 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
             compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
         else:
             raise RuntimeError("Missing MSAs — use --use_msa_server or --msa_db_path")
+        for chain in record.chains:
+            if isinstance(chain.msa_id, str) and not Path(chain.msa_id).exists():
+                a3m = Path(chain.msa_id).with_suffix(".a3m")
+                if a3m.exists():
+                    chain.msa_id = str(a3m)
 
     # Parse MSAs in memory (deduplicated by path)
     msa_cache = {}
