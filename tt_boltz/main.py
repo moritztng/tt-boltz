@@ -12,6 +12,8 @@ import json
 import multiprocessing as mp
 import os
 import random
+import shutil
+import subprocess
 import tarfile
 import time
 import traceback
@@ -99,12 +101,64 @@ def compute_msa(seqs: dict[str, str], target_id: str, msa_dir: Path, url: str, s
         (msa_dir / f"{name}.csv").write_text("\n".join(lines))
 
 
+_COLABFOLD_SEARCH_PATHS = [
+    Path.home() / "localcolabfold" / ".pixi" / "envs" / "default" / "bin" / "colabfold_search",
+]
+
+
+def _find_colabfold_search() -> str:
+    """Find colabfold_search binary on PATH or at common install locations."""
+    found = shutil.which("colabfold_search")
+    if found:
+        return found
+    for p in _COLABFOLD_SEARCH_PATHS:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    raise RuntimeError(
+        "colabfold_search not found. Install localcolabfold:\n"
+        "  https://github.com/YoshitakaMo/localcolabfold"
+    )
+
+
+def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
+                        db_path: str) -> None:
+    """Generate MSAs locally via colabfold_search against a local database."""
+    click.echo(f"MSA for {target_id} ({len(seqs)} sequences, offline)")
+    colabfold_bin = _find_colabfold_search()
+    tmp = msa_dir / f"_offline_tmp_{os.getpid()}"
+    tmp.mkdir(exist_ok=True)
+    try:
+        fasta = tmp / "query.fasta"
+        with open(fasta, "w") as f:
+            for name, seq in seqs.items():
+                f.write(f">{name}\n{seq}\n")
+        a3m_out = tmp / "a3m"
+        a3m_out.mkdir(exist_ok=True)
+        result = subprocess.run(
+            [colabfold_bin, str(fasta), db_path, str(a3m_out),
+             "--use-env", "0", "--use-templates", "0",
+             "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"colabfold_search failed (exit {result.returncode})")
+        for name in seqs:
+            src = a3m_out / f"{name}.a3m"
+            if src.exists():
+                shutil.copy2(src, msa_dir / f"{name}.a3m")
+            else:
+                click.echo(f"  warning: no A3M for {name}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      use_msa, msa_url, msa_strategy, msa_user, msa_pass, api_key,
-                     max_msa, method=None, affinity=False, pred_structure=None):
+                     max_msa, msa_db_path=None, method=None, affinity=False,
+                     pred_structure=None):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
-    MSA CSV files are cached in msa_dir by sequence hash — the same
+    MSA files are cached in msa_dir by sequence hash — the same
     protein sequence is never searched twice across any input file or run.
     Returns (features_dict, input_structure).
     """
@@ -133,9 +187,12 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
             chain.msa_id = -1
 
     if to_gen:
-        if not use_msa:
-            raise RuntimeError("Missing MSAs, use --use_msa_server")
-        compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
+        if msa_db_path:
+            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path)
+        elif use_msa:
+            compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
+        else:
+            raise RuntimeError("Missing MSAs — use --use_msa_server or --msa_db_path")
 
     # Parse MSAs in memory (deduplicated by path)
     msa_cache = {}
@@ -369,7 +426,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
             use_msa=cfg["use_msa_server"], msa_url=cfg["msa_server_url"],
             msa_strategy=cfg["msa_pairing_strategy"], msa_user=cfg["msa_server_username"],
             msa_pass=cfg["msa_server_password"], api_key=cfg["api_key_value"],
-            max_msa=cfg["max_msa_seqs"],
+            max_msa=cfg["max_msa_seqs"], msa_db_path=cfg.get("msa_db_path"),
         )
 
         _pq("loading")
@@ -461,7 +518,8 @@ def cli(): pass
 @click.option("--output_format", type=click.Choice(["pdb", "cif"]), default="cif")
 @click.option("--override", is_flag=True)
 @click.option("--seed", default=None, type=int)
-@click.option("--use_msa_server", is_flag=True)
+@click.option("--use_msa_server", is_flag=True, help="Generate MSAs via ColabFold API (requires internet)")
+@click.option("--msa_db_path", default=None, type=click.Path(exists=True), help="Local ColabFold DB for offline MSA (e.g. ~/colabfold_db)")
 @click.option("--msa_server_url", default="https://api.colabfold.com")
 @click.option("--msa_pairing_strategy", default="greedy")
 @click.option("--msa_server_username", default=None)
@@ -487,7 +545,7 @@ def cli(): pass
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
-            seed, use_msa_server, msa_server_url, msa_pairing_strategy,
+            seed, use_msa_server, msa_db_path, msa_server_url, msa_pairing_strategy,
             msa_server_username, msa_server_password, api_key_value, use_potentials,
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
@@ -622,8 +680,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "mol_dir": str(mol_dir), "msa_dir": str(msa_dir), "struct_dir": str(struct_dir),
             "method": method, "output_format": output_format,
             "write_pae": write_pae, "write_pde": write_pde, "write_embeddings": write_embeddings,
-            "use_msa_server": use_msa_server, "msa_server_url": msa_server_url,
-            "msa_pairing_strategy": msa_pairing_strategy,
+            "use_msa_server": use_msa_server, "msa_db_path": msa_db_path,
+            "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
             "results_path": str(results_path),
@@ -679,7 +737,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                           tokenizer=tokenizer, featurizer=featurizer,
                           use_msa=use_msa_server, msa_url=msa_server_url,
                           msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
-                          msa_pass=msa_server_password, api_key=api_key_value, max_msa=max_msa_seqs)
+                          msa_pass=msa_server_password, api_key=api_key_value,
+                          max_msa=max_msa_seqs, msa_db_path=msa_db_path)
 
         from queue import Queue as ThreadQueue
         pq = ThreadQueue()
