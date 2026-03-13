@@ -53,17 +53,40 @@ pip install -e .
 
 ### Structure Prediction
 
-Predict protein structures with automatic MSA generation:
-
 ```bash
 tt-boltz predict examples/prot.yaml --use_msa_server --override
 ```
 
+Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
+`--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
+
 `predict` accepts either a single YAML/FASTA file or a directory containing many input files.
 
+### Offline MSA (Optional)
+
+Use this if you have enough disk and RAM and want local MSA.
+This avoids external MSA server calls and is faster for repeated runs.
+
+```bash
+tt-boltz msa
+tt-boltz predict examples/prot.yaml --override
+```
+
+`tt-boltz msa` downloads UniRef30 to `~/.boltz/msa_db` (~100GB download, ~500GB on disk after indexing). `predict` auto-detects this path.
+
+To add EnvDB and use it in prediction:
+EnvDB can improve MSA coverage when UniRef30 hits are weak, at higher disk/RAM cost.
+
+```bash
+tt-boltz msa --db all
+tt-boltz predict examples/prot.yaml --use_envdb --override
+```
+
 **Key Options:**
-- `--use_msa_server`: Automatically generate MSAs (required if no MSA provided)
 - `--override`: Re-run from scratch, ignoring cached files
+- `--use_msa_server`: Generate MSA via ColabFold API
+- `--msa_db_path`: Use a local database at a custom path (e.g. `--msa_db_path /data/colabfold_db`)
+- `--use_envdb`: Include EnvDB in offline MSA (`tt-boltz msa --db all`)
 - `--accelerator=tenstorrent`: Use Tenstorrent hardware (default, or use `cpu`/`gpu`)
 - `--debug`: Show all raw output from the hardware and libraries instead of the progress display
 - `--debug --log`: Same as `--debug`, but also print what each device is currently working on
@@ -122,7 +145,7 @@ boltz_results_prot/
 └── prot_embeddings.npz               # (optional, --write_embeddings)
 ```
 
-MSA results are cached in `<out_dir>/msa/` (default `./msa/`), keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs.
+MSA results are cached in `<out_dir>/msa/` (default `./msa/`), keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs. The MSA search uses all available CPU threads and keeps the database index memory-mapped for maximum speed.
 
 ### Confidence Scores
 
@@ -254,7 +277,7 @@ templates:
 | `--diffusion_samples` | `1` | Number of structure samples |
 | `--output_format` | `cif` | `cif` or `pdb` |
 | `--override` | `False` | Re-run from scratch |
-| `--use_msa_server` | `False` | Auto-generate MSAs |
+| `--use_msa_server` | `False` | Use online ColabFold API for MSAs |
 | `--use_potentials` | `False` | Apply physical constraints |
 | `--affinity_mw_correction` | `False` | Apply MW correction to affinity |
 | `--num_devices` | `0` | Number of TT devices (0=all available) |
@@ -271,13 +294,25 @@ templates:
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--msa_db_path` | auto-detect | Path to local ColabFold database |
+| `--use_envdb` | `False` | Also search environmental database |
+| `--use_msa_server` | `False` | Use ColabFold API for MSA |
 | `--msa_server_url` | `https://api.colabfold.com` | MSA server URL |
 | `--msa_pairing_strategy` | `greedy` | `greedy` or `complete` |
 | `--max_msa_seqs` | `8192` | Maximum MSA sequences |
 | `--subsample_msa` | `False` | Subsample MSA |
 | `--num_subsampled_msa` | `1024` | Number of subsampled sequences |
 
+**MSA Database Setup Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--db` | `uniref30` | `uniref30` (~500GB), `envdb` (~800GB), or `all` |
+| `--path` | `~/.boltz/msa_db` | Where to store the databases |
+
 ### MSA Server Authentication
+
+For `--use_msa_server`:
 
 **Basic Authentication:**
 ```bash
