@@ -150,51 +150,72 @@ def _missing_offline_tools() -> list[str]:
     return missing
 
 
+def _ensure_pixi() -> str:
+    """Ensure pixi is installed and return its path."""
+    pixi = _find_pixi()
+    if pixi:
+        return pixi
+    if not shutil.which("curl"):
+        raise RuntimeError("curl is required to auto-install pixi")
+    click.echo("Installing pixi ...")
+    subprocess.run(
+        ["bash", "-lc", "curl -fsSL https://pixi.sh/install.sh | sh"],
+        check=True,
+    )
+    pixi = _find_pixi()
+    if not pixi:
+        raise RuntimeError("pixi install finished but pixi binary was not found")
+    return pixi
+
+
+def _ensure_aria2(pixi: str) -> None:
+    """Install aria2 via pixi if not already available."""
+    if shutil.which("aria2c"):
+        return
+    click.echo("Installing aria2 for fast parallel downloads ...")
+    subprocess.run([pixi, "global", "install", "aria2"], check=True)
+
+
 def _ensure_offline_tools(install_tools: bool) -> None:
-    """Ensure mmseqs + colabfold_search are available; optionally install them."""
+    """Ensure mmseqs + colabfold_search + aria2 are available; optionally install them."""
     missing = _missing_offline_tools()
-    if not missing:
+    need_aria2 = not shutil.which("aria2c")
+
+    if not missing and not need_aria2:
         return
     if not install_tools:
+        all_missing = missing + (["aria2c"] if need_aria2 else [])
         raise RuntimeError(
-            "Missing offline MSA tools: " + ", ".join(missing) + "\n"
+            "Missing offline MSA tools: " + ", ".join(all_missing) + "\n"
             "Rerun with: tt-boltz msa --install-tools"
         )
 
-    click.echo("Missing offline MSA tools: " + ", ".join(missing))
-    click.echo("Installing localcolabfold toolchain ...")
+    pixi = _ensure_pixi()
+    _ensure_aria2(pixi)
 
-    if not shutil.which("git"):
-        raise RuntimeError("git is required to auto-install localcolabfold")
-
-    pixi = _find_pixi()
-    if not pixi:
-        if not shutil.which("curl"):
-            raise RuntimeError("curl is required to auto-install pixi")
-        subprocess.run(
-            ["bash", "-lc", "curl -fsSL https://pixi.sh/install.sh | sh"],
-            check=True,
-        )
-        pixi = _find_pixi()
-        if not pixi:
-            raise RuntimeError("pixi install finished but pixi binary was not found")
-
-    lc = Path.home() / "localcolabfold"
-    if not lc.exists():
-        subprocess.run(
-            ["git", "clone", "https://github.com/YoshitakaMo/localcolabfold.git", str(lc)],
-            check=True,
-        )
-
-    subprocess.run([pixi, "install"], cwd=str(lc), check=True)
-    subprocess.run([pixi, "run", "setup"], cwd=str(lc), check=True)
-
-    missing = _missing_offline_tools()
     if missing:
-        raise RuntimeError(
-            "localcolabfold setup completed but tools are still missing: "
-            + ", ".join(missing)
-        )
+        click.echo("Missing offline MSA tools: " + ", ".join(missing))
+        click.echo("Installing localcolabfold toolchain ...")
+
+        if not shutil.which("git"):
+            raise RuntimeError("git is required to auto-install localcolabfold")
+
+        lc = Path.home() / "localcolabfold"
+        if not lc.exists():
+            subprocess.run(
+                ["git", "clone", "https://github.com/YoshitakaMo/localcolabfold.git", str(lc)],
+                check=True,
+            )
+
+        subprocess.run([pixi, "install"], cwd=str(lc), check=True)
+        subprocess.run([pixi, "run", "setup"], cwd=str(lc), check=True)
+
+        missing = _missing_offline_tools()
+        if missing:
+            raise RuntimeError(
+                "localcolabfold setup completed but tools are still missing: "
+                + ", ".join(missing)
+            )
 
 
 def _find_mmseqs() -> str:
@@ -212,20 +233,36 @@ def _find_mmseqs() -> str:
     )
 
 
-def _download_file(url: str, dest: Path) -> None:
-    """Download a large file with the best available tool."""
+def _download_file(url: str, dest: Path, max_retries: int = 5) -> None:
+    """Download a large file with retries and tool fallback."""
     click.echo(f"  Downloading {dest.name} ...")
+    tools = []
     if shutil.which("aria2c"):
-        subprocess.run(
-            ["aria2c", "--max-connection-per-server=8", "--allow-overwrite=true",
-             "-o", dest.name, "-d", str(dest.parent), url], check=True)
-    elif shutil.which("curl"):
-        subprocess.run(["curl", "-L", "--progress-bar", "-o", str(dest), url], check=True)
-    elif shutil.which("wget"):
-        subprocess.run(["wget", "-O", str(dest), url], check=True)
-    else:
-        click.echo("    (no aria2c/curl/wget — using Python urllib, may be slow for large files)")
+        tools.append(("aria2c", [
+            "aria2c", "--max-connection-per-server=8", "--split=8",
+            "--allow-overwrite=true", "--auto-file-renaming=false",
+            "--retry-wait=5", "--max-tries=0",
+            "-o", dest.name, "-d", str(dest.parent), url]))
+    if shutil.which("curl"):
+        tools.append(("curl", [
+            "curl", "-L", "--retry", "10", "--retry-delay", "5",
+            "-C", "-", "--progress-bar", "-o", str(dest), url]))
+    if shutil.which("wget"):
+        tools.append(("wget", [
+            "wget", "-c", "--tries=10", "--wait=5",
+            "-O", str(dest), url]))
+    if not tools:
+        click.echo("    (no aria2c/curl/wget — using Python urllib, may be slow)")
         urllib.request.urlretrieve(url, dest)
+        return
+    for attempt in range(1, max_retries + 1):
+        for name, cmd in tools:
+            try:
+                subprocess.run(cmd, check=True)
+                return
+            except subprocess.CalledProcessError:
+                click.echo(f"  {name} failed (attempt {attempt}/{max_retries}), retrying ...")
+    raise RuntimeError(f"Download failed after {max_retries} attempts: {url}")
 
 
 def _mmseqs_index_exists(db_dir: Path, db_name: str) -> bool:
