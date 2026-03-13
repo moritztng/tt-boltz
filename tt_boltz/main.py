@@ -120,8 +120,48 @@ def _find_colabfold_search() -> str:
     )
 
 
+_MMSEQS_SEARCH_PATHS = [
+    Path.home() / "localcolabfold" / ".pixi" / "envs" / "default" / "bin" / "mmseqs",
+]
+
+
+def _find_mmseqs() -> str:
+    """Find mmseqs binary on PATH or at common install locations."""
+    found = shutil.which("mmseqs")
+    if found:
+        return found
+    for p in _MMSEQS_SEARCH_PATHS:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    raise RuntimeError(
+        "mmseqs not found. Install localcolabfold:\n"
+        "  https://github.com/YoshitakaMo/localcolabfold"
+    )
+
+
+def _download_file(url: str, dest: Path) -> None:
+    """Download a large file with the best available tool."""
+    click.echo(f"  Downloading {dest.name} ...")
+    if shutil.which("aria2c"):
+        subprocess.run(
+            ["aria2c", "--max-connection-per-server=8", "--allow-overwrite=true",
+             "-o", dest.name, "-d", str(dest.parent), url], check=True)
+    elif shutil.which("curl"):
+        subprocess.run(["curl", "-L", "--progress-bar", "-o", str(dest), url], check=True)
+    elif shutil.which("wget"):
+        subprocess.run(["wget", "-O", str(dest), url], check=True)
+    else:
+        click.echo("    (no aria2c/curl/wget — using Python urllib, may be slow for large files)")
+        urllib.request.urlretrieve(url, dest)
+
+
+def _mmseqs_index_exists(db_dir: Path, db_name: str) -> bool:
+    """Return True if MMseqs index for db_name already exists."""
+    return (db_dir / f"{db_name}.idx").exists()
+
+
 def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
-                        db_path: str) -> None:
+                        db_path: str, use_env: bool = False) -> None:
     """Generate MSAs locally via colabfold_search against a local database."""
     click.echo(f"MSA for {target_id} ({len(seqs)} sequences, offline)")
     colabfold_bin = _find_colabfold_search()
@@ -136,7 +176,7 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
         a3m_out.mkdir(exist_ok=True)
         result = subprocess.run(
             [colabfold_bin, str(fasta), db_path, str(a3m_out),
-             "--use-env", "0", "--use-templates", "0",
+             "--use-env", "1" if use_env else "0", "--use-templates", "0",
              "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1)],
             capture_output=True, text=True,
         )
@@ -154,8 +194,8 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
 
 def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      use_msa, msa_url, msa_strategy, msa_user, msa_pass, api_key,
-                     max_msa, msa_db_path=None, method=None, affinity=False,
-                     pred_structure=None):
+                     max_msa, msa_db_path=None, use_envdb=False, method=None,
+                     affinity=False, pred_structure=None):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
     MSA files are cached in msa_dir by sequence hash — the same
@@ -188,7 +228,7 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
 
     if to_gen:
         if msa_db_path:
-            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path)
+            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path, use_env=use_envdb)
         elif use_msa:
             compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
         else:
@@ -432,6 +472,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
             msa_strategy=cfg["msa_pairing_strategy"], msa_user=cfg["msa_server_username"],
             msa_pass=cfg["msa_server_password"], api_key=cfg["api_key_value"],
             max_msa=cfg["max_msa_seqs"], msa_db_path=cfg.get("msa_db_path"),
+            use_envdb=cfg.get("use_envdb", False),
         )
 
         _pq("loading")
@@ -509,6 +550,91 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
 def cli(): pass
 
 
+_MSA_DBS = {
+    "uniref30": {
+        "url": "https://opendata.mmseqs.org/colabfold/uniref30_2302.db.tar.gz",
+        "name": "uniref30_2302_db",
+        "ready": "UNIREF30_READY",
+    },
+    "envdb": {
+        "url": "https://opendata.mmseqs.org/colabfold/colabfold_envdb_202108.db.tar.gz",
+        "name": "colabfold_envdb_202108_db",
+        "ready": "COLABDB_READY",
+    },
+}
+
+
+@cli.command()
+@click.option("--db", type=click.Choice(["uniref30", "envdb", "all"]), default="uniref30",
+              help="Database to download: uniref30 (~500GB), envdb (~800GB), or all (~1.3TB)")
+@click.option("--path", default=None, type=click.Path(),
+              help="Database location (default: ~/.boltz/msa_db)")
+def msa(db, path):
+    """Download MSA databases for offline structure prediction.
+
+    \b
+    After setup, predictions auto-detect the database:
+        tt-boltz msa
+        tt-boltz predict input.yaml
+    """
+    cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
+    db_dir = Path(path).expanduser() if path else cache / "msa_db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    mmseqs = _find_mmseqs()
+    dbs_to_setup = ["uniref30", "envdb"] if db == "all" else [db]
+
+    for name in dbs_to_setup:
+        info = _MSA_DBS[name]
+        ready = db_dir / info["ready"]
+        if ready.exists():
+            click.echo(f"{name}: already set up")
+            continue
+
+        click.echo(f"\n{name}: downloading")
+        tarball = db_dir / Path(info["url"]).name
+        _download_file(info["url"], tarball)
+
+        click.echo(f"{name}: extracting")
+        subprocess.run(["tar", "-xzf", str(tarball), "-C", str(db_dir)], check=True)
+
+        if _mmseqs_index_exists(db_dir, info["name"]):
+            click.echo(f"{name}: index already present")
+        else:
+            click.echo(f"{name}: building index (this takes a while)")
+            subprocess.run(
+                [mmseqs, "createindex", str(db_dir / info["name"]),
+                 str(db_dir / f"tmp_{name}"), "--remove-tmp-files", "1"],
+                check=True)
+
+        if name == "uniref30":
+            tax_url = "https://opendata.mmseqs.org/colabfold/uniref30_2302_newtaxonomy.tar.gz"
+            tax_tar = db_dir / "uniref30_2302_newtaxonomy.tar.gz"
+            _download_file(tax_url, tax_tar)
+            subprocess.run(["tar", "-xzf", str(tax_tar), "-C", str(db_dir)], check=True)
+            mapping = db_dir / "uniref30_2302_db_mapping"
+            if mapping.exists():
+                subprocess.run(
+                    [mmseqs, "createbintaxmapping", str(mapping), str(mapping) + ".bin"],
+                    check=False)
+                bin_path = Path(str(mapping) + ".bin")
+                if bin_path.exists():
+                    bin_path.rename(mapping)
+            for suffix in ("mapping", "taxonomy"):
+                src = db_dir / f"uniref30_2302_db_{suffix}"
+                link = db_dir / f"uniref30_2302_db.idx_{suffix}"
+                if src.exists() and not link.exists():
+                    link.symlink_to(src.name)
+            tax_tar.unlink(missing_ok=True)
+
+        tarball.unlink(missing_ok=True)
+        ready.touch()
+        click.echo(f"{name}: ready")
+
+    click.echo(f"\nDatabases: {db_dir}")
+    click.echo("Predictions will auto-detect this database, or pass explicitly:")
+    click.echo(f"  tt-boltz predict input.yaml --msa_db_path {db_dir}")
+
+
 @cli.command()
 @click.argument("data", type=click.Path(exists=True))
 @click.option("--out_dir", default="./")
@@ -524,7 +650,8 @@ def cli(): pass
 @click.option("--override", is_flag=True)
 @click.option("--seed", default=None, type=int)
 @click.option("--use_msa_server", is_flag=True, help="Generate MSAs via ColabFold API (requires internet)")
-@click.option("--msa_db_path", default=None, type=click.Path(exists=True), help="Local ColabFold DB for offline MSA (e.g. ~/colabfold_db)")
+@click.option("--msa_db_path", default=None, type=click.Path(exists=True), help="Local ColabFold DB for offline MSA (default: auto-detect ~/.boltz/msa_db)")
+@click.option("--use_envdb", is_flag=True, help="Also search ColabFold environmental database (requires envdb)")
 @click.option("--msa_server_url", default="https://api.colabfold.com")
 @click.option("--msa_pairing_strategy", default="greedy")
 @click.option("--msa_server_username", default=None)
@@ -550,7 +677,7 @@ def cli(): pass
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
-            seed, use_msa_server, msa_db_path, msa_server_url, msa_pairing_strategy,
+            seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
             msa_server_username, msa_server_password, api_key_value, use_potentials,
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
@@ -586,6 +713,23 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     cache = Path(cache).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
     download_all(cache)
+
+    # Auto-detect local MSA database
+    if not msa_db_path and not use_msa_server:
+        default_msa_db = cache / "msa_db"
+        if (default_msa_db / "UNIREF30_READY").exists():
+            msa_db_path = str(default_msa_db)
+
+    if use_envdb and use_msa_server:
+        click.echo("Note: --use_envdb is only used with offline MSA; ignored with --use_msa_server")
+
+    if use_envdb and msa_db_path:
+        env_ready = Path(msa_db_path).expanduser() / "COLABDB_READY"
+        if not env_ready.exists():
+            raise RuntimeError(
+                f"--use_envdb requested but EnvDB is not set up at {env_ready.parent}. "
+                "Run: tt-boltz msa --db all"
+            )
 
     if use_msa_server:
         msa_server_username = msa_server_username or os.environ.get("BOLTZ_MSA_USERNAME")
@@ -685,7 +829,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "mol_dir": str(mol_dir), "msa_dir": str(msa_dir), "struct_dir": str(struct_dir),
             "method": method, "output_format": output_format,
             "write_pae": write_pae, "write_pde": write_pde, "write_embeddings": write_embeddings,
-            "use_msa_server": use_msa_server, "msa_db_path": msa_db_path,
+            "use_msa_server": use_msa_server, "msa_db_path": msa_db_path, "use_envdb": use_envdb,
             "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
@@ -743,7 +887,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                           use_msa=use_msa_server, msa_url=msa_server_url,
                           msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
                           msa_pass=msa_server_password, api_key=api_key_value,
-                          max_msa=max_msa_seqs, msa_db_path=msa_db_path)
+                          max_msa=max_msa_seqs, msa_db_path=msa_db_path,
+                          use_envdb=use_envdb)
 
         from queue import Queue as ThreadQueue
         pq = ThreadQueue()
