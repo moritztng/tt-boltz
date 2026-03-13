@@ -115,7 +115,8 @@ def _find_colabfold_search() -> str:
         if p.is_file() and os.access(p, os.X_OK):
             return str(p)
     raise RuntimeError(
-        "colabfold_search not found. Install localcolabfold:\n"
+        "colabfold_search not found.\n"
+        "Install localcolabfold and/or activate the environment that provides it:\n"
         "  https://github.com/YoshitakaMo/localcolabfold"
     )
 
@@ -134,7 +135,8 @@ def _find_mmseqs() -> str:
         if p.is_file() and os.access(p, os.X_OK):
             return str(p)
     raise RuntimeError(
-        "mmseqs not found. Install localcolabfold:\n"
+        "mmseqs not found.\n"
+        "Install localcolabfold and/or activate the environment that provides it:\n"
         "  https://github.com/YoshitakaMo/localcolabfold"
     )
 
@@ -158,6 +160,32 @@ def _download_file(url: str, dest: Path) -> None:
 def _mmseqs_index_exists(db_dir: Path, db_name: str) -> bool:
     """Return True if MMseqs index for db_name already exists."""
     return (db_dir / f"{db_name}.idx").exists()
+
+
+def _validate_offline_msa_db(db_path: Path, require_envdb: bool = False) -> None:
+    """Validate local MSA DB layout and required ready markers."""
+    db_path = db_path.expanduser()
+    if not db_path.exists():
+        raise RuntimeError(
+            f"Offline MSA DB path does not exist: {db_path}\n"
+            "Run: tt-boltz msa --path <path>  (or use --use_msa_server)"
+        )
+    if not db_path.is_dir():
+        raise RuntimeError(f"Offline MSA DB path must be a directory: {db_path}")
+
+    uniref_ready = db_path / "UNIREF30_READY"
+    if not uniref_ready.exists():
+        raise RuntimeError(
+            f"Offline MSA DB is incomplete at {db_path} (missing UNIREF30_READY).\n"
+            "Run: tt-boltz msa --db uniref30 --path "
+            f"{db_path}  (or use --use_msa_server)"
+        )
+
+    if require_envdb and not (db_path / "COLABDB_READY").exists():
+        raise RuntimeError(
+            f"--use_envdb requested but EnvDB is not set up at {db_path}.\n"
+            f"Run: tt-boltz msa --db all --path {db_path}"
+        )
 
 
 def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
@@ -232,7 +260,11 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
         elif use_msa:
             compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
         else:
-            raise RuntimeError("Missing MSAs — use --use_msa_server or --msa_db_path")
+            raise RuntimeError(
+                "Missing MSAs. Use one of:\n"
+                "  1) Online:  --use_msa_server\n"
+                "  2) Offline: tt-boltz msa  (then rerun predict)"
+            )
         for chain in record.chains:
             if isinstance(chain.msa_id, str) and not Path(chain.msa_id).exists():
                 a3m = Path(chain.msa_id).with_suffix(".a3m")
@@ -714,7 +746,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     cache.mkdir(parents=True, exist_ok=True)
     download_all(cache)
 
-    # Auto-detect local MSA database
+    # Auto-detect local MSA DB (priority: --msa_db_path > ~/.boltz/msa_db)
     if not msa_db_path and not use_msa_server:
         default_msa_db = cache / "msa_db"
         if (default_msa_db / "UNIREF30_READY").exists():
@@ -723,13 +755,14 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     if use_envdb and use_msa_server:
         click.echo("Note: --use_envdb is only used with offline MSA; ignored with --use_msa_server")
 
-    if use_envdb and msa_db_path:
-        env_ready = Path(msa_db_path).expanduser() / "COLABDB_READY"
-        if not env_ready.exists():
-            raise RuntimeError(
-                f"--use_envdb requested but EnvDB is not set up at {env_ready.parent}. "
-                "Run: tt-boltz msa --db all"
-            )
+    if use_envdb and not use_msa_server and not msa_db_path:
+        raise RuntimeError(
+            "--use_envdb requires offline MSA DB setup.\n"
+            "Run: tt-boltz msa --db all  (or use --use_msa_server)"
+        )
+
+    if msa_db_path and not use_msa_server:
+        _validate_offline_msa_db(Path(msa_db_path), require_envdb=use_envdb)
 
     if use_msa_server:
         msa_server_username = msa_server_username or os.environ.get("BOLTZ_MSA_USERNAME")
