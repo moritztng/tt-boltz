@@ -56,14 +56,6 @@ tt-boltz predict --help
 tt-boltz msa --help
 ```
 
-### Offline MSA Prerequisites (Only if using Offline MSA)
-`tt-boltz msa` and offline `predict` require `mmseqs` and `colabfold_search`.
-Install [localcolabfold](https://github.com/YoshitakaMo/localcolabfold), then verify:
-```bash
-which mmseqs
-which colabfold_search
-```
-
 ## Basic Usage
 
 ### Structure Prediction
@@ -324,6 +316,7 @@ templates:
 |--------|---------|-------------|
 | `--db` | `uniref30` | `uniref30` (~500GB), `envdb` (~800GB), or `all` |
 | `--path` | `~/.boltz/msa_db` | Where to store the databases |
+| `--install-tools` | `True` | Auto-install missing `mmseqs`/`colabfold_search` |
 
 ### MSA Server Authentication
 

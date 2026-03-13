@@ -126,6 +126,77 @@ _MMSEQS_SEARCH_PATHS = [
 ]
 
 
+def _find_pixi() -> str | None:
+    """Find pixi binary on PATH or common install location."""
+    found = shutil.which("pixi")
+    if found:
+        return found
+    p = Path.home() / ".pixi" / "bin" / "pixi"
+    if p.is_file() and os.access(p, os.X_OK):
+        return str(p)
+    return None
+
+
+def _missing_offline_tools() -> list[str]:
+    missing = []
+    try:
+        _find_mmseqs()
+    except Exception:
+        missing.append("mmseqs")
+    try:
+        _find_colabfold_search()
+    except Exception:
+        missing.append("colabfold_search")
+    return missing
+
+
+def _ensure_offline_tools(install_tools: bool) -> None:
+    """Ensure mmseqs + colabfold_search are available; optionally install them."""
+    missing = _missing_offline_tools()
+    if not missing:
+        return
+    if not install_tools:
+        raise RuntimeError(
+            "Missing offline MSA tools: " + ", ".join(missing) + "\n"
+            "Rerun with: tt-boltz msa --install-tools"
+        )
+
+    click.echo("Missing offline MSA tools: " + ", ".join(missing))
+    click.echo("Installing localcolabfold toolchain ...")
+
+    if not shutil.which("git"):
+        raise RuntimeError("git is required to auto-install localcolabfold")
+
+    pixi = _find_pixi()
+    if not pixi:
+        if not shutil.which("curl"):
+            raise RuntimeError("curl is required to auto-install pixi")
+        subprocess.run(
+            ["bash", "-lc", "curl -fsSL https://pixi.sh/install.sh | sh"],
+            check=True,
+        )
+        pixi = _find_pixi()
+        if not pixi:
+            raise RuntimeError("pixi install finished but pixi binary was not found")
+
+    lc = Path.home() / "localcolabfold"
+    if not lc.exists():
+        subprocess.run(
+            ["git", "clone", "https://github.com/YoshitakaMo/localcolabfold.git", str(lc)],
+            check=True,
+        )
+
+    subprocess.run([pixi, "install"], cwd=str(lc), check=True)
+    subprocess.run([pixi, "run", "setup"], cwd=str(lc), check=True)
+
+    missing = _missing_offline_tools()
+    if missing:
+        raise RuntimeError(
+            "localcolabfold setup completed but tools are still missing: "
+            + ", ".join(missing)
+        )
+
+
 def _find_mmseqs() -> str:
     """Find mmseqs binary on PATH or at common install locations."""
     found = shutil.which("mmseqs")
@@ -601,7 +672,9 @@ _MSA_DBS = {
               help="Database to download: uniref30 (~500GB), envdb (~800GB), or all (~1.3TB)")
 @click.option("--path", default=None, type=click.Path(),
               help="Database location (default: ~/.boltz/msa_db)")
-def msa(db, path):
+@click.option("--install-tools/--no-install-tools", default=True,
+              help="Auto-install missing mmseqs/colabfold_search via localcolabfold")
+def msa(db, path, install_tools):
     """Download MSA databases for offline structure prediction.
 
     \b
@@ -612,6 +685,7 @@ def msa(db, path):
     cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
     db_dir = Path(path).expanduser() if path else cache / "msa_db"
     db_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_offline_tools(install_tools=install_tools)
     mmseqs = _find_mmseqs()
     dbs_to_setup = ["uniref30", "envdb"] if db == "all" else [db]
 
