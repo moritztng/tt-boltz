@@ -49,6 +49,21 @@ From the `tt-boltz` directory:
 pip install -e .
 ```
 
+### Verify Installation
+```bash
+tt-boltz --help
+tt-boltz predict --help
+tt-boltz msa --help
+```
+
+### Offline MSA Prerequisites (Only if using Offline MSA)
+`tt-boltz msa` and offline `predict` require `mmseqs` and `colabfold_search`.
+Install [localcolabfold](https://github.com/YoshitakaMo/localcolabfold), then verify:
+```bash
+which mmseqs
+which colabfold_search
+```
+
 ## Basic Usage
 
 ### Structure Prediction
