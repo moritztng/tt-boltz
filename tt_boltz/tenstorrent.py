@@ -612,8 +612,14 @@ class Transition(Module):
             )
             ttnn.deallocate(x)
             return x_dram
-
         if len(x.shape) < 4:
+            B = x.shape[0]
+            chunk_b = 3
+            if B > 1:
+                return ttnn.concat(
+                    [swiglu(x[b:min(b + chunk_b, B), :, :]) for b in range(0, B, chunk_b)],
+                    dim=0,
+                )
             return swiglu(x)
 
         H, W = x.shape[1], x.shape[2]
