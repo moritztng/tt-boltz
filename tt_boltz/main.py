@@ -297,10 +297,13 @@ def _validate_offline_msa_db(db_path: Path, require_envdb: bool = False) -> None
 
 
 def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
-                        db_path: str, use_env: bool = False) -> None:
+                        db_path: str, use_env: bool = False,
+                        pairing_strategy: str = "greedy") -> None:
     """Generate MSAs locally via colabfold_search against a local database."""
-    click.echo(f"MSA for {target_id} ({len(seqs)} sequences, offline)")
+    click.echo(f"MSA for {target_id} ({len(seqs)} sequences, offline, pairing={pairing_strategy})")
     colabfold_bin = _find_colabfold_search()
+    strategy_map = {"greedy": "0", "complete": "1"}
+    strategy_val = strategy_map.get(pairing_strategy, pairing_strategy)
     tmp = msa_dir / f"_offline_tmp_{os.getpid()}"
     tmp.mkdir(exist_ok=True)
     try:
@@ -310,12 +313,13 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
                 f.write(f">{name}\n{seq}\n")
         a3m_out = tmp / "a3m"
         a3m_out.mkdir(exist_ok=True)
-        result = subprocess.run(
-            [colabfold_bin, str(fasta), db_path, str(a3m_out),
-             "--use-env", "1" if use_env else "0", "--use-templates", "0",
-             "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1)],
-            capture_output=True, text=True,
-        )
+        cmd = [colabfold_bin, str(fasta), db_path, str(a3m_out),
+               "--use-env", "1" if use_env else "0", "--use-templates", "0",
+               "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1)]
+        if len(seqs) > 1:
+            cmd += ["--pair-mode", "unpaired_paired",
+                    "--pairing_strategy", strategy_val]
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"colabfold_search failed (exit {result.returncode})")
         for name in seqs:
@@ -364,7 +368,8 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
 
     if to_gen:
         if msa_db_path:
-            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path, use_env=use_envdb)
+            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path,
+                                use_env=use_envdb, pairing_strategy=msa_strategy)
         elif use_msa:
             compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
         else:
