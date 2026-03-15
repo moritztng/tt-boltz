@@ -1035,6 +1035,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 procs = {}
                 max_retries = 2
                 idle_timeout_s = 180.0
+                check_log_interval_s = 60.0
+                click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
 
                 def _spawn(dev: int):
                     st = states[dev]
@@ -1061,6 +1063,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         "next_idx": 0,
                         "current": None,
                         "last_event": time.time(),
+                        "last_check_log": 0.0,
                         "retries": {},
                     }
                     _spawn(dev)
@@ -1116,7 +1119,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                             continue
                         if st["current"] is None:
                             continue
-                        if now - st["last_event"] <= idle_timeout_s:
+                        idle_s = now - st["last_event"]
+                        if idle_s >= 60 and now - st["last_check_log"] >= check_log_interval_s:
+                            click.echo(f"[watchdog] check device {dev}: {st['current']} idle {int(idle_s)}s")
+                            st["last_check_log"] = now
+                        if idle_s <= idle_timeout_s:
                             continue
 
                         target = st["current"]
