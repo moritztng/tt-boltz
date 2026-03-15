@@ -705,12 +705,22 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
         queue.put({"ok": False, "dev": device_id, "error": str(e), "results": results, "failed": len(file_paths)})
 
 
-def _reset_tt_device(device_id: int) -> None:
+def _reset_tt_device(device_id: int, retries: int = 2) -> None:
     """Reset one TT device via tt-smi.
 
     device_id here is the same index used for TT_VISIBLE_DEVICES in workers.
+    Use --no_reinit to avoid global board re-init while other workers run.
     """
-    subprocess.run(["tt-smi", "-r", str(device_id)], check=True)
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            subprocess.run(["tt-smi", "-r", str(device_id), "--no_reinit"], check=True)
+            return
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2.0)
+    raise last_err
 
 
 @click.group()
@@ -1129,13 +1139,15 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         target = st["current"]
                         tries = st["retries"].get(target, 0) + 1
                         st["retries"][target] = tries
-                        click.echo(f"\n[watchdog] device {dev} stalled on {target} (>180s no updates)")
+                        click.echo(f"\n[watchdog] device {dev} stalled on {target} (>{int(idle_timeout_s)}s no updates)")
 
                         p.terminate()
                         p.join(timeout=10)
                         if p.is_alive():
                             p.kill()
                             p.join(timeout=5)
+                        # Allow driver handles to drain before running tt-smi reset.
+                        time.sleep(1.0)
                         procs.pop(dev, None)
 
                         if tries > max_retries:
