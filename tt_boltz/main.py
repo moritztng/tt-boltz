@@ -705,22 +705,23 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
         queue.put({"ok": False, "dev": device_id, "error": str(e), "results": results, "failed": len(file_paths)})
 
 
-def _reset_tt_device(device_id: int, retries: int = 2) -> None:
-    """Reset one TT device via tt-smi.
+def _reset_tt_devices(device_ids: list[int], retries: int = 2) -> bool:
+    """Best-effort reset of multiple TT devices via tt-smi.
 
-    device_id here is the same index used for TT_VISIBLE_DEVICES in workers.
-    Use --no_reinit to avoid global board re-init while other workers run.
+    Returns True on success, False if all attempts fail.
+    device_ids are PCI indices used for TT_VISIBLE_DEVICES in workers.
     """
-    last_err = None
+    if not device_ids:
+        return True
+    reset_arg = ",".join(str(d) for d in sorted(set(device_ids)))
     for attempt in range(1, retries + 1):
         try:
-            subprocess.run(["tt-smi", "-r", str(device_id), "--no_reinit"], check=True)
-            return
-        except subprocess.CalledProcessError as e:
-            last_err = e
+            subprocess.run(["tt-smi", "-r", reset_arg], check=True)
+            return True
+        except subprocess.CalledProcessError:
             if attempt < retries:
                 time.sleep(2.0)
-    raise last_err
+    return False
 
 
 @click.group()
@@ -1084,6 +1085,22 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     if st["next_idx"] < len(st["bucket"]) and st["bucket"][st["next_idx"]].stem == name:
                         st["next_idx"] += 1
 
+                def _stop_all_workers():
+                    for d, proc in list(procs.items()):
+                        if proc.is_alive():
+                            proc.terminate()
+                            proc.join(timeout=10)
+                            if proc.is_alive():
+                                proc.kill()
+                                proc.join(timeout=5)
+                        procs.pop(d, None)
+                    # Let driver handles drain before reset/restart.
+                    time.sleep(1.5)
+                    now = time.time()
+                    for st in states.values():
+                        st["last_event"] = now
+                        st["current"] = None
+
                 while procs:
                     # Drain watchdog progress events.
                     while True:
@@ -1121,7 +1138,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         if dev in states:
                             _spawn(dev)
 
-                    # Watchdog: no update for 3 minutes => restart just that worker/device.
+                    # Watchdog: no update for timeout => full worker restart + reset all selected devices.
                     now = time.time()
                     for dev, p in list(procs.items()):
                         st = states[dev]
@@ -1141,15 +1158,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                         st["retries"][target] = tries
                         click.echo(f"\n[watchdog] device {dev} stalled on {target} (>{int(idle_timeout_s)}s no updates)")
 
-                        p.terminate()
-                        p.join(timeout=10)
-                        if p.is_alive():
-                            p.kill()
-                            p.join(timeout=5)
-                        # Allow driver handles to drain before running tt-smi reset.
-                        time.sleep(1.0)
-                        procs.pop(dev, None)
-
                         if tries > max_retries:
                             click.echo(f"[watchdog] giving up on {target} after {max_retries} retries")
                             row = {"id": target, "status": "failed", "error": "watchdog timeout"}
@@ -1161,19 +1169,27 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                                 except Exception:
                                     pass
                             _advance_done(st, target)
-                            st["current"] = None
-                            _spawn(dev)
+                            _stop_all_workers()
+                            for restart_dev in states:
+                                _spawn(restart_dev)
                             continue
 
-                        click.echo(f"[watchdog] resetting device {dev} and retrying {target} (attempt {tries}/{max_retries})")
+                        click.echo(
+                            f"[watchdog] restarting all workers and resetting devices {','.join(str(x) for x in devices)} "
+                            f"(attempt {tries}/{max_retries} for {target})"
+                        )
+                        _stop_all_workers()
                         try:
-                            _reset_tt_device(dev)
+                            reset_ok = _reset_tt_devices(devices)
                             time.sleep(2.0)
                         except Exception as e:
-                            click.echo(f"[watchdog] device reset failed on {dev}: {e}")
-                        st["last_event"] = time.time()
-                        st["current"] = None
-                        _spawn(dev)
+                            reset_ok = False
+                            click.echo(f"[watchdog] reset call raised: {e}; continuing retry")
+                        if not reset_ok:
+                            click.echo("[watchdog] reset unavailable; continuing retry without reset")
+                        for restart_dev in states:
+                            _spawn(restart_dev)
+                        break
 
                     time.sleep(0.5)
         finally:
