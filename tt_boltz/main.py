@@ -19,6 +19,7 @@ import time
 import traceback
 import urllib.request
 import warnings
+from queue import Empty
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -582,11 +583,18 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
     Each worker is pinned to a single physical card via TT_VISIBLE_DEVICES.
     All workers share the same on-disk kernel cache (no TT_METAL_CACHE override).
     """
-    def _pq(event, **kw):
+    watchdog_queue = cfg.get("watchdog_queue")
+
+    def _emit(ev: dict):
         try:
-            progress_queue.put_nowait({"dev": device_id, "event": event, **kw})
+            progress_queue.put_nowait(ev)
+            if watchdog_queue is not None:
+                watchdog_queue.put_nowait(ev)
         except Exception:
             pass
+
+    def _pq(event, **kw):
+        _emit({"dev": device_id, "event": event, **kw})
 
     # Silence all output so it doesn't corrupt the Rich Live display.
     # In subprocesses we redirect both stdout+stderr at the OS fd level
@@ -624,7 +632,13 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
         model = Boltz2.load_from_checkpoint(
             cfg["conf_ckpt"], **cfg["conf_kwargs"],
         ).eval().to(torch_device)
-        model.progress_fn = make_progress_fn(progress_queue, device_id)
+        if watchdog_queue is None:
+            model.progress_fn = make_progress_fn(progress_queue, device_id)
+        else:
+            class _DualQueue:
+                def put_nowait(self, ev):
+                    _emit(ev)
+            model.progress_fn = make_progress_fn(_DualQueue(), device_id)
 
         affinity_items = []
         struct_dir = Path(cfg["struct_dir"])
@@ -685,10 +699,18 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
                     traceback.print_exc()
 
         failed = sum(1 for r in results if r["status"] == "failed")
-        queue.put({"ok": True, "results": results, "failed": failed})
+        queue.put({"ok": True, "dev": device_id, "results": results, "failed": failed})
     except Exception as e:
         traceback.print_exc()
-        queue.put({"ok": False, "error": str(e), "results": results, "failed": len(file_paths)})
+        queue.put({"ok": False, "dev": device_id, "error": str(e), "results": results, "failed": len(file_paths)})
+
+
+def _reset_tt_device(device_id: int) -> None:
+    """Reset one TT device via tt-smi.
+
+    device_id here is the same index used for TT_VISIBLE_DEVICES in workers.
+    """
+    subprocess.run(["tt-smi", "-r", str(device_id)], check=True)
 
 
 @click.group()
@@ -1005,20 +1027,136 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 failed = msg.get("failed", 0)
             else:
                 file_buckets = [files[i::n_devices] for i in range(n_devices)]
-                procs = []
+                watchdog_q = ctx.Queue()
+                worker_cfg["watchdog_queue"] = watchdog_q
+
+                # Per-device worker state for restart-on-hang.
+                states = {}
+                procs = {}
+                max_retries = 2
+                idle_timeout_s = 180.0
+
+                def _spawn(dev: int):
+                    st = states[dev]
+                    remaining = st["bucket"][st["next_idx"]:]
+                    if not remaining:
+                        procs.pop(dev, None)
+                        return
+                    p = ctx.Process(
+                        target=_predict_worker,
+                        args=(dev, [str(x) for x in remaining], worker_cfg, q, pq),
+                        kwargs={"suppress_output": suppress},
+                    )
+                    p.start()
+                    procs[dev] = p
+                    st["last_event"] = time.time()
+                    st["current"] = None
+
                 for i, bucket in enumerate(file_buckets):
-                    if bucket:
-                        p = ctx.Process(target=_predict_worker,
-                                        args=(devices[i], [str(x) for x in bucket], worker_cfg, q, pq),
-                                        kwargs={"suppress_output": suppress})
-                        p.start()
-                        procs.append(p)
-                for _ in procs:
-                    msg = q.get()
-                    results.extend(msg.get("results", []))
-                    failed += msg.get("failed", 0)
-                for p in procs:
-                    p.join()
+                    if not bucket:
+                        continue
+                    dev = devices[i]
+                    states[dev] = {
+                        "bucket": bucket,
+                        "next_idx": 0,
+                        "current": None,
+                        "last_event": time.time(),
+                        "retries": {},
+                    }
+                    _spawn(dev)
+
+                def _advance_done(st, name: str):
+                    while st["next_idx"] < len(st["bucket"]) and st["bucket"][st["next_idx"]].stem != name:
+                        st["next_idx"] += 1
+                    if st["next_idx"] < len(st["bucket"]) and st["bucket"][st["next_idx"]].stem == name:
+                        st["next_idx"] += 1
+
+                while procs:
+                    # Drain watchdog progress events.
+                    while True:
+                        try:
+                            ev = watchdog_q.get_nowait()
+                        except Empty:
+                            break
+                        dev = ev.get("dev")
+                        if dev not in states:
+                            continue
+                        st = states[dev]
+                        st["last_event"] = time.time()
+                        if ev.get("event") == "start":
+                            st["current"] = ev.get("name")
+                        elif ev.get("event") == "done":
+                            _advance_done(st, ev.get("name", ""))
+                            st["current"] = None
+
+                    # Drain worker completion messages.
+                    while True:
+                        try:
+                            msg = q.get_nowait()
+                        except Empty:
+                            break
+                        dev = msg.get("dev")
+                        results.extend(msg.get("results", []))
+                        failed += msg.get("failed", 0)
+                        if dev in states:
+                            # Worker processed all currently assigned files.
+                            states[dev]["next_idx"] = len(states[dev]["bucket"])
+                            states[dev]["current"] = None
+                        p = procs.pop(dev, None)
+                        if p is not None:
+                            p.join(timeout=1)
+                        if dev in states:
+                            _spawn(dev)
+
+                    # Watchdog: no update for 3 minutes => restart just that worker/device.
+                    now = time.time()
+                    for dev, p in list(procs.items()):
+                        st = states[dev]
+                        if not p.is_alive():
+                            continue
+                        if st["current"] is None:
+                            continue
+                        if now - st["last_event"] <= idle_timeout_s:
+                            continue
+
+                        target = st["current"]
+                        tries = st["retries"].get(target, 0) + 1
+                        st["retries"][target] = tries
+                        click.echo(f"\n[watchdog] device {dev} stalled on {target} (>180s no updates)")
+
+                        p.terminate()
+                        p.join(timeout=10)
+                        if p.is_alive():
+                            p.kill()
+                            p.join(timeout=5)
+                        procs.pop(dev, None)
+
+                        if tries > max_retries:
+                            click.echo(f"[watchdog] giving up on {target} after {max_retries} retries")
+                            row = {"id": target, "status": "failed", "error": "watchdog timeout"}
+                            results.append(row)
+                            failed += 1
+                            if "results_path" in worker_cfg:
+                                try:
+                                    _append_result(row, Path(worker_cfg["results_path"]))
+                                except Exception:
+                                    pass
+                            _advance_done(st, target)
+                            st["current"] = None
+                            _spawn(dev)
+                            continue
+
+                        click.echo(f"[watchdog] resetting device {dev} and retrying {target} (attempt {tries}/{max_retries})")
+                        try:
+                            _reset_tt_device(dev)
+                            time.sleep(2.0)
+                        except Exception as e:
+                            click.echo(f"[watchdog] device reset failed on {dev}: {e}")
+                        st["last_event"] = time.time()
+                        st["current"] = None
+                        _spawn(dev)
+
+                    time.sleep(0.5)
         finally:
             _sys.stdout = _sys.__stdout__
             display.stop()
@@ -1111,7 +1249,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             _sys.stdout = _saved_stdout
             display.stop()
 
-    _save_results(results, results_path)
+    # Preserve per-target rows that may have been atomically appended by workers.
+    existing_rows = json.loads(results_path.read_text()) if results_path.exists() else []
+    merged = {r["id"]: r for r in existing_rows}
+    merged.update({r["id"]: r for r in results})
+    _save_results(list(merged.values()), results_path)
     click.echo(f"\nDone: {len(files) - failed} ok, {failed} failed — {results_path}")
 
 
