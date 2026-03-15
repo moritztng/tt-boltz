@@ -177,15 +177,24 @@ def _ensure_aria2(pixi: str) -> None:
     subprocess.run([pixi, "global", "install", "aria2"], check=True)
 
 
+def _ensure_pigz(pixi: str) -> None:
+    """Install pigz via pixi if not already available."""
+    if shutil.which("pigz"):
+        return
+    click.echo("Installing pigz for fast parallel extraction ...")
+    subprocess.run([pixi, "global", "install", "pigz"], check=True)
+
+
 def _ensure_offline_tools(install_tools: bool) -> None:
-    """Ensure mmseqs + colabfold_search + aria2 are available; optionally install them."""
+    """Ensure mmseqs + colabfold_search + aria2/pigz are available; optionally install them."""
     missing = _missing_offline_tools()
     need_aria2 = not shutil.which("aria2c")
+    need_pigz = not shutil.which("pigz")
 
-    if not missing and not need_aria2:
+    if not missing and not need_aria2 and not need_pigz:
         return
     if not install_tools:
-        all_missing = missing + (["aria2c"] if need_aria2 else [])
+        all_missing = missing + (["aria2c"] if need_aria2 else []) + (["pigz"] if need_pigz else [])
         raise RuntimeError(
             "Missing offline MSA tools: " + ", ".join(all_missing) + "\n"
             "Rerun with: tt-boltz msa --install-tools"
@@ -193,6 +202,7 @@ def _ensure_offline_tools(install_tools: bool) -> None:
 
     pixi = _ensure_pixi()
     _ensure_aria2(pixi)
+    _ensure_pigz(pixi)
 
     if missing:
         click.echo("Missing offline MSA tools: " + ", ".join(missing))
@@ -264,6 +274,23 @@ def _download_file(url: str, dest: Path, max_retries: int = 5) -> None:
             except subprocess.CalledProcessError:
                 click.echo(f"  {name} failed (attempt {attempt}/{max_retries}), retrying ...")
     raise RuntimeError(f"Download failed after {max_retries} attempts: {url}")
+
+
+def _recommended_threads() -> int:
+    """Pick a conservative-but-fast thread count across machine sizes."""
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _extract_tarball(tarball: Path, out_dir: Path) -> None:
+    """Extract tar.gz, using pigz for parallel decompression if available."""
+    threads = _recommended_threads()
+    pigz = shutil.which("pigz")
+    if pigz:
+        # GNU tar supports --use-compress-program/-I with an argument string.
+        cmd = ["tar", "-I", f"{pigz} -d -p {threads}", "-xf", str(tarball), "-C", str(out_dir)]
+    else:
+        cmd = ["tar", "-xzf", str(tarball), "-C", str(out_dir)]
+    subprocess.run(cmd, check=True)
 
 
 def _mmseqs_index_exists(db_dir: Path, db_name: str) -> bool:
@@ -773,18 +800,23 @@ def msa(db, path, install_tools):
 
         click.echo(f"\n{name}: downloading")
         tarball = db_dir / Path(info["url"]).name
-        _download_file(info["url"], tarball)
+        if tarball.exists() and tarball.stat().st_size > 0:
+            click.echo(f"  Reusing existing tarball: {tarball.name}")
+        else:
+            _download_file(info["url"], tarball)
 
         click.echo(f"{name}: extracting")
-        subprocess.run(["tar", "-xzf", str(tarball), "-C", str(db_dir)], check=True)
+        _extract_tarball(tarball, db_dir)
 
         if _mmseqs_index_exists(db_dir, info["name"]):
             click.echo(f"{name}: index already present")
         else:
+            threads = _recommended_threads()
             click.echo(f"{name}: building index (this takes a while)")
             subprocess.run(
                 [mmseqs, "createindex", str(db_dir / info["name"]),
-                 str(db_dir / f"tmp_{name}"), "--remove-tmp-files", "1"],
+                 str(db_dir / f"tmp_{name}"), "--remove-tmp-files", "1",
+                 "--threads", str(threads)],
                 check=True)
 
         if name == "uniref30":
