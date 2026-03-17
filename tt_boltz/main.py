@@ -229,7 +229,7 @@ def _ensure_offline_tools(install_tools: bool) -> None:
             )
 
 
-def _find_mmseqs() -> str:
+def _find_mmseqs() -> str | None:
     """Find mmseqs binary on PATH or at common install locations."""
     found = shutil.which("mmseqs")
     if found:
@@ -237,11 +237,7 @@ def _find_mmseqs() -> str:
     for p in _MMSEQS_SEARCH_PATHS:
         if p.is_file() and os.access(p, os.X_OK):
             return str(p)
-    raise RuntimeError(
-        "mmseqs not found.\n"
-        "Install localcolabfold and/or activate the environment that provides it:\n"
-        "  https://github.com/YoshitakaMo/localcolabfold"
-    )
+    return None
 
 
 def _download_file(url: str, dest: Path, max_retries: int = 5) -> None:
@@ -330,6 +326,7 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
     """Generate MSAs locally via colabfold_search against a local database."""
     click.echo(f"MSA for {target_id} ({len(seqs)} sequences, offline, pairing={pairing_strategy})")
     colabfold_bin = _find_colabfold_search()
+    mmseqs_bin = _find_mmseqs()
     strategy_map = {"greedy": "0", "complete": "1"}
     strategy_val = strategy_map.get(pairing_strategy, pairing_strategy)
     tmp = msa_dir / f"_offline_tmp_{os.getpid()}"
@@ -341,15 +338,33 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
                 f.write(f">{name}\n{seq}\n")
         a3m_out = tmp / "a3m"
         a3m_out.mkdir(exist_ok=True)
-        cmd = [colabfold_bin, str(fasta), db_path, str(a3m_out),
-               "--use-env", "1" if use_env else "0", "--use-templates", "0",
-               "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1)]
+        cmd_base = [
+            colabfold_bin, str(fasta), db_path, str(a3m_out),
+            "--use-env", "1" if use_env else "0", "--use-templates", "0",
+            "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1),
+        ]
         if len(seqs) > 1:
-            cmd += ["--pair-mode", "unpaired_paired",
-                    "--pairing_strategy", strategy_val]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"colabfold_search failed (exit {result.returncode})")
+            cmd_base += ["--pair-mode", "unpaired_paired", "--pairing_strategy", strategy_val]
+
+        commands = []
+        if mmseqs_bin:
+            commands.append(cmd_base[:4] + ["--mmseqs", mmseqs_bin] + cmd_base[4:])
+        commands.append(cmd_base)
+
+        last_error = ""
+        for idx, cmd in enumerate(commands):
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                last_error = ""
+                break
+            err = (result.stderr or result.stdout or "").strip()
+            last_error = "\n".join(err.splitlines()[-20:]) if err else ""
+            if idx < len(commands) - 1:
+                click.echo("  colabfold_search failed with explicit --mmseqs, retrying with default lookup")
+        if last_error:
+            raise RuntimeError(
+                f"colabfold_search failed (exit {result.returncode})\n{last_error}"
+            )
         for name in seqs:
             src = a3m_out / f"{name}.a3m"
             if src.exists():
