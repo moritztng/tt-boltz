@@ -680,7 +680,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
                 feats, input_struct = prepare(path, method=cfg["method"])
                 _pq("stage", stage="saving")
                 batch = to_batch(feats, torch_device)
-                with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                with torch.no_grad():
                     pred = model.predict_step(batch)
                 _pq("stage", stage="saving")
                 metrics, best = write_result(
@@ -716,7 +716,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
                 try:
                     feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
                     batch = to_batch(feats, torch_device)
-                    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                    with torch.no_grad():
                         pred = aff_model.predict_step(batch)
                     if not pred["exception"] and path.stem in rows_by_id:
                         for ak in aff_keys:
@@ -911,7 +911,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     """
     use_tt = accelerator == "tenstorrent"
     if use_tt: accelerator = "cpu"
-
     warnings.filterwarnings("ignore", ".*Tensor Cores.*")
     torch.set_grad_enabled(False)
     torch.set_float32_matmul_precision("highest")
@@ -1295,7 +1294,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     pq.put({"dev": 0, "event": "stage", "stage": "msa"})
                     feats, input_struct = prepare(path, method=method)
                     batch = to_batch(feats, torch_device)
-                    with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                    with torch.no_grad():
                         pred = model.predict_step(batch)
                     pq.put({"dev": 0, "event": "stage", "stage": "saving"})
                     metrics, best = write_result(pred, batch, input_struct, struct_dir,
@@ -1329,7 +1328,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     try:
                         feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
                         batch = to_batch(feats, torch_device)
-                        with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                        with torch.no_grad():
                             pred = aff_model.predict_step(batch)
                         if not pred["exception"] and path.stem in rows_by_id:
                             for ak in aff_keys:
