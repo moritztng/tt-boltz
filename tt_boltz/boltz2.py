@@ -5524,18 +5524,16 @@ class Boltz2(nn.Module):
             if self.confidence_prediction:
                 pred_dict["pde"] = out["pde"]
                 pred_dict["plddt"] = out["plddt"]
-                # AF3-style ranking: 0.8*ipTM + 0.2*pTM (prioritizes interface quality)
-                # Original Boltz-2: (4*complex_plddt + ipTM) / 5
                 pred_dict["confidence_score"] = (
-                    0.8 * (
+                    4 * out["complex_plddt"]
+                    + (
                         out["iptm"]
                         if not torch.allclose(
                             out["iptm"], torch.zeros_like(out["iptm"])
                         )
                         else out["ptm"]
                     )
-                    + 0.2 * out["ptm"]
-                )
+                ) / 5
 
                 pred_dict["complex_plddt"] = out["complex_plddt"]
                 pred_dict["complex_iplddt"] = out["complex_iplddt"]
