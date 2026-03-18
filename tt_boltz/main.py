@@ -1116,7 +1116,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     states = {}
                     procs = {}
                     max_retries = 2
-                    idle_timeout_s = 300.0
+                    idle_timeout_s = 600.0
                     check_log_interval_s = 60.0
                     click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
 
