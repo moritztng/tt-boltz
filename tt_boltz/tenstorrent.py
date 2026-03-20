@@ -1116,7 +1116,6 @@ class OuterProductMean(Module):
         b = ttnn.to_layout(b, ttnn.ROW_MAJOR_LAYOUT)
         b = ttnn.reshape(b, (-1, S))
         b = ttnn.to_layout(b, ttnn.TILE_LAYOUT)
-
         def outer_product_mean(a_in):
             rows = a_in.shape[0]
             a_flat = ttnn.reshape(a_in, (rows * C, S))
@@ -1191,17 +1190,17 @@ class MSALayer(Module):
             z = ttnn.reallocate(z)
             chunks = []
             N = m.shape[1]
-            for s in range(0, N, 512):
-                mc = m[:, s:min(s+512, N), :]
-                msk = msa_mask[s:min(s+512, N), :] if msa_mask is not None else None
+            chunk_size = 512
+            for s in range(0, N, chunk_size):
+                mc = m[:, s:min(s + chunk_size, N), :]
                 mc = ttnn.add_(mc, self.pair_weighted_averaging(mc, z, attn_mask))
                 mc = ttnn.add_(mc, self.msa_transition(mc))
-                z = ttnn.add_(z, self.outer_product_mean(mc, msk, n_msa))
                 chunks.append(mc)
             ttnn.deallocate(m)
             m = ttnn.concat(chunks, dim=1)
             del chunks
             m = ttnn.reallocate(m)
+            z = ttnn.add_(z, self.outer_product_mean(m, msa_mask, n_msa))
         else:
             m = ttnn.add_(m, self.pair_weighted_averaging(m, z, attn_mask))
             m = ttnn.add_(m, self.msa_transition(m))
