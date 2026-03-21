@@ -779,8 +779,12 @@ class AdaLN(Module):
         self.s_scale_bias = self.torch_to_tt("s_scale.bias")
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
-        memory_config = ttnn.L1_MEMORY_CONFIG if self.atom_level else None
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, large_seq_len: bool = False) -> ttnn.Tensor:
+        memory_config = (
+            ttnn.DRAM_MEMORY_CONFIG
+            if self.atom_level and large_seq_len
+            else (ttnn.L1_MEMORY_CONFIG if self.atom_level else None)
+        )
         if self.atom_level:
             a = ttnn.to_memory_config(a, memory_config=memory_config)
             s = ttnn.to_memory_config(s, memory_config=memory_config)
@@ -919,8 +923,9 @@ class DiffusionTransformerLayer(Module):
         s: ttnn.Tensor,
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor,
+        large_seq_len: bool = False,
     ) -> ttnn.Tensor:
-        b = self.adaln(a, s)
+        b = self.adaln(a, s, large_seq_len=large_seq_len)
         if not self.atom_level:
             b = self.attn_pair_bias(b, z)
         else:
@@ -973,10 +978,17 @@ class DiffusionTransformer(Module):
         s: ttnn.Tensor,
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor = None,
+        large_seq_len: bool = False,
     ) -> ttnn.Tensor:
         dim = z.shape[1] // len(self.layers)
         for i, layer in enumerate(self.layers):
-            a = layer(a, s, z[:, i * dim : (i + 1) * dim, :, :], keys_indexing)
+            a = layer(
+                a,
+                s,
+                z[:, i * dim : (i + 1) * dim, :, :],
+                keys_indexing,
+                large_seq_len=large_seq_len,
+            )
         return a
 
 
@@ -1377,6 +1389,7 @@ class Diffusion(Module):
         keys_indexing: ttnn.Tensor,
         atom_to_token: ttnn.Tensor,
         atom_to_token_normed: ttnn.Tensor,
+        large_seq_len: bool = False,
     ) -> ttnn.Tensor:
         W = 32
         B, N, D = q.shape
@@ -1406,7 +1419,13 @@ class Diffusion(Module):
         )
         q = ttnn.add(q, r_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
-        q = self.encoder(q, self._c_reshaped, bias_encoder, keys_indexing)
+        q = self.encoder(
+            q,
+            self._c_reshaped,
+            bias_encoder,
+            keys_indexing,
+            large_seq_len=large_seq_len,
+        )
         q = ttnn.reshape(q, (B, NW * W, D))
         a = ttnn.linear(
             q,
@@ -1487,7 +1506,13 @@ class Diffusion(Module):
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
-        q = self.decoder(q, self._c_reshaped, bias_decoder, keys_indexing)
+        q = self.decoder(
+            q,
+            self._c_reshaped,
+            bias_decoder,
+            keys_indexing,
+            large_seq_len=large_seq_len,
+        )
         q = ttnn.reshape(q, (B, NW * W, D))
         r_update = ttnn.layer_norm(
             q,
@@ -1785,6 +1810,7 @@ class DiffusionModule(TorchWrapper):
                 self._keys_indexing,
                 self._atom_to_token,
                 self._atom_to_token_normed,
+                large_seq_len=seq_len > SEQ_LEN_MORE_CHUNKING,
             )
         )
         result = result[:, :N, :]
