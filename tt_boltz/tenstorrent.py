@@ -305,19 +305,6 @@ class TriangleAttention(Module):
             dtype=ttnn.bfloat16,
             core_grid=ttnn.CoreGrid(y=9, x=12),
         )
-        qkv = ttnn.experimental.minimal_matmul(
-            input_tensor=x,
-            weight_tensor=self.qkv_weight,
-            compute_kernel_config=self.compute_kernel_config,
-            dtype=_dtype(),
-        )
-        g = ttnn.experimental.minimal_matmul(
-            input_tensor=x,
-            weight_tensor=self.g_weight,
-            compute_kernel_config=self.compute_kernel_config,
-            dtype=_dtype(),
-        )
-        ttnn.deallocate(x)
         triangle_bias = ttnn.unsqueeze(triangle_bias, 0)
         triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
 
@@ -341,7 +328,19 @@ class TriangleAttention(Module):
             o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             return ttnn.squeeze(o, 1)
 
-        S = qkv.shape[0]
+        def gate_and_project(o_in: ttnn.Tensor, g_in: ttnn.Tensor) -> ttnn.Tensor:
+            o_in = ttnn.multiply_(o_in, g_in, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
+            ttnn.deallocate(g_in)
+            x_out = ttnn.linear(
+                o_in,
+                self.o_weight,
+                compute_kernel_config=self.compute_kernel_config,
+                dtype=_dtype(),
+                core_grid=ttnn.CoreGrid(y=6, x=12),
+            )
+            return x_out
+
+        S = x.shape[0]
         need_chunk = S > SEQ_LEN_MORE_CHUNKING and (self.affinity or not USE_BLOCKFP8)
         if need_chunk:
             if not self.affinity and attn_mask is not None:
@@ -350,34 +349,53 @@ class TriangleAttention(Module):
             parts = []
             for s in range(0, S, chunk):
                 end = min(s + chunk, S)
+                x_chunk = x[s:end, :, :]
+                qkv_chunk = ttnn.experimental.minimal_matmul(
+                    input_tensor=x_chunk,
+                    weight_tensor=self.qkv_weight,
+                    compute_kernel_config=self.compute_kernel_config,
+                    dtype=_dtype(),
+                )
+                g_chunk = ttnn.experimental.minimal_matmul(
+                    input_tensor=x_chunk,
+                    weight_tensor=self.g_weight,
+                    compute_kernel_config=self.compute_kernel_config,
+                    dtype=_dtype(),
+                )
                 if self.affinity:
                     bias = ttnn.add(triangle_bias, attn_mask[s:end, :, :])
-                    parts.append(attend(qkv[s:end, :, :], bias))
+                    o_chunk = attend(qkv_chunk, bias)
                     ttnn.deallocate(bias)
                 else:
-                    parts.append(attend(qkv[s:end, :, :], triangle_bias))
-            ttnn.deallocate(qkv)
+                    o_chunk = attend(qkv_chunk, triangle_bias)
+                ttnn.deallocate(qkv_chunk)
+                parts.append(gate_and_project(o_chunk, g_chunk))
+            ttnn.deallocate(x)
             ttnn.deallocate(triangle_bias)
-            o = ttnn.concat(parts, dim=0)
+            x = ttnn.concat(parts, dim=0)
             for p in parts:
                 ttnn.deallocate(p)
             del parts
         else:
+            qkv = ttnn.experimental.minimal_matmul(
+                input_tensor=x,
+                weight_tensor=self.qkv_weight,
+                compute_kernel_config=self.compute_kernel_config,
+                dtype=_dtype(),
+            )
+            g = ttnn.experimental.minimal_matmul(
+                input_tensor=x,
+                weight_tensor=self.g_weight,
+                compute_kernel_config=self.compute_kernel_config,
+                dtype=_dtype(),
+            )
+            ttnn.deallocate(x)
             if attn_mask is not None:
                 triangle_bias = ttnn.add(triangle_bias, attn_mask)
             o = attend(qkv, triangle_bias)
             ttnn.deallocate(qkv)
             ttnn.deallocate(triangle_bias)
-
-        o = ttnn.multiply_(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
-        ttnn.deallocate(g)
-        x = ttnn.linear(
-            o,
-            self.o_weight,
-            compute_kernel_config=self.compute_kernel_config,
-            dtype=_dtype(),
-            core_grid=ttnn.CoreGrid(y=6, x=12),
-        )
+            x = gate_and_project(o, g)
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))
         x = ttnn.reshape(x, (1, *x.shape))
