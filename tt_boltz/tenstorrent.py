@@ -842,8 +842,10 @@ class ConditionedTransitionBlock(Module):
         self.output_projection_weight = self.torch_to_tt("output_projection.0.weight")
         self.output_projection_bias = self.torch_to_tt("output_projection.0.bias")
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
-        a = self.adaln(a, s)
+    def __call__(
+        self, a: ttnn.Tensor, s: ttnn.Tensor, large_seq_len: bool = False
+    ) -> ttnn.Tensor:
+        a = self.adaln(a, s, large_seq_len=large_seq_len)
         a_swish = ttnn.linear(
             a,
             self.swish_weight,
@@ -945,7 +947,7 @@ class DiffusionTransformerLayer(Module):
             s_o = self.s_o
         b = ttnn.multiply(s_o, b)
         a = ttnn.add(a, b)
-        a_t = self.transition(a, s)
+        a_t = self.transition(a, s, large_seq_len=large_seq_len)
         a = ttnn.add(a, a_t)
         return a
 
