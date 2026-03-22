@@ -632,7 +632,7 @@ class Transition(Module):
             return x_dram
         if len(x.shape) < 4:
             B = x.shape[0]
-            chunk_b = 3
+            chunk_b = 1
             if B > 1:
                 return ttnn.concat(
                     [swiglu(x[b:min(b + chunk_b, B), :, :]) for b in range(0, B, chunk_b)],
