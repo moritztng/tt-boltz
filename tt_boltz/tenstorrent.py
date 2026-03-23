@@ -1154,20 +1154,35 @@ class OuterProductMean(Module):
         b = ttnn.to_layout(b, ttnn.ROW_MAJOR_LAYOUT)
         b = ttnn.reshape(b, (-1, S))
         b = ttnn.to_layout(b, ttnn.TILE_LAYOUT)
+        if I > SEQ_LEN_MORE_CHUNKING:
+            # Compact large tensors before OPM matmuls to reduce DRAM fragmentation.
+            a = ttnn.reallocate(a)
+            b = ttnn.reallocate(b)
         def outer_product_mean(a_in):
             rows = a_in.shape[0]
             a_flat = ttnn.reshape(a_in, (rows * C, S))
             z = ttnn.matmul(a_flat, b, transpose_b=True, compute_kernel_config=self.compute_kernel_config)
+            ttnn.deallocate(a_flat)
             z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
             z = ttnn.reshape(z, (rows, C * D, J))
             z = ttnn.to_layout(z, ttnn.TILE_LAYOUT)
             z = ttnn.permute(z, (0, 2, 1))
             z = ttnn.multiply_(z, 1 / (n_msa if n_msa is not None else S))
-            return ttnn.linear(z, self.o_weight, bias=self.o_bias,
-                               compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13))
+            out = ttnn.linear(
+                z,
+                self.o_weight,
+                bias=self.o_bias,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=ttnn.CoreGrid(y=10, x=13),
+            )
+            ttnn.deallocate(z)
+            return out
 
         if I > SEQ_LEN_MORE_CHUNKING:
-            parts = [outer_product_mean(a[i:min(i+512, I), :, :]) for i in range(0, I, 512)]
+            parts = [
+                outer_product_mean(a[i : min(i + 256, I), :, :])
+                for i in range(0, I, 256)
+            ]
             ttnn.deallocate(a)
             ttnn.deallocate(b)
             z = ttnn.concat(parts, dim=0)
