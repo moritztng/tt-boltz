@@ -176,6 +176,9 @@ class TriangleMultiplication(Module):
             fused_activation=None,
             fuse_batch=False,
         )
+        if H > SEQ_LEN_MORE_CHUNKING:
+            # Compact large input activation for better large-sequence placement.
+            x_norm_in = ttnn.reallocate(x_norm_in)
         # Unsqueeze mask once before chunk loop (mask is [1,S,S] or [1,S])
         mask_u = ttnn.unsqueeze(mask, -1) if mask is not None else None
         for i in range(self.n_pairs):
@@ -216,11 +219,10 @@ class TriangleMultiplication(Module):
             ttnn.deallocate(a_chunk)
             ttnn.deallocate(b_chunk)
             x_chunk = ttnn.permute(x_chunk, (0, 2, 3, 1), memory_config=memory_config)
-            x = (
-                ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-                if i == 0
-                else ttnn.concat([x, x_chunk], dim=-1)
-            )
+            if i == 0:
+                x = ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            else:
+                x = ttnn.concat([x, x_chunk], dim=-1)
             ttnn.deallocate(x_chunk)
         x = ttnn.layer_norm(
             x,
