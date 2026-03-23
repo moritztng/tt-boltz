@@ -229,6 +229,10 @@ class TriangleMultiplication(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
+        if H > SEQ_LEN_MORE_CHUNKING:
+            # Reduce DRAM fragmentation before the two largest output projections.
+            x = ttnn.reallocate(x)
+            x_norm_in = ttnn.reallocate(x_norm_in)
         core_grid_opt = ttnn.CoreGrid(y=10, x=11)
         p_out = ttnn.linear(
             x,
@@ -238,6 +242,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=core_grid_opt,
         )
+        ttnn.deallocate(x)
         g_out = ttnn.linear(
             x_norm_in,
             self.g_out_weight,
@@ -246,6 +251,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=core_grid_opt,
         )
+        ttnn.deallocate(x_norm_in)
         x = ttnn.multiply_(
             p_out, g_out, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID]
         )
