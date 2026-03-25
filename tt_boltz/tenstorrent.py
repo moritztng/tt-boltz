@@ -222,7 +222,9 @@ class TriangleMultiplication(Module):
             if i == 0:
                 x = ttnn.clone(x_chunk, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             else:
-                x = ttnn.concat([x, x_chunk], dim=-1)
+                x_old = x
+                x = ttnn.concat([x_old, x_chunk], dim=-1)
+                ttnn.deallocate(x_old)
             ttnn.deallocate(x_chunk)
         x = ttnn.layer_norm(
             x,
@@ -322,6 +324,7 @@ class TriangleAttention(Module):
                 qkv_in, num_heads=self.n_heads, num_kv_heads=self.n_heads,
                 transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
+            ttnn.deallocate(qkv_in)
             o = ttnn.transformer.scaled_dot_product_attention(
                 q, k, v, attn_mask=bias, is_causal=False, scale=self.scale**-1,
                 program_config=ttnn.SDPAProgramConfig(
@@ -333,8 +336,12 @@ class TriangleAttention(Module):
                     k_chunk_size=256,
                 ),
             )
-            o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            return ttnn.squeeze(o, 1)
+            ttnn.deallocate(q)
+            ttnn.deallocate(k)
+            ttnn.deallocate(v)
+            o_heads = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(o)
+            return ttnn.squeeze(o_heads, 1)
 
         def gate_and_project(o_in: ttnn.Tensor, g_in: ttnn.Tensor) -> ttnn.Tensor:
             o_in = ttnn.multiply_(o_in, g_in, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
@@ -346,6 +353,7 @@ class TriangleAttention(Module):
                 dtype=_dtype(),
                 core_grid=ttnn.CoreGrid(y=6, x=12),
             )
+            ttnn.deallocate(o_in)
             return x_out
 
         S = x.shape[0]
@@ -490,6 +498,7 @@ class AttentionPairBias(Module):
                 num_kv_heads=self.n_heads,
                 transpose_k_heads=False,
             )
+            ttnn.deallocate(qkv)
             if self.compute_pair_bias:
                 z = ttnn.layer_norm(
                     z,
@@ -523,6 +532,9 @@ class AttentionPairBias(Module):
                     k_chunk_size=64,
                 ),
             )
+            ttnn.deallocate(q)
+            ttnn.deallocate(k)
+            ttnn.deallocate(v)
             o = o[:, :, :, :self.head_dim]
             o = ttnn.permute(o, (0, 1, 3, 2))
             o = ttnn.reshape(o, (o.shape[0], -1, o.shape[3]))
@@ -576,12 +588,12 @@ class AttentionPairBias(Module):
         if USE_BLOCKFP8:
             o = ttnn.typecast(o, ttnn.bfloat16)
         o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID], dtype=_dtype())
-        if self.atom_level:
-            ttnn.deallocate(g)
+        ttnn.deallocate(g)
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
+        ttnn.deallocate(o)
         return x
 
 
@@ -717,23 +729,25 @@ class PairformerLayer(Module):
         self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None,
         attn_mask_start: ttnn.Tensor = None, attn_mask_end: ttnn.Tensor = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        z = ttnn.add_(
-            z,
-            self.triangle_multiplication_start(z, mask),
-        )
-        z = ttnn.add_(
-            z,
-            self.triangle_multiplication_end(z, mask),
-        )
-        z = ttnn.add_(
-            z,
-            self.triangle_attention_start(z, attn_mask_start),
-        )
-        z = ttnn.add_(
-            z,
-            self.triangle_attention_end(z, attn_mask_end),
-        )
-        z = ttnn.add_(z, self.transition_z(z))
+        z_update = self.triangle_multiplication_start(z, mask)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
+
+        z_update = self.triangle_multiplication_end(z, mask)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
+
+        z_update = self.triangle_attention_start(z, attn_mask_start)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
+
+        z_update = self.triangle_attention_end(z, attn_mask_end)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
+
+        z_update = self.transition_z(z)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
         if self.transform_s:
             s_norm = ttnn.layer_norm(
                 s,
@@ -742,15 +756,18 @@ class PairformerLayer(Module):
                 epsilon=1e-5,
                 compute_kernel_config=self.compute_kernel_config,
             )
-            s = ttnn.add_(
-                s,
-                self.attention_pair_bias(
-                    s_norm,
-                    z,
-                    seq_mask=attn_mask_start,  # same as end for non-affinity
-                ),
+            s_update = self.attention_pair_bias(
+                s_norm,
+                z,
+                seq_mask=attn_mask_start,  # same as end for non-affinity
             )
-            s = ttnn.add_(s, self.transition_s(s))
+            ttnn.deallocate(s_norm)
+            s = ttnn.add_(s, s_update)
+            ttnn.deallocate(s_update)
+
+            s_update = self.transition_s(s)
+            s = ttnn.add_(s, s_update)
+            ttnn.deallocate(s_update)
         return s, z
 
 
