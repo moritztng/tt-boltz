@@ -389,8 +389,6 @@ class TriangleAttention(Module):
             ttnn.deallocate(x)
             ttnn.deallocate(triangle_bias)
             x = ttnn.concat(parts, dim=0)
-            for p in parts:
-                ttnn.deallocate(p)
             del parts
         else:
             qkv = ttnn.experimental.minimal_matmul(
