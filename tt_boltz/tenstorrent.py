@@ -1478,6 +1478,7 @@ class Diffusion(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13),
             )
+            ttnn.deallocate(s)
             self._c_reshaped = ttnn.reshape(c, (B, NW, W, -1))
         r_to_q = ttnn.linear(
             r,
@@ -1486,6 +1487,7 @@ class Diffusion(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
         q = ttnn.add(q, r_to_q)
+        ttnn.deallocate(r_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
         q = self.encoder(
             q,
@@ -1534,8 +1536,13 @@ class Diffusion(Module):
         )
         fourier = ttnn.unsqueeze(fourier, 1)
         s = ttnn.add(self._s_conditioned, fourier)
-        s = ttnn.add(s, self.conditioner_transition_0(s))
-        s = ttnn.add(s, self.conditioner_transition_1(s))
+        ttnn.deallocate(fourier)
+        s_update = self.conditioner_transition_0(s)
+        s = ttnn.add(s, s_update)
+        ttnn.deallocate(s_update)
+        s_update = self.conditioner_transition_1(s)
+        s = ttnn.add(s, s_update)
+        ttnn.deallocate(s_update)
         s_to_a = ttnn.layer_norm(
             s,
             weight=self.s_to_a_norm_weight,
@@ -1550,7 +1557,9 @@ class Diffusion(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
         a = ttnn.add(a, s_to_a)
+        ttnn.deallocate(s_to_a)
         a = self.token_transformer(a, s, bias_token)
+        ttnn.deallocate(s)
         a = ttnn.layer_norm(
             a,
             weight=self.a_norm_weight,
@@ -1573,6 +1582,7 @@ class Diffusion(Module):
         )
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
+        ttnn.deallocate(a_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
         q = self.decoder(
             q,
@@ -1595,6 +1605,7 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
+        ttnn.deallocate(q)
         return r_update
 
 
