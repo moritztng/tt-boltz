@@ -19,6 +19,7 @@ import time
 import traceback
 import urllib.request
 import warnings
+import fcntl
 from queue import Empty
 from dataclasses import replace
 from functools import partial
@@ -519,9 +520,16 @@ def to_batch(feats: dict, device: torch.device) -> dict:
 
 def _atomic_write(path: Path, content: str):
     """Write file atomically via tmp+rename to prevent corruption on crash."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content)
-    tmp.rename(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(content)
+        with open(tmp, "r+") as f:
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 def write_result(pred, batch, input_struct, out_dir, fmt,
@@ -600,11 +608,62 @@ def write_result(pred, batch, input_struct, out_dir, fmt,
     return metrics, best_struct
 
 
+def _results_lock_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".lock")
+
+
+def _results_backup_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".bak")
+
+
+def _load_results_resilient(path: Path) -> list[dict]:
+    """Load results.json safely; fall back to .bak if corrupted."""
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        # Keep a copy of the corrupted file for post-mortem debugging.
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        corrupt_copy = path.with_suffix(path.suffix + f".corrupt-{ts}")
+        try:
+            shutil.copy2(path, corrupt_copy)
+        except Exception:
+            pass
+
+        bak = _results_backup_path(path)
+        if bak.exists():
+            try:
+                data = json.loads(bak.read_text())
+                return data if isinstance(data, list) else []
+            except Exception:
+                pass
+        return []
+
+
+def _save_results_unlocked(results: list[dict], path: Path) -> None:
+    """Write results.json with backup; caller must hold lock."""
+    bak = _results_backup_path(path)
+    if path.exists():
+        try:
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+    _atomic_write(path, json.dumps(results, indent=2))
+
+
 def _save_results(results: list[dict], path: Path) -> None:
-    """Atomic JSON write (write tmp, rename)."""
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(results, indent=2))
-    tmp.rename(path)
+    """Save results with inter-process lock, backup, and atomic replace."""
+    lock_path = _results_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            _save_results_unlocked(results, path)
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
 def _append_result(row: dict, path: Path) -> None:
@@ -612,10 +671,17 @@ def _append_result(row: dict, path: Path) -> None:
 
     Safe for concurrent workers: reads existing, merges, writes via rename.
     """
-    existing = json.loads(path.read_text()) if path.exists() else []
-    existing = [r for r in existing if r["id"] != row["id"]]
-    existing.append(row)
-    _save_results(existing, path)
+    lock_path = _results_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            existing = _load_results_resilient(path)
+            existing = [r for r in existing if isinstance(r, dict) and r.get("id") != row["id"]]
+            existing.append(row)
+            _save_results_unlocked(existing, path)
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
 def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
@@ -1044,7 +1110,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     )
 
     results_path = out / "results.json"
-    results = [] if override or not results_path.exists() else json.loads(results_path.read_text())
+    results = [] if override else _load_results_resilient(results_path)
 
     # =====================================================================
     # TT path — reuses _predict_worker for all cases:
@@ -1356,7 +1422,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             display.stop()
 
     # Preserve per-target rows that may have been atomically appended by workers.
-    existing_rows = json.loads(results_path.read_text()) if results_path.exists() else []
+    existing_rows = _load_results_resilient(results_path)
     merged = {r["id"]: r for r in existing_rows}
     merged.update({r["id"]: r for r in results})
     _save_results(list(merged.values()), results_path)
