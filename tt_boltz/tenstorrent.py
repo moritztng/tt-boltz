@@ -1196,14 +1196,19 @@ class OuterProductMean(Module):
             return out
 
         if I > SEQ_LEN_MORE_CHUNKING:
-            parts = [
-                outer_product_mean(a[i : min(i + 256, I), :, :])
-                for i in range(0, I, 256)
-            ]
+            z_acc = None
+            for i in range(0, I, 256):
+                part = outer_product_mean(a[i : min(i + 256, I), :, :])
+                if z_acc is None:
+                    z_acc = part
+                else:
+                    z_old = z_acc
+                    z_acc = ttnn.concat([z_old, part], dim=0)
+                    ttnn.deallocate(z_old)
+                    ttnn.deallocate(part)
             ttnn.deallocate(a)
             ttnn.deallocate(b)
-            z = ttnn.concat(parts, dim=0)
-            del parts
+            z = z_acc
         else:
             z = outer_product_mean(a)
             ttnn.deallocate(a)
@@ -1258,17 +1263,22 @@ class MSALayer(Module):
         S = m.shape[2]
         if S > SEQ_LEN_MORE_CHUNKING:
             z = ttnn.reallocate(z)
-            chunks = []
+            m_acc = None
             N = m.shape[1]
             chunk_size = 512
             for s in range(0, N, chunk_size):
                 mc = m[:, s:min(s + chunk_size, N), :]
                 mc = ttnn.add_(mc, self.pair_weighted_averaging(mc, z, attn_mask))
                 mc = ttnn.add_(mc, self.msa_transition(mc))
-                chunks.append(mc)
+                if m_acc is None:
+                    m_acc = mc
+                else:
+                    m_old = m_acc
+                    m_acc = ttnn.concat([m_old, mc], dim=1)
+                    ttnn.deallocate(m_old)
+                    ttnn.deallocate(mc)
             ttnn.deallocate(m)
-            m = ttnn.concat(chunks, dim=1)
-            del chunks
+            m = m_acc
             m = ttnn.reallocate(m)
             z = ttnn.add_(z, self.outer_product_mean(m, msa_mask, n_msa))
         else:
