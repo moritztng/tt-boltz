@@ -1196,14 +1196,19 @@ class OuterProductMean(Module):
             return out
 
         if I > SEQ_LEN_MORE_CHUNKING:
-            parts = [
-                outer_product_mean(a[i : min(i + 256, I), :, :])
-                for i in range(0, I, 256)
-            ]
+            z_acc = None
+            for i in range(0, I, 256):
+                part = outer_product_mean(a[i : min(i + 256, I), :, :])
+                if z_acc is None:
+                    z_acc = part
+                else:
+                    z_old = z_acc
+                    z_acc = ttnn.concat([z_old, part], dim=0)
+                    ttnn.deallocate(z_old)
+                    ttnn.deallocate(part)
             ttnn.deallocate(a)
             ttnn.deallocate(b)
-            z = ttnn.concat(parts, dim=0)
-            del parts
+            z = z_acc
         else:
             z = outer_product_mean(a)
             ttnn.deallocate(a)
@@ -1258,17 +1263,22 @@ class MSALayer(Module):
         S = m.shape[2]
         if S > SEQ_LEN_MORE_CHUNKING:
             z = ttnn.reallocate(z)
-            chunks = []
+            m_acc = None
             N = m.shape[1]
             chunk_size = 512
             for s in range(0, N, chunk_size):
                 mc = m[:, s:min(s + chunk_size, N), :]
                 mc = ttnn.add_(mc, self.pair_weighted_averaging(mc, z, attn_mask))
                 mc = ttnn.add_(mc, self.msa_transition(mc))
-                chunks.append(mc)
+                if m_acc is None:
+                    m_acc = mc
+                else:
+                    m_old = m_acc
+                    m_acc = ttnn.concat([m_old, mc], dim=1)
+                    ttnn.deallocate(m_old)
+                    ttnn.deallocate(mc)
             ttnn.deallocate(m)
-            m = ttnn.concat(chunks, dim=1)
-            del chunks
+            m = m_acc
             m = ttnn.reallocate(m)
             z = ttnn.add_(z, self.outer_product_mean(m, msa_mask, n_msa))
         else:
@@ -1468,6 +1478,7 @@ class Diffusion(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13),
             )
+            ttnn.deallocate(s)
             self._c_reshaped = ttnn.reshape(c, (B, NW, W, -1))
         r_to_q = ttnn.linear(
             r,
@@ -1476,6 +1487,7 @@ class Diffusion(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
         q = ttnn.add(q, r_to_q)
+        ttnn.deallocate(r_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
         q = self.encoder(
             q,
@@ -1524,8 +1536,13 @@ class Diffusion(Module):
         )
         fourier = ttnn.unsqueeze(fourier, 1)
         s = ttnn.add(self._s_conditioned, fourier)
-        s = ttnn.add(s, self.conditioner_transition_0(s))
-        s = ttnn.add(s, self.conditioner_transition_1(s))
+        ttnn.deallocate(fourier)
+        s_update = self.conditioner_transition_0(s)
+        s = ttnn.add(s, s_update)
+        ttnn.deallocate(s_update)
+        s_update = self.conditioner_transition_1(s)
+        s = ttnn.add(s, s_update)
+        ttnn.deallocate(s_update)
         s_to_a = ttnn.layer_norm(
             s,
             weight=self.s_to_a_norm_weight,
@@ -1540,7 +1557,9 @@ class Diffusion(Module):
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
         a = ttnn.add(a, s_to_a)
+        ttnn.deallocate(s_to_a)
         a = self.token_transformer(a, s, bias_token)
+        ttnn.deallocate(s)
         a = ttnn.layer_norm(
             a,
             weight=self.a_norm_weight,
@@ -1563,6 +1582,7 @@ class Diffusion(Module):
         )
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
+        ttnn.deallocate(a_to_q)
         q = ttnn.reshape(q, (B, NW, W, -1))
         q = self.decoder(
             q,
@@ -1585,6 +1605,7 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
+        ttnn.deallocate(q)
         return r_update
 
 
