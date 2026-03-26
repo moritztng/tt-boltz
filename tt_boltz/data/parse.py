@@ -1973,7 +1973,21 @@ def compute_3d_conformer(mol: Mol, version: str = "v3") -> bool:
         conformer = mol.GetConformer(conf_id)
         conformer.SetProp("name", "Computed")
         conformer.SetProp("coord_generation", f"ETKDG{version}")
+        return True
 
+    # Last-resort fallback for molecules where ETKDG embedding fails.
+    # This keeps parsing robust by attaching a deterministic 2D conformer.
+    try:
+        conf_id = AllChem.Compute2DCoords(mol)
+    except RuntimeError:
+        conf_id = -1
+    except ValueError:
+        conf_id = -1
+
+    if conf_id != -1:
+        conformer = mol.GetConformer(conf_id)
+        conformer.SetProp("name", "Computed")
+        conformer.SetProp("coord_generation", "2D")
         return True
 
     return False
