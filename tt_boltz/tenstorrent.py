@@ -1614,6 +1614,7 @@ class TorchWrapper(nn.Module):
         super().__init__()
         self.module = None
         self.tt_device = get_device()
+        self._runtime_cache = {}
         self.compute_kernel_config = ttnn.types.BlackholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
@@ -1634,11 +1635,52 @@ class TorchWrapper(nn.Module):
     def _to_torch(self, x: ttnn.Tensor) -> torch.Tensor:
         return torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
 
+    def _cache_set(self, key: str, value):
+        self._runtime_cache[key] = value
+        return value
+
+    def _cache_get(self, key: str, default=None):
+        return self._runtime_cache.get(key, default)
+
+    def _cache_has_all(self, keys) -> bool:
+        return all(key in self._runtime_cache for key in keys)
+
+    def _deallocate_tensor_like(self, value):
+        if value is None:
+            return
+        # Runtime caches may be a single TT tensor or small containers of TT tensors.
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._deallocate_tensor_like(item)
+            return
+        try:
+            if isinstance(value, ttnn.Tensor):
+                ttnn.deallocate(value)
+        except Exception:
+            # Best effort cleanup: stale/already-freed buffers should not break reset.
+            pass
+
+    def _clear_cached_attrs(self, obj, attr_names):
+        for attr in attr_names:
+            if hasattr(obj, attr):
+                value = getattr(obj, attr)
+                self._deallocate_tensor_like(value)
+                try:
+                    delattr(obj, attr)
+                except Exception:
+                    setattr(obj, attr, None)
+
+    def _clear_runtime_cache(self):
+        for value in self._runtime_cache.values():
+            self._deallocate_tensor_like(value)
+        self._runtime_cache.clear()
+
     def reset_static_cache(self):
         """Reset cached static data so it is recomputed on the next forward pass.
 
         Call between proteins when input dimensions change.
         """
+        self._clear_runtime_cache()
         self._first_forward_pass = True
 
 
@@ -1696,6 +1738,11 @@ class PairformerModule(TorchWrapper):
         seq_len = z.shape[1]
         pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
 
+        required_cache_keys = ("mask_tt", "attn_mask_start_tt", "attn_mask_end_tt")
+        if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
+            self._clear_runtime_cache()
+            self._first_forward_pass = True
+
         if pad:
             z = torch.nn.functional.pad(z, (0, 0, 0, pad, 0, pad))
             if s is not None:
@@ -1707,9 +1754,9 @@ class PairformerModule(TorchWrapper):
                 # Affinity: cross-chain pair_mask, separate start/end additive masks
                 if pad:
                     pair_mask = torch.nn.functional.pad(pair_mask, (0, pad, 0, pad))
-                self._mask_tt = self._from_torch(pair_mask)
-                self._attn_mask_start_tt = self._from_torch(pair_mask.permute(1, 0, 2).unsqueeze(2) * 1e9 - 1e9)
-                self._attn_mask_end_tt = self._from_torch(pair_mask.permute(2, 0, 1).unsqueeze(2) * 1e9 - 1e9)
+                self._cache_set("mask_tt", self._from_torch(pair_mask))
+                self._cache_set("attn_mask_start_tt", self._from_torch(pair_mask.permute(1, 0, 2).unsqueeze(2) * 1e9 - 1e9))
+                self._cache_set("attn_mask_end_tt", self._from_torch(pair_mask.permute(2, 0, 1).unsqueeze(2) * 1e9 - 1e9))
             elif mask is not None or pad:
                 # Non-affinity: 1D mask → additive [1,1,1,S], pair_mask [1,S,S] for TriangleMul
                 mask_1d = mask if mask is not None else z.new_ones(1, seq_len)
@@ -1717,22 +1764,22 @@ class PairformerModule(TorchWrapper):
                     mask_1d = torch.nn.functional.pad(mask_1d, (0, pad))
                     if pair_mask is not None:
                         pair_mask = torch.nn.functional.pad(pair_mask, (0, pad, 0, pad))
-                self._mask_tt = self._from_torch(pair_mask if pair_mask is not None else mask_1d)
+                self._cache_set("mask_tt", self._from_torch(pair_mask if pair_mask is not None else mask_1d))
                 attn_mask = self._from_torch((1 - mask_1d).unsqueeze(1).unsqueeze(1) * -1e9)
-                self._attn_mask_start_tt = attn_mask
-                self._attn_mask_end_tt = attn_mask
+                self._cache_set("attn_mask_start_tt", attn_mask)
+                self._cache_set("attn_mask_end_tt", attn_mask)
             else:
-                self._mask_tt = None
-                self._attn_mask_start_tt = None
-                self._attn_mask_end_tt = None
+                self._cache_set("mask_tt", None)
+                self._cache_set("attn_mask_start_tt", None)
+                self._cache_set("attn_mask_end_tt", None)
             self._first_forward_pass = False
 
         s_out, z_out = self.module(
             self._from_torch(s) if s is not None else None,
             self._from_torch(z),
-            self._mask_tt,
-            self._attn_mask_start_tt,
-            self._attn_mask_end_tt,
+            self._cache_get("mask_tt"),
+            self._cache_get("attn_mask_start_tt"),
+            self._cache_get("attn_mask_end_tt"),
         )
 
         s_result = self._to_torch(s_out)[:, :seq_len, :] if s_out is not None else None
@@ -1792,27 +1839,45 @@ class DiffusionModule(TorchWrapper):
         NW_padded = N_padded // W
         K_padded = B * NW_padded
 
+        required_cache_keys = (
+            "s_inputs",
+            "s_trunk",
+            "q",
+            "c",
+            "keys_indexing",
+            "bias_encoder",
+            "bias_token",
+            "bias_decoder",
+            "atom_to_token",
+            "atom_to_token_normed",
+            "atom_pad",
+        )
+        if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
+            self._clear_runtime_cache()
+            self._first_forward_pass = True
+
         # Compute all static data once (everything except r and times is constant across diffusion steps)
         if self._first_forward_pass:
             if token_pad:
                 s_inputs = torch.nn.functional.pad(s_inputs, (0, 0, 0, token_pad))
                 s_trunk = torch.nn.functional.pad(s_trunk, (0, 0, 0, token_pad))
-            self._s_inputs = self._from_torch(s_inputs)
-            self._s_trunk = self._from_torch(s_trunk)
+            self._cache_set("s_inputs", self._from_torch(s_inputs))
+            self._cache_set("s_trunk", self._from_torch(s_trunk))
 
             q_pt = q if r.shape[0] == q.shape[0] else torch.repeat_interleave(q, r.shape[0], dim=0)
             c_pt = c if r.shape[0] == c.shape[0] else torch.repeat_interleave(c, r.shape[0], dim=0)
             if atom_pad:
                 q_pt = torch.nn.functional.pad(q_pt, (0, 0, 0, atom_pad))
                 c_pt = torch.nn.functional.pad(c_pt, (0, 0, 0, atom_pad))
-            self._q = self._from_torch(q_pt)
-            self._c = self._from_torch(c_pt)
+            self._cache_set("q", self._from_torch(q_pt))
+            self._cache_set("c", self._from_torch(c_pt))
 
             if atom_pad:
                 ki_pad_rows = 2 * NW_padded - keys_indexing.shape[0]
                 ki_pad_cols = 8 * NW_padded - keys_indexing.shape[1]
                 keys_indexing = torch.nn.functional.pad(keys_indexing, (0, ki_pad_cols, 0, ki_pad_rows))
-            self._keys_indexing = self._from_torch(keys_indexing, dtype=ttnn.bfloat4_b)
+            keys_indexing_tt = self._from_torch(keys_indexing, dtype=ttnn.bfloat4_b)
+            self._cache_set("keys_indexing", keys_indexing_tt)
 
             if atom_pad:
                 mask = torch.nn.functional.pad(mask, (0, atom_pad))
@@ -1821,7 +1886,7 @@ class DiffusionModule(TorchWrapper):
             mask = ttnn.permute(mask, (1, 2, 0))
             mask = ttnn.matmul(
                 mask,
-                self._keys_indexing,
+                keys_indexing_tt,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13),
             )
@@ -1836,7 +1901,7 @@ class DiffusionModule(TorchWrapper):
             bias = ttnn.reshape(bias, (B * NW_padded, W, H, -1))
             bias = ttnn.permute(bias, (0, 3, 1, 2))
             bias = ttnn.add_(bias, mask)
-            self._bias_encoder = ttnn.multiply_(bias, 32 ** 0.5)
+            self._cache_set("bias_encoder", ttnn.multiply_(bias, 32 ** 0.5))
 
             if atom_pad:
                 bias_decoder = torch.nn.functional.pad(bias_decoder, (0, 0, 0, 0, 0, 0, 0, NW_padded - NW))
@@ -1844,7 +1909,7 @@ class DiffusionModule(TorchWrapper):
             bias = ttnn.reshape(bias, (B * NW_padded, W, H, -1))
             bias = ttnn.permute(bias, (0, 3, 1, 2))
             bias = ttnn.add_(bias, mask)
-            self._bias_decoder = ttnn.multiply_(bias, 32 ** 0.5)
+            self._cache_set("bias_decoder", ttnn.multiply_(bias, 32 ** 0.5))
 
             if token_pad:
                 bias_token = torch.nn.functional.pad(bias_token, (0, 0, 0, token_pad, 0, token_pad))
@@ -1852,43 +1917,47 @@ class DiffusionModule(TorchWrapper):
             bias = ttnn.multiply_(
                 bias, (TOKEN_TRANSFORMER_DIM / TOKEN_TRANSFORMER_N_HEADS) ** 0.5
             )
-            self._bias_token = ttnn.permute(bias, (0, 3, 1, 2))
+            bias_token_tt = ttnn.permute(bias, (0, 3, 1, 2))
             if token_pad:
                 # Fuse additive padding mask into token bias (bfloat16 for -1e9)
                 seq_mask = torch.zeros(1, 1, 1, padded_seq)
                 seq_mask[..., seq_len:] = -1e9
-                self._bias_token = ttnn.add_(self._bias_token, self._from_torch(seq_mask))
+                bias_token_tt = ttnn.add_(bias_token_tt, self._from_torch(seq_mask))
+            self._cache_set("bias_token", bias_token_tt)
 
             if atom_pad or token_pad:
                 atom_to_token = torch.nn.functional.pad(atom_to_token, (0, token_pad, 0, atom_pad))
-            self._atom_to_token = self._from_torch(atom_to_token)
-            self._atom_to_token_normed = ttnn.multiply(
-                self._atom_to_token,
+            atom_to_token_tt = self._from_torch(atom_to_token)
+            self._cache_set("atom_to_token", atom_to_token_tt)
+            atom_to_token_normed_tt = ttnn.multiply(
+                atom_to_token_tt,
                 ttnn.reciprocal(
-                    ttnn.sum(self._atom_to_token, dim=1, keepdim=True) + 1e-6
+                    ttnn.sum(atom_to_token_tt, dim=1, keepdim=True) + 1e-6
                 ),
             )
+            self._cache_set("atom_to_token_normed", atom_to_token_normed_tt)
 
-            self._atom_pad = atom_pad
+            self._cache_set("atom_pad", atom_pad)
             self._first_forward_pass = False
 
-        if self._atom_pad:
-            r = torch.nn.functional.pad(r, (0, 0, 0, self._atom_pad))
+        atom_pad_cached = self._cache_get("atom_pad", 0)
+        if atom_pad_cached:
+            r = torch.nn.functional.pad(r, (0, 0, 0, atom_pad_cached))
 
         result = self._to_torch(
             self.module(
                 self._from_torch(r),
                 self._from_torch(times),
-                self._s_inputs,
-                self._s_trunk,
-                self._q,
-                self._c,
-                self._bias_encoder,
-                self._bias_token,
-                self._bias_decoder,
-                self._keys_indexing,
-                self._atom_to_token,
-                self._atom_to_token_normed,
+                self._cache_get("s_inputs"),
+                self._cache_get("s_trunk"),
+                self._cache_get("q"),
+                self._cache_get("c"),
+                self._cache_get("bias_encoder"),
+                self._cache_get("bias_token"),
+                self._cache_get("bias_decoder"),
+                self._cache_get("keys_indexing"),
+                self._cache_get("atom_to_token"),
+                self._cache_get("atom_to_token_normed"),
                 large_seq_len=seq_len > SEQ_LEN_MORE_CHUNKING,
             )
         )
@@ -1898,12 +1967,9 @@ class DiffusionModule(TorchWrapper):
     def reset_static_cache(self):
         super().reset_static_cache()
         if self.module is not None:
-            for attr in ('_s_conditioned', '_c_reshaped'):
-                if hasattr(self.module, attr):
-                    delattr(self.module, attr)
+            self._clear_cached_attrs(self.module, ("_s_conditioned", "_c_reshaped"))
             for layer in self.module.encoder.layers + self.module.decoder.layers:
-                if hasattr(layer, 's_o'):
-                    delattr(layer, 's_o')
+                self._clear_cached_attrs(layer, ("s_o",))
 
 
 class MSAModule(TorchWrapper):
@@ -1965,6 +2031,11 @@ class MSAModule(TorchWrapper):
         seq_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
         msa_pad = (-n_msa) % MSA_PAD_MULTIPLE
 
+        required_cache_keys = ("mask_tt", "attn_mask_tt", "msa_mask_tt", "n_msa")
+        if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
+            self._clear_runtime_cache()
+            self._first_forward_pass = True
+
         if seq_pad:
             z = torch.nn.functional.pad(z, (0, 0, 0, seq_pad, 0, seq_pad))
             emb = torch.nn.functional.pad(emb, (0, 0, 0, seq_pad))
@@ -1978,21 +2049,21 @@ class MSAModule(TorchWrapper):
                 mask_1d = z.new_ones(1, padded_seq)
                 mask_1d[:, seq_len:] = 0.0
                 # 2D mask for TriangleMultiplication (row + column masking)
-                self._mask_tt = self._from_torch(mask_1d.unsqueeze(-1) * mask_1d.unsqueeze(1))
+                self._cache_set("mask_tt", self._from_torch(mask_1d.unsqueeze(-1) * mask_1d.unsqueeze(1)))
                 # 4D additive mask for TriangleAttention (bfloat16 for -1e9)
-                self._attn_mask_tt = self._from_torch((1 - mask_1d).unsqueeze(1).unsqueeze(1) * -1e9)
+                self._cache_set("attn_mask_tt", self._from_torch((1 - mask_1d).unsqueeze(1).unsqueeze(1) * -1e9))
             else:
-                self._mask_tt = None
-                self._attn_mask_tt = None
+                self._cache_set("mask_tt", None)
+                self._cache_set("attn_mask_tt", None)
             if msa_pad:
                 padded_msa = n_msa + msa_pad
                 msa_mask = z.new_zeros(padded_msa, 1, 1)
                 msa_mask[:n_msa] = 1.0
-                self._msa_mask_tt = self._from_torch(msa_mask)
-                self._n_msa = n_msa
+                self._cache_set("msa_mask_tt", self._from_torch(msa_mask))
+                self._cache_set("n_msa", n_msa)
             else:
-                self._msa_mask_tt = None
-                self._n_msa = None
+                self._cache_set("msa_mask_tt", None)
+                self._cache_set("n_msa", None)
             self._first_forward_pass = False
 
         z_out = self._to_torch(
@@ -2000,10 +2071,10 @@ class MSAModule(TorchWrapper):
                 self._from_torch(z),
                 self._from_torch(m),
                 self._from_torch(emb),
-                self._mask_tt,
-                self._attn_mask_tt,
-                self._msa_mask_tt,
-                self._n_msa,
+                self._cache_get("mask_tt"),
+                self._cache_get("attn_mask_tt"),
+                self._cache_get("msa_mask_tt"),
+                self._cache_get("n_msa"),
             )
         )
 
