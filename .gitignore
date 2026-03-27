@@ -22,6 +22,10 @@ mgtbind_inputs/
 mgtbind_inputs/
 mgtbind/sample.csv
 mgtbind/comparison.csv
+backup_mgtbind_cleanup_*/
+mgtbind_tenstorrent_boltz2/
+mgtbind_tenstorrent_boltz2.zip
+examples/huntingtin_P42858.fasta
 
 # IDE
 .vscode/
