@@ -4,50 +4,34 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card (e.g. QuietBox with 4 cards) configurations.
+TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards).
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
 ## Installation
 
-### Clone
+### Recommended: Create Virtual Environment
 ```bash
-git clone https://github.com/moritztng/tt-boltz.git
-cd tt-boltz
-```
-
-### Create Virtual Environment
-```bash
-python3 -m venv env
+python3.10 -m venv env
 source env/bin/activate
 ```
 
-### Build TT-Metal from Source
-When following the [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md), you **must** use a different clone command to checkout the `boltz` branch:
-
-**❌ Do NOT use the standard clone command from the installation guide:**
+### Simple Install
 ```bash
-git clone https://github.com/tenstorrent/tt-metal.git --recurse-submodules
+pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
 ```
 
-**✅ Instead, use this command to clone the `boltz` branch:**
-```bash
-git clone https://github.com/tenstorrent/tt-metal.git --branch boltz --recurse-submodules
-```
+This installs `tt-boltz` and its Python dependencies (including `ttnn`). That's it.
 
-Then continue with the rest of the installation guide.
-
-### Install TT-NN into the Virtual Environment
-From the `tt-metal` directory:
+### Advanced Install (editable local clone)
 ```bash
+git clone https://github.com/moritztng/tt-boltz.git
+cd tt-boltz
 pip install -e .
 ```
 
-### Install TT-Boltz into the Virtual Environment
-From the `tt-boltz` directory:
-```bash
-pip install -e .
-```
+### Optional: Build TT-Metal / TT-NN from Source
+If you need to build from source, follow the [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md).
 
 ### Verify Installation
 ```bash
