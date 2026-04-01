@@ -163,7 +163,7 @@ class TriangleMultiplication(Module):
         H = x_norm_in.shape[1]
         memory_config = ttnn.DRAM_MEMORY_CONFIG if H > (704 if _FAST_MODE else 352) else ttnn.L1_MEMORY_CONFIG
         seq_len_tiles, core_grid = (H + 31) // 32, (
-            (10, 13)
+            (10, 12)
         )
         per_core_M, per_core_N = (seq_len_tiles + core_grid[0] - 1) // core_grid[0], (
             seq_len_tiles + core_grid[1] - 1
@@ -334,7 +334,7 @@ class TriangleAttention(Module):
                 q, k, v, attn_mask=bias, is_causal=False, scale=self.scale**-1,
                 program_config=ttnn.SDPAProgramConfig(
                     compute_with_storage_grid_size=(
-                        (13, 10)
+                        (12, 10)
                     ),
                     exp_approx_mode=False,
                     q_chunk_size=256,  # CAN CAUSE ACCURACY ISSUES IN TEMPLATE MODULE
@@ -492,7 +492,7 @@ class AttentionPairBias(Module):
                 self.qkv_weight,
                 bias=self.qkv_bias,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             qkv = ttnn.unsqueeze(qkv, 1)
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -528,7 +528,7 @@ class AttentionPairBias(Module):
                 scale=self.head_dim**-0.5,
                 program_config=ttnn.SDPAProgramConfig(
                     compute_with_storage_grid_size=(
-                        (13, 10)
+                        (12, 10)
                     ),
                     exp_approx_mode=False,
                     q_chunk_size=64,
@@ -551,13 +551,13 @@ class AttentionPairBias(Module):
                 s_kv,
                 keys_indexing,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
             s_kv = ttnn.reshape(s_kv, (B, K, -1, D_S))
             
-            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13), dtype=_dtype())
-            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=13), dtype=_dtype())
+            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=12), dtype=_dtype())
+            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, core_grid=ttnn.CoreGrid(y=10, x=12), dtype=_dtype())
             
             q = ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT)
             q = ttnn.pad(q, [[0, 0], [0, 0], [0, 96], [0, 0]], 0.0)
@@ -574,7 +574,7 @@ class AttentionPairBias(Module):
             o = ttnn.transformer.scaled_dot_product_attention(
                 q, k, v, attn_mask=z, is_causal=False, scale=self.head_dim**-0.5,
                 program_config=ttnn.SDPAProgramConfig(
-                    compute_with_storage_grid_size=((13, 10)),
+                    compute_with_storage_grid_size=((12, 10)),
                     exp_approx_mode=False, q_chunk_size=32, k_chunk_size=128,
                 ),
             )
@@ -586,7 +586,7 @@ class AttentionPairBias(Module):
             s,
             self.g_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         if _FAST_MODE:
             o = ttnn.typecast(o, ttnn.bfloat16)
@@ -594,7 +594,7 @@ class AttentionPairBias(Module):
         ttnn.deallocate(g)
         x = ttnn.linear(
             o, self.o_weight, compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         ttnn.deallocate(o)
         return x
@@ -630,7 +630,7 @@ class Transition(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 dtype=_dtype(),
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             x_2 = ttnn.linear(
                 x_norm,
@@ -849,14 +849,14 @@ class AdaLN(Module):
             bias=self.s_scale_bias,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
-            #core_grid=ttnn.CoreGrid(y=10, x=13), CAUSES ACCURACY ISSUE
+            #core_grid=ttnn.CoreGrid(y=10, x=12), CAUSES ACCURACY ISSUE
         )
         s_bias = ttnn.linear(
             s,
             self.s_bias_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
-            #core_grid=ttnn.CoreGrid(y=10, x=13), CAUSES ACCURACY ISSUE
+            #core_grid=ttnn.CoreGrid(y=10, x=12), CAUSES ACCURACY ISSUE
         )
         a = ttnn.multiply_(a, s_scale, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         ttnn.deallocate(s_scale)
@@ -896,20 +896,20 @@ class ConditionedTransitionBlock(Module):
             a,
             self.swish_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         gates = ttnn.linear(
             a,
             self.gates_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         a_swish = ttnn.multiply_(gates, a_swish, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
         a_b = ttnn.linear(
             a,
             self.a_to_b_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         ttnn.deallocate(a)
         b = ttnn.multiply_(a_swish, a_b)
@@ -919,13 +919,13 @@ class ConditionedTransitionBlock(Module):
             self.output_projection_weight,
             bias=self.output_projection_bias,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         b_a = ttnn.linear(
             b,
             self.b_to_a_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         ttnn.deallocate(b)
         a = ttnn.multiply_(s, b_a, input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID])
@@ -984,7 +984,7 @@ class DiffusionTransformerLayer(Module):
                 self.output_projection_weight,
                 bias=self.output_projection_bias,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
                 activation="sigmoid",
             )
             if self.atom_level:
@@ -1082,7 +1082,7 @@ class PairWeightedAveraging(Module):
                 z,
                 self.z_weight[:, i : i + 1],
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             b = ttnn.permute(b, (2, 0, 1))
             if attn_mask is not None:
@@ -1097,7 +1097,7 @@ class PairWeightedAveraging(Module):
                 m,
                 self.m_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             # TODO: Inline with transpose_a=True after newest tt-metal release.
             v = ttnn.permute(v, (0, 2, 1))
@@ -1106,7 +1106,7 @@ class PairWeightedAveraging(Module):
                 w,
                 transpose_b=True,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             del v, w
             o = ttnn.permute(o, (0, 2, 1))
@@ -1114,7 +1114,7 @@ class PairWeightedAveraging(Module):
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
             del g
@@ -1122,7 +1122,7 @@ class PairWeightedAveraging(Module):
                 o,
                 self.o_weight[i * self.head_dim : (i + 1) * self.head_dim, :],
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             if i == 0:
                 o_out = o
@@ -1159,13 +1159,13 @@ class OuterProductMean(Module):
             m,
             self.a_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         b = ttnn.linear(
             m,
             self.b_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         ttnn.deallocate(m)
         if msa_mask is not None:
@@ -1196,7 +1196,7 @@ class OuterProductMean(Module):
                 self.o_weight,
                 bias=self.o_bias,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             ttnn.deallocate(z)
             return out
@@ -1339,7 +1339,7 @@ class MSA(Module):
             m,
             self.msa_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         m = ttnn.add_(
             m,
@@ -1347,7 +1347,7 @@ class MSA(Module):
                 emb,
                 self.s_weight,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             ),
         )
         for block in self.blocks:
@@ -1482,7 +1482,7 @@ class Diffusion(Module):
                 self.conditioner_embed_weight,
                 bias=self.conditioner_embed_bias,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             ttnn.deallocate(s)
             self._c_reshaped = ttnn.reshape(c, (B, NW, W, -1))
@@ -1490,7 +1490,7 @@ class Diffusion(Module):
             r,
             self.r_to_q_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         q = ttnn.add(q, r_to_q)
         ttnn.deallocate(r_to_q)
@@ -1508,7 +1508,7 @@ class Diffusion(Module):
             self.atom_to_token_weight,
             compute_kernel_config=self.compute_kernel_config,
             activation="relu",
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         a = ttnn.matmul(
             a,
@@ -1523,7 +1523,7 @@ class Diffusion(Module):
             self.conditioner_fourier_embed_weight,
             bias=self.conditioner_fourier_embed_bias,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         fourier = ttnn.multiply(fourier, 2 * pi)
         fourier = ttnn.cos(fourier)
@@ -1538,7 +1538,7 @@ class Diffusion(Module):
             fourier,
             self.conditioner_fourier_single_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         fourier = ttnn.unsqueeze(fourier, 1)
         s = ttnn.add(self._s_conditioned, fourier)
@@ -1560,7 +1560,7 @@ class Diffusion(Module):
             s_to_a,
             self.s_to_a_linear_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         a = ttnn.add(a, s_to_a)
         ttnn.deallocate(s_to_a)
@@ -1577,7 +1577,7 @@ class Diffusion(Module):
             a,
             self.a_to_q_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         # TODO: Inline with transpose_a=True after newest tt-metal release.
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
@@ -1610,7 +1610,7 @@ class Diffusion(Module):
             r_update,
             self.feat_to_pos_linear_weight,
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=ttnn.CoreGrid(y=10, x=13),
+            core_grid=ttnn.CoreGrid(y=10, x=12),
         )
         ttnn.deallocate(q)
         return r_update
@@ -1896,7 +1896,7 @@ class DiffusionModule(TorchWrapper):
                 mask,
                 keys_indexing_tt,
                 compute_kernel_config=self.compute_kernel_config,
-                core_grid=ttnn.CoreGrid(y=10, x=13),
+                core_grid=ttnn.CoreGrid(y=10, x=12),
             )
             mask = ttnn.permute(mask, (2, 0, 1))
             mask = ttnn.reshape(mask, (K_padded, 1, 1, -1))
