@@ -1094,6 +1094,7 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=ttnn.CoreGrid(y=10, x=13),
             )
+            # TODO: Inline with transpose_a=True after newest tt-metal release.
             v = ttnn.permute(v, (0, 2, 1))
             o = ttnn.matmul(
                 v,
@@ -1573,6 +1574,7 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
+        # TODO: Inline with transpose_a=True after newest tt-metal release.
         a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         a_to_q = ttnn.matmul(
             a_to_q,
@@ -1883,6 +1885,7 @@ class DiffusionModule(TorchWrapper):
                 mask = torch.nn.functional.pad(mask, (0, atom_pad))
             mask = self._from_torch(mask)
             mask = ttnn.reshape(mask, (2 * K_padded, W // 2, -1))
+            # TODO: Inline with transpose_a=True after newest tt-metal release.
             mask = ttnn.permute(mask, (1, 2, 0))
             mask = ttnn.matmul(
                 mask,
