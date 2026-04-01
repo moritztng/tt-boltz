@@ -51,6 +51,8 @@ tt-boltz predict examples/prot.yaml --use_msa_server --override
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
 
+`--fast` makes some operations use block-fp8, a lower-precision numeric format that runs faster. Accuracy is typically very close.
+
 `predict` accepts either a single YAML/FASTA file or a directory containing many input files.
 
 ### Offline MSA (Optional)
@@ -79,6 +81,7 @@ tt-boltz predict examples/prot.yaml --use_envdb --override
 - `--msa_db_path`: Use a local database at a custom path (e.g. `--msa_db_path /data/colabfold_db`)
 - `--use_envdb`: Include EnvDB in offline MSA (`tt-boltz msa --db all`)
 - `--accelerator=tenstorrent`: Use Tenstorrent hardware (default, or use `cpu`/`gpu`)
+- `--fast`: Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close
 - `--debug`: Show all raw output from the hardware and libraries instead of the progress display
 - `--debug --log`: Same as `--debug`, but also print what each device is currently working on
 
@@ -273,6 +276,7 @@ templates:
 | `--affinity_mw_correction` | `False` | Apply MW correction to affinity |
 | `--num_devices` | `0` | Number of TT devices (0=all available) |
 | `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
+| `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
 
 **Affinity-Specific Options:**
 

@@ -3,13 +3,18 @@ from torch import nn
 from typing import Tuple, Callable, Dict
 from math import pi
 
-USE_BLOCKFP8 = False
-
 TRIANGLE_MULT_CHUNK_SIZE = 32
 SEQ_LEN_MORE_CHUNKING = 1536
+_FAST_MODE = False
 
 def _dtype():
-    return ttnn.bfloat8_b if USE_BLOCKFP8 else ttnn.bfloat16
+    return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
+
+
+def set_fast_mode(enabled: bool) -> None:
+    """Set fast block-fp8 mode for the current worker process."""
+    global _FAST_MODE
+    _FAST_MODE = bool(enabled)
 
 _device = None
 
@@ -137,7 +142,7 @@ class TriangleMultiplication(Module):
                 (ttnn.permute, permute_dims),
                 (ttnn.typecast, ttnn.bfloat8_b),
                 (ttnn.reallocate,),
-            ] if USE_BLOCKFP8 else [
+            ] if _FAST_MODE else [
                 (ttnn.permute, permute_dims),
                 (ttnn.reallocate,),
             ]
@@ -156,7 +161,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         H = x_norm_in.shape[1]
-        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > (704 if USE_BLOCKFP8 else 352) else ttnn.L1_MEMORY_CONFIG
+        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > (704 if _FAST_MODE else 352) else ttnn.L1_MEMORY_CONFIG
         seq_len_tiles, core_grid = (H + 31) // 32, (
             (10, 13)
         )
@@ -357,11 +362,11 @@ class TriangleAttention(Module):
             return x_out
 
         S = x.shape[0]
-        need_chunk = S > SEQ_LEN_MORE_CHUNKING and (self.affinity or not USE_BLOCKFP8)
+        need_chunk = S > SEQ_LEN_MORE_CHUNKING and (self.affinity or not _FAST_MODE)
         if need_chunk:
             if not self.affinity and attn_mask is not None:
                 triangle_bias = ttnn.add(triangle_bias, attn_mask)
-            chunk = 1024 if USE_BLOCKFP8 else 512
+            chunk = 1024 if _FAST_MODE else 512
             parts = []
             for s in range(0, S, chunk):
                 end = min(s + chunk, S)
@@ -583,7 +588,7 @@ class AttentionPairBias(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=ttnn.CoreGrid(y=10, x=13),
         )
-        if USE_BLOCKFP8:
+        if _FAST_MODE:
             o = ttnn.typecast(o, ttnn.bfloat16)
         o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID], dtype=_dtype())
         ttnn.deallocate(g)
@@ -659,7 +664,7 @@ class Transition(Module):
             return swiglu(x)
 
         H, W = x.shape[1], x.shape[2]
-        chunk_h = (64 if USE_BLOCKFP8 else 32) if W * x.shape[3] <= 768 * 128 else (32 if USE_BLOCKFP8 else 16)
+        chunk_h = (64 if _FAST_MODE else 32) if W * x.shape[3] <= 768 * 128 else (32 if _FAST_MODE else 16)
         chunks = ttnn.chunk(x, -(-H // chunk_h), dim=1)
         if W <= SEQ_LEN_MORE_CHUNKING:
             return ttnn.concat([swiglu(c) for c in chunks], dim=1)

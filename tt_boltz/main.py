@@ -723,6 +723,8 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
     results = []
     try:
         os.environ["TT_VISIBLE_DEVICES"] = str(device_id)
+        from tt_boltz.tenstorrent import set_fast_mode as _set_fast_mode
+        _set_fast_mode(cfg.get("fast", False))
         torch_device = torch.device("cpu")
         tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
         ccd = load_canonicals(Path(cfg["mol_dir"]))
@@ -967,6 +969,7 @@ def msa(db, path, install_tools):
 @click.option("--affinity_checkpoint", type=click.Path(exists=True), default=None)
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
 @click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use (e.g. '0,2')")
+@click.option("--fast", is_flag=True, help="Make some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close")
 @click.option("--disable_watchdog", is_flag=True, help="Disable multi-device watchdog reset/retry logic")
 @click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
@@ -977,7 +980,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
-            num_devices, device_ids, disable_watchdog, debug, log):
+            num_devices, device_ids, fast, disable_watchdog, debug, log):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -992,6 +995,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     """
     use_tt = accelerator == "tenstorrent"
     if use_tt: accelerator = "cpu"
+    if fast and not use_tt:
+        click.echo("Note: --fast is only used with --accelerator tenstorrent; ignoring.")
     warnings.filterwarnings("ignore", ".*Tensor Cores.*")
     torch.set_grad_enabled(False)
     torch.set_float32_matmul_precision("highest")
@@ -1129,6 +1134,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
             "results_path": str(results_path),
+            "fast": fast,
         }
         import sys as _sys
         ctx = mp.get_context("spawn")
