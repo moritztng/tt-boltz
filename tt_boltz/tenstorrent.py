@@ -1,6 +1,6 @@
 import torch, ttnn, atexit
 from torch import nn
-from typing import Tuple, Callable, Dict
+from typing import Tuple, Callable, Dict, Mapping
 from math import pi
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
@@ -52,26 +52,53 @@ def cleanup():
 atexit.register(cleanup)
 
 
-def filter_dict(state_dict: dict, prefix: str, remove: str = "") -> dict:
-    if not prefix:
-        return state_dict
-    prefix += "."
-    return {
-        key[len(prefix) :].replace(remove, ""): value
-        for key, value in state_dict.items()
-        if key.startswith(prefix)
-    }
+class WeightScope:
+    """Immutable scoped view over a flat checkpoint state-dict."""
+
+    def __init__(self, data: Mapping[str, torch.Tensor]):
+        self.data = dict(data)
+
+    @classmethod
+    def wrap(cls, data: Mapping[str, torch.Tensor] | "WeightScope") -> "WeightScope":
+        return data if isinstance(data, cls) else cls(data)
+
+    def child(self, scope: str, strip_prefix: str = "") -> "WeightScope":
+        if not scope:
+            return WeightScope(self.data)
+        scope_prefix = f"{scope}."
+        out = {}
+        for key, value in self.data.items():
+            if not key.startswith(scope_prefix):
+                continue
+            child_key = key[len(scope_prefix) :]
+            if strip_prefix and child_key.startswith(strip_prefix):
+                child_key = child_key[len(strip_prefix) :]
+            out[child_key] = value
+        return WeightScope(out)
+
+
+def substate_dict(state_dict: Mapping[str, torch.Tensor] | WeightScope, scope: str, strip_prefix: str = "") -> dict:
+    """Compatibility helper: return a plain dict for a scoped checkpoint subtree."""
+    return WeightScope.wrap(state_dict).child(scope, strip_prefix).data
+
+
+# Backward-compatible alias (prefer `substate_dict` for clarity).
+filter_dict = substate_dict
 
 
 class Module:
     def __init__(
         self,
-        state_dict: dict,
+        state_dict: Mapping[str, torch.Tensor] | WeightScope,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
-        self.state_dict = state_dict
+        self.weights = WeightScope.wrap(state_dict)
+        self.state_dict = self.weights.data
         self.compute_kernel_config = compute_kernel_config
         self.device = get_device()
+
+    def scope(self, scope: str, strip_prefix: str = "") -> dict[str, torch.Tensor]:
+        return self.weights.child(scope, strip_prefix).data
 
     def torch_to_tt(
         self,
@@ -694,16 +721,16 @@ class PairformerLayer(Module):
         super().__init__(state_dict, compute_kernel_config)
         self.transform_s = transform_s
         self.triangle_multiplication_start = TriangleMultiplication(
-            False, filter_dict(state_dict, "tri_mul_out"), compute_kernel_config
+            False, self.scope("tri_mul_out"), compute_kernel_config
         )
         self.triangle_multiplication_end = TriangleMultiplication(
-            True, filter_dict(state_dict, "tri_mul_in"), compute_kernel_config
+            True, self.scope("tri_mul_in"), compute_kernel_config
         )
         self.triangle_attention_start = TriangleAttention(
             tri_att_head_dim,
             tri_att_n_heads,
             False,
-            filter_dict(state_dict, "tri_att_start", "mha."),
+            self.scope("tri_att_start", "mha."),
             compute_kernel_config,
             affinity=affinity,
         )
@@ -711,12 +738,12 @@ class PairformerLayer(Module):
             tri_att_head_dim,
             tri_att_n_heads,
             True,
-            filter_dict(state_dict, "tri_att_end", "mha."),
+            self.scope("tri_att_end", "mha."),
             compute_kernel_config,
             affinity=affinity,
         )
         self.transition_z = Transition(
-            filter_dict(state_dict, "transition_z"), compute_kernel_config
+            self.scope("transition_z"), compute_kernel_config
         )
         if transform_s:
             self.pre_norm_s_weight = self.torch_to_tt("pre_norm_s.weight")
@@ -726,11 +753,11 @@ class PairformerLayer(Module):
                 att_n_heads,
                 True,
                 False,
-                filter_dict(state_dict, "attention"),
+                self.scope("attention"),
                 compute_kernel_config,
             )
             self.transition_s = Transition(
-                filter_dict(state_dict, "transition_s"), compute_kernel_config
+                self.scope("transition_s"), compute_kernel_config
             )
 
     def __call__(
@@ -800,7 +827,7 @@ class Pairformer(Module):
                 att_head_dim,
                 att_n_heads,
                 transform_s,
-                filter_dict(state_dict, f"layers.{i}"),
+                self.scope(f"layers.{i}"),
                 compute_kernel_config,
                 affinity=affinity,
             )
@@ -881,7 +908,7 @@ class ConditionedTransitionBlock(Module):
         super().__init__(state_dict, compute_kernel_config)
         self.atom_level = atom_level
         self.adaln = AdaLN(
-            atom_level, filter_dict(state_dict, "adaln"), compute_kernel_config
+            atom_level, self.scope("adaln"), compute_kernel_config
         )
         swish_chunk, gates_chunk = torch.chunk(self.state_dict["swish_gate.0.weight"], chunks=2, dim=0)
         self.swish_weight, self.gates_weight = [
@@ -950,14 +977,14 @@ class DiffusionTransformerLayer(Module):
         super().__init__(state_dict, compute_kernel_config)
         self.atom_level = atom_level
         self.adaln = AdaLN(
-            atom_level, filter_dict(state_dict, "adaln"), compute_kernel_config
+            atom_level, self.scope("adaln"), compute_kernel_config
         )
         self.attn_pair_bias = AttentionPairBias(
             head_dim=dim // n_heads,
             n_heads=n_heads,
             compute_pair_bias=False,
             atom_level=atom_level,
-            state_dict=filter_dict(state_dict, "pair_bias_attn"),
+            state_dict=self.scope("pair_bias_attn"),
             compute_kernel_config=compute_kernel_config,
         )
         self.output_projection_weight = self.torch_to_tt(
@@ -966,7 +993,7 @@ class DiffusionTransformerLayer(Module):
         self.output_projection_bias = self.torch_to_tt("output_projection_linear.bias")
         self.transition = ConditionedTransitionBlock(
             atom_level,
-            filter_dict(state_dict, "transition"),
+            self.scope("transition"),
             compute_kernel_config,
         )
 
@@ -1019,7 +1046,7 @@ class DiffusionTransformer(Module):
                 dim,
                 n_heads,
                 atom_level,
-                filter_dict(state_dict, f"layers.{i}"),
+                self.scope(f"layers.{i}"),
                 compute_kernel_config,
             )
             for i in range(n_layers)
@@ -1240,16 +1267,16 @@ class MSALayer(Module):
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.msa_transition = Transition(
-            filter_dict(state_dict, "msa_transition"), compute_kernel_config
+            self.scope("msa_transition"), compute_kernel_config
         )
         self.pair_weighted_averaging = PairWeightedAveraging(
             head_dim=avg_head_dim,
             n_heads=avg_n_heads,
-            state_dict=filter_dict(state_dict, "pair_weighted_averaging"),
+            state_dict=self.scope("pair_weighted_averaging"),
             compute_kernel_config=compute_kernel_config,
         )
         self.outer_product_mean = OuterProductMean(
-            state_dict=filter_dict(state_dict, "outer_product_mean"),
+            state_dict=self.scope("outer_product_mean"),
             compute_kernel_config=compute_kernel_config,
         )
         self.pairformer_layer = PairformerLayer(
@@ -1258,7 +1285,7 @@ class MSALayer(Module):
             None,
             None,
             False,
-            filter_dict(state_dict, f"pairformer_layer"),
+            self.scope("pairformer_layer"),
             compute_kernel_config,
         )
 
@@ -1324,7 +1351,7 @@ class MSA(Module):
                 avg_n_heads,
                 tri_att_head_dim,
                 tri_att_n_heads,
-                filter_dict(state_dict, f"layers.{i}"),
+                self.scope(f"layers.{i}"),
                 compute_kernel_config,
             )
             for i in range(n_blocks)
@@ -1395,11 +1422,11 @@ class Diffusion(Module):
             "single_conditioner.fourier_to_single.weight"
         )
         self.conditioner_transition_0 = Transition(
-            filter_dict(state_dict, "single_conditioner.transitions.0"),
+            self.scope("single_conditioner.transitions.0"),
             compute_kernel_config,
         )
         self.conditioner_transition_1 = Transition(
-            filter_dict(state_dict, "single_conditioner.transitions.1"),
+            self.scope("single_conditioner.transitions.1"),
             compute_kernel_config,
         )
         self.r_to_q_weight = self.torch_to_tt(
@@ -1410,9 +1437,7 @@ class Diffusion(Module):
             dim=128,
             n_heads=4,
             atom_level=True,
-            state_dict=filter_dict(
-                state_dict, f"atom_attention_encoder.atom_encoder.diffusion_transformer"
-            ),
+            state_dict=self.scope("atom_attention_encoder.atom_encoder.diffusion_transformer"),
             compute_kernel_config=compute_kernel_config,
         )
         self.atom_to_token_weight = self.torch_to_tt(
@@ -1426,7 +1451,7 @@ class Diffusion(Module):
             dim=2 * 384,
             n_heads=16,
             atom_level=False,
-            state_dict=filter_dict(state_dict, f"token_transformer"),
+            state_dict=self.scope("token_transformer"),
             compute_kernel_config=compute_kernel_config,
         )
         self.a_norm_weight = self.torch_to_tt("a_norm.weight")
@@ -1439,9 +1464,7 @@ class Diffusion(Module):
             dim=128,
             n_heads=4,
             atom_level=True,
-            state_dict=filter_dict(
-                state_dict, f"atom_attention_decoder.atom_decoder.diffusion_transformer"
-            ),
+            state_dict=self.scope("atom_attention_decoder.atom_decoder.diffusion_transformer"),
             compute_kernel_config=compute_kernel_config,
         )
         self.feat_to_pos_norm_weight = self.torch_to_tt(
@@ -1734,7 +1757,7 @@ class PairformerModule(TorchWrapper):
             self.att_head_dim,
             self.att_n_heads,
             self.transform_s,
-            filter_dict(state_dict, prefix[:-1]),
+            WeightScope.wrap(state_dict).child(prefix[:-1]),
             self.compute_kernel_config,
             affinity=self.affinity,
         )
@@ -1815,7 +1838,7 @@ class DiffusionModule(TorchWrapper):
         error_msgs,
     ):
         self.module = Diffusion(
-            filter_dict(state_dict, prefix[:-1]),
+            WeightScope.wrap(state_dict).child(prefix[:-1]),
             self.compute_kernel_config,
         )
 
@@ -2018,7 +2041,7 @@ class MSAModule(TorchWrapper):
             self.avg_n_heads,
             self.tri_att_head_dim,
             self.tri_att_n_heads,
-            filter_dict(state_dict, prefix[:-1]),
+            WeightScope.wrap(state_dict).child(prefix[:-1]),
             self.compute_kernel_config,
         )
 
