@@ -1491,7 +1491,7 @@ def warmup(max_seq, max_msa, n_samples, cache):
     import gc
 
     from tt_boltz.tenstorrent import (
-        substate_dict, PairformerModule, MSAModule, DiffusionModule,
+        WeightScope, PairformerModule, MSAModule, DiffusionModule,
         PAIRFORMER_PAD_MULTIPLE as SEQ_PAD, MSA_PAD_MULTIPLE as MSA_PAD,
         MAX_ATOMS_PER_TOKEN,
     )
@@ -1515,7 +1515,7 @@ def warmup(max_seq, max_msa, n_samples, cache):
 
     click.echo(f"\n[1/4] Pairformer (z=128) — {len(seq_bk)} buckets")
     pf = PairformerModule(1, 32, 4, 24, 16, True)
-    pf.load_state_dict(substate_dict(state, "pairformer_module"), strict=False)
+    pf.load_state_dict(WeightScope.wrap(state).child("pairformer_module").as_dict(), strict=False)
     for seq in seq_bk:
         t = time.time()
         pf.reset_static_cache()
@@ -1528,7 +1528,7 @@ def warmup(max_seq, max_msa, n_samples, cache):
 
     click.echo(f"\n[2/4] Template Pairformer (z=64) — {len(seq_bk)} buckets")
     pf_tpl = PairformerModule(1, 32, 4, None, None, False)
-    pf_tpl.load_state_dict(substate_dict(state, "template_module.pairformer"), strict=False)
+    pf_tpl.load_state_dict(WeightScope.wrap(state).child("template_module.pairformer").as_dict(), strict=False)
     for seq in seq_bk:
         t = time.time()
         pf_tpl.reset_static_cache()
@@ -1540,7 +1540,7 @@ def warmup(max_seq, max_msa, n_samples, cache):
     n = len(seq_bk) * len(msa_bk)
     click.echo(f"\n[3/4] MSA — {n} combos ({len(seq_bk)} seq × {len(msa_bk)} msa)")
     msa_mod = MSAModule(1, 32, 8, 32, 4)
-    msa_mod.load_state_dict(substate_dict(state, "msa_module"), strict=False)
+    msa_mod.load_state_dict(WeightScope.wrap(state).child("msa_module").as_dict(), strict=False)
     for seq in seq_bk:
         actual_seq = seq - 1
         for n_msa_val in msa_bk:
@@ -1565,7 +1565,7 @@ def warmup(max_seq, max_msa, n_samples, cache):
 
     B = n_samples
     W, H = 32, 128
-    diff_sd = substate_dict(state, "structure_module.score_model")
+    diff_sd = WeightScope.wrap(state).child("structure_module.score_model").as_dict()
     click.echo(f"\n[4/4] Diffusion — {len(seq_bk)} buckets (n_samples={B})")
     for seq in seq_bk:
         actual_seq = seq - 1
