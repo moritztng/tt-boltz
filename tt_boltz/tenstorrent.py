@@ -2,6 +2,7 @@ import torch, ttnn, atexit
 from torch import nn
 from typing import Tuple, Callable, Dict, Mapping
 from math import pi
+from types import MappingProxyType
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
 SEQ_LEN_MORE_CHUNKING = 1536
@@ -56,18 +57,28 @@ class WeightScope:
     """Immutable scoped view over a flat checkpoint state-dict."""
 
     def __init__(self, data: Mapping[str, torch.Tensor]):
-        self.data = dict(data)
+        self._data = MappingProxyType(dict(data))
 
     @classmethod
     def wrap(cls, data: Mapping[str, torch.Tensor] | "WeightScope") -> "WeightScope":
         return data if isinstance(data, cls) else cls(data)
 
+    @property
+    def data(self) -> Mapping[str, torch.Tensor]:
+        return self._data
+
+    def as_dict(self) -> dict[str, torch.Tensor]:
+        return dict(self._data)
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self._data[key]
+
     def child(self, scope: str, strip_prefix: str = "") -> "WeightScope":
         if not scope:
-            return WeightScope(self.data)
+            return self
         scope_prefix = f"{scope}."
         out = {}
-        for key, value in self.data.items():
+        for key, value in self._data.items():
             if not key.startswith(scope_prefix):
                 continue
             child_key = key[len(scope_prefix) :]
@@ -77,40 +88,32 @@ class WeightScope:
         return WeightScope(out)
 
 
-def substate_dict(state_dict: Mapping[str, torch.Tensor] | WeightScope, scope: str, strip_prefix: str = "") -> dict:
-    """Compatibility helper: return a plain dict for a scoped checkpoint subtree."""
-    return WeightScope.wrap(state_dict).child(scope, strip_prefix).data
-
-
-# Backward-compatible alias (prefer `substate_dict` for clarity).
-filter_dict = substate_dict
-
+Weights = Mapping[str, torch.Tensor] | WeightScope
 
 class Module:
     def __init__(
         self,
-        state_dict: Mapping[str, torch.Tensor] | WeightScope,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         self.weights = WeightScope.wrap(state_dict)
-        self.state_dict = self.weights.data
         self.compute_kernel_config = compute_kernel_config
         self.device = get_device()
 
-    def scope(self, scope: str, strip_prefix: str = "") -> dict[str, torch.Tensor]:
-        return self.weights.child(scope, strip_prefix).data
+    def scope(self, scope: str, strip_prefix: str = "") -> WeightScope:
+        return self.weights.child(scope, strip_prefix)
 
     def torch_to_tt(
         self,
         key: str,
         transform: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.t(),
-        dtype=None,
+        dtype=ttnn.bfloat16,
     ) -> ttnn.Tensor:
         return ttnn.from_torch(
-            transform(self.state_dict[key]),
+            transform(self.weights[key]),
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
-            dtype=ttnn.bfloat16 if dtype is None else dtype,
+            dtype=dtype,
         )
 
 
@@ -118,7 +121,7 @@ class TriangleMultiplication(Module):
     def __init__(
         self,
         ending: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -128,7 +131,7 @@ class TriangleMultiplication(Module):
         self.out_norm_weight = self.torch_to_tt("norm_out.weight")
         self.out_norm_bias = self.torch_to_tt("norm_out.bias")
         g_in_t, p_in_t = [
-            self.state_dict[k].t() for k in ["g_in.weight", "p_in.weight"]
+            self.weights[k].t() for k in ["g_in.weight", "p_in.weight"]
         ]
         chunk_size, n_chunks = (
             TRIANGLE_MULT_CHUNK_SIZE,
@@ -305,7 +308,7 @@ class TriangleAttention(Module):
         head_dim: int,
         n_heads: int,
         ending: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
         affinity: bool = False,
     ):
@@ -322,9 +325,9 @@ class TriangleAttention(Module):
         self.qkv_weight = ttnn.from_torch(
             torch.cat(
                 [
-                    self.state_dict["linear_q.weight"],
-                    self.state_dict["linear_k.weight"],
-                    self.state_dict["linear_v.weight"],
+                    self.weights["linear_q.weight"],
+                    self.weights["linear_k.weight"],
+                    self.weights["linear_v.weight"],
                 ],
                 dim=0,
             ).t(),
@@ -460,7 +463,7 @@ class AttentionPairBias(Module):
         n_heads: int,
         compute_pair_bias: bool,
         atom_level: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -471,7 +474,7 @@ class AttentionPairBias(Module):
         if atom_level:
             self.q_weight = self.torch_to_tt("proj_q.weight", dtype=_dtype())
             self.q_bias = self.torch_to_tt("proj_q.bias", dtype=_dtype())
-            kv_weight = torch.cat([self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
+            kv_weight = torch.cat([self.weights["proj_k.weight"], self.weights["proj_v.weight"]], dim=0)
             self.kv_weight = ttnn.from_torch(
                 kv_weight.t(),
                 layout=ttnn.TILE_LAYOUT,
@@ -479,7 +482,7 @@ class AttentionPairBias(Module):
                 dtype=_dtype(),
             )
         else:
-            qkv_weight = torch.cat([self.state_dict["proj_q.weight"], self.state_dict["proj_k.weight"], self.state_dict["proj_v.weight"]], dim=0)
+            qkv_weight = torch.cat([self.weights["proj_q.weight"], self.weights["proj_k.weight"], self.weights["proj_v.weight"]], dim=0)
             head_dim_padding = -head_dim % 32
             padded_head_dim = head_dim + head_dim_padding
             qkv_weight = qkv_weight.reshape(3 * self.n_heads, head_dim, -1)
@@ -491,7 +494,7 @@ class AttentionPairBias(Module):
                 device=self.device,
                 dtype=ttnn.bfloat16,
             )
-            q_bias = self.state_dict["proj_q.bias"]
+            q_bias = self.weights["proj_q.bias"]
             q_bias = q_bias.reshape(self.n_heads, head_dim)
             q_bias = torch.nn.functional.pad(q_bias, (0, head_dim_padding), mode='constant', value=0)
             q_bias = q_bias.reshape(self.n_heads * padded_head_dim)
@@ -635,7 +638,7 @@ class AttentionPairBias(Module):
 class Transition(Module):
     def __init__(
         self,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -714,7 +717,7 @@ class PairformerLayer(Module):
         att_head_dim: int,
         att_n_heads: int,
         transform_s: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
         affinity: bool = False,
     ):
@@ -815,7 +818,7 @@ class Pairformer(Module):
         att_head_dim: int,
         att_n_heads: int,
         transform_s: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
         affinity: bool = False,
     ):
@@ -847,7 +850,7 @@ class AdaLN(Module):
     def __init__(
         self,
         atom_level: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -902,7 +905,7 @@ class ConditionedTransitionBlock(Module):
     def __init__(
         self,
         atom_level: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -910,7 +913,7 @@ class ConditionedTransitionBlock(Module):
         self.adaln = AdaLN(
             atom_level, self.scope("adaln"), compute_kernel_config
         )
-        swish_chunk, gates_chunk = torch.chunk(self.state_dict["swish_gate.0.weight"], chunks=2, dim=0)
+        swish_chunk, gates_chunk = torch.chunk(self.weights["swish_gate.0.weight"], chunks=2, dim=0)
         self.swish_weight, self.gates_weight = [
             ttnn.from_torch(chunk.t(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
             for chunk in [swish_chunk, gates_chunk]
@@ -971,11 +974,12 @@ class DiffusionTransformerLayer(Module):
         dim: int,
         n_heads: int,
         atom_level: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
         self.atom_level = atom_level
+        self.s_o = None
         self.adaln = AdaLN(
             atom_level, self.scope("adaln"), compute_kernel_config
         )
@@ -1010,7 +1014,7 @@ class DiffusionTransformerLayer(Module):
             b = self.attn_pair_bias(b, z)
         else:
             b = self.attn_pair_bias(b, z, keys_indexing)
-        if not hasattr(self, "s_o"):
+        if self.s_o is None:
             s_o = ttnn.linear(
                 s,
                 self.output_projection_weight,
@@ -1037,7 +1041,7 @@ class DiffusionTransformer(Module):
         dim: int,
         n_heads: int,
         atom_level: bool,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -1077,7 +1081,7 @@ class PairWeightedAveraging(Module):
         self,
         head_dim: int,
         n_heads: int,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -1167,7 +1171,7 @@ class PairWeightedAveraging(Module):
 class OuterProductMean(Module):
     def __init__(
         self,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -1262,7 +1266,7 @@ class MSALayer(Module):
         avg_n_heads: int,
         tri_att_head_dim: int,
         tri_att_n_heads: int,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -1339,7 +1343,7 @@ class MSA(Module):
         avg_n_heads: int,
         tri_att_head_dim: int,
         tri_att_n_heads: int,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
@@ -1390,10 +1394,12 @@ class MSA(Module):
 class Diffusion(Module):
     def __init__(
         self,
-        state_dict: dict,
+        state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
     ):
         super().__init__(state_dict, compute_kernel_config)
+        self._s_conditioned = None
+        self._c_reshaped = None
         self.conditioner_norm_weight = self.torch_to_tt(
             "single_conditioner.norm_single.weight"
         )
@@ -1496,7 +1502,7 @@ class Diffusion(Module):
         W = 32
         B, N, D = q.shape
         NW = N // W
-        if not hasattr(self, '_s_conditioned'):
+        if self._s_conditioned is None:
             s = ttnn.concat([s_trunk, s_inputs], dim=-1)
             s = ttnn.layer_norm(
                 s,
@@ -1650,6 +1656,7 @@ class TorchWrapper(nn.Module):
         self.module = None
         self.tt_device = get_device()
         self._runtime_cache = {}
+        self._first_forward_pass = True
         self.compute_kernel_config = ttnn.types.BlackholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
@@ -1657,9 +1664,7 @@ class TorchWrapper(nn.Module):
             packer_l1_acc=True,
         )
 
-    def _from_torch(self, x: torch.Tensor, dtype=None) -> ttnn.Tensor:
-        if dtype is None:
-            dtype = ttnn.bfloat16
+    def _from_torch(self, x: torch.Tensor, dtype=ttnn.bfloat16) -> ttnn.Tensor:
         return ttnn.from_torch(
             x,
             device=self.tt_device,
@@ -1697,18 +1702,20 @@ class TorchWrapper(nn.Module):
 
     def _clear_cached_attrs(self, obj, attr_names):
         for attr in attr_names:
-            if hasattr(obj, attr):
-                value = getattr(obj, attr)
-                self._deallocate_tensor_like(value)
-                try:
-                    delattr(obj, attr)
-                except Exception:
-                    setattr(obj, attr, None)
+            value = getattr(obj, attr, None)
+            self._deallocate_tensor_like(value)
+            setattr(obj, attr, None)
 
     def _clear_runtime_cache(self):
         for value in self._runtime_cache.values():
             self._deallocate_tensor_like(value)
         self._runtime_cache.clear()
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        self.module = self._create_module(WeightScope.wrap(state_dict).child(prefix[:-1]))
+
+    def _create_module(self, weights: WeightScope):
+        raise NotImplementedError
 
     def reset_static_cache(self):
         """Reset cached static data so it is recomputed on the next forward pass.
@@ -1738,26 +1745,16 @@ class PairformerModule(TorchWrapper):
         self.att_n_heads = att_n_heads
         self.transform_s = transform_s
         self.affinity = affinity
-        self._first_forward_pass = True
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        self.module = Pairformer(
+    def _create_module(self, weights: WeightScope):
+        return Pairformer(
             self.n_blocks,
             self.tri_att_head_dim,
             self.tri_att_n_heads,
             self.att_head_dim,
             self.att_n_heads,
             self.transform_s,
-            WeightScope.wrap(state_dict).child(prefix[:-1]),
+            weights,
             self.compute_kernel_config,
             affinity=self.affinity,
         )
@@ -1825,22 +1822,9 @@ class PairformerModule(TorchWrapper):
 class DiffusionModule(TorchWrapper):
     def __init__(self):
         super().__init__()
-        self._first_forward_pass = True
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        self.module = Diffusion(
-            WeightScope.wrap(state_dict).child(prefix[:-1]),
-            self.compute_kernel_config,
-        )
+    def _create_module(self, weights: WeightScope):
+        return Diffusion(weights, self.compute_kernel_config)
 
     def forward(
         self,
@@ -2023,25 +2007,15 @@ class MSAModule(TorchWrapper):
         self.avg_n_heads = avg_n_heads
         self.tri_att_head_dim = tri_att_head_dim
         self.tri_att_n_heads = tri_att_n_heads
-        self._first_forward_pass = True
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        self.module = MSA(
+    def _create_module(self, weights: WeightScope):
+        return MSA(
             self.n_blocks,
             self.avg_head_dim,
             self.avg_n_heads,
             self.tri_att_head_dim,
             self.tri_att_n_heads,
-            WeightScope.wrap(state_dict).child(prefix[:-1]),
+            weights,
             self.compute_kernel_config,
         )
 
