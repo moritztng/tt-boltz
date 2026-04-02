@@ -161,30 +161,16 @@ class TriangleMultiplication(Module):
         g_in_t, p_in_t = [
             self.weights[k].t() for k in ["g_in.weight", "p_in.weight"]
         ]
-        chunk_size, n_chunks = (
-            TRIANGLE_MULT_CHUNK_SIZE,
-            g_in_t.shape[1] // TRIANGLE_MULT_CHUNK_SIZE,
-        )
-        self.n_g_in_chunks = n_chunks
-        self.n_pairs = n_chunks // 2
+        C = TRIANGLE_MULT_CHUNK_SIZE
+        self.n_pairs = g_in_t.shape[1] // C // 2
         self.gp_in_weight_fused_chunks = [
             ttnn.from_torch(
                 torch.cat(
                     [
-                        g_in_t[:, i * chunk_size : (i + 1) * chunk_size],
-                        g_in_t[
-                            :,
-                            (i + self.n_pairs)
-                            * chunk_size : (i + self.n_pairs + 1)
-                            * chunk_size,
-                        ],
-                        p_in_t[:, i * chunk_size : (i + 1) * chunk_size],
-                        p_in_t[
-                            :,
-                            (i + self.n_pairs)
-                            * chunk_size : (i + self.n_pairs + 1)
-                            * chunk_size,
-                        ],
+                        g_in_t[:, i * C : (i + 1) * C],
+                        g_in_t[:, (i + self.n_pairs) * C : (i + self.n_pairs + 1) * C],
+                        p_in_t[:, i * C : (i + 1) * C],
+                        p_in_t[:, (i + self.n_pairs) * C : (i + self.n_pairs + 1) * C],
                     ],
                     dim=1,
                 ),
@@ -224,7 +210,8 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         H = x_norm_in.shape[1]
-        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > (704 if _FAST_MODE else 352) else ttnn.L1_MEMORY_CONFIG
+        dram_threshold = 704 if _FAST_MODE else 352
+        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > dram_threshold else ttnn.L1_MEMORY_CONFIG
         seq_len_tiles = (H + 31) // 32
         gx, gy = COMPUTE_GRID_12x10
         per_core_M = -(-seq_len_tiles // gy)
@@ -491,7 +478,7 @@ class AttentionPairBias(Module):
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.compute_pair_bias = compute_pair_bias
-        self.atom_level = atom_level 
+        self.atom_level = atom_level
         if atom_level:
             self.q_weight = self.torch_to_tt("proj_q.weight", dtype=_dtype())
             self.q_bias = self.torch_to_tt("proj_q.bias", dtype=_dtype())
@@ -503,7 +490,10 @@ class AttentionPairBias(Module):
                 dtype=_dtype(),
             )
         else:
-            qkv_weight = torch.cat([self.weights["proj_q.weight"], self.weights["proj_k.weight"], self.weights["proj_v.weight"]], dim=0)
+            qkv_weight = torch.cat(
+                [self.weights["proj_q.weight"], self.weights["proj_k.weight"], self.weights["proj_v.weight"]],
+                dim=0,
+            )
             head_dim_padding = -head_dim % 32
             padded_head_dim = head_dim + head_dim_padding
             qkv_weight = qkv_weight.reshape(3 * self.n_heads, head_dim, -1)
@@ -604,10 +594,23 @@ class AttentionPairBias(Module):
             )
             s_kv = ttnn.permute(s_kv, (0, 3, 1, 2))
             s_kv = ttnn.reshape(s_kv, (B, K, -1, D_S))
-            
-            q = ttnn.linear(s, self.q_weight, bias=self.q_bias, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN, dtype=_dtype())
-            kv = ttnn.linear(s_kv, self.kv_weight, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN, dtype=_dtype())
-            
+
+            q = ttnn.linear(
+                s,
+                self.q_weight,
+                bias=self.q_bias,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=CORE_GRID_MAIN,
+                dtype=_dtype(),
+            )
+            kv = ttnn.linear(
+                s_kv,
+                self.kv_weight,
+                compute_kernel_config=self.compute_kernel_config,
+                core_grid=CORE_GRID_MAIN,
+                dtype=_dtype(),
+            )
+
             q = ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT)
             q = ttnn.pad(q, [[0, 0], [0, 0], [0, ATOM_DIM - ATOM_WINDOW], [0, 0]], 0.0)
             q = ttnn.to_layout(q, ttnn.TILE_LAYOUT, dtype=_dtype())
@@ -700,17 +703,15 @@ class Transition(Module):
             ttnn.deallocate(x)
             return x_dram
         if len(x.shape) < 4:
-            B = x.shape[0]
-            chunk_b = 1
-            if B > 1:
-                return ttnn.concat(
-                    [swiglu(x[b:min(b + chunk_b, B), :, :]) for b in range(0, B, chunk_b)],
-                    dim=0,
-                )
+            if x.shape[1] > SEQ_LEN_MORE_CHUNKING:
+                return ttnn.concat([swiglu(x[b:b+1, :, :]) for b in range(x.shape[0])], dim=0)
             return swiglu(x)
 
         H, W = x.shape[1], x.shape[2]
-        chunk_h = (64 if _FAST_MODE else 32) if W * x.shape[3] <= TOKEN_DIM * ATOM_DIM else (32 if _FAST_MODE else 16)
+        if W * x.shape[3] <= TOKEN_DIM * ATOM_DIM:
+            chunk_h = 64 if _FAST_MODE else 32
+        else:
+            chunk_h = 32 if _FAST_MODE else 16
         chunks = ttnn.chunk(x, -(-H // chunk_h), dim=1)
         if W <= SEQ_LEN_MORE_CHUNKING:
             return ttnn.concat([swiglu(c) for c in chunks], dim=1)
@@ -895,14 +896,14 @@ class AdaLN(Module):
             bias=self.s_scale_bias,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
-            #core_grid=CORE_GRID_MAIN, CAUSES ACCURACY ISSUE
+            #core_grid=ttnn.CoreGrid(y=10, x=12), CAUSES ACCURACY ISSUE
         )
         s_bias = ttnn.linear(
             s,
             self.s_bias_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
-            #core_grid=CORE_GRID_MAIN, CAUSES ACCURACY ISSUE
+            #core_grid=ttnn.CoreGrid(y=10, x=12), CAUSES ACCURACY ISSUE
         )
         a = ttnn.multiply_(a, s_scale, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         ttnn.deallocate(s_scale)
@@ -1124,6 +1125,7 @@ class PairWeightedAveraging(Module):
             epsilon=1e-5,
             compute_kernel_config=self.compute_kernel_config,
         )
+        o_out = None
         for i in range(self.n_heads):
             b = ttnn.linear(
                 z,
@@ -1155,7 +1157,8 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=CORE_GRID_MAIN,
             )
-            del v, w
+            ttnn.deallocate(v)
+            ttnn.deallocate(w)
             o = ttnn.permute(o, (0, 2, 1))
             g = ttnn.linear(
                 m,
@@ -1164,17 +1167,14 @@ class PairWeightedAveraging(Module):
                 core_grid=CORE_GRID_MAIN,
             )
             o = ttnn.multiply(o, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
-            del g
+            ttnn.deallocate(g)
             o = ttnn.linear(
                 o,
                 self.o_weight[i * self.head_dim : (i + 1) * self.head_dim, :],
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=CORE_GRID_MAIN,
             )
-            if i == 0:
-                o_out = o
-            else:
-                o_out = ttnn.add(o_out, o)
+            o_out = o if o_out is None else ttnn.add(o_out, o)
         o_out = ttnn.reshape(o_out, (1, *o_out.shape))
         return o_out
 
@@ -1919,21 +1919,17 @@ class DiffusionModule(TorchWrapper):
             # Additive mask: 0 → valid, -1e9 → padded (bfloat16 for -1e9 precision)
             mask = (-1 * mask + 1) * -1e9
 
-            if atom_pad:
-                bias_encoder = torch.nn.functional.pad(bias_encoder, (0, 0, 0, 0, 0, 0, 0, NW_padded - NW))
-            bias = self._from_torch(bias_encoder)
-            bias = ttnn.reshape(bias, (B * NW_padded, ATOM_WINDOW, ATOM_DIM, -1))
-            bias = ttnn.permute(bias, (0, 3, 1, 2))
-            bias = ttnn.add_(bias, mask)
-            self._cache_set("bias_encoder", ttnn.multiply_(bias, ATOM_WINDOW ** 0.5))
+            def prepare_atom_bias(bias_pt):
+                if atom_pad:
+                    bias_pt = torch.nn.functional.pad(bias_pt, (0, 0, 0, 0, 0, 0, 0, NW_padded - NW))
+                bias = self._from_torch(bias_pt)
+                bias = ttnn.reshape(bias, (B * NW_padded, ATOM_WINDOW, ATOM_DIM, -1))
+                bias = ttnn.permute(bias, (0, 3, 1, 2))
+                bias = ttnn.add_(bias, mask)
+                return ttnn.multiply_(bias, ATOM_WINDOW ** 0.5)
 
-            if atom_pad:
-                bias_decoder = torch.nn.functional.pad(bias_decoder, (0, 0, 0, 0, 0, 0, 0, NW_padded - NW))
-            bias = self._from_torch(bias_decoder)
-            bias = ttnn.reshape(bias, (B * NW_padded, ATOM_WINDOW, ATOM_DIM, -1))
-            bias = ttnn.permute(bias, (0, 3, 1, 2))
-            bias = ttnn.add_(bias, mask)
-            self._cache_set("bias_decoder", ttnn.multiply_(bias, ATOM_WINDOW ** 0.5))
+            self._cache_set("bias_encoder", prepare_atom_bias(bias_encoder))
+            self._cache_set("bias_decoder", prepare_atom_bias(bias_decoder))
 
             if token_pad:
                 bias_token = torch.nn.functional.pad(bias_token, (0, 0, 0, token_pad, 0, token_pad))
