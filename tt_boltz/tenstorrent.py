@@ -1,6 +1,6 @@
 import torch, ttnn, atexit
 from torch import nn
-from typing import Tuple, Callable, Dict, Mapping
+from typing import Callable, Mapping
 from math import pi
 from types import MappingProxyType
 
@@ -197,7 +197,7 @@ class TriangleMultiplication(Module):
         self.g_out_weight = self.torch_to_tt("g_out.weight")
         self.out_p_weight = self.torch_to_tt("p_out.weight")
 
-    def _transform_chunk(self, chunk, permute_dims, memory_config):
+    def _transform_chunk(self, chunk: ttnn.Tensor, permute_dims: tuple, memory_config) -> ttnn.Tensor:
         old = chunk
         for op, *args in (
             [
@@ -215,7 +215,7 @@ class TriangleMultiplication(Module):
             old = chunk
         return chunk
 
-    def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor = None) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
         x_norm_in = ttnn.layer_norm(
             x,
             weight=self.in_norm_weight,
@@ -362,7 +362,7 @@ class TriangleAttention(Module):
         )
         self.g_weight = self.torch_to_tt("linear_g.weight", dtype=_dtype())
 
-    def __call__(self, x: ttnn.Tensor, attn_mask: ttnn.Tensor = None) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, attn_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         if self.ending:
             x = ttnn.permute(x, (1, 0, 2))  # THIS CAUSES CACHE -> RESHAPE PROBLEM
@@ -539,8 +539,8 @@ class AttentionPairBias(Module):
         self,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
-        keys_indexing: ttnn.Tensor = None,
-        seq_mask: ttnn.Tensor = None,
+        keys_indexing: ttnn.Tensor | None = None,
+        seq_mask: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         if not self.atom_level:
             qkv = ttnn.linear(
@@ -725,8 +725,8 @@ class PairformerLayer(Module):
         self,
         tri_att_head_dim: int,
         tri_att_n_heads: int,
-        att_head_dim: int,
-        att_n_heads: int,
+        att_head_dim: int | None,
+        att_n_heads: int | None,
         transform_s: bool,
         state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
@@ -775,9 +775,9 @@ class PairformerLayer(Module):
             )
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None,
-        attn_mask_start: ttnn.Tensor = None, attn_mask_end: ttnn.Tensor = None,
-    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        self, s: ttnn.Tensor | None, z: ttnn.Tensor, mask: ttnn.Tensor | None = None,
+        attn_mask_start: ttnn.Tensor | None = None, attn_mask_end: ttnn.Tensor | None = None,
+    ) -> tuple[ttnn.Tensor | None, ttnn.Tensor]:
         z_update = self.triangle_multiplication_start(z, mask)
         z = ttnn.add_(z, z_update)
         ttnn.deallocate(z_update)
@@ -826,8 +826,8 @@ class Pairformer(Module):
         n_blocks: int,
         tri_att_head_dim: int,
         tri_att_n_heads: int,
-        att_head_dim: int,
-        att_n_heads: int,
+        att_head_dim: int | None,
+        att_n_heads: int | None,
         transform_s: bool,
         state_dict: Weights,
         compute_kernel_config: ttnn.DeviceComputeKernelConfig,
@@ -849,9 +849,9 @@ class Pairformer(Module):
         ]
 
     def __call__(
-        self, s: ttnn.Tensor, z: ttnn.Tensor, mask: ttnn.Tensor = None,
-        attn_mask_start: ttnn.Tensor = None, attn_mask_end: ttnn.Tensor = None,
-    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        self, s: ttnn.Tensor | None, z: ttnn.Tensor, mask: ttnn.Tensor | None = None,
+        attn_mask_start: ttnn.Tensor | None = None, attn_mask_end: ttnn.Tensor | None = None,
+    ) -> tuple[ttnn.Tensor | None, ttnn.Tensor]:
         for block in self.blocks:
             s, z = block(s, z, mask, attn_mask_start, attn_mask_end)
         return s, z
@@ -1017,7 +1017,7 @@ class DiffusionTransformerLayer(Module):
         a: ttnn.Tensor,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
-        keys_indexing: ttnn.Tensor,
+        keys_indexing: ttnn.Tensor | None = None,
         large_seq_len: bool = False,
     ) -> ttnn.Tensor:
         b = self.adaln(a, s, large_seq_len=large_seq_len)
@@ -1072,7 +1072,7 @@ class DiffusionTransformer(Module):
         a: ttnn.Tensor,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
-        keys_indexing: ttnn.Tensor = None,
+        keys_indexing: ttnn.Tensor | None = None,
         large_seq_len: bool = False,
     ) -> ttnn.Tensor:
         dim = z.shape[1] // len(self.layers)
@@ -1107,7 +1107,7 @@ class PairWeightedAveraging(Module):
         self.z_weight = self.torch_to_tt("proj_z.weight")
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
-    def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor, attn_mask: ttnn.Tensor = None) -> ttnn.Tensor:
+    def __call__(self, m: ttnn.Tensor, z: ttnn.Tensor, attn_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
         m = ttnn.reshape(m, tuple(m.shape)[1:])
         z = ttnn.reshape(z, tuple(z.shape)[1:])
         m = ttnn.layer_norm(
@@ -1193,7 +1193,7 @@ class OuterProductMean(Module):
         self.o_weight = self.torch_to_tt("proj_o.weight")
         self.o_bias = self.torch_to_tt("proj_o.bias")
 
-    def __call__(self, x: ttnn.Tensor, msa_mask: ttnn.Tensor = None, n_msa: int = None) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, msa_mask: ttnn.Tensor | None = None, n_msa: int | None = None) -> ttnn.Tensor:
         x = ttnn.reshape(x, tuple(x.shape)[1:])
         m = ttnn.layer_norm(
             x,
@@ -1308,11 +1308,11 @@ class MSALayer(Module):
         self,
         z: ttnn.Tensor,
         m: ttnn.Tensor,
-        mask: ttnn.Tensor,
-        attn_mask: ttnn.Tensor,
-        msa_mask: ttnn.Tensor,
-        n_msa: int,
-    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        mask: ttnn.Tensor | None,
+        attn_mask: ttnn.Tensor | None,
+        msa_mask: ttnn.Tensor | None,
+        n_msa: int | None,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         S = m.shape[2]
         if S > SEQ_LEN_MORE_CHUNKING:
             z = ttnn.reallocate(z)
@@ -1376,10 +1376,10 @@ class MSA(Module):
         z: ttnn.Tensor,
         m: ttnn.Tensor,
         emb: ttnn.Tensor,
-        mask: ttnn.Tensor,
-        attn_mask: ttnn.Tensor,
-        msa_mask: ttnn.Tensor,
-        n_msa: int,
+        mask: ttnn.Tensor | None,
+        attn_mask: ttnn.Tensor | None,
+        msa_mask: ttnn.Tensor | None,
+        n_msa: int | None,
     ) -> ttnn.Tensor:
         m = ttnn.linear(
             m,
@@ -1691,7 +1691,7 @@ class TorchWrapper(nn.Module):
     def _cache_get(self, key: str, default=None):
         return self._runtime_cache.get(key, default)
 
-    def _cache_has_all(self, keys) -> bool:
+    def _cache_has_all(self, keys: tuple[str, ...]) -> bool:
         return all(key in self._runtime_cache for key in keys)
 
     def _deallocate_tensor_like(self, value):
@@ -1770,12 +1770,12 @@ class PairformerModule(TorchWrapper):
 
     def forward(
         self,
-        s: torch.Tensor,
+        s: torch.Tensor | None,
         z: torch.Tensor,
-        mask: torch.Tensor = None,
-        pair_mask: torch.Tensor = None,
+        mask: torch.Tensor | None = None,
+        pair_mask: torch.Tensor | None = None,
         use_kernels: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         seq_len = z.shape[1]
         pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
 
@@ -2027,7 +2027,7 @@ class MSAModule(TorchWrapper):
         self,
         z: torch.Tensor,
         emb: torch.Tensor,
-        feats: Dict[str, torch.Tensor],
+        feats: dict[str, torch.Tensor],
         use_kernels: bool = False,
     ) -> torch.Tensor:
         m = torch.cat(
