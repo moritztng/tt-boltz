@@ -12,6 +12,7 @@ import json
 import multiprocessing as mp
 import os
 import random
+import signal
 import shutil
 import subprocess
 import tarfile
@@ -704,6 +705,16 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
     def _pq(event, **kw):
         _emit({"dev": device_id, "event": event, **kw})
 
+    # Convert termination signals into Python exceptions so worker finally-blocks run.
+    def _handle_stop_signal(signum, _frame):
+        raise KeyboardInterrupt(f"worker {device_id} received signal {signum}")
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_stop_signal)
+        signal.signal(signal.SIGINT, _handle_stop_signal)
+    except Exception:
+        pass
+
     # Silence all output so it doesn't corrupt the Rich Live display.
     # In subprocesses we redirect both stdout+stderr at the OS fd level
     # (catches C++ library noise too). In the main process we only redirect
@@ -721,6 +732,8 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
 
     _pq("init", assigned=len(file_paths))
     results = []
+    model = None
+    aff_model = None
     try:
         os.environ["TT_VISIBLE_DEVICES"] = str(device_id)
         from tt_boltz.tenstorrent import set_fast_mode as _set_fast_mode
@@ -810,9 +823,29 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
 
         failed = sum(1 for r in results if r["status"] == "failed")
         queue.put({"ok": True, "dev": device_id, "results": results, "failed": failed})
-    except Exception as e:
+    except BaseException as e:
         traceback.print_exc()
         queue.put({"ok": False, "dev": device_id, "error": str(e), "results": results, "failed": len(file_paths)})
+    finally:
+        # Always attempt deterministic worker teardown.
+        try:
+            del aff_model
+        except Exception:
+            pass
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+        try:
+            from tt_boltz.tenstorrent import cleanup as _tt_cleanup
+            _tt_cleanup()
+        except Exception:
+            pass
 
 
 def _reset_tt_devices(device_ids: list[int], retries: int = 2) -> bool:
@@ -1146,6 +1179,24 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         display = (ProgressDisplay(pq, total=len(files), n_devices=n_devices) if not debug
                    else DebugDisplay(pq) if log else NullDisplay(pq))
         display.start()
+        procs = {}
+
+        def _stop_worker_processes():
+            # Try graceful interrupt first so worker cleanup/finally can close devices.
+            for d, proc in list(procs.items()):
+                if proc.is_alive():
+                    try:
+                        os.kill(proc.pid, signal.SIGINT)
+                    except Exception:
+                        pass
+                    proc.join(timeout=12)
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=8)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=3)
+                procs.pop(d, None)
 
         try:
             if n_devices == 1:
@@ -1159,7 +1210,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 file_buckets = [files[i::n_devices] for i in range(n_devices)]
                 if disable_watchdog:
                     click.echo("[watchdog] disabled")
-                    procs = {}
                     for i, bucket in enumerate(file_buckets):
                         if not bucket:
                             continue
@@ -1186,7 +1236,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
                     # Per-device worker state for restart-on-hang.
                     states = {}
-                    procs = {}
                     max_retries = 2
                     idle_timeout_s = 900.0
                     check_log_interval_s = 60.0
@@ -1229,14 +1278,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                             st["next_idx"] += 1
 
                     def _stop_all_workers():
-                        for d, proc in list(procs.items()):
-                            if proc.is_alive():
-                                proc.terminate()
-                                proc.join(timeout=10)
-                                if proc.is_alive():
-                                    proc.kill()
-                                    proc.join(timeout=5)
-                            procs.pop(d, None)
+                        _stop_worker_processes()
                         # Let driver handles drain before reset/restart.
                         time.sleep(1.5)
                         now = time.time()
@@ -1335,6 +1377,10 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                             break
 
                         time.sleep(0.5)
+        except KeyboardInterrupt:
+            click.echo("\nInterrupted: stopping TT workers...")
+            _stop_worker_processes()
+            raise
         finally:
             _sys.stdout = _sys.__stdout__
             display.stop()

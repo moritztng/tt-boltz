@@ -40,6 +40,11 @@ def get_device():
 def cleanup():
     global _device
     if _device is not None:
+        try:
+            # Drain queued work before closing so teardown is deterministic.
+            ttnn.synchronize_device(_device)
+        except Exception:
+            pass
         ttnn.close_device(_device)
         _device = None
 
