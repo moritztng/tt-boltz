@@ -13,6 +13,8 @@ MSA_CHUNK_SIZE = 512
 TRANSITION_W_CHUNK_SIZE = 1024
 SEQ_LEN_MORE_CHUNKING = 1536
 _FAST_MODE = False
+SDPA_CHUNK_TILE = 32
+SDPA_CHUNK_MAX = 256
 
 PAIRFORMER_PAD_MULTIPLE = 64  # Pad token dim to this multiple to avoid kernel recompilation
 MSA_PAD_MULTIPLE = 1024  # Pad MSA dim to this multiple to avoid kernel recompilation
@@ -50,6 +52,21 @@ def _sdpa_program_config(q_chunk_size: int, k_chunk_size: int) -> ttnn.SDPAProgr
         exp_approx_mode=False,
         q_chunk_size=q_chunk_size,
         k_chunk_size=k_chunk_size,
+    )
+
+
+@lru_cache(maxsize=None)
+def _capped_sdpa_chunk_size(seq_len: int) -> int:
+    if seq_len <= 0:
+        return SDPA_CHUNK_TILE
+    return min(SDPA_CHUNK_MAX, ((seq_len + SDPA_CHUNK_TILE - 1) // SDPA_CHUNK_TILE) * SDPA_CHUNK_TILE)
+
+
+@lru_cache(maxsize=None)
+def _sdpa_program_config_for_lengths(q_len: int, k_len: int) -> ttnn.SDPAProgramConfig:
+    return _sdpa_program_config(
+        q_chunk_size=_capped_sdpa_chunk_size(q_len),
+        k_chunk_size=_capped_sdpa_chunk_size(k_len),
     )
 
 
@@ -394,10 +411,7 @@ class TriangleAttention(Module):
             ttnn.deallocate(qkv_in)
             o = ttnn.transformer.scaled_dot_product_attention(
                 q, k, v, attn_mask=bias, is_causal=False, scale=self.scale**-1,
-                program_config=_sdpa_program_config(
-                    q_chunk_size=256,  # CAN CAUSE ACCURACY ISSUES IN TEMPLATE MODULE
-                    k_chunk_size=256,
-                ),
+                program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
             )
             ttnn.deallocate(q)
             ttnn.deallocate(k)
@@ -587,7 +601,7 @@ class AttentionPairBias(Module):
                 attn_mask=z,
                 is_causal=False,
                 scale=self.head_dim**-0.5,
-                program_config=_sdpa_program_config(q_chunk_size=64, k_chunk_size=64),
+                program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
             )
             ttnn.deallocate(q)
             ttnn.deallocate(k)
@@ -640,7 +654,7 @@ class AttentionPairBias(Module):
             z = ttnn.reshape(z, (1, -1, z.shape[2], z.shape[3]))
             o = ttnn.transformer.scaled_dot_product_attention(
                 q, k, v, attn_mask=z, is_causal=False, scale=self.head_dim**-0.5,
-                program_config=_sdpa_program_config(q_chunk_size=32, k_chunk_size=128),
+                program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
             )
             o = ttnn.reshape(o, (B * K, H, W, D_Q))
             o = ttnn.experimental.nlp_concat_heads(o)
