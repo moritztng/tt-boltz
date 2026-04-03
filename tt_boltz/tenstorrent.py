@@ -37,6 +37,12 @@ def _dtype():
     return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
 
 
+def _adaln_memory_config(atom_level: bool, large_seq_len: bool) -> ttnn.MemoryConfig | None:
+    if not atom_level:
+        return None
+    return ttnn.DRAM_MEMORY_CONFIG if large_seq_len else ttnn.L1_MEMORY_CONFIG
+
+
 @lru_cache(maxsize=None)
 def _sdpa_program_config(q_chunk_size: int, k_chunk_size: int) -> ttnn.SDPAProgramConfig:
     return ttnn.SDPAProgramConfig(
@@ -205,7 +211,9 @@ class TriangleMultiplication(Module):
         self.g_out_weight = self.torch_to_tt("g_out.weight")
         self.out_p_weight = self.torch_to_tt("p_out.weight")
 
-    def _transform_chunk(self, chunk: ttnn.Tensor, permute_dims: tuple, memory_config) -> ttnn.Tensor:
+    def _transform_chunk(
+        self, chunk: ttnn.Tensor, permute_dims: tuple[int, ...], memory_config: ttnn.MemoryConfig
+    ) -> ttnn.Tensor:
         old = chunk
         for op, *args in (
             [
@@ -880,11 +888,7 @@ class AdaLN(Module):
         self.s_bias_weight = self.torch_to_tt("s_bias.weight")
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, large_seq_len: bool = False) -> ttnn.Tensor:
-        memory_config = (
-            ttnn.DRAM_MEMORY_CONFIG
-            if self.atom_level and large_seq_len
-            else (ttnn.L1_MEMORY_CONFIG if self.atom_level else None)
-        )
+        memory_config = _adaln_memory_config(self.atom_level, large_seq_len)
         if self.atom_level:
             a = ttnn.to_memory_config(a, memory_config=memory_config)
             s = ttnn.to_memory_config(s, memory_config=memory_config)
