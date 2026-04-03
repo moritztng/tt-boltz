@@ -2,6 +2,7 @@ import torch, ttnn, atexit
 from torch import nn
 from typing import Callable, Mapping
 from math import pi
+from functools import lru_cache
 from types import MappingProxyType
 
 TRIANGLE_MULT_CHUNK_SIZE = 32
@@ -36,12 +37,33 @@ def _dtype():
     return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
 
 
+@lru_cache(maxsize=None)
 def _sdpa_program_config(q_chunk_size: int, k_chunk_size: int) -> ttnn.SDPAProgramConfig:
     return ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=COMPUTE_GRID_12x10,
         exp_approx_mode=False,
         q_chunk_size=q_chunk_size,
         k_chunk_size=k_chunk_size,
+    )
+
+
+@lru_cache(maxsize=None)
+def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReuseMultiCastProgramConfig:
+    gx, gy = COMPUTE_GRID_12x10
+    per_core_M = -(-seq_len_tiles // gy)
+    per_core_N = -(-seq_len_tiles // gx)
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=COMPUTE_GRID_12x10,
+        in0_block_w=1,
+        out_subblock_h=1,
+        out_subblock_w=1,
+        out_block_h=per_core_M,
+        out_block_w=per_core_N,
+        per_core_M=per_core_M,
+        per_core_N=per_core_N,
+        transpose_mcast=False,
+        fused_activation=None,
+        fuse_batch=False,
     )
 
 
@@ -213,22 +235,7 @@ class TriangleMultiplication(Module):
         dram_threshold = 704 if _FAST_MODE else 352
         memory_config = ttnn.DRAM_MEMORY_CONFIG if H > dram_threshold else ttnn.L1_MEMORY_CONFIG
         seq_len_tiles = (H + 31) // 32
-        gx, gy = COMPUTE_GRID_12x10
-        per_core_M = -(-seq_len_tiles // gy)
-        per_core_N = -(-seq_len_tiles // gx)
-        program_config = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-            compute_with_storage_grid_size=COMPUTE_GRID_12x10,
-            in0_block_w=1,
-            out_subblock_h=1,
-            out_subblock_w=1,
-            out_block_h=per_core_M,
-            out_block_w=per_core_N,
-            per_core_M=per_core_M,
-            per_core_N=per_core_N,
-            transpose_mcast=False,
-            fused_activation=None,
-            fuse_batch=False,
-        )
+        program_config = _triangle_mul_program_config(seq_len_tiles)
         if H > SEQ_LEN_MORE_CHUNKING:
             # Compact large input activation for better large-sequence placement.
             x_norm_in = ttnn.reallocate(x_norm_in)
