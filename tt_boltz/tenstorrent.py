@@ -35,8 +35,7 @@ CORE_GRID_WIDE = ttnn.CoreGrid(y=10, x=11)
 CORE_GRID_ATTN_BIAS = ttnn.CoreGrid(y=9, x=11)
 CORE_GRID_ATTN_OUT = ttnn.CoreGrid(y=6, x=11)
 CORE_GRID_REDUCED = ttnn.CoreGrid(y=8, x=11)
-MAX_COMPUTE_GRID_X = 11
-MAX_COMPUTE_GRID_Y = 10
+COMPUTE_GRID_11x10 = (11, 10)
 
 def _dtype():
     return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
@@ -53,15 +52,10 @@ def _triangle_mul_memory_config(seq_len: int) -> ttnn.MemoryConfig:
     return ttnn.L1_MEMORY_CONFIG if seq_len <= l1_max_seq else ttnn.DRAM_MEMORY_CONFIG
 
 
-@lru_cache(maxsize=1)
-def _active_compute_grid_size() -> tuple[int, int]:
-    return (MAX_COMPUTE_GRID_X, MAX_COMPUTE_GRID_Y)
-
-
 @lru_cache(maxsize=None)
 def _sdpa_program_config(q_chunk_size: int, k_chunk_size: int) -> ttnn.SDPAProgramConfig:
     return ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=_active_compute_grid_size(),
+        compute_with_storage_grid_size=COMPUTE_GRID_11x10,
         exp_approx_mode=False,
         q_chunk_size=q_chunk_size,
         k_chunk_size=k_chunk_size,
@@ -85,7 +79,7 @@ def _sdpa_program_config_for_lengths(q_len: int, k_len: int) -> ttnn.SDPAProgram
 
 @lru_cache(maxsize=None)
 def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReuseMultiCastProgramConfig:
-    gx, gy = _active_compute_grid_size()
+    gx, gy = COMPUTE_GRID_11x10
     per_core_M = -(-seq_len_tiles // gy)
     per_core_N = -(-seq_len_tiles // gx)
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
