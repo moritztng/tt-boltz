@@ -30,12 +30,13 @@ TOKEN_DIM = 2 * 384
 TOKEN_N_HEADS = 16
 TOKEN_N_LAYERS = 24
 
-CORE_GRID_MAIN = ttnn.CoreGrid(y=10, x=12)
+CORE_GRID_MAIN = ttnn.CoreGrid(y=10, x=11)
 CORE_GRID_WIDE = ttnn.CoreGrid(y=10, x=11)
-CORE_GRID_ATTN_BIAS = ttnn.CoreGrid(y=9, x=12)
-CORE_GRID_ATTN_OUT = ttnn.CoreGrid(y=6, x=12)
+CORE_GRID_ATTN_BIAS = ttnn.CoreGrid(y=9, x=11)
+CORE_GRID_ATTN_OUT = ttnn.CoreGrid(y=6, x=11)
 CORE_GRID_REDUCED = ttnn.CoreGrid(y=8, x=11)
-COMPUTE_GRID_12x10 = (12, 10)
+MAX_COMPUTE_GRID_X = 11
+MAX_COMPUTE_GRID_Y = 10
 
 def _dtype():
     return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
@@ -52,10 +53,15 @@ def _triangle_mul_memory_config(seq_len: int) -> ttnn.MemoryConfig:
     return ttnn.L1_MEMORY_CONFIG if seq_len <= l1_max_seq else ttnn.DRAM_MEMORY_CONFIG
 
 
+@lru_cache(maxsize=1)
+def _active_compute_grid_size() -> tuple[int, int]:
+    return (MAX_COMPUTE_GRID_X, MAX_COMPUTE_GRID_Y)
+
+
 @lru_cache(maxsize=None)
 def _sdpa_program_config(q_chunk_size: int, k_chunk_size: int) -> ttnn.SDPAProgramConfig:
     return ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=COMPUTE_GRID_12x10,
+        compute_with_storage_grid_size=_active_compute_grid_size(),
         exp_approx_mode=False,
         q_chunk_size=q_chunk_size,
         k_chunk_size=k_chunk_size,
@@ -79,11 +85,11 @@ def _sdpa_program_config_for_lengths(q_len: int, k_len: int) -> ttnn.SDPAProgram
 
 @lru_cache(maxsize=None)
 def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReuseMultiCastProgramConfig:
-    gx, gy = COMPUTE_GRID_12x10
+    gx, gy = _active_compute_grid_size()
     per_core_M = -(-seq_len_tiles // gy)
     per_core_N = -(-seq_len_tiles // gx)
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-        compute_with_storage_grid_size=COMPUTE_GRID_12x10,
+        compute_with_storage_grid_size=(gx, gy),
         in0_block_w=1,
         out_subblock_h=1,
         out_subblock_w=1,
@@ -927,14 +933,14 @@ class AdaLN(Module):
             bias=self.s_scale_bias,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
-            #core_grid=ttnn.CoreGrid(y=10, x=12), CAUSES ACCURACY ISSUE
+            #core_grid=ttnn.CoreGrid(y=10, x=11), CAUSES ACCURACY ISSUE
         )
         s_bias = ttnn.linear(
             s,
             self.s_bias_weight,
             compute_kernel_config=self.compute_kernel_config,
             memory_config=memory_config,
-            #core_grid=ttnn.CoreGrid(y=10, x=12), CAUSES ACCURACY ISSUE
+            #core_grid=ttnn.CoreGrid(y=10, x=11), CAUSES ACCURACY ISSUE
         )
         a = ttnn.multiply_(a, s_scale, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         ttnn.deallocate(s_scale)
