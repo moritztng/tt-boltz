@@ -13,7 +13,7 @@ MSA_CHUNK_SIZE = 512
 TRANSITION_W_CHUNK_SIZE = 1024
 SEQ_LEN_MORE_CHUNKING = 1536
 _FAST_MODE = False
-TRIANGLE_MULT_L1_MAX_SEQ_FAST = 672
+TRIANGLE_MULT_L1_MAX_SEQ_FAST = 704
 TRIANGLE_MULT_L1_MAX_SEQ = 352
 SDPA_CHUNK_TILE = 32
 SDPA_CHUNK_MAX = 256
@@ -31,11 +31,7 @@ TOKEN_N_HEADS = 16
 TOKEN_N_LAYERS = 24
 
 CORE_GRID_MAIN = ttnn.CoreGrid(y=10, x=11)
-CORE_GRID_WIDE = ttnn.CoreGrid(y=10, x=11)
-CORE_GRID_ATTN_BIAS = ttnn.CoreGrid(y=9, x=11)
-CORE_GRID_ATTN_OUT = ttnn.CoreGrid(y=6, x=11)
-CORE_GRID_REDUCED = ttnn.CoreGrid(y=8, x=11)
-COMPUTE_GRID_11x10 = (11, 10)
+COMPUTE_GRID_MAIN = (CORE_GRID_MAIN.x, CORE_GRID_MAIN.y)
 
 def _dtype():
     return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
@@ -55,7 +51,7 @@ def _triangle_mul_memory_config(seq_len: int) -> ttnn.MemoryConfig:
 @lru_cache(maxsize=None)
 def _sdpa_program_config(q_chunk_size: int, k_chunk_size: int) -> ttnn.SDPAProgramConfig:
     return ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=COMPUTE_GRID_11x10,
+        compute_with_storage_grid_size=COMPUTE_GRID_MAIN,
         exp_approx_mode=False,
         q_chunk_size=q_chunk_size,
         k_chunk_size=k_chunk_size,
@@ -79,7 +75,7 @@ def _sdpa_program_config_for_lengths(q_len: int, k_len: int) -> ttnn.SDPAProgram
 
 @lru_cache(maxsize=None)
 def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReuseMultiCastProgramConfig:
-    gx, gy = COMPUTE_GRID_11x10
+    gx, gy = COMPUTE_GRID_MAIN
     per_core_M = -(-seq_len_tiles // gy)
     per_core_N = -(-seq_len_tiles // gx)
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
@@ -334,7 +330,7 @@ class TriangleMultiplication(Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=_dtype(),
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=CORE_GRID_WIDE,
+            core_grid=CORE_GRID_MAIN,
         )
         ttnn.deallocate(x)
         g_out = ttnn.linear(
@@ -343,7 +339,7 @@ class TriangleMultiplication(Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=_dtype(),
             compute_kernel_config=self.compute_kernel_config,
-            core_grid=CORE_GRID_WIDE,
+            core_grid=CORE_GRID_MAIN,
         )
         ttnn.deallocate(x_norm_in)
         x = ttnn.multiply_(
@@ -403,7 +399,7 @@ class TriangleAttention(Module):
             self.bias_weight,
             compute_kernel_config=self.compute_kernel_config,
             dtype=ttnn.bfloat16,
-            core_grid=CORE_GRID_ATTN_BIAS,
+            core_grid=CORE_GRID_MAIN,
         )
         triangle_bias = ttnn.unsqueeze(triangle_bias, 0)
         triangle_bias = ttnn.permute(triangle_bias, (0, 3, 1, 2))
@@ -434,7 +430,7 @@ class TriangleAttention(Module):
                 self.o_weight,
                 compute_kernel_config=self.compute_kernel_config,
                 dtype=_dtype(),
-                core_grid=CORE_GRID_ATTN_OUT,
+                core_grid=CORE_GRID_MAIN,
             )
             ttnn.deallocate(o_in)
             return x_out
@@ -595,7 +591,7 @@ class AttentionPairBias(Module):
                     z,
                     self.z_weight,
                     compute_kernel_config=self.compute_kernel_config,
-                    core_grid=CORE_GRID_REDUCED,
+                    core_grid=CORE_GRID_MAIN,
                 )
                 z = ttnn.permute(z, (0, 3, 1, 2))
             if seq_mask is not None:
@@ -732,7 +728,7 @@ class Transition(Module):
                 self.fc3_weight,
                 compute_kernel_config=self.compute_kernel_config,
                 dtype=_dtype(),
-                core_grid=CORE_GRID_REDUCED,
+                core_grid=CORE_GRID_MAIN,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             ttnn.deallocate(x)
