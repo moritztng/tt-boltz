@@ -13,6 +13,8 @@ MSA_CHUNK_SIZE = 512
 TRANSITION_W_CHUNK_SIZE = 1024
 SEQ_LEN_MORE_CHUNKING = 1536
 _FAST_MODE = False
+TRIANGLE_MULT_L1_MAX_SEQ_FAST = 672
+TRIANGLE_MULT_L1_MAX_SEQ = 352
 SDPA_CHUNK_TILE = 32
 SDPA_CHUNK_MAX = 256
 
@@ -43,6 +45,11 @@ def _adaln_memory_config(atom_level: bool, large_seq_len: bool) -> ttnn.MemoryCo
     if not atom_level:
         return None
     return ttnn.DRAM_MEMORY_CONFIG if large_seq_len else ttnn.L1_MEMORY_CONFIG
+
+
+def _triangle_mul_memory_config(seq_len: int) -> ttnn.MemoryConfig:
+    l1_max_seq = TRIANGLE_MULT_L1_MAX_SEQ_FAST if _FAST_MODE else TRIANGLE_MULT_L1_MAX_SEQ
+    return ttnn.L1_MEMORY_CONFIG if seq_len <= l1_max_seq else ttnn.DRAM_MEMORY_CONFIG
 
 
 @lru_cache(maxsize=None)
@@ -257,8 +264,7 @@ class TriangleMultiplication(Module):
             compute_kernel_config=self.compute_kernel_config,
         )
         H = x_norm_in.shape[1]
-        dram_threshold = 704 if _FAST_MODE else 352
-        memory_config = ttnn.DRAM_MEMORY_CONFIG if H > dram_threshold else ttnn.L1_MEMORY_CONFIG
+        memory_config = _triangle_mul_memory_config(H)
         seq_len_tiles = (H + 31) // 32
         program_config = _triangle_mul_program_config(seq_len_tiles)
         if H > SEQ_LEN_MORE_CHUNKING:
