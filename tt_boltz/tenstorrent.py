@@ -12,6 +12,9 @@ OPM_CHUNK_SIZE = 256
 MSA_CHUNK_SIZE = 512
 TRANSITION_W_CHUNK_SIZE = 1024
 SEQ_LEN_MORE_CHUNKING = 1536
+TRANSITION_BATCH_CHUNKING_THRESHOLD = 1024
+TRANSITION_W_CHUNKING_THRESHOLD = 1024
+TRANSITION_H_CHUNK_SIZE = 32
 _FAST_MODE = False
 TRIANGLE_MULT_L1_MAX_SEQ_FAST = 640
 TRIANGLE_MULT_L1_MAX_SEQ = 352
@@ -734,17 +737,14 @@ class Transition(Module):
             ttnn.deallocate(x)
             return x_dram
         if len(x.shape) < 4:
-            if x.shape[1] > SEQ_LEN_MORE_CHUNKING:
+            if x.shape[1] > TRANSITION_BATCH_CHUNKING_THRESHOLD:
                 return ttnn.concat([swiglu(x[b:b+1, :, :]) for b in range(x.shape[0])], dim=0)
             return swiglu(x)
 
         H, W = x.shape[1], x.shape[2]
-        if W * x.shape[3] <= TOKEN_DIM * ATOM_DIM:
-            chunk_h = 64 if _FAST_MODE else 32
-        else:
-            chunk_h = 32 if _FAST_MODE else 16
-        chunks = ttnn.chunk(x, -(-H // chunk_h), dim=1)
-        if W <= SEQ_LEN_MORE_CHUNKING:
+
+        chunks = ttnn.chunk(x, -(-H // TRANSITION_H_CHUNK_SIZE), dim=1)
+        if W <= TRANSITION_W_CHUNKING_THRESHOLD:
             return ttnn.concat([swiglu(c) for c in chunks], dim=1)
         return ttnn.concat([
             ttnn.concat([swiglu(c[:, :, w:min(w+TRANSITION_W_CHUNK_SIZE, W), :]) for w in range(0, W, TRANSITION_W_CHUNK_SIZE)], dim=2)
