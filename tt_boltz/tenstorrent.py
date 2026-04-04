@@ -14,7 +14,8 @@ TRANSITION_W_CHUNK_SIZE = 1024
 SEQ_LEN_MORE_CHUNKING = 1536
 TRANSITION_BATCH_CHUNKING_THRESHOLD = 1024
 TRANSITION_W_CHUNKING_THRESHOLD = 1024
-TRANSITION_H_CHUNK_SIZE = 32
+TRANSITION_H_CHUNK_SIZE_FAST = 32
+TRANSITION_H_CHUNK_SIZE = 16
 _FAST_MODE = False
 TRIANGLE_MULT_L1_MAX_SEQ_FAST = 640
 TRIANGLE_MULT_L1_MAX_SEQ = 352
@@ -743,7 +744,8 @@ class Transition(Module):
 
         H, W = x.shape[1], x.shape[2]
 
-        chunks = ttnn.chunk(x, -(-H // TRANSITION_H_CHUNK_SIZE), dim=1)
+        transition_h_chunk_size = TRANSITION_H_CHUNK_SIZE_FAST if _FAST_MODE else TRANSITION_H_CHUNK_SIZE
+        chunks = ttnn.chunk(x, -(-H // transition_h_chunk_size), dim=1)
         if W <= TRANSITION_W_CHUNKING_THRESHOLD:
             return ttnn.concat([swiglu(c) for c in chunks], dim=1)
         return ttnn.concat([
