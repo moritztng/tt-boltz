@@ -31,3 +31,6 @@ mgtbind/comparison.csv
 # Test cache
 .pytest_cache/
 test_16/
+*.log
+memory_inputs/
+oom_inputs/
