@@ -5143,6 +5143,14 @@ class Boltz2(nn.Module):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
+        if self.use_tenstorrent:
+            try:
+                dev = tenstorrent.get_device()
+                dev.disable_and_clear_program_cache()
+                dev.enable_program_cache()
+            except Exception:
+                pass
+
         # Reset cached static data so masks/biases are recomputed for this protein
         if self.use_tenstorrent:
             for m in self.modules():
