@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from functools import partial
 
+import tt_boltz.tenstorrent as tt_tenstorrent
 from tt_boltz.tenstorrent import WeightScope, PairformerModule, MSAModule, DiffusionModule
 from tt_boltz.reference import MSAModule as MSAModuleTorch, DiffusionModule as DiffusionModuleTorch
 from tt_boltz.reference import PairformerModule as PairformerModuleTorch, PairformerNoSeqModule as PairformerNoSeqModuleTorch
@@ -100,6 +101,66 @@ def test_diffusion(n_tokens, n_atoms, n_pairs, n_samples):
         multiplicity=n_samples,
     )
     check(r_tt, r_ref, tol=0.12)
+
+
+def test_diffusion_trace_segment():
+    tt_tenstorrent.set_model_trace_enabled(True)
+    try:
+        n_tokens, n_atoms, n_pairs, n_samples = 117, 928, 29, 1
+        tt, ref = DiffusionModule(), DiffusionModuleTorch(384, 128, token_transformer_heads=16).eval()
+        load(tt, ref, STATE, "structure_module.score_model")
+
+        s_inputs = torch.randn(1, n_tokens, 384)
+        s_trunk = torch.randn(1, n_tokens, 384)
+        q, c = torch.randn(1, n_atoms, 128), torch.randn(1, n_atoms, 128)
+        bias_encoder = torch.randn(1, n_pairs, 32, 128, 12)
+        bias_decoder = torch.randn(1, n_pairs, 32, 128, 12)
+        bias_token = torch.randn(1, n_tokens, n_tokens, 384)
+        keys = get_indexing_matrix(n_pairs, 32, 128, "cpu")
+        atom_pad_mask = torch.ones(1, n_atoms)
+        atom_to_token = torch.ones(1, n_atoms, n_tokens)
+
+        def run_ref(r_noisy, times):
+            return ref(
+                r_noisy=r_noisy,
+                times=times,
+                s_inputs=s_inputs,
+                s_trunk=s_trunk,
+                diffusion_conditioning={
+                    "q": q,
+                    "c": c,
+                    "atom_enc_bias": bias_encoder,
+                    "token_trans_bias": bias_token,
+                    "atom_dec_bias": bias_decoder,
+                    "to_keys": partial(single_to_keys, indexing_matrix=keys, W=32, H=128),
+                },
+                feats={
+                    "atom_pad_mask": atom_pad_mask,
+                    "atom_to_token": atom_to_token,
+                    "ref_pos": torch.randn(1, n_atoms, 3),
+                    "token_pad_mask": torch.ones(1, n_tokens),
+                },
+                multiplicity=n_samples,
+            )
+
+        # First call captures this real diffusion segment; second call replays it.
+        r0 = torch.randn(n_samples, n_atoms, 3)
+        t0 = torch.randn(n_samples)
+        out0_tt = tt(
+            r0, t0, s_inputs, s_trunk, q, c, bias_encoder, bias_token, bias_decoder, keys, atom_pad_mask, atom_to_token
+        )
+        out0_ref = run_ref(r0, t0)
+        check(out0_tt, out0_ref, tol=0.12)
+
+        r1 = torch.randn(n_samples, n_atoms, 3)
+        t1 = torch.randn(n_samples)
+        out1_tt = tt(
+            r1, t1, s_inputs, s_trunk, q, c, bias_encoder, bias_token, bias_decoder, keys, atom_pad_mask, atom_to_token
+        )
+        out1_ref = run_ref(r1, t1)
+        check(out1_tt, out1_ref, tol=0.12)
+    finally:
+        tt_tenstorrent.set_model_trace_enabled(False)
 
 
 @pytest.mark.parametrize("seq_len", [100, 500, 1000])

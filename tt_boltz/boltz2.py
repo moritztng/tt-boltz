@@ -4834,6 +4834,7 @@ class Boltz2(nn.Module):
         use_kernels: bool = False,
         use_tenstorrent: bool = False,
         trace: bool = False,
+        debug_trace: bool = False,
     ) -> None:
         super().__init__()
         
@@ -4902,8 +4903,10 @@ class Boltz2(nn.Module):
             "use_kernels": use_kernels,
             "use_tenstorrent": use_tenstorrent,
             "trace": trace,
+            "debug_trace": debug_trace,
         }
         self.trace = trace
+        self.debug_trace = debug_trace
         self.progress_fn = None  # optional callback: fn(stage, step=0, total=0)
 
         # Inference configuration
@@ -5143,6 +5146,9 @@ class Boltz2(nn.Module):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
+        if self.use_tenstorrent:
+            tenstorrent.set_model_trace_enabled(self.trace)
+
         # Reset cached static data so masks/biases are recomputed for this protein
         if self.use_tenstorrent:
             for m in self.modules():
@@ -5153,7 +5159,7 @@ class Boltz2(nn.Module):
         if _pfn:
             _pfn("trunk", step=0, total=recycling_steps + 1)
 
-        if self.trace:
+        if self.debug_trace:
             print("[boltz2] forward: input_embedder")
         
         s_inputs = self.input_embedder(feats)
@@ -5190,7 +5196,7 @@ class Boltz2(nn.Module):
 
                 # Compute pairwise stack
                 if self.use_templates:
-                    if self.trace:
+                    if self.debug_trace:
                         print("[boltz2] template_module")
                     if self.is_template_compiled:
                         template_module = self.template_module._orig_mod  # noqa: SLF001
@@ -5201,7 +5207,7 @@ class Boltz2(nn.Module):
                         z, feats, pair_mask, use_kernels=self.use_kernels
                     )
 
-                if self.trace:
+                if self.debug_trace:
                     print("[boltz2] msa_module")
                 if self.is_msa_compiled:
                     msa_module = self.msa_module._orig_mod  # noqa: SLF001
@@ -5213,7 +5219,7 @@ class Boltz2(nn.Module):
                 )
 
                 # Revert to uncompiled version for validation
-                if self.trace:
+                if self.debug_trace:
                     print("[boltz2] pairformer_module")
                 if self.is_pairformer_compiled:
                     pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
@@ -5238,7 +5244,7 @@ class Boltz2(nn.Module):
         if self.run_trunk_and_structure and not self.skip_run_structure:
             if _pfn:
                 _pfn("diffusion", step=0, total=num_sampling_steps or self.structure_module.num_sampling_steps)
-            if self.trace:
+            if self.debug_trace:
                 print("[boltz2] diffusion_conditioning")
             q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
                 self.diffusion_conditioning(
@@ -5257,7 +5263,7 @@ class Boltz2(nn.Module):
                 "token_trans_bias": token_trans_bias,
             }
 
-            if self.trace:
+            if self.debug_trace:
                 print("[boltz2] structure_module.sample")
             with torch.autocast("cuda", enabled=False):
                 struct_out = self.structure_module.sample(
@@ -5281,7 +5287,7 @@ class Boltz2(nn.Module):
         if self.confidence_prediction:
             if _pfn:
                 _pfn("confidence")
-            if self.trace:
+            if self.debug_trace:
                 print("[boltz2] confidence_module")
             dict_out.update(
                 self.confidence_module(
@@ -5306,7 +5312,7 @@ class Boltz2(nn.Module):
             )
 
         if self.affinity_prediction:
-            if self.trace:
+            if self.debug_trace:
                 print("[boltz2] affinity_module")
             pad_token_mask = feats["token_pad_mask"][0]
             rec_mask = feats["mol_type"][0] == 0

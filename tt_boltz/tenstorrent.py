@@ -103,6 +103,13 @@ def set_fast_mode(enabled: bool) -> None:
     _FAST_MODE = bool(enabled)
 
 _device = None
+_model_trace_enabled = False
+
+
+def set_model_trace_enabled(enabled: bool) -> None:
+    """Enable/disable diffusion trace replay in this process."""
+    global _model_trace_enabled
+    _model_trace_enabled = bool(enabled)
 
 def get_device():
     """Open (or return cached) TT device 0.
@@ -1860,9 +1867,56 @@ class PairformerModule(TorchWrapper):
 class DiffusionModule(TorchWrapper):
     def __init__(self):
         super().__init__()
+        self._trace_tid = None
+        self._trace_key = None
+        self._trace_r_dev = None
+        self._trace_times_dev = None
+        self._trace_out_dev = None
 
     def _create_module(self, weights: WeightScope):
         return Diffusion(weights, self.compute_kernel_config)
+
+    def _clear_diffusion_trace(self):
+        if self._trace_tid is not None:
+            try:
+                ttnn.release_trace(self.tt_device, self._trace_tid)
+            except Exception:
+                pass
+        for tensor in (self._trace_r_dev, self._trace_times_dev, self._trace_out_dev):
+            self._deallocate_tensor_like(tensor)
+        self._trace_tid = None
+        self._trace_key = None
+        self._trace_r_dev = None
+        self._trace_times_dev = None
+        self._trace_out_dev = None
+
+    def _run_diffusion_kernel(self, r_tt: ttnn.Tensor, times_tt: ttnn.Tensor, seq_len: int) -> ttnn.Tensor:
+        return self.module(
+            r_tt,
+            times_tt,
+            self._cache_get("s_inputs"),
+            self._cache_get("s_trunk"),
+            self._cache_get("q"),
+            self._cache_get("c"),
+            self._cache_get("bias_encoder"),
+            self._cache_get("bias_token"),
+            self._cache_get("bias_decoder"),
+            self._cache_get("keys_indexing"),
+            self._cache_get("atom_to_token"),
+            self._cache_get("atom_to_token_normed"),
+            large_seq_len=seq_len > SEQ_LEN_MORE_CHUNKING,
+        )
+
+    def _copy_runtime_inputs_to_trace_buffers(self, r: torch.Tensor, times: torch.Tensor) -> None:
+        """Update traced input buffers from torch tensors and free temporary host TT tensors."""
+        r_host = ttnn.from_torch(r, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        times_host = ttnn.from_torch(times, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        try:
+            ttnn.copy_host_to_device_tensor(r_host, self._trace_r_dev)
+            ttnn.copy_host_to_device_tensor(times_host, self._trace_times_dev)
+        finally:
+            self._deallocate_tensor_like(r_host)
+            self._deallocate_tensor_like(times_host)
 
     def forward(
         self,
@@ -1992,28 +2046,50 @@ class DiffusionModule(TorchWrapper):
         atom_pad_cached = self._cache_get("atom_pad", 0)
         if atom_pad_cached:
             r = torch.nn.functional.pad(r, (0, 0, 0, atom_pad_cached))
+        trace_key = (tuple(r.shape), tuple(times.shape), seq_len > SEQ_LEN_MORE_CHUNKING)
+        if _model_trace_enabled:
+            if self._trace_tid is None or self._trace_key != trace_key:
+                self._clear_diffusion_trace()
+                self._trace_r_dev = self._from_torch(r)
+                self._trace_times_dev = self._from_torch(times)
 
-        result = self._to_torch(
-            self.module(
-                self._from_torch(r),
-                self._from_torch(times),
-                self._cache_get("s_inputs"),
-                self._cache_get("s_trunk"),
-                self._cache_get("q"),
-                self._cache_get("c"),
-                self._cache_get("bias_encoder"),
-                self._cache_get("bias_token"),
-                self._cache_get("bias_decoder"),
-                self._cache_get("keys_indexing"),
-                self._cache_get("atom_to_token"),
-                self._cache_get("atom_to_token_normed"),
-                large_seq_len=seq_len > SEQ_LEN_MORE_CHUNKING,
-            )
-        )
+                # Warmup compile before capture.
+                warmup_out = self._run_diffusion_kernel(self._trace_r_dev, self._trace_times_dev, seq_len)
+                ttnn.deallocate(warmup_out)
+
+                self._trace_tid = ttnn.begin_trace_capture(self.tt_device, cq_id=0)
+                try:
+                    self._trace_out_dev = self._run_diffusion_kernel(self._trace_r_dev, self._trace_times_dev, seq_len)
+                    ttnn.end_trace_capture(self.tt_device, self._trace_tid, cq_id=0)
+                except Exception:
+                    try:
+                        ttnn.end_trace_capture(self.tt_device, self._trace_tid, cq_id=0)
+                    except Exception:
+                        pass
+                    self._clear_diffusion_trace()
+                    raise
+                self._trace_key = trace_key
+            else:
+                self._copy_runtime_inputs_to_trace_buffers(r, times)
+                ttnn.execute_trace(self.tt_device, self._trace_tid, cq_id=0, blocking=True)
+            result = self._to_torch(self._trace_out_dev)
+        else:
+            self._clear_diffusion_trace()
+            r_dev = self._from_torch(r)
+            times_dev = self._from_torch(times)
+            out_dev = None
+            try:
+                out_dev = self._run_diffusion_kernel(r_dev, times_dev, seq_len)
+                result = self._to_torch(out_dev)
+            finally:
+                self._deallocate_tensor_like(out_dev)
+                self._deallocate_tensor_like(r_dev)
+                self._deallocate_tensor_like(times_dev)
         result = result[:, :N, :]
         return result
 
     def reset_static_cache(self):
+        self._clear_diffusion_trace()
         super().reset_static_cache()
         if self.module is not None:
             self._clear_cached_attrs(self.module, ("_s_conditioned", "_c_reshaped"))
