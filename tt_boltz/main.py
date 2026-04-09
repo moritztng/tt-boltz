@@ -41,6 +41,7 @@ from tt_boltz.data.tokenize import Boltz2Tokenizer
 from tt_boltz.data.types import Coords, Input, Interface
 from tt_boltz.data.write import to_mmcif, to_pdb
 from tt_boltz.boltz2 import Boltz2
+from tt_boltz.energy import DEFAULT_ENERGY_SAMPLE_HZ, SysfsPowerProfiler
 from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay, make_progress_fn
 
 URLS = {
@@ -1006,6 +1007,7 @@ def msa(db, path, install_tools):
 @click.option("--disable_watchdog", is_flag=True, help="Disable multi-device watchdog reset/retry logic")
 @click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
+@click.option("--report-energy", "report_energy", is_flag=True, help="Report TT device energy and always write a power-vs-time plot (single-device TT runs)")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1013,7 +1015,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
-            num_devices, device_ids, fast, disable_watchdog, debug, log):
+            num_devices, device_ids, fast, disable_watchdog, debug, log,
+            report_energy):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -1149,6 +1152,25 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     results_path = out / "results.json"
     results = [] if override else _load_results_resilient(results_path)
+    energy_profiler = None
+    energy_sample_hz = DEFAULT_ENERGY_SAMPLE_HZ
+    energy_csv_path = out / "power_profile.csv"
+    energy_plot_path = out / "power_profile.png"
+    if report_energy:
+        if not use_tt:
+            click.echo("Energy profiling is currently supported only for --accelerator=tenstorrent; skipping")
+        elif n_devices != 1:
+            click.echo("Energy profiling currently supports one TT device only; skipping")
+        else:
+            try:
+                energy_profiler = SysfsPowerProfiler(device_id=devices[0], sample_hz=energy_sample_hz)
+                energy_profiler.start()
+                click.echo(
+                    f"Energy profiler: source=sysfs device={devices[0]} target_hz={energy_sample_hz:.2f}"
+                )
+            except Exception as e:
+                click.echo(f"Energy profiler unavailable: {e}")
+                energy_profiler = None
 
     # =====================================================================
     # TT path — reuses _predict_worker for all cases:
@@ -1478,6 +1500,31 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     merged = {r["id"]: r for r in existing_rows}
     merged.update({r["id"]: r for r in results})
     _save_results(list(merged.values()), results_path)
+    if energy_profiler is not None:
+        energy_profiler.stop()
+        summary = energy_profiler.summarize()
+        energy_profiler.write_csv(energy_csv_path)
+        click.echo("\nEnergy summary (sysfs, one TT device)")
+        click.echo(f"  device_id:      {devices[0]}")
+        click.echo(f"  samples:        {summary.samples}")
+        click.echo(f"  duration_s:     {summary.duration_s:.3f}")
+        click.echo(f"  energy_j:       {summary.energy_j:.3f}")
+        click.echo(f"  energy_wh:      {summary.energy_wh:.6f}")
+        click.echo(f"  avg_power_w:    {summary.avg_w:.3f}")
+        click.echo(f"  peak_power_w:   {summary.peak_w:.3f}")
+        click.echo(f"  min_power_w:    {summary.min_w:.3f}")
+        click.echo(f"  power_source:   {energy_profiler.source}")
+        click.echo(f"  power_csv:      {energy_csv_path}")
+        if energy_profiler.error:
+            click.echo(f"  sampler_note:   {energy_profiler.error}")
+        wrote_plot = energy_profiler.write_plot(
+            energy_plot_path,
+            title=f"TT device {devices[0]} power vs time",
+        )
+        if wrote_plot:
+            click.echo(f"  power_plot:     {energy_plot_path}")
+        else:
+            click.echo("  power_plot:     failed (matplotlib not available)")
     click.echo(f"\nDone: {len(files) - failed} ok, {failed} failed — {results_path}")
 
 
