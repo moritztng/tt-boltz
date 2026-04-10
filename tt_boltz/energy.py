@@ -1,4 +1,4 @@
-"""Lightweight Tenstorrent board energy profiling via sysfs hwmon."""
+"""Lightweight Tenstorrent energy profiling via tt-mgmt telemetry."""
 
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ class EnergySummary:
 DEFAULT_ENERGY_SAMPLE_HZ = 20.0
 
 
-class SysfsPowerProfiler:
-    """Sample one Tenstorrent device power from sysfs and integrate energy."""
+class PowerProfiler:
+    """Sample one Tenstorrent device power via tt-mgmt and integrate energy."""
 
     def __init__(
         self,
@@ -58,57 +58,15 @@ class SysfsPowerProfiler:
         self.enable_tdp = metric_mode in ("both", "tdp")
         self.enable_input = metric_mode in ("both", "input")
         self.interval_s = 1.0 / self.sample_hz
-        self.power_path, self.sysfs_device_name, self.pci_bdf = self._resolve_paths(self.device_id, self.enable_tdp)
         self.samples: list[tuple[float, float | None, float | None]] = []  # (monotonic_time_s, tdp_power_w, input_power_w)
-        self.input_samples: list[tuple[float, float]] = []  # (monotonic_time_s, input_power_w)
         self._thread: threading.Thread | None = None
-        self._input_thread: threading.Thread | None = None
-        self._input_proc: subprocess.Popen[str] | None = None
+        self._helper_proc: subprocess.Popen[str] | None = None
         self._stop = threading.Event()
         self._error: str | None = None
         self._input_power_note: str | None = None
-        self._input_power_latest: float | None = None
-        self._input_power_lock = threading.Lock()
         self._helper_python = self._resolve_helper_python()
-        self._input_power_source = (
-            f"tt-mgmt UMD input_power_w via helper process ({self._helper_python})"
-        )
-
-    @staticmethod
-    def _resolve_paths(device_id: int, require_power_path: bool) -> tuple[Path | None, str, str]:
-        """Resolve BDF (+ optional power file) using runtime device order."""
-        entries = []
-        for entry in sorted(Path("/sys/class/tenstorrent").glob("tenstorrent!*")):
-            try:
-                pci_bdf = entry.resolve().parent.parent.name
-            except Exception:
-                continue
-            entries.append((pci_bdf, entry))
-
-        if not entries:
-            raise RuntimeError("No /sys/class/tenstorrent/tenstorrent!* entries found")
-
-        # tt-boltz --device_ids uses TT runtime ordering, which follows sorted PCI BDF.
-        entries.sort(key=lambda x: x[0])
-        if device_id < 0 or device_id >= len(entries):
-            raise RuntimeError(
-                f"Runtime device_id {device_id} out of range; found {len(entries)} Tenstorrent devices"
-            )
-        pci_bdf, tt_dir = entries[device_id]
-
-        if not require_power_path:
-            return None, tt_dir.name, pci_bdf
-
-        candidates = sorted((tt_dir / "device" / "hwmon").glob("hwmon*/power1_input"))
-        if not candidates:
-            raise RuntimeError(f"No hwmon power1_input found for device {device_id} under {tt_dir}/device/hwmon")
-        return candidates[0], tt_dir.name, pci_bdf
-
-    def _read_power_w(self) -> float:
-        if self.power_path is None:
-            raise RuntimeError("TDP channel is disabled")
-        raw = self.power_path.read_text().strip()
-        return int(raw) / 1_000_000.0  # microwatts -> watts
+        self._power_source = f"tt-mgmt UMD telemetry.power via helper process ({self._helper_python})"
+        self._input_power_source = f"tt-mgmt UMD telemetry.input_power_w via helper process ({self._helper_python})"
 
     def _resolve_helper_python(self) -> Path:
         """Pick python executable for isolated tt-mgmt reads."""
@@ -117,8 +75,8 @@ class SysfsPowerProfiler:
             return Path(env_override).expanduser().resolve()
         return Path(sys.executable)
 
-    def _start_input_power_helper(self) -> subprocess.Popen[str]:
-        """Start helper process that continuously prints INPUT_POWER samples."""
+    def _start_helper(self) -> subprocess.Popen[str]:
+        """Start helper process that continuously prints tt-mgmt power samples."""
         if not self._helper_python.exists():
             raise RuntimeError(f"helper python not found: {self._helper_python}")
         # Keep power measurement optional: only users of --report-energy need tt-mgmt.
@@ -132,30 +90,41 @@ class SysfsPowerProfiler:
         script = (
             "import sys\n"
             "import time\n"
-            "target_bdf=sys.argv[1].lower()\n"
+            "device_id=int(sys.argv[1])\n"
             "hz=float(sys.argv[2])\n"
+            "mode=sys.argv[3]\n"
+            "if mode not in ('both','tdp','input'):\n"
+            "  raise RuntimeError(f'invalid mode: {mode}')\n"
             "dt=1.0/hz\n"
             "from tt_mgmt.api import connect\n"
             "c=connect(embedded=True, backend='umd')\n"
             "devs=c.device_list()\n"
-            "idx=None\n"
-            "for i,d in enumerate(devs):\n"
-            "  if str(d.get('pci_bdf','')).lower()==target_bdf:\n"
-            "    idx=i\n"
-            "    break\n"
-            "if idx is None:\n"
-            "  raise RuntimeError(f'pci_bdf {target_bdf} not found in tt-mgmt device list')\n"
+            "if not devs:\n"
+            "  raise RuntimeError('no tt-mgmt devices found')\n"
+            "devs_sorted=sorted(devs, key=lambda d: str(d.get('pci_bdf','')).lower())\n"
+            "if device_id<0 or device_id>=len(devs_sorted):\n"
+            "  raise RuntimeError(f'device_id {device_id} out of range; found {len(devs_sorted)} devices')\n"
+            "target_bdf=str(devs_sorted[device_id].get('pci_bdf','')).lower()\n"
+            "bdf_to_idx={str(d.get('pci_bdf','')).lower(): i for i,d in enumerate(devs)}\n"
+            "if target_bdf not in bdf_to_idx:\n"
+            "  raise RuntimeError(f'could not map target bdf {target_bdf} to tt-mgmt index')\n"
+            "idx=bdf_to_idx[target_bdf]\n"
             "while True:\n"
             "  d=c.update_telemetry(idx)\n"
             "  t=d.get('telemetry',{})\n"
-            "  p=t.get('input_power_w')\n"
-            "  if p is None:\n"
-            "    raise RuntimeError('input_power_w unavailable from tt-mgmt telemetry')\n"
-            "  print(f'{float(p)}', flush=True)\n"
+            "  tdp=t.get('power')\n"
+            "  inp=t.get('input_power_w')\n"
+            "  if mode in ('both','tdp') and tdp is None:\n"
+            "    raise RuntimeError('telemetry.power unavailable from tt-mgmt')\n"
+            "  if mode in ('both','input') and inp is None:\n"
+            "    raise RuntimeError('telemetry.input_power_w unavailable from tt-mgmt')\n"
+            "  tdp_s='' if tdp is None else str(float(tdp))\n"
+            "  inp_s='' if inp is None else str(float(inp))\n"
+            "  print(f'{tdp_s},{inp_s}', flush=True)\n"
             "  time.sleep(dt)\n"
         )
         proc = subprocess.Popen(
-            [str(self._helper_python), "-u", "-c", script, self.pci_bdf, str(self.input_sample_hz)],
+            [str(self._helper_python), "-u", "-c", script, str(self.device_id), str(self.sample_hz), self.metric_mode],
             text=True,
             stderr=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -163,19 +132,17 @@ class SysfsPowerProfiler:
         )
         return proc
 
-    def _input_loop(self) -> None:
+    def _loop(self) -> None:
         try:
-            proc = self._start_input_power_helper()
+            proc = self._start_helper()
         except Exception as e:
-            if self._input_power_note is None:
-                self._input_power_note = f"input_power unavailable: {e}"
+            self._error = str(e)
             return
 
-        self._input_proc = proc
+        self._helper_proc = proc
         stdout: TextIOWrapper | None = proc.stdout
         if stdout is None:
-            if self._input_power_note is None:
-                self._input_power_note = "input_power unavailable: helper stdout not available"
+            self._error = "power helper unavailable: stdout not available"
             return
 
         try:
@@ -185,18 +152,26 @@ class SysfsPowerProfiler:
                     if proc.poll() is not None:
                         if self._stop.is_set():
                             break
-                        if self._input_power_note is None:
-                            self._input_power_note = f"input_power unavailable: helper exited with code {proc.returncode}"
+                        if self._error is None:
+                            self._error = f"power helper exited with code {proc.returncode}"
                         break
                     continue
                 now = time.monotonic()
                 try:
-                    value = float(line.strip())
+                    raw_tdp, raw_input = line.strip().split(",", 1)
+                    tdp_power_w = float(raw_tdp) if raw_tdp else None
+                    input_power_w = float(raw_input) if raw_input else None
                 except ValueError:
                     continue
-                with self._input_power_lock:
-                    self._input_power_latest = value
-                    self.input_samples.append((now, value))
+                if self.enable_tdp and tdp_power_w is None:
+                    if self._error is None:
+                        self._error = "telemetry.power missing in helper sample"
+                    continue
+                if self.enable_input and input_power_w is None:
+                    if self._input_power_note is None:
+                        self._input_power_note = "telemetry.input_power_w missing in helper sample"
+                    continue
+                self.samples.append((now, tdp_power_w if self.enable_tdp else None, input_power_w if self.enable_input else None))
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -204,39 +179,13 @@ class SysfsPowerProfiler:
                 proc.wait(timeout=1.0)
             except Exception:
                 proc.kill()
-            self._input_proc = None
-
-    def _loop(self) -> None:
-        next_tick = time.monotonic()
-        while not self._stop.is_set():
-            now = time.monotonic()
-            try:
-                power_w = self._read_power_w() if self.enable_tdp else None
-                with self._input_power_lock:
-                    input_power_w = self._input_power_latest if self.enable_input else None
-                if power_w is not None or input_power_w is not None:
-                    self.samples.append((now, power_w, input_power_w))
-            except Exception as e:  # best effort sampling; keep first error
-                if self._error is None:
-                    self._error = str(e)
-            next_tick += self.interval_s
-            sleep_s = next_tick - time.monotonic()
-            if sleep_s > 0:
-                self._stop.wait(sleep_s)
+            self._helper_proc = None
 
     def start(self) -> None:
         self._stop.clear()
         self.samples.clear()
         self._error = None
         self._input_power_note = None
-        self.input_samples.clear()
-        with self._input_power_lock:
-            self._input_power_latest = None
-        if self.enable_input:
-            self._input_thread = threading.Thread(target=self._input_loop, name="tt-input-power-profiler", daemon=True)
-            self._input_thread.start()
-        else:
-            self._input_thread = None
         self._thread = threading.Thread(target=self._loop, name="tt-power-profiler", daemon=True)
         self._thread.start()
 
@@ -244,11 +193,9 @@ class SysfsPowerProfiler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        proc = self._input_proc
-        if self.enable_input and proc is not None and proc.poll() is None:
+        proc = self._helper_proc
+        if proc is not None and proc.poll() is None:
             proc.terminate()
-        if self._input_thread is not None:
-            self._input_thread.join(timeout=2.0)
 
     def summarize(self) -> EnergySummary:
         tdp_pts = [(t, p) for t, p, _ in self.samples if p is not None]
@@ -275,7 +222,7 @@ class SysfsPowerProfiler:
             peak_w = None
             min_w = None
 
-        input_pts = self.input_samples if self.enable_input else []
+        input_pts = [(t, p) for t, _, p in self.samples if p is not None]
         if input_pts:
             input_duration_s = max(0.0, input_pts[-1][0] - input_pts[0][0])
             input_energy_j = 0.0
@@ -374,9 +321,7 @@ class SysfsPowerProfiler:
 
     @property
     def source(self) -> str:
-        if self.power_path is None:
-            return f"{self.sysfs_device_name} ({self.pci_bdf})"
-        return f"{self.sysfs_device_name} ({self.pci_bdf}) @ {self.power_path}"
+        return self._power_source
 
     @property
     def input_power_source(self) -> str | None:
@@ -385,4 +330,8 @@ class SysfsPowerProfiler:
     @property
     def input_power_note(self) -> str | None:
         return self._input_power_note
+
+
+# Backward-compatible alias for older imports.
+SysfsPowerProfiler = PowerProfiler
 

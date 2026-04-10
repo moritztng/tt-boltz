@@ -41,7 +41,7 @@ from tt_boltz.data.tokenize import Boltz2Tokenizer
 from tt_boltz.data.types import Coords, Input, Interface
 from tt_boltz.data.write import to_mmcif, to_pdb
 from tt_boltz.boltz2 import Boltz2
-from tt_boltz.energy import DEFAULT_ENERGY_SAMPLE_HZ, SysfsPowerProfiler
+from tt_boltz.energy import DEFAULT_ENERGY_SAMPLE_HZ, PowerProfiler
 from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay, make_progress_fn
 
 URLS = {
@@ -1164,7 +1164,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             click.echo("Energy profiling currently supports one TT device only; skipping")
         else:
             try:
-                energy_profiler = SysfsPowerProfiler(
+                energy_profiler = PowerProfiler(
                     device_id=devices[0],
                     sample_hz=energy_sample_hz,
                     input_sample_hz=energy_sample_hz,

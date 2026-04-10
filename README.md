@@ -352,7 +352,7 @@ Behavior:
 - Uses one sampling rate (`--energy-sample-hz`, default 20 Hz)
 - Supports only Tenstorrent runs with one selected device
 - Records two power channels when available:
-  - `power_w`: sysfs/hwmon power (TDP channel)
+  - `power_w`: `tt-mgmt` UMD telemetry power (TDP channel)
   - `input_power_w`: `tt-mgmt` UMD telemetry input power
 - Requires optional `tt-mgmt` installation:
   - `git clone --recursive https://github.com/aperezvicente-TT/tt-mgmt.git`
