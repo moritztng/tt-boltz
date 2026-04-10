@@ -29,7 +29,6 @@ dependencies = [
     "pytest",
     "omegaconf",
     "ttnn==0.67.4",
-    "tt-umd",
 ]
 
 [project.scripts]

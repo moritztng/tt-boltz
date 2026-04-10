@@ -21,7 +21,7 @@ source env/bin/activate
 pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
 ```
 
-This installs `tt-boltz` and its Python dependencies (including `ttnn` and `tt-umd`). That's it.
+This installs `tt-boltz` and its core Python dependencies (including `ttnn`). That's it.
 
 ### Advanced Install (editable local clone)
 ```bash
@@ -94,26 +94,6 @@ tt-boltz predict examples/affinity.yaml --use_msa_server --override --affinity_m
 ```
 
 The `--affinity_mw_correction` flag applies molecular weight correction for more accurate predictions.
-
-### Energy Measurement (Single Flag)
-
-Use `--report-energy` to profile energy during prediction:
-
-```bash
-tt-boltz predict examples/686.yaml --override --device_ids 0 --report-energy --energy-sample-hz 5
-```
-
-Behavior:
-- Uses one sampling rate for both channels (`--energy-sample-hz`, default 20 Hz)
-- Supports only Tenstorrent runs with one selected device
-- Records two power channels when available:
-  - `power_w`: sysfs/hwmon power (TDP channel)
-  - `input_power_w`: UMD tag 54 INPUT_POWER (BH)
-- No `tt-smi` command is required
-- Prints energy summary metrics for both channels
-- Always writes:
-  - `power_profile.csv`
-  - `power_profile.png`
 
 ### Input Format
 
@@ -299,7 +279,8 @@ templates:
 | `--num_devices` | `0` | Number of TT devices (0=all available) |
 | `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
 | `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
-| `--report-energy` | `False` | Enables energy profiling for one TT device; writes `power_profile.csv` and `power_profile.png` |
+| `--report-energy` | `False` | Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
+| `--energy-metric` | `both` | Choose power channel(s): `tdp`, `input`, or `both` |
 | `--energy-sample-hz` | `20.0` | Sampling rate in Hz for both `power_w` and `input_power_w` channels |
 
 **Affinity-Specific Options:**
@@ -357,6 +338,29 @@ Runtime for a 686 amino acid protein:
 | Nvidia T4 | ~9 min |
 | Tenstorrent Blackhole p150 | ~1 min |
 | Nvidia RTX 5090 | ~1 min |
+
+## Optional: Energy Measurement
+
+Use `--report-energy` to profile energy during prediction:
+
+```bash
+tt-boltz predict examples/686.yaml --override --device_ids 0 --report-energy --energy-metric both --energy-sample-hz 5
+```
+
+Behavior:
+- Select metric channel(s) with `--energy-metric` (`tdp`, `input`, `both`)
+- Uses one sampling rate (`--energy-sample-hz`, default 20 Hz)
+- Supports only Tenstorrent runs with one selected device
+- Records two power channels when available:
+  - `power_w`: sysfs/hwmon power (TDP channel)
+  - `input_power_w`: `tt-mgmt` UMD telemetry input power
+- Requires optional `tt-mgmt` installation:
+  - `git clone --recursive https://github.com/aperezvicente-TT/tt-mgmt.git`
+  - `pip install -e ./tt-mgmt`
+- Prints energy summary metrics for selected channels
+- Always writes:
+  - `power_profile.csv`
+  - `power_profile.png`
 
 ## Cite
 

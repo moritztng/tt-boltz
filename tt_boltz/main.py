@@ -1009,6 +1009,7 @@ def msa(db, path, install_tools):
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 @click.option("--report-energy", "report_energy", is_flag=True, help="Report TT device energy and always write a power-vs-time plot (single-device TT runs)")
 @click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for both power and input_power in --report-energy")
+@click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Select which power channel(s) to measure with --report-energy")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1017,7 +1018,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, disable_watchdog, debug, log,
-            report_energy, energy_sample_hz):
+            report_energy, energy_sample_hz, energy_metric):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -1167,10 +1168,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     device_id=devices[0],
                     sample_hz=energy_sample_hz,
                     input_sample_hz=energy_sample_hz,
+                    metric_mode=energy_metric,
                 )
                 energy_profiler.start()
                 click.echo(
-                    f"Energy profiler: source=sysfs device={devices[0]} target_hz={energy_sample_hz:.2f}"
+                    f"Energy profiler: device={devices[0]} metric={energy_metric} target_hz={energy_sample_hz:.2f}"
                 )
             except Exception as e:
                 click.echo(f"Energy profiler unavailable: {e}")
@@ -1510,14 +1512,16 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         energy_profiler.write_csv(energy_csv_path)
         click.echo("\nEnergy summary (one TT device)")
         click.echo(f"  device_id:      {devices[0]}")
-        click.echo(f"  samples:        {summary.samples}")
-        click.echo(f"  duration_s:     {summary.duration_s:.3f}")
-        click.echo(f"  energy_j:       {summary.energy_j:.3f}")
-        click.echo(f"  energy_wh:      {summary.energy_wh:.6f}")
-        click.echo(f"  avg_power_w:    {summary.avg_w:.3f}")
-        click.echo(f"  peak_power_w:   {summary.peak_w:.3f}")
-        click.echo(f"  min_power_w:    {summary.min_w:.3f}")
-        click.echo(f"  power_source:   {energy_profiler.source}")
+        if summary.energy_j is not None:
+            click.echo("  tdp_metric:")
+            click.echo(f"    samples:      {summary.samples}")
+            click.echo(f"    duration_s:   {summary.duration_s:.3f}")
+            click.echo(f"    energy_j:     {summary.energy_j:.3f}")
+            click.echo(f"    energy_wh:    {summary.energy_wh:.6f}")
+            click.echo(f"    avg_power_w:  {summary.avg_w:.3f}")
+            click.echo(f"    peak_power_w: {summary.peak_w:.3f}")
+            click.echo(f"    min_power_w:  {summary.min_w:.3f}")
+            click.echo(f"    source:       {energy_profiler.source}")
         if summary.input_energy_j is not None:
             click.echo("  input_power_metric:")
             click.echo(f"    samples:      {summary.input_samples}")
@@ -1528,7 +1532,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             click.echo(f"    peak_power_w: {summary.input_peak_w:.3f}")
             click.echo(f"    min_power_w:  {summary.input_min_w:.3f}")
             click.echo(f"    source:       {energy_profiler.input_power_source}")
-        elif energy_profiler.input_power_note:
+        if energy_profiler.input_power_note:
             click.echo(f"  input_power:    {energy_profiler.input_power_note}")
         click.echo(f"  power_csv:      {energy_csv_path}")
         if energy_profiler.error:
