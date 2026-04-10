@@ -1008,6 +1008,7 @@ def msa(db, path, install_tools):
 @click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
 @click.option("--report-energy", "report_energy", is_flag=True, help="Report TT device energy and always write a power-vs-time plot (single-device TT runs)")
+@click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for both power and input_power in --report-energy")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1016,7 +1017,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, disable_watchdog, debug, log,
-            report_energy):
+            report_energy, energy_sample_hz):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -1153,7 +1154,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     results_path = out / "results.json"
     results = [] if override else _load_results_resilient(results_path)
     energy_profiler = None
-    energy_sample_hz = DEFAULT_ENERGY_SAMPLE_HZ
     energy_csv_path = out / "power_profile.csv"
     energy_plot_path = out / "power_profile.png"
     if report_energy:
@@ -1163,7 +1163,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             click.echo("Energy profiling currently supports one TT device only; skipping")
         else:
             try:
-                energy_profiler = SysfsPowerProfiler(device_id=devices[0], sample_hz=energy_sample_hz)
+                energy_profiler = SysfsPowerProfiler(
+                    device_id=devices[0],
+                    sample_hz=energy_sample_hz,
+                    input_sample_hz=energy_sample_hz,
+                )
                 energy_profiler.start()
                 click.echo(
                     f"Energy profiler: source=sysfs device={devices[0]} target_hz={energy_sample_hz:.2f}"
@@ -1504,7 +1508,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         energy_profiler.stop()
         summary = energy_profiler.summarize()
         energy_profiler.write_csv(energy_csv_path)
-        click.echo("\nEnergy summary (sysfs, one TT device)")
+        click.echo("\nEnergy summary (one TT device)")
         click.echo(f"  device_id:      {devices[0]}")
         click.echo(f"  samples:        {summary.samples}")
         click.echo(f"  duration_s:     {summary.duration_s:.3f}")
@@ -1514,6 +1518,18 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         click.echo(f"  peak_power_w:   {summary.peak_w:.3f}")
         click.echo(f"  min_power_w:    {summary.min_w:.3f}")
         click.echo(f"  power_source:   {energy_profiler.source}")
+        if summary.input_energy_j is not None:
+            click.echo("  input_power_metric:")
+            click.echo(f"    samples:      {summary.input_samples}")
+            click.echo(f"    duration_s:   {summary.input_duration_s:.3f}")
+            click.echo(f"    energy_j:     {summary.input_energy_j:.3f}")
+            click.echo(f"    energy_wh:    {summary.input_energy_wh:.6f}")
+            click.echo(f"    avg_power_w:  {summary.input_avg_w:.3f}")
+            click.echo(f"    peak_power_w: {summary.input_peak_w:.3f}")
+            click.echo(f"    min_power_w:  {summary.input_min_w:.3f}")
+            click.echo(f"    source:       {energy_profiler.input_power_source}")
+        elif energy_profiler.input_power_note:
+            click.echo(f"  input_power:    {energy_profiler.input_power_note}")
         click.echo(f"  power_csv:      {energy_csv_path}")
         if energy_profiler.error:
             click.echo(f"  sampler_note:   {energy_profiler.error}")

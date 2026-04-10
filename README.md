@@ -95,6 +95,25 @@ tt-boltz predict examples/affinity.yaml --use_msa_server --override --affinity_m
 
 The `--affinity_mw_correction` flag applies molecular weight correction for more accurate predictions.
 
+### Energy Measurement (Single Flag)
+
+Use `--report-energy` to profile energy during prediction:
+
+```bash
+tt-boltz predict examples/686.yaml --override --device_ids 0 --report-energy --energy-sample-hz 5
+```
+
+Behavior:
+- Uses one sampling rate for both channels (`--energy-sample-hz`, default 20 Hz)
+- Supports only Tenstorrent runs with one selected device
+- Records two power channels when available:
+  - `power_w`: sysfs/hwmon power (TDP channel)
+  - `input_power_w`: UMD tag 54 INPUT_POWER (BH)
+- Prints energy summary metrics for both channels
+- Always writes:
+  - `power_profile.csv`
+  - `power_profile.png`
+
 ### Input Format
 
 Create a YAML file describing your complex:
@@ -134,6 +153,8 @@ boltz_results_prot/
 │   ├── prot.cif                      # Best-ranked predicted structure
 │   └── prot_model_1.cif              # Additional samples (if diffusion_samples > 1)
 ├── results.json                      # One entry per target with confidence/affinity metrics
+├── power_profile.csv                 # (optional, --report-energy)
+├── power_profile.png                 # (optional, --report-energy)
 ├── prot_pae.npz                      # (optional, --write_pae)
 ├── prot_pde.npz                      # (optional, --write_pde)
 └── prot_embeddings.npz               # (optional, --write_embeddings)
@@ -277,6 +298,8 @@ templates:
 | `--num_devices` | `0` | Number of TT devices (0=all available) |
 | `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
 | `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
+| `--report-energy` | `False` | Enables energy profiling for one TT device; writes `power_profile.csv` and `power_profile.png` |
+| `--energy-sample-hz` | `20.0` | Sampling rate in Hz for both `power_w` and `input_power_w` channels |
 
 **Affinity-Specific Options:**
 
