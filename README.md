@@ -21,7 +21,7 @@ source env/bin/activate
 pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
 ```
 
-This installs `tt-boltz` and its Python dependencies (including `ttnn`). That's it.
+This installs `tt-boltz` and its Python dependencies (including `ttnn` and `tt-umd`). That's it.
 
 ### Advanced Install (editable local clone)
 ```bash
@@ -109,6 +109,7 @@ Behavior:
 - Records two power channels when available:
   - `power_w`: sysfs/hwmon power (TDP channel)
   - `input_power_w`: UMD tag 54 INPUT_POWER (BH)
+- No `tt-smi` command is required
 - Prints energy summary metrics for both channels
 - Always writes:
   - `power_profile.csv`

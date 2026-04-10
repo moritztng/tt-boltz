@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import os
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -30,7 +32,6 @@ class EnergySummary:
 
 
 DEFAULT_ENERGY_SAMPLE_HZ = 20.0
-TTSMI_VENV_PYTHON = Path("/home/ttuser/.local/pipx/venvs/tt-smi/bin/python")
 
 
 class SysfsPowerProfiler:
@@ -58,10 +59,13 @@ class SysfsPowerProfiler:
         self._input_proc: subprocess.Popen[str] | None = None
         self._stop = threading.Event()
         self._error: str | None = None
-        self._input_power_source = "umd TelemetryTag 54 (INPUT_POWER) via helper process"
         self._input_power_note: str | None = None
         self._input_power_latest: float | None = None
         self._input_power_lock = threading.Lock()
+        self._helper_python = self._resolve_helper_python()
+        self._input_power_source = (
+            f"umd TelemetryTag 54 (INPUT_POWER) via helper process ({self._helper_python})"
+        )
 
     @staticmethod
     def _resolve_power_path(device_id: int) -> tuple[Path, str, str]:
@@ -94,10 +98,17 @@ class SysfsPowerProfiler:
         raw = self.power_path.read_text().strip()
         return int(raw) / 1_000_000.0  # microwatts -> watts
 
+    def _resolve_helper_python(self) -> Path:
+        """Pick python executable for isolated tt_umd reads."""
+        env_override = os.environ.get("TT_UMD_PYTHON")
+        if env_override:
+            return Path(env_override).expanduser()
+        return Path(sys.executable)
+
     def _start_input_power_helper(self) -> subprocess.Popen[str]:
         """Start helper process that continuously prints INPUT_POWER samples."""
-        if not TTSMI_VENV_PYTHON.exists():
-            raise RuntimeError(f"helper python not found: {TTSMI_VENV_PYTHON}")
+        if not self._helper_python.exists():
+            raise RuntimeError(f"helper python not found: {self._helper_python}")
         script = (
             "import sys\n"
             "import time\n"
@@ -119,7 +130,7 @@ class SysfsPowerProfiler:
             "  time.sleep(dt)\n"
         )
         proc = subprocess.Popen(
-            [str(TTSMI_VENV_PYTHON), "-u", "-c", script, str(self.device_id), str(self.input_sample_hz)],
+            [str(self._helper_python), "-u", "-c", script, str(self.device_id), str(self.input_sample_hz)],
             text=True,
             stderr=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
