@@ -29,7 +29,11 @@ build_stack() {
     cd "$TT_METAL_DIR"
     git pull origin main >> "$LOGFILE" 2>&1 || true
     log "--> Building tt-metal"
-    ./build_metal.sh >> "$LOGFILE" 2>&1
+    ./build_metal.sh --disable-profiler >> "$LOGFILE" 2>&1
+
+    log "--> Reinstalling tt-metal (ttnn) into test environment"
+    source "$TT_BOLTZ_DIR/env/bin/activate"
+    pip install -e "$TT_METAL_DIR" --no-deps >> "$LOGFILE" 2>&1
 
     log "--> Updating tt-boltz"
     cd "$TT_BOLTZ_DIR"
@@ -67,10 +71,10 @@ test_memory() {
     python tests/generate_random_protein_sweep.py --out-dir "$INPUT_DIR" --max-len $MAX_LEN --step 32 >> "$LOGFILE" 2>&1
 
     log "--> Running Memory Test (Normal mode)"
-    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --debug --log >> "$LOGFILE" 2>&1 || log "Normal mode encountered an error/OOM!"
+    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --max_parallel_samples 1 --seed $SEED --debug --log >> "$LOGFILE" 2>&1 || log "Normal mode encountered an error/OOM!"
 
     log "--> Running Memory Test (Fast mode)"
-    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --fast --debug --log >> "$LOGFILE" 2>&1 || log "Fast mode encountered an error/OOM!"
+    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --max_parallel_samples 1 --seed $SEED --fast --debug --log >> "$LOGFILE" 2>&1 || log "Fast mode encountered an error/OOM!"
 }
 
 print_usage() {
