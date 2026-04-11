@@ -39,11 +39,8 @@ build_stack() {
     cd "$TT_BOLTZ_DIR"
     git pull origin main >> "$LOGFILE" 2>&1 || true
 
-    log "--> Recreating python virtual environment"
-    rm -rf env
-    python3 -m venv env
+    log "--> Updating python virtual environment"
     source env/bin/activate
-    pip install --upgrade pip >> "$LOGFILE" 2>&1
     
     log "--> Installing tt-metal (ttnn) and tt-boltz"
     pip install -e "$TT_METAL_DIR" >> "$LOGFILE" 2>&1
