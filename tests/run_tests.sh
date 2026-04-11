@@ -28,8 +28,10 @@ build_stack() {
     log "--> Updating tt-metal"
     cd "$TT_METAL_DIR"
     git pull origin main >> "$LOGFILE" 2>&1 || true
+    git submodule update --init --recursive >> "$LOGFILE" 2>&1 || true
+
     log "--> Building tt-metal"
-    ./build_metal.sh --disable-profiler >> "$LOGFILE" 2>&1
+    ./build_metal.sh >> "$LOGFILE" 2>&1
 
     log "--> Reinstalling tt-metal (ttnn) into test environment"
     source "$TT_BOLTZ_DIR/env/bin/activate"
