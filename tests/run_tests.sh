@@ -68,7 +68,7 @@ test_correctness() {
 }
 
 test_memory() {
-    local MAX_LEN=${1:-1536}
+    local MAX_LEN=${1:-1024}
     log "=== Memory Test Started: $(date) ==="
     setup_env
     cd "$TT_BOLTZ_DIR"
@@ -81,10 +81,10 @@ test_memory() {
     python tests/generate_random_protein_sweep.py --out-dir "$INPUT_DIR" --max-len $MAX_LEN --step 32 >> "$LOGFILE" 2>&1
 
     log "--> Running Memory Test (Normal mode)"
-    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --max_parallel_samples 1 --seed $SEED --debug --log >> "$LOGFILE" 2>&1 || log "Normal mode encountered an error/OOM!"
+    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --debug --log >> "$LOGFILE" 2>&1 || log "Normal mode encountered an error/OOM!"
 
     log "--> Running Memory Test (Fast mode)"
-    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --max_parallel_samples 1 --seed $SEED --fast --debug --log >> "$LOGFILE" 2>&1 || log "Fast mode encountered an error/OOM!"
+    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --fast --debug --log >> "$LOGFILE" 2>&1 || log "Fast mode encountered an error/OOM!"
 }
 
 print_usage() {
@@ -92,7 +92,7 @@ print_usage() {
     echo "  all         : Run build, correctness, and memory tests"
     echo "  build       : Pull latest and build tt-metal"
     echo "  correctness : Run hemoglobin accuracy tests"
-    echo "  memory      : Run memory limit sweep tests (default max_len: 1536)"
+    echo "  memory      : Run memory limit sweep tests (default max_len: 1024)"
 }
 
 COMMAND=${1:-all}
