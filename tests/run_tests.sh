@@ -18,8 +18,10 @@ setup_env() {
     export PYTHONPATH="$TT_METAL_DIR"
     
     # Ensure sfpi runtime is linked for TT hardware
-    mkdir -p env/lib/python3.10/site-packages/ttnn/runtime
-    ln -sf "$TT_METAL_DIR/runtime/sfpi" env/lib/python3.10/site-packages/ttnn/runtime/sfpi
+    local py_ver
+    py_ver=$(python -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+    mkdir -p "env/lib/${py_ver}/site-packages/ttnn/runtime"
+    ln -sf "$TT_METAL_DIR/runtime/sfpi" "env/lib/${py_ver}/site-packages/ttnn/runtime/sfpi"
 }
 
 build_stack() {
@@ -33,13 +35,19 @@ build_stack() {
     log "--> Building tt-metal"
     ./build_metal.sh >> "$LOGFILE" 2>&1
 
-    log "--> Reinstalling tt-metal (ttnn) into test environment"
-    source "$TT_BOLTZ_DIR/env/bin/activate"
-    pip install -e "$TT_METAL_DIR" --no-deps >> "$LOGFILE" 2>&1
-
     log "--> Updating tt-boltz"
     cd "$TT_BOLTZ_DIR"
     git pull origin main >> "$LOGFILE" 2>&1 || true
+
+    log "--> Recreating python virtual environment"
+    rm -rf env
+    python3 -m venv env
+    source env/bin/activate
+    pip install --upgrade pip >> "$LOGFILE" 2>&1
+    
+    log "--> Installing tt-metal (ttnn) and tt-boltz"
+    pip install -e "$TT_METAL_DIR" >> "$LOGFILE" 2>&1
+    pip install -e . >> "$LOGFILE" 2>&1
 }
 
 test_correctness() {
