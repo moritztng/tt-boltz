@@ -68,7 +68,7 @@ test_correctness() {
 }
 
 test_memory() {
-    local MAX_LEN=${1:-1024}
+    local MAX_LEN=${1:-1536}
     log "=== Memory Test Started: $(date) ==="
     setup_env
     cd "$TT_BOLTZ_DIR"
@@ -92,7 +92,7 @@ print_usage() {
     echo "  all         : Run build, correctness, and memory tests"
     echo "  build       : Pull latest and build tt-metal"
     echo "  correctness : Run hemoglobin accuracy tests"
-    echo "  memory      : Run memory limit sweep tests (default max_len: 1024)"
+    echo "  memory      : Run memory limit sweep tests (default max_len: 1536)"
 }
 
 COMMAND=${1:-all}
