@@ -15,7 +15,6 @@ log() {
 setup_env() {
     cd "$TT_BOLTZ_DIR"
     source env/bin/activate
-    export PYTHONPATH="$TT_METAL_DIR"
     
     # Ensure sfpi runtime is linked for TT hardware
     local py_ver
@@ -44,7 +43,11 @@ build_stack() {
     
     log "--> Installing tt-metal (ttnn) and tt-boltz"
     pip install -e "$TT_METAL_DIR" >> "$LOGFILE" 2>&1
+    # Strip strict ttnn versions before installing tt-boltz locally to allow the source metal wheel
+    sed -i 's/"ttnn==[0-9.]*"/"ttnn"/g' pyproject.toml
     pip install -e . >> "$LOGFILE" 2>&1
+    # Restore the strict dependency for the repo
+    git checkout pyproject.toml
 }
 
 test_correctness() {
