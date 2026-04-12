@@ -18,6 +18,7 @@ TRANSITION_H_CHUNK_SIZE_FAST = 32
 TRANSITION_H_CHUNK_SIZE = 16
 _FAST_MODE = False
 TRIANGLE_MULT_L1_MAX_SEQ_FAST = 640
+TRIANGLE_MULT_L1_MAX_SEQ_FAST_13X10 = 704
 TRIANGLE_MULT_L1_MAX_SEQ = 352
 SDPA_CHUNK_TILE = 32
 SDPA_CHUNK_MAX = 256
@@ -34,7 +35,11 @@ TOKEN_DIM = 2 * 384
 TOKEN_N_HEADS = 16
 TOKEN_N_LAYERS = 24
 
-CORE_GRID_MAIN = ttnn.CoreGrid(y=10, x=11)
+COMPUTE_GRID_X_11 = 11
+COMPUTE_GRID_X_13 = 13
+COMPUTE_GRID_Y = 10
+
+CORE_GRID_MAIN = ttnn.CoreGrid(y=COMPUTE_GRID_Y, x=COMPUTE_GRID_X_11)
 COMPUTE_GRID_MAIN = (CORE_GRID_MAIN.x, CORE_GRID_MAIN.y)
 
 def _dtype():
@@ -48,7 +53,14 @@ def _adaln_memory_config(atom_level: bool, large_seq_len: bool) -> ttnn.MemoryCo
 
 
 def _triangle_mul_memory_config(seq_len: int) -> ttnn.MemoryConfig:
-    l1_max_seq = TRIANGLE_MULT_L1_MAX_SEQ_FAST if _FAST_MODE else TRIANGLE_MULT_L1_MAX_SEQ
+    if _FAST_MODE:
+        l1_max_seq = (
+            TRIANGLE_MULT_L1_MAX_SEQ_FAST_13X10
+            if COMPUTE_GRID_MAIN[0] == COMPUTE_GRID_X_13
+            else TRIANGLE_MULT_L1_MAX_SEQ_FAST
+        )
+    else:
+        l1_max_seq = TRIANGLE_MULT_L1_MAX_SEQ
     return ttnn.L1_MEMORY_CONFIG if seq_len <= l1_max_seq else ttnn.DRAM_MEMORY_CONFIG
 
 
@@ -97,6 +109,30 @@ def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReus
     )
 
 
+def _configure_active_compute_grid(device: ttnn.Device) -> None:
+    """Select one of two supported compute grids: 11x10 or 13x10."""
+    global CORE_GRID_MAIN, COMPUTE_GRID_MAIN
+
+    is_13x10 = False
+    try:
+        active_grid = device.compute_with_storage_grid_size()
+        is_13x10 = int(active_grid.x) >= COMPUTE_GRID_X_13
+    except Exception:
+        # Keep conservative 11x10 fallback if introspection is unavailable.
+        pass
+
+    gx = COMPUTE_GRID_X_13 if is_13x10 else COMPUTE_GRID_X_11
+
+    if (gx, COMPUTE_GRID_Y) == COMPUTE_GRID_MAIN:
+        return
+
+    CORE_GRID_MAIN = ttnn.CoreGrid(y=COMPUTE_GRID_Y, x=gx)
+    COMPUTE_GRID_MAIN = (gx, COMPUTE_GRID_Y)
+    _sdpa_program_config.cache_clear()
+    _sdpa_program_config_for_lengths.cache_clear()
+    _triangle_mul_program_config.cache_clear()
+
+
 def set_fast_mode(enabled: bool) -> None:
     """Set fast block-fp8 mode for the current worker process."""
     global _FAST_MODE
@@ -114,6 +150,7 @@ def get_device():
     global _device
     if _device is None:
         _device = ttnn.open_device(device_id=0)
+        _configure_active_compute_grid(_device)
         _device.enable_program_cache()
     return _device
 
@@ -738,15 +775,24 @@ class Transition(Module):
             ttnn.deallocate(x)
             return x_dram
         if len(x.shape) < 4:
-            if x.shape[1] > TRANSITION_BATCH_CHUNKING_THRESHOLD:
+            batch_chunking_threshold = (
+                SEQ_LEN_MORE_CHUNKING
+                if COMPUTE_GRID_MAIN[0] == COMPUTE_GRID_X_13
+                else TRANSITION_BATCH_CHUNKING_THRESHOLD
+            )
+            if x.shape[1] > batch_chunking_threshold:
                 return ttnn.concat([swiglu(x[b:b+1, :, :]) for b in range(x.shape[0])], dim=0)
             return swiglu(x)
 
         H, W = x.shape[1], x.shape[2]
-
         transition_h_chunk_size = TRANSITION_H_CHUNK_SIZE_FAST if _FAST_MODE else TRANSITION_H_CHUNK_SIZE
+        transition_w_chunking_threshold = (
+            SEQ_LEN_MORE_CHUNKING
+            if COMPUTE_GRID_MAIN[0] == COMPUTE_GRID_X_13
+            else TRANSITION_W_CHUNKING_THRESHOLD
+        )
         chunks = ttnn.chunk(x, -(-H // transition_h_chunk_size), dim=1)
-        if W <= TRANSITION_W_CHUNKING_THRESHOLD:
+        if W <= transition_w_chunking_threshold:
             return ttnn.concat([swiglu(c) for c in chunks], dim=1)
         return ttnn.concat([
             ttnn.concat([swiglu(c[:, :, w:min(w+TRANSITION_W_CHUNK_SIZE, W), :]) for w in range(0, W, TRANSITION_W_CHUNK_SIZE)], dim=2)
