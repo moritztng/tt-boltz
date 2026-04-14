@@ -28,7 +28,7 @@ dependencies = [
     "rich",
     "pytest",
     "omegaconf",
-    "ttnn==0.67.4",
+    "ttnn==0.68.0",
 ]
 
 [project.scripts]
