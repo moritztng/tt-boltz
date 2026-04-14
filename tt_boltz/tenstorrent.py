@@ -1223,18 +1223,14 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=CORE_GRID_MAIN,
             )
-            # TODO: Inline with transpose_a=True after newest tt-metal release.
-            v = ttnn.permute(v, (0, 2, 1))
             o = ttnn.matmul(
-                v,
                 w,
-                transpose_b=True,
+                v,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=CORE_GRID_MAIN,
             )
             ttnn.deallocate(v)
             ttnn.deallocate(w)
-            o = ttnn.permute(o, (0, 2, 1))
             g = ttnn.linear(
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
@@ -1629,12 +1625,11 @@ class Diffusion(Module):
             core_grid=CORE_GRID_MAIN,
         )
         a = ttnn.matmul(
-            a,
             atom_to_token_normed,
+            a,
             transpose_a=True,
             compute_kernel_config=self.compute_kernel_config,
         )
-        a = ttnn.permute(a, (0, 2, 1))
         times = ttnn.unsqueeze(times, 1)
         fourier = ttnn.linear(
             times,
@@ -1697,15 +1692,11 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=CORE_GRID_MAIN,
         )
-        # TODO: Inline with transpose_a=True after newest tt-metal release.
-        a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         a_to_q = ttnn.matmul(
-            a_to_q,
             atom_to_token,
-            transpose_b=True,
+            a_to_q,
             compute_kernel_config=self.compute_kernel_config,
         )
-        a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
         ttnn.deallocate(a_to_q)
         q = ttnn.reshape(q, (B, NW, ATOM_WINDOW, -1))
@@ -1981,7 +1972,7 @@ class DiffusionModule(TorchWrapper):
                 mask = torch.nn.functional.pad(mask, (0, atom_pad))
             mask = self._from_torch(mask)
             mask = ttnn.reshape(mask, (2 * K_padded, ATOM_WINDOW // 2, -1))
-            # TODO: Inline with transpose_a=True after newest tt-metal release.
+            # transpose_a swaps only the last two dims and cannot replace this 3D axis reorder.
             mask = ttnn.permute(mask, (1, 2, 0))
             mask = ttnn.matmul(
                 mask,
