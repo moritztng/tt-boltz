@@ -1223,14 +1223,17 @@ class PairWeightedAveraging(Module):
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=CORE_GRID_MAIN,
             )
+            v = ttnn.permute(v, (0, 2, 1))
             o = ttnn.matmul(
-                w,
                 v,
+                w,
+                transpose_b=True,
                 compute_kernel_config=self.compute_kernel_config,
                 core_grid=CORE_GRID_MAIN,
             )
             ttnn.deallocate(v)
             ttnn.deallocate(w)
+            o = ttnn.permute(o, (0, 2, 1))
             g = ttnn.linear(
                 m,
                 self.g_weight[:, i * self.head_dim : (i + 1) * self.head_dim],
