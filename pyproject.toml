@@ -13,7 +13,6 @@ dependencies = [
     "requests",
     "pandas",
     "einops",
-    "einx",
     "mashumaro",
     "modelcif",
     "click",
@@ -27,7 +26,6 @@ dependencies = [
     "tqdm",
     "rich",
     "pytest",
-    "omegaconf",
     "ttnn==0.68.0",
 ]
 
