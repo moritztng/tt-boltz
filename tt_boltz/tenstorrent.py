@@ -1795,7 +1795,7 @@ class TorchWrapper(nn.Module):
             self._deallocate_tensor_like(value)
         self._runtime_cache.clear()
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    def _load_from_state_dict(self, state_dict, prefix, _local_metadata, _strict, _missing_keys, _unexpected_keys, _error_msgs):
         self.module = self._create_module(WeightScope.wrap(state_dict).child(prefix[:-1]))
 
     def _create_module(self, weights: WeightScope):
