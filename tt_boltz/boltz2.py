@@ -2754,7 +2754,6 @@ class AffinityHeadsTransformer(nn.Module):
         num_blocks,
         num_heads,
         activation_checkpointing,
-        use_cross_transformer,
         groups={},
     ):
         super().__init__()
@@ -4654,7 +4653,6 @@ class AffinityModule(nn.Module):
         transformer_args: dict,
         num_dist_bins=64,
         max_dist=22,
-        use_cross_transformer: bool = False,
         groups: dict = {},
         use_tenstorrent: bool = False,
     ):
@@ -4690,7 +4688,6 @@ class AffinityModule(nn.Module):
             transformer_args["num_blocks"],
             transformer_args["num_heads"],
             transformer_args["activation_checkpointing"],
-            False,
             groups=groups,
         )
 
@@ -4787,7 +4784,6 @@ class Boltz2(nn.Module):
         affinity_model_args: Optional[dict[str, Any]] = None,
         affinity_model_args1: Optional[dict[str, Any]] = None,
         affinity_model_args2: Optional[dict[str, Any]] = None,
-        validators: Any = None,
         num_val_datasets: int = 1,
         atom_feature_dim: int = 128,
         template_args: Optional[dict] = None,
@@ -5138,7 +5134,6 @@ class Boltz2(nn.Module):
         feats: dict[str, Tensor],
         recycling_steps: int = 0,
         num_sampling_steps: Optional[int] = None,
-        multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
