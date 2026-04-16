@@ -44,27 +44,23 @@ from tt_boltz.boltz2 import Boltz2
 from tt_boltz.energy import DEFAULT_ENERGY_SAMPLE_HZ, PowerProfiler
 from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay, make_progress_fn
 
+ARTIFACT_BASE_URL = "https://storage.googleapis.com/tt-boltz-artifacts"
 URLS = {
-    "mols": "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar",
-    "conf": ["https://model-gateway.boltz.bio/boltz2_conf.ckpt",
-             "https://huggingface.co/boltz-community/boltz-2/resolve/main/boltz2_conf.ckpt"],
-    "aff": ["https://model-gateway.boltz.bio/boltz2_aff.ckpt",
-            "https://huggingface.co/boltz-community/boltz-2/resolve/main/boltz2_aff.ckpt"],
+    "mols": f"{ARTIFACT_BASE_URL}/mols.tar",
+    "conf": f"{ARTIFACT_BASE_URL}/boltz2_conf.ckpt",
+    "aff": f"{ARTIFACT_BASE_URL}/boltz2_aff.ckpt",
 }
 
 
-def download(urls: list[str], dest: Path) -> None:
-    """Download file from list of URLs (tries each until success)."""
+def download(url: str, dest: Path) -> None:
+    """Download a required artifact if it is missing locally."""
     if dest.exists():
         return
     click.echo(f"Downloading {dest.name}")
-    for url in urls:
-        try:
-            urllib.request.urlretrieve(url, dest)
-            return
-        except Exception:
-            continue
-    raise RuntimeError(f"Failed to download {dest.name}")
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except Exception as e:
+        raise RuntimeError(f"Failed to download {dest.name} from {url}") from e
 
 
 def download_all(cache: Path) -> None:
