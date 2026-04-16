@@ -1628,11 +1628,12 @@ class Diffusion(Module):
             core_grid=CORE_GRID_MAIN,
         )
         a = ttnn.matmul(
-            atom_to_token_normed,
             a,
+            atom_to_token_normed,
             transpose_a=True,
             compute_kernel_config=self.compute_kernel_config,
         )
+        a = ttnn.permute(a, (0, 2, 1))
         times = ttnn.unsqueeze(times, 1)
         fourier = ttnn.linear(
             times,
@@ -1695,11 +1696,16 @@ class Diffusion(Module):
             compute_kernel_config=self.compute_kernel_config,
             core_grid=CORE_GRID_MAIN,
         )
+        # Keep explicit 3D axis reorder for this batched path; operand swapping
+        # changed semantics under stricter matmul batch validation.
+        a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         a_to_q = ttnn.matmul(
-            atom_to_token,
             a_to_q,
+            atom_to_token,
+            transpose_b=True,
             compute_kernel_config=self.compute_kernel_config,
         )
+        a_to_q = ttnn.permute(a_to_q, (0, 2, 1))
         q = ttnn.add(q, a_to_q)
         ttnn.deallocate(a_to_q)
         q = ttnn.reshape(q, (B, NW, ATOM_WINDOW, -1))
