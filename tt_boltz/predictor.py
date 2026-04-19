@@ -68,7 +68,12 @@ _DIFFUSION_ARGS = {
     "step_scale": 1.5, "gamma_0": 0.8, "gamma_min": 1.0, "noise_scale": 1.003,
     "rho": 7, "sigma_min": 0.0001, "sigma_max": 160.0, "sigma_data": 16.0,
     "P_mean": -1.2, "P_std": 1.5,
-    "coordinate_augmentation": True, "alignment_reverse_diff": True,
+    "coordinate_augmentation": True,
+    # Disable the per-step random SO(3) rotation during sampling so the
+    # intermediate frames we stream to the browser stay in a fixed frame
+    # and the structure visibly settles instead of tumbling.
+    "coordinate_augmentation_inference": False,
+    "alignment_reverse_diff": True,
     "synchronize_sigmas": True,
 }
 _PAIRFORMER_ARGS = {"num_blocks": 64, "num_heads": 16, "dropout": 0.0, "v2": True}
