@@ -879,33 +879,26 @@
             }
         }
         
-        // Update progress UI
+        // Stage vocabulary mirrors tt_boltz.progress: each stage claims
+        // [start, end] of the overall progress bar, and per-step progress
+        // linearly fills its slice.
+        const STAGES = {
+            loading:    { label: 'Loading model',     start: 0.00, end: 0.05 },
+            msa:        { label: 'Generating MSA',    start: 0.05, end: 0.15 },
+            prep:       { label: 'Featurizing',       start: 0.15, end: 0.20 },
+            trunk:      { label: 'Pairformer',        start: 0.20, end: 0.50 },
+            diffusion:  { label: 'Folding',           start: 0.50, end: 0.90 },
+            confidence: { label: 'Scoring',           start: 0.90, end: 0.95 },
+            saving:     { label: 'Finalizing',        start: 0.95, end: 1.00 },
+        };
+
         function updateProgress(event) {
-            const stageNames = {
-                'setup': 'Setting up',
-                'msa': 'Generating MSA',
-                'preprocess': 'Preprocessing',
-                'model': 'Loading model',
-                'inference': 'Predicting',
-                'recycling': 'Pairformer',
-                'diffusion': 'Folding',
-                'postprocess': 'Processing results'
-            };
-            
-            progressStage.textContent = stageNames[event.stage] || event.stage;
-            progressDetail.textContent = event.message || '';
-            
-            // Calculate overall progress
-            let progress = 0;
-            if (event.stage === 'setup') progress = 5;
-            else if (event.stage === 'msa') progress = 10 + (event.step / event.total) * 15;
-            else if (event.stage === 'preprocess') progress = 25;
-            else if (event.stage === 'model') progress = 30;
-            else if (event.stage === 'recycling') progress = 35 + (event.step / event.total) * 15;
-            else if (event.stage === 'diffusion') progress = 50 + (event.step / event.total) * 45;
-            else if (event.stage === 'postprocess') progress = 95;
-            
-            progressBar.style.width = `${progress}%`;
+            const stage = STAGES[event.stage] || { label: event.stage, start: 0, end: 1 };
+            progressStage.textContent = stage.label;
+            const frac = event.total > 0 ? Math.min(event.step / event.total, 1) : 0;
+            progressDetail.textContent = event.total > 0 ? `${event.step}/${event.total}` : '';
+            const overall = stage.start + (stage.end - stage.start) * frac;
+            progressBar.style.width = `${(overall * 100).toFixed(1)}%`;
         }
         
         // Handle completion

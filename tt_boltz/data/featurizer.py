@@ -4,7 +4,6 @@ from collections import deque
 import numba
 import numpy as np
 import numpy.typing as npt
-import rdkit.Chem.Descriptors
 import torch
 from numba import types
 from rdkit.Chem import Mol

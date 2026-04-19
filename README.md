@@ -4,65 +4,86 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz is the Boltz-2 implementation for inference on a single Tenstorrent Blackhole or Wormhole.
+TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards).
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
 ## Installation
 
-### Clone
+### Recommended: Create Virtual Environment
 ```bash
-git clone https://github.com/moritztng/tt-boltz.git
-cd tt-boltz
-```
-
-### Create Virtual Environment
-```bash
-python3 -m venv env
+python3.10 -m venv env
 source env/bin/activate
 ```
 
-### Build TT-Metal from Source
-When following the [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md), you **must** use a different clone command to checkout the `boltz` branch:
-
-**❌ Do NOT use the standard clone command from the installation guide:**
+### Simple Install
 ```bash
-git clone https://github.com/tenstorrent/tt-metal.git --recurse-submodules
+pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
 ```
 
-**✅ Instead, use this command to clone the `boltz` branch:**
-```bash
-git clone https://github.com/tenstorrent/tt-metal.git --branch boltz --recurse-submodules
-```
+This installs `tt-boltz` and its core Python dependencies (including `ttnn`). That's it.
 
-Then continue with the rest of the installation guide.
-
-### Install TT-NN into the Virtual Environment
-From the `tt-metal` directory:
+### Advanced Install (editable local clone)
 ```bash
+git clone https://github.com/moritztng/tt-boltz.git
+cd tt-boltz
 pip install -e .
 ```
 
-### Install TT-Boltz into the Virtual Environment
-From the `tt-boltz` directory:
+### Optional: Build TT-Metal / TT-NN from Source
+If you need to build from source, follow the [Tenstorrent Installation Guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md).
+
+### Verify Installation
 ```bash
-pip install -e .
+tt-boltz --help
+tt-boltz predict --help
+tt-boltz msa --help
 ```
 
 ## Basic Usage
 
 ### Structure Prediction
 
-Predict protein structures with automatic MSA generation:
-
 ```bash
 tt-boltz predict examples/prot.yaml --use_msa_server --override
 ```
 
+Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
+`--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
+
+`--fast` makes some operations use block-fp8, a lower-precision numeric format that runs faster. Accuracy is typically very close.
+
+`predict` accepts either a single YAML/FASTA file or a directory containing many input files.
+
+### Offline MSA (Optional)
+
+Use this if you have enough disk and RAM and want local MSA.
+This avoids external MSA server calls and is faster for repeated runs.
+
+```bash
+tt-boltz msa
+tt-boltz predict examples/prot.yaml --override
+```
+
+`tt-boltz msa` downloads UniRef30 to `~/.boltz/msa_db` (~100GB download, ~500GB on disk after indexing). `predict` auto-detects this path.
+
+To add EnvDB and use it in prediction:
+EnvDB can improve MSA coverage when UniRef30 hits are weak, at higher disk/RAM cost.
+
+```bash
+tt-boltz msa --db all
+tt-boltz predict examples/prot.yaml --use_envdb --override
+```
+
 **Key Options:**
-- `--use_msa_server`: Automatically generate MSAs (required if no MSA provided)
 - `--override`: Re-run from scratch, ignoring cached files
+- `--use_msa_server`: Generate MSA via ColabFold API
+- `--msa_db_path`: Use a local database at a custom path (e.g. `--msa_db_path /data/colabfold_db`)
+- `--use_envdb`: Include EnvDB in offline MSA (`tt-boltz msa --db all`)
 - `--accelerator=tenstorrent`: Use Tenstorrent hardware (default, or use `cpu`/`gpu`)
+- `--fast`: Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close
+- `--debug`: Show all raw output from the hardware and libraries instead of the progress display
+- `--debug --log`: Same as `--debug`, but also print what each device is currently working on
 
 ### Binding Affinity Prediction
 
@@ -109,23 +130,27 @@ properties:
 
 ```
 boltz_results_prot/
-├── predictions/
-│   └── prot/
-│       ├── prot_model_0.cif          # Predicted structure (ranked by confidence)
-│       ├── confidence_prot_model_0.json
-│       ├── affinity_prot.json        # (if affinity prediction enabled)
-│       ├── pae_prot_model_0.npz      # Predicted aligned error
-│       ├── pde_prot_model_0.npz      # Predicted distance error
-│       └── plddt_prot_model_0.npz    # Per-residue confidence
-└── processed/                         # Cached preprocessing data
+├── structures/
+│   ├── prot.cif                      # Best-ranked predicted structure
+│   └── prot_model_1.cif              # Additional samples (if diffusion_samples > 1)
+├── results.json                      # One entry per target with confidence/affinity metrics
+├── power_profile.csv                 # (optional, --report-energy)
+├── power_profile.png                 # (optional, --report-energy)
+├── prot_pae.npz                      # (optional, --write_pae)
+├── prot_pde.npz                      # (optional, --write_pde)
+└── prot_embeddings.npz               # (optional, --write_embeddings)
 ```
+
+MSA results are cached in `<out_dir>/msa/` (default `./msa/`), keyed by sequence hash. The same protein sequence is never searched twice, even across different input files or runs. The MSA search uses all available CPU threads and keeps the database index memory-mapped for maximum speed.
 
 ### Confidence Scores
 
-The `confidence_*.json` file contains:
+Each target entry in `results.json` contains confidence metrics:
 
 ```json
 {
+    "id": "prot",
+    "status": "ok",
     "confidence_score": 0.84,
     "ptm": 0.84,
     "iptm": 0.82,
@@ -133,6 +158,10 @@ The `confidence_*.json` file contains:
     "chains_ptm": {
         "0": 0.85,
         "1": 0.83
+    },
+    "pair_chains_iptm": {
+        "0": {"0": 0.85, "1": 0.72},
+        "1": {"0": 0.82, "1": 0.83}
     }
 }
 ```
@@ -142,10 +171,11 @@ The `confidence_*.json` file contains:
 - `iptm`: Interface TM-score (0-1)
 - `complex_plddt`: Average per-residue confidence (0-1)
 - `chains_ptm`: Per-chain TM-scores (0-1)
+- `pair_chains_iptm`: Per-chain-pair interface TM-scores (0-1)
 
 ### Affinity Predictions
 
-The `affinity_*.json` file contains:
+For affinity targets, the same `results.json` entry also contains:
 
 ```json
 {
@@ -243,9 +273,15 @@ templates:
 | `--diffusion_samples` | `1` | Number of structure samples |
 | `--output_format` | `cif` | `cif` or `pdb` |
 | `--override` | `False` | Re-run from scratch |
-| `--use_msa_server` | `False` | Auto-generate MSAs |
+| `--use_msa_server` | `False` | Use online ColabFold API for MSAs |
 | `--use_potentials` | `False` | Apply physical constraints |
 | `--affinity_mw_correction` | `False` | Apply MW correction to affinity |
+| `--num_devices` | `0` | Number of TT devices (0=all available) |
+| `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
+| `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
+| `--report-energy` | `False` | Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
+| `--energy-metric` | `both` | Choose power channel(s): `tdp`, `input`, or `both` |
+| `--energy-sample-hz` | `20.0` | Sampling rate in Hz for both `power_w` and `input_power_w` channels |
 
 **Affinity-Specific Options:**
 
@@ -258,13 +294,26 @@ templates:
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--msa_db_path` | auto-detect | Path to local ColabFold database |
+| `--use_envdb` | `False` | Also search environmental database |
+| `--use_msa_server` | `False` | Use ColabFold API for MSA |
 | `--msa_server_url` | `https://api.colabfold.com` | MSA server URL |
 | `--msa_pairing_strategy` | `greedy` | `greedy` or `complete` |
 | `--max_msa_seqs` | `8192` | Maximum MSA sequences |
 | `--subsample_msa` | `False` | Subsample MSA |
 | `--num_subsampled_msa` | `1024` | Number of subsampled sequences |
 
+**MSA Database Setup Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--db` | `uniref30` | `uniref30` (~500GB), `envdb` (~800GB), or `all` |
+| `--path` | `~/.boltz/msa_db` | Where to store the databases |
+| `--install-tools` | `True` | Auto-install missing `mmseqs`/`colabfold_search` |
+
 ### MSA Server Authentication
+
+For `--use_msa_server`:
 
 **Basic Authentication:**
 ```bash
@@ -276,7 +325,7 @@ tt-boltz predict ... --use_msa_server
 **API Key Authentication:**
 ```bash
 export MSA_API_KEY_VALUE=your-api-key
-tt-boltz predict ... --use_msa_server --api_key_header X-API-Key
+tt-boltz predict ... --use_msa_server
 ```
 
 ## Performance
@@ -289,6 +338,29 @@ Runtime for a 686 amino acid protein:
 | Nvidia T4 | ~9 min |
 | Tenstorrent Blackhole p150 | ~1 min |
 | Nvidia RTX 5090 | ~1 min |
+
+## Optional: Energy Measurement
+
+Use `--report-energy` to profile energy during prediction:
+
+```bash
+tt-boltz predict examples/686.yaml --override --device_ids 0 --report-energy --energy-metric both --energy-sample-hz 5
+```
+
+Behavior:
+- Select metric channel(s) with `--energy-metric` (`tdp`, `input`, `both`)
+- Uses one sampling rate (`--energy-sample-hz`, default 20 Hz)
+- Supports only Tenstorrent runs with one selected device
+- Records two power channels when available:
+  - `power_w`: `tt-mgmt` UMD telemetry power (TDP channel)
+  - `input_power_w`: `tt-mgmt` UMD telemetry input power
+- Requires optional `tt-mgmt` installation:
+  - `git clone --recursive https://github.com/aperezvicente-TT/tt-mgmt.git`
+  - `pip install -e ./tt-mgmt`
+- Prints energy summary metrics for selected channels
+- Always writes:
+  - `power_profile.csv`
+  - `power_profile.png`
 
 ## Cite
 

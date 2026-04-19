@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tt-boltz"
 version = "0.1"
-description = "Boltz-2 implementation for inference on Tenstorrent Blackhole or Wormhole"
+description = "Boltz-2 implementation for inference on Tenstorrent Blackhole"
 dependencies = [
     "torch",
     "numpy",
@@ -13,7 +13,6 @@ dependencies = [
     "requests",
     "pandas",
     "einops",
-    "einx",
     "mashumaro",
     "modelcif",
     "click",
@@ -25,8 +24,9 @@ dependencies = [
     "scikit-learn",
     "chembl_structure_pipeline",
     "tqdm",
+    "rich",
     "pytest",
-    "omegaconf",
+    "ttnn==0.68.0",
     "flask",
 ]
 
@@ -34,7 +34,9 @@ dependencies = [
 tt-boltz = "tt_boltz.main:cli"
 
 [tool.setuptools]
-packages = ["tt_boltz"]
+
+[tool.setuptools.packages.find]
+include = ["tt_boltz*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

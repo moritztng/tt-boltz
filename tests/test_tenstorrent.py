@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from functools import partial
 
-from tt_boltz.tenstorrent import filter_dict, PairformerModule, MSAModule, DiffusionModule
+from tt_boltz.tenstorrent import WeightScope, PairformerModule, MSAModule, DiffusionModule
 from tt_boltz.reference import MSAModule as MSAModuleTorch, DiffusionModule as DiffusionModuleTorch
 from tt_boltz.reference import PairformerModule as PairformerModuleTorch, PairformerNoSeqModule as PairformerNoSeqModuleTorch
 from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
@@ -18,7 +18,7 @@ STATE_AFF = torch.load(CACHE / "boltz2_aff.ckpt", map_location="cpu", mmap=True,
 
 
 def load(tt, ref, state, key, strict=False):
-    sd = filter_dict(state, key)
+    sd = WeightScope.wrap(state).child(key).as_dict()
     tt.load_state_dict(sd, strict=strict)
     ref.load_state_dict(sd, strict=strict)
 
@@ -54,7 +54,7 @@ def test_template_pairformer(seq_len):
 
 @pytest.mark.parametrize("seq_len", [100, 500])
 def test_affinity_pairformer(seq_len):
-    tt, ref = PairformerModule(4, 32, 4, None, None, transform_s=False, use_mask=True), PairformerNoSeqModuleTorch(128, 4, v2=True).eval()
+    tt, ref = PairformerModule(4, 32, 4, None, None, transform_s=False, affinity=True), PairformerNoSeqModuleTorch(128, 4, v2=True).eval()
     load(tt, ref, STATE_AFF, "affinity_module1.pairformer_stack")
 
     z = 26 * torch.randn(1, seq_len, seq_len, 128)

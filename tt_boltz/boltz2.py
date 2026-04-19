@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import gc
-import time
 from abc import ABC, abstractmethod
 from functools import partial
 from math import exp, pi, sqrt
@@ -2755,7 +2754,6 @@ class AffinityHeadsTransformer(nn.Module):
         num_blocks,
         num_heads,
         activation_checkpointing,
-        use_cross_transformer,
         groups={},
     ):
         super().__init__()
@@ -4023,7 +4021,7 @@ class AtomDiffusion(Module):
         multiplicity=1,
         max_parallel_samples=None,
         steering_args=None,
-        progress_callback=None,
+        progress_fn=None,
         **network_condition_kwargs,
     ):
         if steering_args is not None and (
@@ -4257,13 +4255,17 @@ class AtomDiffusion(Module):
             )
 
             atom_coords = atom_coords_next
-            
-            # Report progress with optional intermediate coordinates for visualization
-            if progress_callback:
-                coords = None
-                if (step_idx + 1) % 5 == 0:
-                    coords = atom_coords_denoised[0].clone()
-                progress_callback("diffusion", step_idx + 1, num_sampling_steps, coords)
+
+            # Emit progress; every 5 steps attach the latest denoised coords so
+            # interactive frontends can render the structure as it forms.
+            if progress_fn:
+                coords = atom_coords_denoised[0].clone() if (step_idx + 1) % 5 == 0 else None
+                progress_fn(
+                    "diffusion",
+                    step=step_idx + 1,
+                    total=num_sampling_steps,
+                    coords=coords,
+                )
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 
@@ -4663,7 +4665,6 @@ class AffinityModule(nn.Module):
         transformer_args: dict,
         num_dist_bins=64,
         max_dist=22,
-        use_cross_transformer: bool = False,
         groups: dict = {},
         use_tenstorrent: bool = False,
     ):
@@ -4688,7 +4689,7 @@ class AffinityModule(nn.Module):
         _, _, PairformerNoSeqModule_, _ = _get_pytorch_modules()
         self.pairformer_stack = (
             tenstorrent.PairformerModule(
-                pairformer_args["num_blocks"], 32, 4, None, None, False, True
+                pairformer_args["num_blocks"], 32, 4, None, None, False, affinity=True
             )
             if use_tenstorrent
             else PairformerNoSeqModule_(token_z, **pairformer_args)
@@ -4699,7 +4700,6 @@ class AffinityModule(nn.Module):
             transformer_args["num_blocks"],
             transformer_args["num_heads"],
             transformer_args["activation_checkpointing"],
-            False,
             groups=groups,
         )
 
@@ -4796,7 +4796,6 @@ class Boltz2(nn.Module):
         affinity_model_args: Optional[dict[str, Any]] = None,
         affinity_model_args1: Optional[dict[str, Any]] = None,
         affinity_model_args2: Optional[dict[str, Any]] = None,
-        validators: Any = None,
         num_val_datasets: int = 1,
         atom_feature_dim: int = 128,
         template_args: Optional[dict] = None,
@@ -4913,6 +4912,7 @@ class Boltz2(nn.Module):
             "trace": trace,
         }
         self.trace = trace
+        self.progress_fn = None  # optional callback: fn(stage, step=0, total=0)
 
         # Inference configuration
         self.predict_args = predict_args
@@ -5146,12 +5146,28 @@ class Boltz2(nn.Module):
         feats: dict[str, Tensor],
         recycling_steps: int = 0,
         num_sampling_steps: Optional[int] = None,
-        multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
-        progress_callback=None,
     ) -> dict[str, Tensor]:
+        if self.use_tenstorrent:
+            try:
+                dev = tenstorrent.get_device()
+                dev.disable_and_clear_program_cache()
+                dev.enable_program_cache()
+            except Exception:
+                pass
+
+        # Reset cached static data so masks/biases are recomputed for this protein
+        if self.use_tenstorrent:
+            for m in self.modules():
+                if hasattr(m, 'reset_static_cache'):
+                    m.reset_static_cache()
+
+        _pfn = self.progress_fn
+        if _pfn:
+            _pfn("trunk", step=0, total=recycling_steps + 1)
+
         if self.trace:
             print("[boltz2] forward: input_embedder")
         
@@ -5181,8 +5197,8 @@ class Boltz2(nn.Module):
         pair_mask = mask[:, :, None] * mask[:, None, :]
         if self.run_trunk_and_structure:
             for i in range(recycling_steps + 1):
-                if progress_callback:
-                    progress_callback("recycling", i + 1, recycling_steps + 1, None)
+                if _pfn:
+                    _pfn("trunk", step=i + 1, total=recycling_steps + 1)
                 # Apply recycling
                 s = s_init + self.s_recycle(self.s_norm(s))
                 z = z_init + self.z_recycle(self.z_norm(z))
@@ -5235,6 +5251,8 @@ class Boltz2(nn.Module):
         }
 
         if self.run_trunk_and_structure and not self.skip_run_structure:
+            if _pfn:
+                _pfn("diffusion", step=0, total=num_sampling_steps or self.structure_module.num_sampling_steps)
             if self.trace:
                 print("[boltz2] diffusion_conditioning")
             q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
@@ -5267,7 +5285,7 @@ class Boltz2(nn.Module):
                     max_parallel_samples=max_parallel_samples,
                     steering_args=self.steering_args,
                     diffusion_conditioning=diffusion_conditioning,
-                    progress_callback=progress_callback,
+                    progress_fn=_pfn,
                 )
                 dict_out.update(struct_out)
 
@@ -5276,6 +5294,8 @@ class Boltz2(nn.Module):
                 dict_out["pbfactor"] = pbfactor
 
         if self.confidence_prediction:
+            if _pfn:
+                _pfn("confidence")
             if self.trace:
                 print("[boltz2] confidence_module")
             dict_out.update(
@@ -5480,24 +5500,14 @@ class Boltz2(nn.Module):
         model.load_state_dict(new_state_dict, strict=strict)
         return model
 
-    def predict_step(self, batch: dict[str, Tensor], progress_callback=None) -> dict:
+    def predict_step(self, batch: dict[str, Tensor]) -> dict:
         """Run prediction on a single batch.
-        
-        Parameters
-        ----------
-        batch : dict[str, Tensor]
-            The input batch.
-        progress_callback : callable, optional
-            Callback function for progress updates. Called with (stage, step, total).
-            
-        Returns
-        -------
-        dict
-            The prediction dictionary.
+
+        Progress is reported via ``self.progress_fn`` (set by the caller) —
+        see ``tt_boltz.progress.make_progress_fn`` for the CLI callback and
+        ``tt_boltz.predictor`` for the web-demo callback.
         """
         try:
-            # Profile forward pass timing
-            start_time = time.perf_counter()
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
@@ -5505,10 +5515,7 @@ class Boltz2(nn.Module):
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["max_parallel_samples"],
                 run_confidence_sequentially=True,
-                progress_callback=progress_callback,
             )
-            forward_time = time.perf_counter() - start_time
-            print(f"Forward pass time: {forward_time:.4f} seconds")
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
                 for key in self.predict_args["keys_dict_batch"]:
