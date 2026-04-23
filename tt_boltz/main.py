@@ -67,8 +67,10 @@ def download_all(cache: Path) -> None:
     """Download all required model files and molecules."""
     tar_path = cache / "mols.tar"
     if not tar_path.exists():
+        click.echo(f"Downloading {tar_path.name}")
         urllib.request.urlretrieve(URLS["mols"], tar_path)
     if not (cache / "mols").exists():
+        click.echo(f"Extracting {tar_path.name}")
         with tarfile.open(tar_path) as tar:
             tar.extractall(cache)
     download(URLS["conf"], cache / "boltz2_conf.ckpt")
