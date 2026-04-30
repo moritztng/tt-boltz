@@ -17,6 +17,7 @@ dependencies = [
     "modelcif",
     "click",
     "pyyaml",
+    "omegaconf",
     "biopython",
     "scipy",
     "numba",
