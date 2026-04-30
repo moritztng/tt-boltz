@@ -17,6 +17,8 @@ app = Flask(__name__)
 
 MAX_REQUEST_SIZE = 50 * 1024                      # 50 KiB — only a sequence
 MIN_PREDICTION_INTERVAL = 5                       # seconds per client IP
+SHOW_QR_CODES = False
+USE_FAST_MODE = True
 
 _last_prediction: dict[str, float] = {}
 _rate_limit_lock = threading.Lock()
@@ -66,7 +68,7 @@ def _parse_request(require_length: bool = True):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", show_qr_codes=SHOW_QR_CODES)
 
 
 @app.route("/predict", methods=["POST"])
@@ -77,23 +79,24 @@ def predict():
         payload, status = err
         return jsonify(payload), status
 
+    if not _active_prediction.acquire(blocking=False):
+        return jsonify({
+            "type": "error",
+            "message": "Another prediction is in progress. Please wait.",
+        }), 503
+
     client_ip = request.remote_addr or "unknown"
     now = time.time()
     with _rate_limit_lock:
         last = _last_prediction.get(client_ip, 0.0)
         if now - last < MIN_PREDICTION_INTERVAL:
+            _active_prediction.release()
             wait = int(MIN_PREDICTION_INTERVAL - (now - last)) + 1
             return jsonify({
                 "type": "error",
                 "message": f"Please wait {wait} seconds before submitting again",
             }), 429
         _last_prediction[client_ip] = now
-
-    if not _active_prediction.acquire(blocking=False):
-        return jsonify({
-            "type": "error",
-            "message": "Another prediction is in progress. Please wait.",
-        }), 503
 
     use_msa = bool(body.get("use_msa_server", True))
 
@@ -103,6 +106,7 @@ def predict():
                 sequence=sequence,
                 use_msa_server=use_msa,
                 accelerator="tenstorrent",
+                fast=USE_FAST_MODE,
             ):
                 yield json.dumps(event) + "\n"
         except Exception:

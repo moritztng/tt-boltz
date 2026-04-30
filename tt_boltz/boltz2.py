@@ -4256,10 +4256,10 @@ class AtomDiffusion(Module):
 
             atom_coords = atom_coords_next
 
-            # Emit progress; every 5 steps attach the latest denoised coords so
-            # interactive frontends can render the structure as it forms.
+            # Emit denoised coords every 2 steps so interactive frontends can
+            # render the structure smoothly without overwhelming the browser.
             if progress_fn:
-                coords = atom_coords_denoised[0].clone() if (step_idx + 1) % 5 == 0 else None
+                coords = atom_coords_denoised[0].clone() if (step_idx + 1) % 2 == 0 else None
                 progress_fn(
                     "diffusion",
                     step=step_idx + 1,

@@ -411,11 +411,12 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
             chain.msa_id = -1
 
     if to_gen:
+        msa_job_id = hashlib.sha256("|".join(sorted(to_gen)).encode()).hexdigest()[:16]
         if msa_db_path:
-            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path,
+            compute_msa_offline(to_gen, msa_job_id, msa_dir, msa_db_path,
                                 use_env=use_envdb, pairing_strategy=msa_strategy)
         elif use_msa:
-            compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
+            compute_msa(to_gen, msa_job_id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
         else:
             raise RuntimeError(
                 "Missing MSAs. Use one of:\n"

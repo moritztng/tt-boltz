@@ -116,6 +116,7 @@ def predict_structure(
     cache_dir: Optional[Path] = None,
     use_msa_server: bool = True,
     accelerator: str = "tenstorrent",
+    fast: bool = False,
     recycling_steps: int = 3,
     sampling_steps: int = 200,
     msa_server_url: str = "https://api.colabfold.com",
@@ -141,7 +142,12 @@ def predict_structure(
     download_all(cache)
 
     mol_dir = cache / "mols"
+    msa_dir = cache / "demo_msa"
+    msa_dir.mkdir(parents=True, exist_ok=True)
     use_tt = accelerator == "tenstorrent"
+    if use_tt:
+        from tt_boltz.tenstorrent import set_fast_mode
+        set_fast_mode(fast)
     device = torch.device("cpu")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -154,9 +160,6 @@ def predict_structure(
             "      id: A\n"
             f"      sequence: {sequence}\n"
         )
-        msa_dir = tmp / "msa"
-        msa_dir.mkdir()
-
         try:
             yield {"type": "progress", "stage": "msa", "step": 0, "total": 1}
             ccd = load_canonicals(mol_dir)
@@ -230,16 +233,20 @@ def predict_structure(
         thread = threading.Thread(target=run_inference, daemon=True)
         thread.start()
 
-        while True:
-            try:
-                ev = events.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if ev is None:
-                break
-            yield ev
-
-        thread.join()
+        try:
+            while True:
+                try:
+                    ev = events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if ev is None:
+                    break
+                yield ev
+        finally:
+            # If the browser disconnects mid-stream, keep this generator alive
+            # until the TT inference thread finishes so the demo never starts a
+            # second prediction while the device is still busy.
+            thread.join()
 
         if result["error"]:
             yield {"type": "error", "message": f"Prediction failed: {result['error']}"}

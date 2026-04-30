@@ -212,6 +212,11 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         
         .btn-primary {
             background: var(--accent);
@@ -223,18 +228,13 @@
             box-shadow: 0 0 20px var(--accent-glow);
         }
         
-        .btn-primary:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
         .btn-secondary {
             background: var(--bg-tertiary);
             color: var(--text-primary);
             border: 1px solid var(--border);
         }
         
-        .btn-secondary:hover {
+        .btn-secondary:hover:not(:disabled) {
             background: var(--border);
         }
         
@@ -264,17 +264,17 @@
         }
         
         .progress-bar-container {
-            height: 6px;
+            height: 10px;
             background: var(--bg-tertiary);
-            border-radius: 3px;
+            border-radius: 999px;
             overflow: hidden;
-            margin-bottom: 1rem;
+            margin-bottom: 1.2rem;
         }
         
         .progress-bar {
             height: 100%;
             background: linear-gradient(90deg, var(--accent), #00eebb);
-            border-radius: 3px;
+            border-radius: 999px;
             transition: width 0.3s ease-out;
             width: 0%;
         }
@@ -282,14 +282,14 @@
         .progress-status {
             display: flex;
             align-items: center;
-            gap: 0.75rem;
-            font-size: 0.9rem;
+            gap: 0.8rem;
+            font-size: 1.05rem;
         }
         
         .spinner {
-            width: 18px;
-            height: 18px;
-            border: 2px solid var(--border);
+            width: 20px;
+            height: 20px;
+            border: 3px solid var(--border);
             border-top-color: var(--accent);
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
@@ -301,13 +301,13 @@
         
         .progress-stage {
             color: var(--text-primary);
-            font-weight: 500;
+            font-weight: 600;
         }
         
         .progress-detail {
             color: var(--text-secondary);
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.8rem;
+            font-size: 0.95rem;
         }
         
         /* Results section */
@@ -351,24 +351,63 @@
         /* Marketing phrase */
         .marketing-phrase {
             margin-top: 2rem;
-            padding: 1rem;
-            text-align: center;
-            background: var(--bg-tertiary);
-            border-radius: var(--radius-sm);
-            border: 1px solid var(--accent-dim);
+            padding: 1.15rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.9rem;
+            background: rgba(0, 216, 191, 0.035);
+            border-radius: var(--radius);
+            border: 1px solid rgba(0, 216, 191, 0.22);
         }
-        
-        .marketing-phrase p {
+
+        .value-strip {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.2rem;
+        }
+
+        .value-chip {
+            display: block;
+            padding: 0;
             color: var(--accent);
-            font-size: 1rem;
-            font-weight: 600;
-            line-height: 1.4;
-            margin: 0;
-        }
-        
-        .marketing-phrase .contact-cta {
-            margin-top: 0.5rem;
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            font-size: 1.08rem;
             font-weight: 700;
+            letter-spacing: -0.02em;
+            line-height: 1.25;
+        }
+
+        .contact-line {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-weight: 700;
+        }
+
+        .contact-line::before,
+        .contact-line::after {
+            content: '';
+            width: 1.5rem;
+            height: 1px;
+            background: rgba(0, 216, 191, 0.25);
+        }
+
+        .contact-link {
+            color: var(--accent);
+            font-size: 0.95rem;
+            font-weight: 600;
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+
+        .contact-link:hover {
+            color: var(--text-primary);
         }
         
         /* Contact info */
@@ -404,15 +443,6 @@
             text-align: center;
         }
         
-        .contact-email {
-            text-align: center;
-        }
-        
-        .contact-email span {
-            color: var(--text-dim);
-            font-size: 0.8rem;
-        }
-        
         /* Viewer panel */
         .viewer-panel {
             display: flex;
@@ -433,6 +463,15 @@
             background: var(--bg-tertiary);
             position: relative;
         }
+
+        #viewer-container.placeholder-visible #molstar-container {
+            display: none;
+        }
+
+        #molstar-container {
+            position: absolute;
+            inset: 0;
+        }
         
         .viewer-placeholder {
             position: absolute;
@@ -444,6 +483,14 @@
             color: var(--text-secondary);
             text-align: center;
             padding: 2rem;
+            z-index: 1;
+        }
+
+        .viewer-initial,
+        .viewer-loading {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
         }
         
         .viewer-placeholder svg {
@@ -452,11 +499,41 @@
             margin-bottom: 1rem;
             opacity: 0.3;
         }
+
+        .viewer-loading {
+            min-width: 220px;
+            padding: 1.25rem 1.5rem;
+            background: rgba(10, 10, 15, 0.42);
+            border: 1px solid rgba(0, 216, 191, 0.18);
+            border-radius: var(--radius);
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.18);
+            transform: translateY(-12%);
+        }
+
+        .viewer-loading-spinner {
+            width: 38px;
+            height: 38px;
+            margin-bottom: 1rem;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
         
         .viewer-placeholder p {
             font-size: 0.9rem;
             max-width: 300px;
             line-height: 1.5;
+        }
+
+        .viewer-loading p {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .viewer-placeholder.loading .viewer-initial,
+        .viewer-placeholder:not(.loading) .viewer-loading {
+            display: none;
         }
         
         .viewer-placeholder.hidden {
@@ -486,15 +563,22 @@
         }
         
         .examples-title {
-            font-size: 0.8rem;
+            font-size: 0.9rem;
             color: var(--text-secondary);
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.6rem;
+            font-weight: 500;
         }
         
         .example-btns {
             display: flex;
             flex-wrap: wrap;
-            gap: 0.5rem;
+            gap: 0.65rem;
+        }
+
+        .example-btns .btn-sm {
+            padding: 0.52rem 0.9rem;
+            font-size: 0.9rem;
+            font-weight: 600;
         }
         
         /* Footer */
@@ -590,10 +674,18 @@
                     
                     <!-- Marketing Phrase -->
                     <div class="marketing-phrase">
-                        <p>Blistering speed. Low cost. Open.</p>
-                        <p class="contact-cta">Contact us.</p>
+                        <div class="value-strip" aria-label="TT-Boltz value proposition">
+                            <span class="value-chip">High throughput.</span>
+                            <span class="value-chip">Low cost.</span>
+                            <span class="value-chip">Open.</span>
+                        </div>
+                        <div class="contact-line">
+                            <span>Contact us.</span>
+                            <a class="contact-link" href="mailto:mthuening@tenstorrent.com">mthuening@tenstorrent.com</a>
+                        </div>
                     </div>
                     
+                    {% if show_qr_codes %}
                     <!-- Contact Info -->
                     <div class="contact-info">
                         <div class="contact-qr-group">
@@ -606,10 +698,8 @@
                                 <span>Ping me on LinkedIn</span>
                             </div>
                         </div>
-                        <div class="contact-email">
-                            <span>mthuening@tenstorrent.com</span>
-                        </div>
                     </div>
+                    {% endif %}
                 </div>
             </div>
             
@@ -619,14 +709,21 @@
                     <span class="panel-title">3D Structure</span>
                 </div>
                 <div class="panel-content">
-                    <div id="viewer-container">
+                    <div id="viewer-container" class="placeholder-visible">
+                        <div id="molstar-container"></div>
                         <div class="viewer-placeholder" id="viewer-placeholder">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                                <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
-                                <path d="M2 17l10 5 10-5"></path>
-                                <path d="M2 12l10 5 10-5"></path>
-                            </svg>
-                            <p>Enter an amino acid sequence and click "Predict Structure" to see the 3D protein model</p>
+                            <div class="viewer-initial">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                                    <path d="M2 17l10 5 10-5"></path>
+                                    <path d="M2 12l10 5 10-5"></path>
+                                </svg>
+                                <p>Enter an amino acid sequence and click "Predict Structure" to see the 3D protein model</p>
+                            </div>
+                            <div class="viewer-loading" role="status" aria-live="polite">
+                                <div class="viewer-loading-spinner"></div>
+                                <p>Predicting structure...</p>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -655,15 +752,34 @@
         const errorMessage = document.getElementById('error-message');
         const resultsSection = document.getElementById('results-section');
         const viewerPlaceholder = document.getElementById('viewer-placeholder');
+        const exampleButtons = document.querySelectorAll('[data-example]');
         
         let viewer = null;
         let currentCif = null;
         let isPredicting = false;  // Prevent multiple simultaneous predictions
+        let renderGeneration = 0;
+        let renderInFlight = false;
+        let pendingStructureRender = null;
+        let renderIdleResolvers = [];
+        let lastRenderedFrame = null;
         
         // Valid amino acid characters
         const VALID_AA = new Set('ACDEFGHIKLMNPQRSTVWY');
         const MIN_LENGTH = 10;
         const MAX_LENGTH = 1024;
+        const VIEWER_OPTIONS = {
+            layoutIsExpanded: false,
+            layoutShowControls: false,
+            layoutShowRemoteState: false,
+            layoutShowSequence: false,
+            layoutShowLog: false,
+            layoutShowLeftPanel: false,
+            viewportShowExpand: false,
+            viewportShowSelectionMode: false,
+            viewportShowAnimation: false,
+            collapseLeftPanel: true,
+            collapseRightPanel: true,
+        };
         
         // Clean sequence: remove all non-letter characters and uppercase
         function cleanSequence(seq) {
@@ -711,60 +827,253 @@
         
         // Initialize Mol* viewer
         async function initViewer() {
-            const container = document.getElementById('viewer-container');
-            
-            viewer = await molstar.Viewer.create(container, {
-                layoutIsExpanded: false,
-                layoutShowControls: false,
-                layoutShowRemoteState: false,
-                layoutShowSequence: false,
-                layoutShowLog: false,
-                layoutShowLeftPanel: false,
-                viewportShowExpand: false,
-                viewportShowSelectionMode: false,
-                viewportShowAnimation: false,
-                collapseLeftPanel: true,
-                collapseRightPanel: true,
-            });
+            const container = document.getElementById('molstar-container');
+            viewer = await molstar.Viewer.create(container, VIEWER_OPTIONS);
         }
         
-        // Load structure into viewer
-        async function loadStructure(cifContent, isFinal = false) {
+        function resolveRenderIdle() {
+            const resolvers = renderIdleResolvers;
+            renderIdleResolvers = [];
+            resolvers.forEach(resolve => resolve());
+        }
+
+        function waitForStructureRenderIdle() {
+            if (!renderInFlight && !pendingStructureRender) {
+                return Promise.resolve();
+            }
+            return new Promise(resolve => renderIdleResolvers.push(resolve));
+        }
+
+        function tokenizeCifLine(line) {
+            return line.match(/(?:'[^']*'|"[^"]*"|\S+)/g)?.map(token => token.replace(/^['"]|['"]$/g, '')) || [];
+        }
+
+        function estimateCifFrame(cifContent) {
+            const lines = cifContent.split('\n');
+            let inAtomLoop = false;
+            let headers = [];
+            let points = [];
+            let count = 0;
+            const min = [Infinity, Infinity, Infinity];
+            const max = [-Infinity, -Infinity, -Infinity];
+
+            for (const rawLine of lines) {
+                const line = rawLine.trim();
+                if (!line || line.startsWith('#')) continue;
+
+                if (line === 'loop_') {
+                    inAtomLoop = false;
+                    headers = [];
+                    continue;
+                }
+
+                if (line.startsWith('_atom_site.')) {
+                    headers.push(line.split(/\s+/)[0]);
+                    inAtomLoop = true;
+                    continue;
+                }
+
+                if (!inAtomLoop || headers.length === 0 || line.startsWith('_')) continue;
+
+                const xIndex = headers.indexOf('_atom_site.Cartn_x');
+                const yIndex = headers.indexOf('_atom_site.Cartn_y');
+                const zIndex = headers.indexOf('_atom_site.Cartn_z');
+                if (xIndex < 0 || yIndex < 0 || zIndex < 0) continue;
+
+                const tokens = tokenizeCifLine(line);
+                const x = Number(tokens[xIndex]);
+                const y = Number(tokens[yIndex]);
+                const z = Number(tokens[zIndex]);
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+
+                min[0] = Math.min(min[0], x);
+                min[1] = Math.min(min[1], y);
+                min[2] = Math.min(min[2], z);
+                max[0] = Math.max(max[0], x);
+                max[1] = Math.max(max[1], y);
+                max[2] = Math.max(max[2], z);
+                points.push([x, y, z]);
+                count += 1;
+            }
+
+            if (count === 0) return null;
+
+            const center = min.map((value, index) => (value + max[index]) / 2);
+            const radius = points.reduce((maxRadius, point) => {
+                const dx = point[0] - center[0];
+                const dy = point[1] - center[1];
+                const dz = point[2] - center[2];
+                return Math.max(maxRadius, Math.hypot(dx, dy, dz));
+            }, 0);
+
+            return { center, radius: Math.max(radius, 0.01) };
+        }
+
+        function getConservativeFitDistance(radius, fov) {
+            const container = document.getElementById('molstar-container');
+            const width = container?.clientWidth || 1;
+            const height = container?.clientHeight || 1;
+            const aspect = width / height;
+            const verticalFov = fov || Math.PI / 4;
+            const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
+            const limitingFov = Math.max(Math.min(verticalFov, horizontalFov), 0.01);
+            return Math.max((radius / Math.sin(limitingFov / 2)) * 1.34, 48);
+        }
+
+        function fitCameraToFrame(cameraSnapshot, nextFrame, previousFrame = null) {
+            if (!cameraSnapshot || !nextFrame) return cameraSnapshot;
+
+            const position = Array.from(cameraSnapshot.position);
+            const target = Array.from(cameraSnapshot.target);
+            const delta = previousFrame
+                ? nextFrame.center.map((value, index) => value - previousFrame.center[index])
+                : nextFrame.center.map((value, index) => value - target[index]);
+            const shiftedTarget = target.map((value, index) => value + delta[index]);
+            let shiftedPosition = position.map((value, index) => value + delta[index]);
+
+            const viewDirection = shiftedPosition.map((value, index) => value - shiftedTarget[index]);
+            const distance = Math.hypot(...viewDirection);
+            const minDistance = getConservativeFitDistance(nextFrame.radius, cameraSnapshot.fov);
+
+            if (distance > 0) {
+                const scale = minDistance / distance;
+                shiftedPosition = shiftedTarget.map((value, index) => value + viewDirection[index] * scale);
+            }
+
+            return {
+                ...cameraSnapshot,
+                position: shiftedPosition,
+                target: shiftedTarget,
+                radius: Math.max(nextFrame.radius * 1.12, 1),
+                radiusMax: Math.max(nextFrame.radius * 1.5, 10),
+                fog: 0,
+                clipFar: false,
+                minNear: 0.01,
+                minFar: 0,
+            };
+        }
+
+        function restoreCamera(cameraSnapshot) {
+            if (!cameraSnapshot) return;
+            const camera = viewer?.plugin.canvas3d?.camera;
+            camera?.setState(cameraSnapshot, 0);
+            requestAnimationFrame(() => camera?.setState(cameraSnapshot, 0));
+        }
+
+        function queueStructureRender(cifContent, isFinal = false) {
+            pendingStructureRender = {
+                cifContent,
+                isFinal,
+                generation: renderGeneration,
+            };
+            if (!renderInFlight) {
+                processStructureRenderQueue();
+            }
+        }
+
+        async function renderStructureAndWait(cifContent, isFinal = false) {
+            queueStructureRender(cifContent, isFinal);
+            await waitForStructureRenderIdle();
+        }
+
+        async function processStructureRenderQueue() {
+            renderInFlight = true;
+            try {
+                while (pendingStructureRender) {
+                    const next = pendingStructureRender;
+                    pendingStructureRender = null;
+                    if (next.generation === renderGeneration) {
+                        try {
+                            await loadStructure(next.cifContent, next.isFinal, next.generation);
+                        } catch (e) {
+                            console.warn('Skipping structure render update', e);
+                        }
+                    }
+                }
+            } finally {
+                renderInFlight = false;
+                if (pendingStructureRender) {
+                    processStructureRenderQueue();
+                } else {
+                    resolveRenderIdle();
+                }
+            }
+        }
+
+        // Load one structure into Mol* while keeping the previous frame visible.
+        async function loadStructure(cifContent, isFinal = false, generation = renderGeneration) {
+            if (generation !== renderGeneration) return;
+
             viewerPlaceholder.classList.add('hidden');
-            const container = document.getElementById('viewer-container');
+            const viewerContainer = document.getElementById('viewer-container');
+            const molstarContainer = document.getElementById('molstar-container');
+            viewerContainer.classList.remove('placeholder-visible');
             
             // Create viewer once
             if (!viewer) {
-                viewer = await molstar.Viewer.create(container, {
-                    layoutIsExpanded: false,
-                    layoutShowControls: false,
-                    layoutShowRemoteState: false,
-                    layoutShowSequence: false,
-                    layoutShowLog: false,
-                    layoutShowLeftPanel: false,
-                    viewportShowExpand: false,
-                    viewportShowSelectionMode: false,
-                    viewportShowAnimation: false,
-                    collapseLeftPanel: true,
-                    collapseRightPanel: true,
-                });
-            } else {
-                // Clear previous structures
-                await viewer.plugin.managers.structure.hierarchy.remove(
-                    viewer.plugin.managers.structure.hierarchy.current.structures
-                );
+                viewer = await molstar.Viewer.create(molstarContainer, VIEWER_OPTIONS);
             }
+
+            const hierarchy = viewer.plugin.managers.structure.hierarchy;
+            const previousStructures = [...hierarchy.current.structures];
+            const shouldPreserveCamera = previousStructures.length > 0 && !isFinal;
+            const nextFrame = estimateCifFrame(cifContent);
+            let cameraSnapshot = shouldPreserveCamera
+                ? fitCameraToFrame(viewer.plugin.canvas3d?.camera.getSnapshot(), nextFrame, lastRenderedFrame)
+                : null;
             
             const data = await viewer.plugin.builders.data.rawData({ data: cifContent }, { state: { isGhost: false } });
             const trajectory = await viewer.plugin.builders.structure.parseTrajectory(data, 'mmcif');
             const model = await viewer.plugin.builders.structure.createModel(trajectory);
             const structure = await viewer.plugin.builders.structure.createStructure(model);
+
+            if (generation !== renderGeneration) {
+                try {
+                    await hierarchy.remove([structure]);
+                } catch {
+                    // Best-effort cleanup for stale renders.
+                }
+                return;
+            }
             
             const reprOptions = isFinal 
                 ? { type: 'cartoon', color: 'plddt-confidence' }
                 : { type: 'cartoon', color: 'uniform', colorParams: { value: 0x00D4AA } };
             
             await viewer.plugin.builders.structure.representation.addRepresentation(structure, reprOptions);
+            if (!cameraSnapshot) {
+                cameraSnapshot = fitCameraToFrame(viewer.plugin.canvas3d?.camera.getSnapshot(), nextFrame);
+            }
+            restoreCamera(cameraSnapshot);
+
+            if (previousStructures.length > 0) {
+                await hierarchy.remove(previousStructures);
+                restoreCamera(cameraSnapshot);
+            }
+
+            lastRenderedFrame = nextFrame || lastRenderedFrame;
+        }
+
+        // Clear any previous prediction before starting a new one.
+        async function clearCurrentStructure({ showLoading = false } = {}) {
+            renderGeneration += 1;
+            pendingStructureRender = null;
+            currentCif = null;
+            lastRenderedFrame = null;
+            const viewerContainer = document.getElementById('viewer-container');
+            viewerContainer.classList.add('placeholder-visible');
+            viewerPlaceholder.classList.remove('hidden');
+            viewerPlaceholder.classList.toggle('loading', showLoading);
+
+            if (!viewer) {
+                return;
+            }
+
+            const hierarchy = viewer.plugin.managers.structure.hierarchy;
+            const structures = hierarchy.current.structures;
+            if (structures.length > 0) {
+                await hierarchy.remove(structures);
+            }
         }
         
         // Run prediction
@@ -794,6 +1103,9 @@
             progressBar.style.width = '0%';
             predictBtn.disabled = true;
             predictBtn.textContent = 'Predicting...';
+            clearBtn.disabled = true;
+            exampleButtons.forEach(btn => { btn.disabled = true; });
+            await clearCurrentStructure({ showLoading: true });
             
             try {
                 const controller = new AbortController();
@@ -838,7 +1150,7 @@
                         
                         try {
                             const event = JSON.parse(line);
-                            handleEvent(event);
+                            await handleEvent(event);
                         } catch (e) {
                             // Skip malformed lines silently
                         }
@@ -853,6 +1165,8 @@
             } finally {
                 isPredicting = false;
                 predictBtn.disabled = false;
+                clearBtn.disabled = false;
+                exampleButtons.forEach(btn => { btn.disabled = false; });
                 predictBtn.innerHTML = `
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polygon points="5 3 19 12 5 21 5 3"></polygon>
@@ -864,16 +1178,16 @@
         }
         
         // Handle streaming event
-        function handleEvent(event) {
+        async function handleEvent(event) {
             if (event.type === 'progress') {
                 updateProgress(event);
             } else if (event.type === 'intermediate') {
                 updateProgress(event);
                 if (event.cif) {
-                    loadStructure(event.cif);
+                    queueStructureRender(event.cif);
                 }
             } else if (event.type === 'complete') {
-                handleComplete(event);
+                await handleComplete(event);
             } else if (event.type === 'error') {
                 showError(event.message);
             }
@@ -887,7 +1201,7 @@
             msa:        { label: 'Generating MSA',    start: 0.05, end: 0.15 },
             prep:       { label: 'Featurizing',       start: 0.15, end: 0.20 },
             trunk:      { label: 'Pairformer',        start: 0.20, end: 0.50 },
-            diffusion:  { label: 'Folding',           start: 0.50, end: 0.90 },
+            diffusion:  { label: 'Diffusion module',  start: 0.50, end: 0.90 },
             confidence: { label: 'Scoring',           start: 0.90, end: 0.95 },
             saving:     { label: 'Finalizing',        start: 0.95, end: 1.00 },
         };
@@ -902,7 +1216,7 @@
         }
         
         // Handle completion
-        function handleComplete(event) {
+        async function handleComplete(event) {
             progressSection.classList.remove('visible');
             resultsSection.classList.add('visible');
             progressBar.style.width = '100%';
@@ -921,7 +1235,7 @@
             // Load final structure with pLDDT coloring
             if (event.cif) {
                 currentCif = event.cif;
-                loadStructure(event.cif, true);
+                await renderStructureAndWait(event.cif, true);
             }
         }
         
@@ -952,13 +1266,14 @@
         // Event listeners
         sequenceInput.addEventListener('input', updateCharCount);
         predictBtn.addEventListener('click', predict);
-        clearBtn.addEventListener('click', () => {
+        clearBtn.addEventListener('click', async () => {
             if (isPredicting) return; // Don't clear during prediction
             sequenceInput.value = '';
             updateCharCount();
             errorMessage.classList.remove('visible');
             progressSection.classList.remove('visible');
             resultsSection.classList.remove('visible');
+            await clearCurrentStructure();
         });
         
         // Limit paste content to prevent huge inputs
@@ -972,8 +1287,9 @@
         });
         
         // Example buttons
-        document.querySelectorAll('[data-example]').forEach(btn => {
+        exampleButtons.forEach(btn => {
             btn.addEventListener('click', () => {
+                if (isPredicting) return;
                 const name = btn.dataset.example;
                 if (EXAMPLES[name]) {
                     sequenceInput.value = EXAMPLES[name];
