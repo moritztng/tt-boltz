@@ -23,7 +23,7 @@ A web interface for protein structure prediction using TT-Boltz.
 The demo gzip-compresses the streaming prediction response when the browser
 supports it. For realtime visualization, the first intermediate frame includes
 a full CIF template; later intermediate frames send only compact coordinate
-arrays every 5 diffusion steps. The browser rebuilds temporary CIF frames
+arrays every 10 diffusion steps. The browser rebuilds temporary CIF frames
 locally for Mol*, and the final CIF is always sent in full.
 
 ## Features

@@ -763,11 +763,13 @@
         let renderIdleResolvers = [];
         let lastRenderedFrame = null;
         let intermediateCifTemplate = null;
+        let lastStructureRenderStartedAt = 0;
         
         // Valid amino acid characters
         const VALID_AA = new Set('ACDEFGHIKLMNPQRSTVWY');
         const MIN_LENGTH = 10;
         const MAX_LENGTH = 1024;
+        const MIN_STRUCTURE_RENDER_INTERVAL_MS = 250;
         const VIEWER_OPTIONS = {
             layoutIsExpanded: false,
             layoutShowControls: false,
@@ -843,6 +845,10 @@
                 return Promise.resolve();
             }
             return new Promise(resolve => renderIdleResolvers.push(resolve));
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
         }
 
         function tokenizeCifLine(line) {
@@ -1038,8 +1044,24 @@
 
         function queueStructureRender(cifContent, isFinal = false) {
             pendingStructureRender = {
+                type: 'cif',
                 cifContent,
                 isFinal,
+                generation: renderGeneration,
+            };
+            if (!renderInFlight) {
+                processStructureRenderQueue();
+            }
+        }
+
+        function queueCoordinateRender(coords, atomCount) {
+            if (!intermediateCifTemplate) return;
+            pendingStructureRender = {
+                type: 'coords',
+                coords,
+                atomCount,
+                templateCif: intermediateCifTemplate,
+                isFinal: false,
                 generation: renderGeneration,
             };
             if (!renderInFlight) {
@@ -1052,6 +1074,20 @@
             await waitForStructureRenderIdle();
         }
 
+        function resolveRenderCif(renderRequest) {
+            if (renderRequest.type === 'cif') {
+                return renderRequest.cifContent;
+            }
+            if (renderRequest.type === 'coords') {
+                return buildCifFromCoordinateFrame(
+                    renderRequest.templateCif,
+                    renderRequest.coords,
+                    renderRequest.atomCount
+                );
+            }
+            return null;
+        }
+
         async function processStructureRenderQueue() {
             renderInFlight = true;
             try {
@@ -1060,7 +1096,21 @@
                     pendingStructureRender = null;
                     if (next.generation === renderGeneration) {
                         try {
-                            await loadStructure(next.cifContent, next.isFinal, next.generation);
+                            if (!next.isFinal) {
+                                // Mol* rebuilds are expensive; keep only the freshest live frame.
+                                const elapsed = performance.now() - lastStructureRenderStartedAt;
+                                const waitMs = Math.max(0, MIN_STRUCTURE_RENDER_INTERVAL_MS - elapsed);
+                                if (waitMs > 0) {
+                                    await sleep(waitMs);
+                                }
+                                if (next.generation !== renderGeneration || pendingStructureRender) {
+                                    continue;
+                                }
+                            }
+                            const cifContent = resolveRenderCif(next);
+                            if (!cifContent) continue;
+                            lastStructureRenderStartedAt = performance.now();
+                            await loadStructure(cifContent, next.isFinal, next.generation);
                         } catch (e) {
                             console.warn('Skipping structure render update', e);
                         }
@@ -1137,6 +1187,7 @@
             currentCif = null;
             lastRenderedFrame = null;
             intermediateCifTemplate = null;
+            lastStructureRenderStartedAt = 0;
             const viewerContainer = document.getElementById('viewer-container');
             viewerContainer.classList.add('placeholder-visible');
             viewerPlaceholder.classList.remove('hidden');
@@ -1260,18 +1311,11 @@
                 updateProgress(event);
             } else if (event.type === 'intermediate') {
                 updateProgress(event);
-                let cif = event.cif || null;
-                if (cif) {
-                    intermediateCifTemplate = cif;
-                } else if (event.coords && intermediateCifTemplate) {
-                    cif = buildCifFromCoordinateFrame(
-                        intermediateCifTemplate,
-                        event.coords,
-                        event.atom_count
-                    );
-                }
-                if (cif) {
-                    queueStructureRender(cif);
+                if (event.cif) {
+                    intermediateCifTemplate = event.cif;
+                    queueStructureRender(event.cif);
+                } else if (event.coords) {
+                    queueCoordinateRender(event.coords, event.atom_count);
                 }
             } else if (event.type === 'complete') {
                 await handleComplete(event);

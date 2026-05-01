@@ -45,7 +45,7 @@ from tt_boltz.main import download_all, prepare_features, to_batch
 AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
 MIN_LEN = 10
 MAX_LEN = 1024
-INTERMEDIATE_FRAME_INTERVAL = 5
+INTERMEDIATE_FRAME_INTERVAL = 10
 
 
 def validate_sequence(sequence: str) -> tuple[bool, str]:
