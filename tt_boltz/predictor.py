@@ -9,7 +9,7 @@ It reuses the same preprocessing (``prepare_features``), batching
 Events yielded by :func:`predict_structure`::
 
     {"type": "progress", "stage": <str>, "step": <int>, "total": <int>}
-    {"type": "intermediate", "stage": "diffusion", "step": ..., "cif": <str>}
+    {"type": "intermediate", "stage": "diffusion", "step": ..., "coords": [...], "cif": <str optional>}
     {"type": "complete",   "cif": <str>, "confidence": {...}, "sequence_length": int}
     {"type": "error",      "message": <str>}
 
@@ -45,6 +45,7 @@ from tt_boltz.main import download_all, prepare_features, to_batch
 AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
 MIN_LEN = 10
 MAX_LEN = 1024
+INTERMEDIATE_FRAME_INTERVAL = 5
 
 
 def validate_sequence(sequence: str) -> tuple[bool, str]:
@@ -85,26 +86,32 @@ _STEERING_ARGS = {
 }
 
 
-def _build_intermediate_cif_maker(base_struct: StructureV2, atom_mask: torch.Tensor):
-    """Return a fn that converts a ``(n_atoms, 3)`` tensor into a CIF string."""
+def _build_intermediate_frame_maker(base_struct: StructureV2, atom_mask: torch.Tensor):
+    """Return a fn that converts coords into compact streamable frame data."""
     atoms_template = base_struct.atoms.copy()
     residues_template = base_struct.residues.copy()
     residues_template["is_present"] = True
 
-    def make(coords_tensor: torch.Tensor) -> Optional[str]:
+    def make(coords_tensor: torch.Tensor, include_cif: bool = False) -> Optional[dict]:
         try:
             coords = coords_tensor.float()[atom_mask].cpu().numpy()
-            atoms = atoms_template.copy()
-            atoms["coords"] = coords
-            atoms["is_present"] = True
-            snapshot = replace(
-                base_struct,
-                atoms=atoms,
-                residues=residues_template,
-                interfaces=np.array([], dtype=Interface),
-                coords=np.array([(x,) for x in coords], dtype=Coords),
-            )
-            return to_mmcif(snapshot, plddts=None, boltz2=True)
+            frame = {
+                "coords": np.round(coords.reshape(-1), 3).tolist(),
+                "atom_count": int(coords.shape[0]),
+            }
+            if include_cif:
+                atoms = atoms_template.copy()
+                atoms["coords"] = coords
+                atoms["is_present"] = True
+                snapshot = replace(
+                    base_struct,
+                    atoms=atoms,
+                    residues=residues_template,
+                    interfaces=np.array([], dtype=Interface),
+                    coords=np.array([(x,) for x in coords], dtype=Coords),
+                )
+                frame["cif"] = to_mmcif(snapshot, plddts=None, boltz2=True)
+            return frame
         except Exception:
             return None
 
@@ -197,23 +204,31 @@ def predict_structure(
 
         # Intermediate-coord renderer needs the un-padded template structure.
         atom_mask = batch["atom_pad_mask"].squeeze(0).bool()
-        make_intermediate_cif = _build_intermediate_cif_maker(
+        make_intermediate_frame = _build_intermediate_frame_maker(
             input_struct.remove_invalid_chains(), atom_mask,
         )
 
         # Bridge the model's progress_fn (called from the model thread) to
         # this generator (running on the request thread).
         events: queue.Queue = queue.Queue()
+        sent_intermediate_template = False
 
         def progress_fn(stage: str, step: int = 0, total: int = 0,
                         coords: Optional[torch.Tensor] = None, **_):
+            nonlocal sent_intermediate_template
             event = {"type": "progress", "stage": stage, "step": step, "total": total}
-            if coords is not None:
-                cif = make_intermediate_cif(coords)
-                if cif is not None:
+            should_stream_coords = (
+                coords is not None
+                and stage == "diffusion"
+                and (step % INTERMEDIATE_FRAME_INTERVAL == 0 or step >= total)
+            )
+            if should_stream_coords:
+                frame = make_intermediate_frame(coords, include_cif=not sent_intermediate_template)
+                if frame is not None:
+                    sent_intermediate_template = sent_intermediate_template or "cif" in frame
                     event = {
                         "type": "intermediate", "stage": stage,
-                        "step": step, "total": total, "cif": cif,
+                        "step": step, "total": total, **frame,
                     }
             events.put(event)
 

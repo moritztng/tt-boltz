@@ -762,6 +762,7 @@
         let pendingStructureRender = null;
         let renderIdleResolvers = [];
         let lastRenderedFrame = null;
+        let intermediateCifTemplate = null;
         
         // Valid amino acid characters
         const VALID_AA = new Set('ACDEFGHIKLMNPQRSTVWY');
@@ -846,6 +847,81 @@
 
         function tokenizeCifLine(line) {
             return line.match(/(?:'[^']*'|"[^"]*"|\S+)/g)?.map(token => token.replace(/^['"]|['"]$/g, '')) || [];
+        }
+
+        function tokenizeCifLineWithSpans(line) {
+            const tokens = [];
+            const regex = /'[^']*'|"[^"]*"|\S+/g;
+            let match;
+            while ((match = regex.exec(line)) !== null) {
+                tokens.push({
+                    start: match.index,
+                    end: match.index + match[0].length,
+                });
+            }
+            return tokens;
+        }
+
+        function formatCoordinate(value) {
+            return Number(value).toFixed(3);
+        }
+
+        function replaceToken(line, token, value) {
+            return `${line.slice(0, token.start)}${value}${line.slice(token.end)}`;
+        }
+
+        function buildCifFromCoordinateFrame(templateCif, coords, atomCount) {
+            const expectedAtomCount = Number(atomCount) || Math.floor((coords?.length || 0) / 3);
+            if (!templateCif || !Array.isArray(coords) || coords.length < expectedAtomCount * 3) {
+                return null;
+            }
+
+            const lines = templateCif.split('\n');
+            let inAtomLoop = false;
+            let headers = [];
+            let atomIndex = 0;
+
+            for (let i = 0; i < lines.length; i += 1) {
+                const line = lines[i].trim();
+                if (!line || line.startsWith('#')) continue;
+
+                if (line === 'loop_') {
+                    inAtomLoop = false;
+                    headers = [];
+                    continue;
+                }
+
+                if (line.startsWith('_atom_site.')) {
+                    headers.push(line.split(/\s+/)[0]);
+                    inAtomLoop = true;
+                    continue;
+                }
+
+                if (!inAtomLoop || headers.length === 0 || line.startsWith('_')) continue;
+
+                const xIndex = headers.indexOf('_atom_site.Cartn_x');
+                const yIndex = headers.indexOf('_atom_site.Cartn_y');
+                const zIndex = headers.indexOf('_atom_site.Cartn_z');
+                if (xIndex < 0 || yIndex < 0 || zIndex < 0 || atomIndex >= expectedAtomCount) continue;
+
+                const tokens = tokenizeCifLineWithSpans(lines[i]);
+                if (tokens.length <= Math.max(xIndex, yIndex, zIndex)) continue;
+
+                const coordOffset = atomIndex * 3;
+                let nextLine = lines[i];
+                const replacements = [
+                    [tokens[xIndex], coords[coordOffset]],
+                    [tokens[yIndex], coords[coordOffset + 1]],
+                    [tokens[zIndex], coords[coordOffset + 2]],
+                ].sort(([a], [b]) => b.start - a.start);
+                replacements.forEach(([token, value]) => {
+                    nextLine = replaceToken(nextLine, token, formatCoordinate(value));
+                });
+                lines[i] = nextLine;
+                atomIndex += 1;
+            }
+
+            return atomIndex === expectedAtomCount ? lines.join('\n') : null;
         }
 
         function estimateCifFrame(cifContent) {
@@ -1060,6 +1136,7 @@
             pendingStructureRender = null;
             currentCif = null;
             lastRenderedFrame = null;
+            intermediateCifTemplate = null;
             const viewerContainer = document.getElementById('viewer-container');
             viewerContainer.classList.add('placeholder-visible');
             viewerPlaceholder.classList.remove('hidden');
@@ -1183,8 +1260,18 @@
                 updateProgress(event);
             } else if (event.type === 'intermediate') {
                 updateProgress(event);
-                if (event.cif) {
-                    queueStructureRender(event.cif);
+                let cif = event.cif || null;
+                if (cif) {
+                    intermediateCifTemplate = cif;
+                } else if (event.coords && intermediateCifTemplate) {
+                    cif = buildCifFromCoordinateFrame(
+                        intermediateCifTemplate,
+                        event.coords,
+                        event.atom_count
+                    );
+                }
+                if (cif) {
+                    queueStructureRender(cif);
                 }
             } else if (event.type === 'complete') {
                 await handleComplete(event);

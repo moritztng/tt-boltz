@@ -8,6 +8,7 @@ import json
 import re
 import threading
 import time
+import zlib
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -30,6 +31,27 @@ def _clean(raw: object) -> str:
     if not isinstance(raw, str):
         return ""
     return re.sub(r"[^A-Za-z]", "", raw).upper()
+
+
+def _accepts_gzip() -> bool:
+    """Return whether the client can receive a gzip-compressed stream."""
+    return "gzip" in request.headers.get("Accept-Encoding", "").lower()
+
+
+def _gzip_stream(chunks):
+    """Compress a streaming response while flushing after each useful chunk."""
+    compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        compressed = compressor.compress(chunk) + compressor.flush(zlib.Z_SYNC_FLUSH)
+        if compressed:
+            yield compressed
+    tail = compressor.flush(zlib.Z_FINISH)
+    if tail:
+        yield tail
 
 
 def _parse_request(require_length: bool = True):
@@ -108,17 +130,27 @@ def predict():
                 accelerator="tenstorrent",
                 fast=USE_FAST_MODE,
             ):
-                yield json.dumps(event) + "\n"
+                yield json.dumps(event, separators=(",", ":")) + "\n"
         except Exception:
             # Never leak internal details to the browser.
-            yield json.dumps({"type": "error", "message": "Prediction failed. Please try again."}) + "\n"
+            yield json.dumps({"type": "error", "message": "Prediction failed. Please try again."}, separators=(",", ":")) + "\n"
         finally:
             _active_prediction.release()
 
+    response_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Vary": "Accept-Encoding",
+    }
+    body_iter = stream()
+    if _accepts_gzip():
+        body_iter = _gzip_stream(body_iter)
+        response_headers["Content-Encoding"] = "gzip"
+
     return Response(
-        stream(),
+        body_iter,
         mimetype="application/x-ndjson",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=response_headers,
     )
 
 
