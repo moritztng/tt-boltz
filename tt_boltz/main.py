@@ -867,7 +867,16 @@ def _reset_tt_devices(device_ids: list[int], retries: int = 2) -> bool:
 
 
 @click.group()
-def cli(): pass
+def cli():
+    """Run Boltz-2 inference on Tenstorrent hardware."""
+
+
+@cli.command("install-deps")
+def install_deps():
+    """Install system dependencies that match the installed ttnn wheel."""
+    from tt_boltz.install_system_deps import main as install_system_deps
+
+    install_system_deps()
 
 
 _MSA_DBS = {
