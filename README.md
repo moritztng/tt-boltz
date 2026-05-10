@@ -10,24 +10,23 @@ For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated Alph
 
 ## Installation
 
-### Recommended: Create Virtual Environment
+Create a Python 3.10 virtual environment, install TT-Boltz, then install the matching Tenstorrent system dependencies:
+
 ```bash
 python3.10 -m venv env
 source env/bin/activate
-```
-
-### Simple Install
-```bash
 pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
+tt-boltz install-deps
 ```
 
-This installs `tt-boltz` and its core Python dependencies (including `ttnn`). That's it.
+`tt-boltz install-deps` installs the SFPI compiler version that matches the installed `ttnn` wheel and clears stale TT-Metal kernel cache entries. It may ask for your sudo password.
 
 ### Advanced Install (editable local clone)
 ```bash
 git clone https://github.com/moritztng/tt-boltz.git
 cd tt-boltz
 pip install -e .
+tt-boltz install-deps
 ```
 
 ### Optional: Build TT-Metal / TT-NN from Source
