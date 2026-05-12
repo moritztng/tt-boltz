@@ -10,10 +10,10 @@ For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated Alph
 
 ## Installation
 
-Create a Python virtual environment with Python 3.10, 3.11, or 3.12, install TT-Boltz, then install the matching Tenstorrent system dependencies:
+Create a Python virtual environment with Python 3.10, install TT-Boltz, then install the matching Tenstorrent system dependencies. Python 3.11 is not supported because `ttnn==0.68.0` does not publish a Python 3.11 wheel. Python 3.12 can install, but Python 3.10 is the recommended environment.
 
 ```bash
-python3 -m venv env
+python3.10 -m venv env
 source env/bin/activate
 pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
 tt-boltz install-deps
