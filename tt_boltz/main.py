@@ -7,7 +7,60 @@ if "--debug" not in _sys.argv:
     _os.environ.setdefault("LOGURU_LEVEL", "WARNING")
     _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
 
+
+def _install_nanobind_leak_stderr_filter() -> None:
+    """Drop nanobind leak reports while forwarding other fd-level stderr."""
+    try:
+        read_fd, write_fd = _os.pipe()
+        original_stderr_fd = _os.dup(2)
+        pid = _os.fork()
+        if pid == 0:
+            try:
+                _os.close(write_fd)
+                suppressing_nanobind_leak = False
+                with _os.fdopen(read_fd, "rb", closefd=True) as pipe:
+                    for raw_line in pipe:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        if line.startswith("nanobind: leaked "):
+                            suppressing_nanobind_leak = True
+                            continue
+                        if suppressing_nanobind_leak:
+                            if (
+                                line.startswith(" - ")
+                                or line.startswith("nanobind: this is likely caused")
+                                or line.startswith("See https://nanobind.")
+                            ):
+                                continue
+                            suppressing_nanobind_leak = False
+                        _os.write(original_stderr_fd, raw_line)
+            except Exception:
+                pass
+            finally:
+                _os._exit(0)
+
+        _os.close(read_fd)
+        _os.dup2(write_fd, 2)
+        _os.close(write_fd)
+        python_stderr = _os.fdopen(
+            _os.dup(original_stderr_fd),
+            "w",
+            buffering=1,
+            encoding=getattr(_sys.stderr, "encoding", None) or "utf-8",
+            errors=getattr(_sys.stderr, "errors", None) or "replace",
+        )
+        _sys.stderr = python_stderr
+        _sys.__stderr__ = python_stderr
+        _os.close(original_stderr_fd)
+    except Exception:
+        pass
+
+
+if "--debug" not in _sys.argv:
+    _install_nanobind_leak_stderr_filter()
+
+
 import hashlib
+import importlib.util
 import json
 import multiprocessing as mp
 import os
@@ -685,12 +738,74 @@ def _append_result(row: dict, path: Path) -> None:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
+def _detect_p300_devices() -> list[int]:
+    """Return P300 TT device indices from kernel sysfs.
+
+    This avoids importing ttnn in the parent process and avoids requiring tt-smi.
+    The subsystem IDs mirror tt-metal's Blackhole board-type mapping for P300.
+    """
+    p300_subsystems = {"0x0044", "0x0045", "0x0046"}
+    devices = []
+    for entry in (Path("/sys/class/tenstorrent")).glob("tenstorrent!*"):
+        try:
+            device_id = int(entry.name.rsplit("!", 1)[1])
+            subsystem_id = (entry / "device" / "subsystem_device").read_text().strip().lower()
+        except Exception:
+            continue
+        if subsystem_id in p300_subsystems:
+            devices.append(device_id)
+    return sorted(devices)
+
+
+def _find_ttnn_mesh_graph_descriptor(filename: str) -> str | None:
+    spec = importlib.util.find_spec("ttnn")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    ttnn_root = Path(next(iter(spec.submodule_search_locations)))
+    descriptor = ttnn_root / "tt_metal" / "fabric" / "mesh_graph_descriptors" / filename
+    return str(descriptor) if descriptor.is_file() else None
+
+
+def _build_worker_device_assignments(devices: list[int]) -> dict[int, dict[str, object]]:
+    """Build per-worker visibility/logical-device assignments.
+
+    P300 chips are exposed one-at-a-time like other devices. Because a lone P300
+    chip is a custom topology, those workers also get a 1x1 Blackhole MGD.
+    """
+    p300_devices = set(_detect_p300_devices())
+    p300_mgd = (
+        _find_ttnn_mesh_graph_descriptor("p150_mesh_graph_descriptor.textproto")
+        if p300_devices and not os.environ.get("TT_MESH_GRAPH_DESC_PATH")
+        else None
+    )
+
+    assignments: dict[int, dict[str, object]] = {}
+    for device in devices:
+        assignment: dict[str, object] = {"visible_devices": str(device), "logical_device_id": 0}
+        if device in p300_devices and p300_mgd:
+            assignment["mesh_graph_descriptor"] = p300_mgd
+        assignments[device] = assignment
+    return assignments
+
+
+def _configure_worker_device_assignment(device_id: int, cfg: dict) -> None:
+    """Apply the per-worker TT visibility assignment before importing ttnn."""
+    assignments = cfg.get("worker_device_assignments") or {}
+    assignment = assignments.get(device_id) or assignments.get(str(device_id)) or {}
+
+    os.environ["TT_VISIBLE_DEVICES"] = str(assignment.get("visible_devices", device_id))
+    os.environ["TT_BOLTZ_LOGICAL_DEVICE_ID"] = str(assignment.get("logical_device_id", 0))
+    if "mesh_graph_descriptor" in assignment and not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(assignment["mesh_graph_descriptor"])
+
+
 def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
                      suppress_output=True):
     """Worker process: run predictions on one TT device.
 
-    Each worker is pinned to a single physical card via TT_VISIBLE_DEVICES.
-    All workers share the same on-disk kernel cache (no TT_METAL_CACHE override).
+    Each worker selects its TT device via TT_VISIBLE_DEVICES before importing
+    ttnn. P300 workers also set a 1x1 mesh descriptor so one-chip worker views
+    stay independent instead of opening a full two-chip P300 board context.
     """
     watchdog_queue = cfg.get("watchdog_queue")
 
@@ -723,7 +838,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
         import sys as _sys
         _devnull = open(os.devnull, "w")
         _sys.stdout = _devnull
-        if device_id > 0:  # subprocesses
+        if mp.current_process().name != "MainProcess":
             _sys.stderr = _devnull
             _dn_fd = os.open(os.devnull, os.O_WRONLY)
             os.dup2(_dn_fd, 1)   # fd 1 = stdout  (C++ prints)
@@ -735,7 +850,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
     model = None
     aff_model = None
     try:
-        os.environ["TT_VISIBLE_DEVICES"] = str(device_id)
+        _configure_worker_device_assignment(device_id, cfg)
         from tt_boltz.tenstorrent import set_fast_mode as _set_fast_mode
         _set_fast_mode(cfg.get("fast", False))
         torch_device = torch.device("cpu")
@@ -1119,13 +1234,12 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             devices = all_devices
         devices = devices[:len(files)]
         n_devices = max(1, len(devices))
+        worker_device_assignments = _build_worker_device_assignments(devices)
     else:
         devices = [0]
         n_devices = 1
+        worker_device_assignments = {}
 
-
-    click.echo("")
-    click.echo("")
     click.echo("")
 
     # --- Model kwargs (built once, shared by single- and multi-device paths) ---
@@ -1204,6 +1318,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
             "results_path": str(results_path),
             "fast": fast,
+            "worker_device_assignments": worker_device_assignments,
         }
         import sys as _sys
         ctx = mp.get_context("spawn")
@@ -1245,7 +1360,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             else:
                 file_buckets = [files[i::n_devices] for i in range(n_devices)]
                 if disable_watchdog:
-                    click.echo("[watchdog] disabled")
+                    if debug and log:
+                        click.echo("[watchdog] disabled")
                     for i, bucket in enumerate(file_buckets):
                         if not bucket:
                             continue
@@ -1275,7 +1391,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     max_retries = 2
                     idle_timeout_s = 900.0
                     check_log_interval_s = 60.0
-                    click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
+                    if debug and log:
+                        click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
 
                     def _spawn(dev: int):
                         st = states[dev]

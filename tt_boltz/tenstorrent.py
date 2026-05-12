@@ -1,3 +1,4 @@
+import os
 import torch, ttnn, atexit
 from torch import nn
 from typing import Callable, Mapping
@@ -143,13 +144,13 @@ _device = None
 def get_device():
     """Open (or return cached) TT device 0.
 
-    For multi-device setups each worker process sets TT_VISIBLE_DEVICES
-    before any ttnn call so that its single physical card appears as
-    logical device 0.  All workers share the default on-disk kernel cache.
+    Worker processes set TT_VISIBLE_DEVICES before importing ttnn, so the
+    assigned physical chip appears as logical device 0.
     """
     global _device
     if _device is None:
-        _device = ttnn.open_device(device_id=0)
+        device_id = int(os.environ.get("TT_BOLTZ_LOGICAL_DEVICE_ID", "0"))
+        _device = ttnn.open_device(device_id=device_id)
         _configure_active_compute_grid(_device)
         _device.enable_program_cache()
     return _device
