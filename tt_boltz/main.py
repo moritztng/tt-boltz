@@ -684,12 +684,68 @@ def _append_result(row: dict, path: Path) -> None:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
+def _detect_p300_devices() -> list[int]:
+    """Return P300 TT device indices from kernel sysfs.
+
+    This avoids importing ttnn in the parent process and avoids requiring tt-smi.
+    The subsystem IDs mirror tt-metal's Blackhole board-type mapping for P300.
+    """
+    p300_subsystems = {"0x0044", "0x0045", "0x0046"}
+    devices = []
+    for entry in (Path("/sys/class/tenstorrent")).glob("tenstorrent!*"):
+        try:
+            device_id = int(entry.name.rsplit("!", 1)[1])
+            subsystem_id = (entry / "device" / "subsystem_device").read_text().strip().lower()
+        except Exception:
+            continue
+        if subsystem_id in p300_subsystems:
+            devices.append(device_id)
+    return sorted(devices)
+
+
+def _build_worker_device_assignments(devices: list[int]) -> dict[int, dict[str, object]]:
+    """Build per-worker visibility/logical-device assignments.
+
+    On P300, exposing only one chip makes tt-metal classify the worker view as
+    CUSTOM. Exposing both chips from that P300 board lets each worker open the
+    intended logical chip while staying on the native P300 path.
+    """
+    p300_devices = _detect_p300_devices()
+    p300_pairs = [p300_devices[i:i + 2] for i in range(0, len(p300_devices), 2)]
+
+    assignments: dict[int, dict[str, object]] = {}
+    for device in devices:
+        visible_devices = [device]
+        logical_device_id = 0
+
+        p300_siblings = next((pair for pair in p300_pairs if device in pair), [])
+        if len(p300_siblings) >= 2:
+            visible_devices = p300_siblings
+            logical_device_id = p300_siblings.index(device)
+
+        assignments[device] = {
+            "visible_devices": ",".join(str(d) for d in visible_devices),
+            "logical_device_id": logical_device_id,
+        }
+    return assignments
+
+
+def _configure_worker_device_assignment(device_id: int, cfg: dict) -> None:
+    """Apply the per-worker TT visibility assignment before importing ttnn."""
+    assignments = cfg.get("worker_device_assignments") or {}
+    assignment = assignments.get(device_id) or assignments.get(str(device_id)) or {}
+
+    os.environ["TT_VISIBLE_DEVICES"] = str(assignment.get("visible_devices", device_id))
+    os.environ["TT_BOLTZ_LOGICAL_DEVICE_ID"] = str(assignment.get("logical_device_id", 0))
+
+
 def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
                      suppress_output=True):
     """Worker process: run predictions on one TT device.
 
-    Each worker is pinned to a single physical card via TT_VISIBLE_DEVICES.
-    All workers share the same on-disk kernel cache (no TT_METAL_CACHE override).
+    Each worker selects its TT device via TT_VISIBLE_DEVICES before importing
+    ttnn. P300 workers expose both sibling chips and open the intended logical
+    chip; other workers expose only their assigned chip.
     """
     watchdog_queue = cfg.get("watchdog_queue")
 
@@ -734,7 +790,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
     model = None
     aff_model = None
     try:
-        os.environ["TT_VISIBLE_DEVICES"] = str(device_id)
+        _configure_worker_device_assignment(device_id, cfg)
         from tt_boltz.tenstorrent import set_fast_mode as _set_fast_mode
         _set_fast_mode(cfg.get("fast", False))
         torch_device = torch.device("cpu")
@@ -1118,9 +1174,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             devices = all_devices
         devices = devices[:len(files)]
         n_devices = max(1, len(devices))
+        worker_device_assignments = _build_worker_device_assignments(devices)
     else:
         devices = [0]
         n_devices = 1
+        worker_device_assignments = {}
 
 
     click.echo("")
@@ -1203,6 +1261,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
             "results_path": str(results_path),
             "fast": fast,
+            "worker_device_assignments": worker_device_assignments,
         }
         import sys as _sys
         ctx = mp.get_context("spawn")
