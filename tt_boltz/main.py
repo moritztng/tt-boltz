@@ -7,6 +7,7 @@ if "--debug" not in _sys.argv:
     _os.environ.setdefault("LOGURU_LEVEL", "WARNING")
     _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
 
+import atexit
 import hashlib
 import importlib.util
 import json
@@ -51,6 +52,20 @@ URLS = {
     "conf": f"{ARTIFACT_BASE_URL}/boltz2_conf.ckpt",
     "aff": f"{ARTIFACT_BASE_URL}/boltz2_aff.ckpt",
 }
+
+
+def _silence_shutdown_stderr() -> None:
+    """Hide shutdown-only C++ binding warnings after CLI output is complete."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(fd, 2)
+        os.close(fd)
+    except Exception:
+        pass
+
+
+if "--debug" not in _sys.argv:
+    atexit.register(_silence_shutdown_stderr)
 
 
 def download(url: str, dest: Path) -> None:
@@ -785,7 +800,7 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
         import sys as _sys
         _devnull = open(os.devnull, "w")
         _sys.stdout = _devnull
-        if device_id > 0:  # subprocesses
+        if mp.current_process().name != "MainProcess":
             _sys.stderr = _devnull
             _dn_fd = os.open(os.devnull, os.O_WRONLY)
             os.dup2(_dn_fd, 1)   # fd 1 = stdout  (C++ prints)
