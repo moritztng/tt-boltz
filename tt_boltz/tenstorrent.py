@@ -144,9 +144,8 @@ _device = None
 def get_device():
     """Open (or return cached) TT device 0.
 
-    Worker processes set TT_VISIBLE_DEVICES before importing ttnn. Most workers
-    open logical device 0; P300 workers may expose both sibling chips and select
-    logical device 1 via TT_BOLTZ_LOGICAL_DEVICE_ID.
+    Worker processes set TT_VISIBLE_DEVICES before importing ttnn, so the
+    assigned physical chip appears as logical device 0.
     """
     global _device
     if _device is None:
