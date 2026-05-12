@@ -7,7 +7,58 @@ if "--debug" not in _sys.argv:
     _os.environ.setdefault("LOGURU_LEVEL", "WARNING")
     _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
 
-import atexit
+
+def _install_nanobind_leak_stderr_filter() -> None:
+    """Drop nanobind leak reports while forwarding other fd-level stderr."""
+    try:
+        read_fd, write_fd = _os.pipe()
+        original_stderr_fd = _os.dup(2)
+        pid = _os.fork()
+        if pid == 0:
+            try:
+                _os.close(write_fd)
+                suppressing_nanobind_leak = False
+                with _os.fdopen(read_fd, "rb", closefd=True) as pipe:
+                    for raw_line in pipe:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        if line.startswith("nanobind: leaked "):
+                            suppressing_nanobind_leak = True
+                            continue
+                        if suppressing_nanobind_leak:
+                            if (
+                                line.startswith(" - ")
+                                or line.startswith("nanobind: this is likely caused")
+                                or line.startswith("See https://nanobind.")
+                            ):
+                                continue
+                            suppressing_nanobind_leak = False
+                        _os.write(original_stderr_fd, raw_line)
+            except Exception:
+                pass
+            finally:
+                _os._exit(0)
+
+        _os.close(read_fd)
+        _os.dup2(write_fd, 2)
+        _os.close(write_fd)
+        python_stderr = _os.fdopen(
+            _os.dup(original_stderr_fd),
+            "w",
+            buffering=1,
+            encoding=getattr(_sys.stderr, "encoding", None) or "utf-8",
+            errors=getattr(_sys.stderr, "errors", None) or "replace",
+        )
+        _sys.stderr = python_stderr
+        _sys.__stderr__ = python_stderr
+        _os.close(original_stderr_fd)
+    except Exception:
+        pass
+
+
+if "--debug" not in _sys.argv:
+    _install_nanobind_leak_stderr_filter()
+
+
 import hashlib
 import importlib.util
 import json
@@ -52,20 +103,6 @@ URLS = {
     "conf": f"{ARTIFACT_BASE_URL}/boltz2_conf.ckpt",
     "aff": f"{ARTIFACT_BASE_URL}/boltz2_aff.ckpt",
 }
-
-
-def _silence_shutdown_stderr() -> None:
-    """Hide shutdown-only C++ binding warnings after CLI output is complete."""
-    try:
-        fd = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(fd, 2)
-        os.close(fd)
-    except Exception:
-        pass
-
-
-if "--debug" not in _sys.argv:
-    atexit.register(_silence_shutdown_stderr)
 
 
 def download(url: str, dest: Path) -> None:
@@ -1202,9 +1239,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         n_devices = 1
         worker_device_assignments = {}
 
-
-    click.echo("")
-    click.echo("")
     click.echo("")
 
     # --- Model kwargs (built once, shared by single- and multi-device paths) ---
@@ -1325,7 +1359,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             else:
                 file_buckets = [files[i::n_devices] for i in range(n_devices)]
                 if disable_watchdog:
-                    click.echo("[watchdog] disabled")
+                    if debug and log:
+                        click.echo("[watchdog] disabled")
                     for i, bucket in enumerate(file_buckets):
                         if not bucket:
                             continue
@@ -1355,7 +1390,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                     max_retries = 2
                     idle_timeout_s = 900.0
                     check_log_interval_s = 60.0
-                    click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
+                    if debug and log:
+                        click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
 
                     def _spawn(dev: int):
                         st = states[dev]
