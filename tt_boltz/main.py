@@ -8,6 +8,7 @@ if "--debug" not in _sys.argv:
     _os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "FATAL")
 
 import hashlib
+import importlib.util
 import json
 import multiprocessing as mp
 import os
@@ -703,30 +704,34 @@ def _detect_p300_devices() -> list[int]:
     return sorted(devices)
 
 
+def _find_ttnn_mesh_graph_descriptor(filename: str) -> str | None:
+    spec = importlib.util.find_spec("ttnn")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    ttnn_root = Path(next(iter(spec.submodule_search_locations)))
+    descriptor = ttnn_root / "tt_metal" / "fabric" / "mesh_graph_descriptors" / filename
+    return str(descriptor) if descriptor.is_file() else None
+
+
 def _build_worker_device_assignments(devices: list[int]) -> dict[int, dict[str, object]]:
     """Build per-worker visibility/logical-device assignments.
 
-    On P300, exposing only one chip makes tt-metal classify the worker view as
-    CUSTOM. Exposing both chips from that P300 board lets each worker open the
-    intended logical chip while staying on the native P300 path.
+    P300 chips are exposed one-at-a-time like other devices. Because a lone P300
+    chip is a custom topology, those workers also get a 1x1 Blackhole MGD.
     """
-    p300_devices = _detect_p300_devices()
-    p300_pairs = [p300_devices[i:i + 2] for i in range(0, len(p300_devices), 2)]
+    p300_devices = set(_detect_p300_devices())
+    p300_mgd = (
+        _find_ttnn_mesh_graph_descriptor("p150_mesh_graph_descriptor.textproto")
+        if p300_devices and not os.environ.get("TT_MESH_GRAPH_DESC_PATH")
+        else None
+    )
 
     assignments: dict[int, dict[str, object]] = {}
     for device in devices:
-        visible_devices = [device]
-        logical_device_id = 0
-
-        p300_siblings = next((pair for pair in p300_pairs if device in pair), [])
-        if len(p300_siblings) >= 2:
-            visible_devices = p300_siblings
-            logical_device_id = p300_siblings.index(device)
-
-        assignments[device] = {
-            "visible_devices": ",".join(str(d) for d in visible_devices),
-            "logical_device_id": logical_device_id,
-        }
+        assignment: dict[str, object] = {"visible_devices": str(device), "logical_device_id": 0}
+        if device in p300_devices and p300_mgd:
+            assignment["mesh_graph_descriptor"] = p300_mgd
+        assignments[device] = assignment
     return assignments
 
 
@@ -737,6 +742,8 @@ def _configure_worker_device_assignment(device_id: int, cfg: dict) -> None:
 
     os.environ["TT_VISIBLE_DEVICES"] = str(assignment.get("visible_devices", device_id))
     os.environ["TT_BOLTZ_LOGICAL_DEVICE_ID"] = str(assignment.get("logical_device_id", 0))
+    if "mesh_graph_descriptor" in assignment and not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(assignment["mesh_graph_descriptor"])
 
 
 def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
@@ -744,8 +751,8 @@ def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
     """Worker process: run predictions on one TT device.
 
     Each worker selects its TT device via TT_VISIBLE_DEVICES before importing
-    ttnn. P300 workers expose both sibling chips and open the intended logical
-    chip; other workers expose only their assigned chip.
+    ttnn. P300 workers also set a 1x1 mesh descriptor so one-chip worker views
+    stay independent instead of opening a full two-chip P300 board context.
     """
     watchdog_queue = cfg.get("watchdog_queue")
 
