@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "tt-boltz"
 version = "0.1"
 description = "Boltz-2 implementation for inference on Tenstorrent Blackhole"
+requires-python = ">=3.10,<3.13,!=3.11.*"
 dependencies = [
     "torch",
     "numpy",
