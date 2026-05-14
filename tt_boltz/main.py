@@ -874,8 +874,12 @@ def _public_join_url(bind_host: str, port: int) -> str:
 
 
 def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: int,
-                debug: bool, log: bool) -> int:
-    """Stream events from a controller and render progress; return failed count."""
+                debug: bool, log: bool, results_path: Path | None = None) -> int:
+    """Stream events from a controller and render progress; return failed count.
+
+    If results_path is given, each completed job's row is merged into
+    results.json on the fly so interrupted runs preserve partial progress.
+    """
     from queue import Queue as ThreadQueue
 
     pq = ThreadQueue()
@@ -886,6 +890,10 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
     display.start()
     after = 0
     failed = 0
+    rows_by_id: dict[str, dict] = {}
+    if results_path is not None:
+        rows_by_id = {r["id"]: r for r in _load_results_resilient(results_path)
+                      if isinstance(r, dict) and "id" in r}
     try:
         while True:
             snapshot = client.events(run_id, after)
@@ -893,6 +901,14 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
                 after = max(after, int(ev.get("seq", after)))
                 if ev.get("event") in ("run", "run_done"):
                     continue
+                if results_path is not None and ev.get("event") == "done":
+                    row = ev.get("row")
+                    if isinstance(row, dict) and "id" in row:
+                        rows_by_id[row["id"]] = row
+                        try:
+                            _save_results(list(rows_by_id.values()), results_path)
+                        except Exception:
+                            pass
                 pq.put(ev)
             if snapshot.get("status") in ("ok", "failed"):
                 failed = int(snapshot.get("failed") or 0)
@@ -1256,7 +1272,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         client = ControllerClient(controller)
         run_id = client.create_run(run_payload)["run_id"]
         click.echo(f"Submitted run {run_id} to {controller}")
-        failed = _stream_run(client, run_id, total=len(jobs), n_workers=0, debug=debug, log=log)
+        failed = _stream_run(client, run_id, total=len(jobs), n_workers=0,
+                             debug=debug, log=log, results_path=results_path)
         _persist_run_results(client, run_id, results_path)
         click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
         return
@@ -1310,7 +1327,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     procs = _spawn_worker_processes(controller_url, workers, debug)
     failed = 0
     try:
-        failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers), debug=debug, log=log)
+        failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers),
+                             debug=debug, log=log, results_path=results_path)
     finally:
         _stop_worker_processes(procs)
         server.shutdown()
