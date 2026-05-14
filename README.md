@@ -54,6 +54,46 @@ Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 
 `predict` accepts either a single YAML/FASTA file or a directory containing many input files.
 
+Prediction uses one runtime architecture for every scale: inputs become jobs,
+jobs are assigned to workers, and workers write into one result directory. On a
+single machine the workers are local CPU/GPU/TT slots; on a multi-card QuietBox
+each card is shown as its own worker. The live display names each worker by host
+and device, for example `quietbox:tt0`, so it is clear where every protein is
+running while keeping the command the same:
+
+```bash
+tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
+```
+
+### Multi-Machine Prediction
+
+For multiple computers, run one lightweight controller and connect workers to it.
+The command still submits the same folder of YAML/FASTA inputs; the only extra
+piece is the controller URL. Use a shared filesystem so all machines see the
+same input, cache, MSA, and result paths.
+
+On the controller machine:
+
+```bash
+tt-boltz serve --host 0.0.0.0 --port 8765 --workdir ~/boltz-controller
+```
+
+On each compute machine:
+
+```bash
+tt-boltz worker start --connect http://pc.local:8765
+```
+
+Submit a run:
+
+```bash
+tt-boltz predict /shared/boltz/proteins --out_dir /shared/boltz/results --controller http://pc.local:8765 --use_msa_server --fast
+```
+
+You can also set `TT_BOLTZ_CONTROLLER=http://pc.local:8765` and keep using the
+regular `tt-boltz predict ...` command. The realtime display shows each active
+worker by host and device, such as `pc:tt0` or `quietbox:tt3`.
+
 ### Offline MSA (Optional)
 
 Use this if you have enough disk and RAM and want local MSA.
