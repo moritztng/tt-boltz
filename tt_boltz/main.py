@@ -1045,6 +1045,7 @@ def _remote_worker_loop(controller_url: str, worker_dict: dict, batch_size: int,
             worker_id=worker_id,
         )
         msg = result_queue.get()
+        completed_ids = set()
         for row in msg.get("results", []):
             client.complete(
                 lease["run_id"],
@@ -1052,6 +1053,31 @@ def _remote_worker_loop(controller_url: str, worker_dict: dict, batch_size: int,
                 row,
                 {"event": "job_recorded", "name": row.get("id"), "status": row.get("status")},
             )
+            completed_ids.add(row.get("id"))
+
+        if not msg.get("ok", True):
+            err = (msg.get("error") or "worker crashed")[:200]
+            for job in jobs:
+                if job["id"] in completed_ids:
+                    continue
+                client.complete(
+                    lease["run_id"],
+                    worker_id,
+                    {"id": job["id"], "status": "failed", "error": err},
+                    {
+                        "dev": worker_dict["device_id"],
+                        "worker": worker_id,
+                        "host": worker_dict["host"],
+                        "accelerator": worker_dict["accelerator"],
+                        "label": worker_dict["label"],
+                        "event": "done",
+                        "name": job["id"],
+                        "status": "failed",
+                        "time": 0,
+                        "error": err,
+                    },
+                )
+            time.sleep(poll_interval)
 
 
 @click.group()
@@ -1101,7 +1127,7 @@ def worker_group():
 @click.option("--accelerator", type=click.Choice(["gpu", "cpu", "tenstorrent"]), default="tenstorrent")
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
 @click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use")
-@click.option("--batch-size", default=4, show_default=True, type=int, help="Jobs leased per worker/model load")
+@click.option("--batch-size", default=1, show_default=True, type=int, help="Jobs leased per worker/model load")
 @click.option("--poll-interval", default=2.0, show_default=True, type=float, help="Seconds between empty lease polls")
 @click.option("--debug", is_flag=True, help="Do not suppress worker output")
 def worker_start(connect, accelerator, num_devices, device_ids, batch_size, poll_interval, debug):
@@ -1127,6 +1153,8 @@ def worker_start(connect, accelerator, num_devices, device_ids, batch_size, poll
     ctx = mp.get_context("spawn")
     procs = []
     click.echo(f"Connecting {len(workers)} worker{'s' if len(workers) != 1 else ''} to {connect}")
+    if accelerator == "tenstorrent":
+        click.echo(f"  Detected TT devices: {[int(w.device_id) for w in workers]}")
     for worker in workers:
         payload = worker_payload(worker)
         click.echo(f"  {payload['label']}")
