@@ -329,6 +329,7 @@ def _execute_job(
                 "time": elapsed,
                 "status": row["status"],
                 "error": row.get("error", ""),
+                "row": row,
             },
         )
     except Exception:
@@ -345,11 +346,12 @@ def _complete_failure(
 ) -> None:
     """Mark each leased job as failed when worker setup itself fails."""
     for job in jobs:
+        row = {"id": job["id"], "status": "failed", "error": error}
         try:
             client.complete(
                 run_id,
                 worker_id,
-                {"id": job["id"], "status": "failed", "error": error},
+                row,
                 {
                     "dev": worker_info["device_id"],
                     "worker": worker_id,
@@ -361,6 +363,7 @@ def _complete_failure(
                     "status": "failed",
                     "time": 0,
                     "error": error,
+                    "row": row,
                 },
             )
         except Exception:
