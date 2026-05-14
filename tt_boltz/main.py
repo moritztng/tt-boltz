@@ -795,10 +795,10 @@ def _build_worker_device_assignments(devices: list[int]) -> dict[int, dict[str, 
     return assignments
 
 
-def _local_workers(accelerator: str, num_devices: int, device_ids: str | None, n_jobs: int) -> list:
+def _local_workers(accelerator: str, num_devices: int, device_ids: str | None, max_workers: int) -> list:
     """Build a list of WorkerSlot objects covering this host's accelerators."""
     if accelerator == "tenstorrent":
-        devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=max(n_jobs, 1))
+        devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=max_workers)
         if not devices:
             raise RuntimeError(
                 "No Tenstorrent devices found. Use --accelerator cpu/gpu or check /dev/tenstorrent."
@@ -963,7 +963,7 @@ def serve(host, port, workdir):
 @click.option("--debug", is_flag=True, help="Do not suppress worker output")
 def worker_cmd(connect, accelerator, num_devices, device_ids, debug):
     """Join a tt-boltz controller and run predictions on this machine's accelerators."""
-    workers = _local_workers(accelerator, num_devices, device_ids, n_jobs=1)
+    workers = _local_workers(accelerator, num_devices, device_ids, max_workers=10_000)
     click.echo(f"Connecting {len(workers)} worker{'s' if len(workers) != 1 else ''} to {connect}")
     if accelerator == "tenstorrent":
         click.echo(f"  Devices: {[int(w.device_id) for w in workers]}")
@@ -1264,7 +1264,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     # Mode 2: in-process scheduler + local workers (and optional --listen for remote workers).
     workers = _local_workers(
         "tenstorrent" if use_tt else accelerator,
-        num_devices, device_ids, n_jobs=len(jobs),
+        num_devices, device_ids, max_workers=max(len(jobs), 1),
     )
     devices = [int(w.device_id) for w in workers if w.accelerator == "tenstorrent"]
 
