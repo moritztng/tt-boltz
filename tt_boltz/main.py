@@ -70,20 +70,16 @@ import shutil
 import subprocess
 import tarfile
 import time
-import traceback
 import urllib.request
 import warnings
 import fcntl
-from queue import Empty
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
 
 import click
 import numpy as np
 import torch
 from rdkit import Chem
-from tqdm import tqdm
 
 from tt_boltz.data import const
 from tt_boltz.data.featurizer import Boltz2Featurizer
@@ -97,19 +93,17 @@ from tt_boltz.boltz2 import Boltz2
 from tt_boltz.distributed import (
     ControllerClient,
     ControllerServer,
-    HttpProgressQueue,
     job_payloads,
     worker_payload,
 )
 from tt_boltz.energy import DEFAULT_ENERGY_SAMPLE_HZ, PowerProfiler
-from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay, make_progress_fn
+from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay
 from tt_boltz.runtime import (
-    RunPlan,
-    assign_jobs_round_robin,
     build_local_workers,
     detect_tenstorrent_devices,
     discover_jobs,
 )
+from tt_boltz.worker import run_worker_loop
 
 ARTIFACT_BASE_URL = "https://storage.googleapis.com/tt-boltz-artifacts"
 URLS = {
@@ -801,291 +795,127 @@ def _build_worker_device_assignments(devices: list[int]) -> dict[int, dict[str, 
     return assignments
 
 
-def _configure_worker_device_assignment(device_id: int, cfg: dict) -> None:
-    """Apply the per-worker TT visibility assignment before importing ttnn."""
-    assignments = cfg.get("worker_device_assignments") or {}
-    assignment = assignments.get(device_id) or assignments.get(str(device_id)) or {}
-
-    os.environ["TT_VISIBLE_DEVICES"] = str(assignment.get("visible_devices", device_id))
-    os.environ["TT_BOLTZ_LOGICAL_DEVICE_ID"] = str(assignment.get("logical_device_id", 0))
-    if "mesh_graph_descriptor" in assignment and not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
-        os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(assignment["mesh_graph_descriptor"])
-
-
-def _predict_worker(device_id, file_paths, cfg, queue, progress_queue,
-                     suppress_output=True, worker_id=None):
-    """Worker process: run predictions on one TT device.
-
-    Each worker selects its TT device via TT_VISIBLE_DEVICES before importing
-    ttnn. P300 workers also set a 1x1 mesh descriptor so one-chip worker views
-    stay independent instead of opening a full two-chip P300 board context.
-    """
-    watchdog_queue = cfg.get("watchdog_queue")
-
-    worker_id = str(worker_id or device_id)
-    worker_meta = dict((cfg.get("worker_metadata") or {}).get(worker_id, {}))
-
-    def _emit(ev: dict):
-        try:
-            progress_queue.put_nowait(ev)
-            if watchdog_queue is not None:
-                watchdog_queue.put_nowait(ev)
-        except Exception:
-            pass
-
-    def _pq(event, **kw):
-        _emit({"dev": device_id, "worker": worker_id, "event": event, **worker_meta, **kw})
-
-    # Convert termination signals into Python exceptions so worker finally-blocks run.
-    def _handle_stop_signal(signum, _frame):
-        raise KeyboardInterrupt(f"worker {device_id} received signal {signum}")
-
-    try:
-        signal.signal(signal.SIGTERM, _handle_stop_signal)
-        signal.signal(signal.SIGINT, _handle_stop_signal)
-    except Exception:
-        pass
-
-    # Silence all output so it doesn't corrupt the Rich Live display.
-    # In subprocesses we redirect both stdout+stderr at the OS fd level
-    # (catches C++ library noise too). In the main process we only redirect
-    # Python stdout — Rich needs stderr there.
-    if suppress_output:
-        import sys as _sys
-        _devnull = open(os.devnull, "w")
-        _sys.stdout = _devnull
-        if mp.current_process().name != "MainProcess":
-            _sys.stderr = _devnull
-            _dn_fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(_dn_fd, 1)   # fd 1 = stdout  (C++ prints)
-            os.dup2(_dn_fd, 2)   # fd 2 = stderr  (C++ warnings/logs)
-            os.close(_dn_fd)
-
-    _pq("init", assigned=len(file_paths))
-    results = []
-    model = None
-    aff_model = None
-    try:
-        _configure_worker_device_assignment(device_id, cfg)
-        from tt_boltz.tenstorrent import set_fast_mode as _set_fast_mode
-        _set_fast_mode(cfg.get("fast", False))
-        torch_device = torch.device("cpu")
-        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
-        ccd = load_canonicals(Path(cfg["mol_dir"]))
-        prepare = partial(
-            prepare_features, ccd=ccd, mol_dir=Path(cfg["mol_dir"]),
-            msa_dir=Path(cfg["msa_dir"]), tokenizer=tokenizer, featurizer=featurizer,
-            use_msa=cfg["use_msa_server"], msa_url=cfg["msa_server_url"],
-            msa_strategy=cfg["msa_pairing_strategy"], msa_user=cfg["msa_server_username"],
-            msa_pass=cfg["msa_server_password"], api_key=cfg["api_key_value"],
-            max_msa=cfg["max_msa_seqs"], msa_db_path=cfg.get("msa_db_path"),
-            use_envdb=cfg.get("use_envdb", False),
-        )
-
-        _pq("loading")
-        model = Boltz2.load_from_checkpoint(
-            cfg["conf_ckpt"], **cfg["conf_kwargs"],
-        ).eval().to(torch_device)
-        if watchdog_queue is None:
-            model.progress_fn = make_progress_fn(progress_queue, device_id, worker_id, worker_meta)
-        else:
-            class _DualQueue:
-                def put_nowait(self, ev):
-                    _emit(ev)
-            model.progress_fn = make_progress_fn(_DualQueue(), device_id, worker_id, worker_meta)
-
-        affinity_items = []
-        struct_dir = Path(cfg["struct_dir"])
-
-        for p in file_paths:
-            path = Path(p)
-            row = {"id": path.stem, "status": "failed"}
-            t0 = time.time()
-            _pq("start", name=path.stem)
-            try:
-                _pq("stage", stage="msa")
-                feats, input_struct = prepare(path, method=cfg["method"])
-                _pq("stage", stage="saving")
-                batch = to_batch(feats, torch_device)
-                with torch.no_grad():
-                    pred = model.predict_step(batch)
-                _pq("stage", stage="saving")
-                metrics, best = write_result(
-                    pred, batch, input_struct, struct_dir,
-                    cfg["output_format"], cfg["write_pae"], cfg["write_pde"], cfg["write_embeddings"],
-                )
-                if metrics:
-                    row.update(metrics)
-                    row["status"] = "ok"
-                    row["runtime_s"] = round(time.time() - t0, 1)
-                    if feats["record"].affinity and best is not None:
-                        affinity_items.append((path, best))
-            except Exception as e:
-                traceback.print_exc()
-                row["error"] = str(e)[:80]
-            elapsed = round(time.time() - t0, 1)
-            _pq("done", name=path.stem, time=elapsed, status=row["status"],
-                error=row.get("error", ""))
-            results.append(row)
-            if "results_path" in cfg:
-                try: _append_result(row, Path(cfg["results_path"]))
-                except Exception: pass
-
-        if affinity_items:
-            aff_model = Boltz2.load_from_checkpoint(
-                cfg["aff_ckpt"], **cfg["aff_kwargs"],
-            ).eval().to(torch_device)
-            rows_by_id = {r["id"]: r for r in results}
-            aff_keys = ["affinity_pred_value", "affinity_probability_binary",
-                        "affinity_pred_value1", "affinity_probability_binary1",
-                        "affinity_pred_value2", "affinity_probability_binary2"]
-            for path, pred_struct in affinity_items:
-                try:
-                    feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
-                    batch = to_batch(feats, torch_device)
-                    with torch.no_grad():
-                        pred = aff_model.predict_step(batch)
-                    if not pred["exception"] and path.stem in rows_by_id:
-                        for ak in aff_keys:
-                            if ak in pred:
-                                rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
-                except Exception as e:
-                    traceback.print_exc()
-
-        failed = sum(1 for r in results if r["status"] == "failed")
-        queue.put({"ok": True, "dev": device_id, "worker": worker_id, "results": results, "failed": failed})
-    except BaseException as e:
-        traceback.print_exc()
-        queue.put({"ok": False, "dev": device_id, "worker": worker_id, "error": str(e), "results": results, "failed": len(file_paths)})
-    finally:
-        # Always attempt deterministic worker teardown.
-        try:
-            del aff_model
-        except Exception:
-            pass
-        try:
-            del model
-        except Exception:
-            pass
-        try:
-            import gc as _gc
-            _gc.collect()
-        except Exception:
-            pass
-        try:
-            from tt_boltz.tenstorrent import cleanup as _tt_cleanup
-            _tt_cleanup()
-        except Exception:
-            pass
-
-
-def _reset_tt_devices(device_ids: list[int], retries: int = 2) -> bool:
-    """Best-effort reset of multiple TT devices via tt-smi.
-
-    Returns True on success, False if all attempts fail.
-    device_ids are PCI indices used for TT_VISIBLE_DEVICES in workers.
-    """
-    if not device_ids:
-        return True
-    reset_arg = ",".join(str(d) for d in sorted(set(device_ids)))
-    for attempt in range(1, retries + 1):
-        try:
-            subprocess.run(["tt-smi", "-r", reset_arg], check=True)
-            return True
-        except subprocess.CalledProcessError:
-            if attempt < retries:
-                time.sleep(2.0)
-    return False
-
-
-def _remote_worker_loop(controller_url: str, worker_dict: dict, batch_size: int,
-                        poll_interval: float, debug: bool) -> None:
-    """Pull leased jobs from a controller and execute them on one local worker slot."""
-    client = ControllerClient(controller_url)
-    worker_id = worker_dict["worker_id"]
-    client.register_worker(worker_dict)
-    while True:
-        lease = client.lease(worker_dict, batch_size=batch_size)
-        jobs = lease.get("jobs") or []
-        if not jobs:
-            time.sleep(poll_interval)
-            continue
-
-        cfg = dict(lease["config"])
-
-        local_cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
-        local_cache.mkdir(parents=True, exist_ok=True)
-        download_all(local_cache)
-        cfg["conf_ckpt"] = str(local_cache / "boltz2_conf.ckpt")
-        cfg["aff_ckpt"] = str(local_cache / "boltz2_aff.ckpt")
-        cfg["mol_dir"] = str(local_cache / "mols")
-
-        cfg["worker_metadata"] = {
-            worker_id: {
-                "host": worker_dict["host"],
-                "accelerator": worker_dict["accelerator"],
-                "label": worker_dict["label"],
-            }
-        }
-        if worker_dict["accelerator"] == "tenstorrent":
-            cfg["worker_device_assignments"] = {
-                int(worker_dict["device_id"]): {
-                    "visible_devices": worker_dict.get("visible_devices") or worker_dict["device_id"],
-                    "logical_device_id": worker_dict.get("logical_device_id", 0),
-                    **(
-                        {"mesh_graph_descriptor": worker_dict["mesh_graph_descriptor"]}
-                        if worker_dict.get("mesh_graph_descriptor")
-                        else {}
-                    ),
-                }
-            }
-
-        ctx = mp.get_context("spawn")
-        result_queue = ctx.Queue()
-        progress_queue = HttpProgressQueue(client, lease["run_id"], worker_id)
-        _predict_worker(
-            int(worker_dict["device_id"]) if worker_dict["accelerator"] == "tenstorrent" else 0,
-            [job["path"] for job in jobs],
-            cfg,
-            result_queue,
-            progress_queue,
-            suppress_output=not debug,
-            worker_id=worker_id,
-        )
-        msg = result_queue.get()
-        completed_ids = set()
-        for row in msg.get("results", []):
-            client.complete(
-                lease["run_id"],
-                worker_id,
-                row,
-                {"event": "job_recorded", "name": row.get("id"), "status": row.get("status")},
+def _local_workers(accelerator: str, num_devices: int, device_ids: str | None, n_jobs: int) -> list:
+    """Build a list of WorkerSlot objects covering this host's accelerators."""
+    if accelerator == "tenstorrent":
+        devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=max(n_jobs, 1))
+        if not devices:
+            raise RuntimeError(
+                "No Tenstorrent devices found. Use --accelerator cpu/gpu or check /dev/tenstorrent."
             )
-            completed_ids.add(row.get("id"))
+        workers = build_local_workers("tenstorrent", [object()] * len(devices), devices)
+        assigns = _build_worker_device_assignments([int(w.device_id) for w in workers])
+        return [
+            replace(
+                w,
+                visible_devices=str(assigns.get(int(w.device_id), {}).get("visible_devices", w.device_id)),
+                logical_device_id=int(assigns.get(int(w.device_id), {}).get("logical_device_id", 0)),
+                mesh_graph_descriptor=assigns.get(int(w.device_id), {}).get("mesh_graph_descriptor"),
+            )
+            for w in workers
+        ]
+    return build_local_workers(accelerator, [object()], [0])
 
-        if not msg.get("ok", True):
-            err = (msg.get("error") or "worker crashed")[:200]
-            for job in jobs:
-                if job["id"] in completed_ids:
+
+def _spawn_worker_processes(controller_url: str, workers: list, debug: bool) -> list:
+    """Spawn one process per worker slot, each connected to the controller."""
+    ctx = mp.get_context("spawn")
+    procs = []
+    for worker in workers:
+        proc = ctx.Process(
+            target=run_worker_loop,
+            args=(controller_url, worker_payload(worker), debug),
+        )
+        proc.start()
+        procs.append(proc)
+    return procs
+
+
+def _stop_worker_processes(procs: list) -> None:
+    """Cleanly stop spawned worker processes."""
+    for proc in procs:
+        if proc.is_alive():
+            try:
+                os.kill(proc.pid, signal.SIGINT)
+            except Exception:
+                pass
+            proc.join(timeout=12)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=8)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=3)
+
+
+def _parse_listen(listen: str | None) -> tuple[str, int]:
+    """Parse a --listen value into (host, port). Defaults are 0.0.0.0:8765."""
+    if not listen:
+        return "127.0.0.1", 0
+    listen = listen.strip()
+    if listen.isdigit():
+        return "0.0.0.0", int(listen)
+    if ":" in listen:
+        host, _, port = listen.rpartition(":")
+        return (host or "0.0.0.0"), int(port)
+    return listen, 8765
+
+
+def _public_join_url(bind_host: str, port: int) -> str:
+    """Best-effort host name to print so remote workers can connect."""
+    if bind_host not in ("0.0.0.0", "::", ""):
+        return f"http://{bind_host}:{port}"
+    try:
+        import socket
+
+        return f"http://{socket.gethostname()}:{port}"
+    except Exception:
+        return f"http://<this-host>:{port}"
+
+
+def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: int,
+                debug: bool, log: bool) -> int:
+    """Stream events from a controller and render progress; return failed count."""
+    from queue import Queue as ThreadQueue
+
+    pq = ThreadQueue()
+    display = (
+        ProgressDisplay(pq, total=total, n_workers=n_workers) if not debug
+        else DebugDisplay(pq) if log else NullDisplay(pq)
+    )
+    display.start()
+    after = 0
+    failed = 0
+    try:
+        while True:
+            snapshot = client.events(run_id, after)
+            for ev in snapshot.get("events", []):
+                after = max(after, int(ev.get("seq", after)))
+                if ev.get("event") in ("run", "run_done"):
                     continue
-                client.complete(
-                    lease["run_id"],
-                    worker_id,
-                    {"id": job["id"], "status": "failed", "error": err},
-                    {
-                        "dev": worker_dict["device_id"],
-                        "worker": worker_id,
-                        "host": worker_dict["host"],
-                        "accelerator": worker_dict["accelerator"],
-                        "label": worker_dict["label"],
-                        "event": "done",
-                        "name": job["id"],
-                        "status": "failed",
-                        "time": 0,
-                        "error": err,
-                    },
-                )
-            time.sleep(poll_interval)
+                pq.put(ev)
+            if snapshot.get("status") in ("ok", "failed"):
+                failed = int(snapshot.get("failed") or 0)
+                break
+            time.sleep(0.5)
+    finally:
+        display.stop()
+    return failed
+
+
+def _persist_run_results(client: ControllerClient, run_id: str, results_path: Path) -> None:
+    """Merge per-run result rows from the controller into the local results.json."""
+    try:
+        new_rows = client.results(run_id)
+    except Exception:
+        return
+    existing = _load_results_resilient(results_path)
+    merged = {r["id"]: r for r in existing if isinstance(r, dict) and "id" in r}
+    for row in new_rows:
+        if isinstance(row, dict) and "id" in row:
+            merged[row["id"]] = row
+    _save_results(list(merged.values()), results_path)
+
 
 
 @click.group()
@@ -1125,64 +955,28 @@ def serve(host, port, workdir):
     server.serve_forever()
 
 
-@cli.group("worker")
-def worker_group():
-    """Manage worker processes for controller-backed runs."""
-
-
-@worker_group.command("start")
+@cli.command("worker")
 @click.option("--connect", required=True, help="Controller URL, e.g. http://pc.local:8765")
 @click.option("--accelerator", type=click.Choice(["gpu", "cpu", "tenstorrent"]), default="tenstorrent")
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
 @click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use")
-@click.option("--batch-size", default=1, show_default=True, type=int, help="Jobs leased per worker/model load")
-@click.option("--poll-interval", default=2.0, show_default=True, type=float, help="Seconds between empty lease polls")
 @click.option("--debug", is_flag=True, help="Do not suppress worker output")
-def worker_start(connect, accelerator, num_devices, device_ids, batch_size, poll_interval, debug):
-    """Start local worker slots that pull jobs from a controller."""
-    if accelerator == "tenstorrent":
-        devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=10_000)
-        if not devices:
-            raise RuntimeError("No Tenstorrent devices found. Use --accelerator cpu/gpu or check /dev/tenstorrent.")
-        workers = build_local_workers("tenstorrent", [object()] * len(devices), devices)
-        device_assignments = _build_worker_device_assignments([int(w.device_id) for w in workers])
-        workers = [
-            replace(
-                worker,
-                visible_devices=str(device_assignments.get(int(worker.device_id), {}).get("visible_devices", worker.device_id)),
-                logical_device_id=int(device_assignments.get(int(worker.device_id), {}).get("logical_device_id", 0)),
-                mesh_graph_descriptor=device_assignments.get(int(worker.device_id), {}).get("mesh_graph_descriptor"),
-            )
-            for worker in workers
-        ]
-    else:
-        workers = build_local_workers(accelerator, [object()], [0])
-
-    ctx = mp.get_context("spawn")
-    procs = []
+def worker_cmd(connect, accelerator, num_devices, device_ids, debug):
+    """Join a tt-boltz controller and run predictions on this machine's accelerators."""
+    workers = _local_workers(accelerator, num_devices, device_ids, n_jobs=1)
     click.echo(f"Connecting {len(workers)} worker{'s' if len(workers) != 1 else ''} to {connect}")
     if accelerator == "tenstorrent":
-        click.echo(f"  Detected TT devices: {[int(w.device_id) for w in workers]}")
+        click.echo(f"  Devices: {[int(w.device_id) for w in workers]}")
     for worker in workers:
-        payload = worker_payload(worker)
-        click.echo(f"  {payload['label']}")
-        proc = ctx.Process(
-            target=_remote_worker_loop,
-            args=(connect, payload, batch_size, poll_interval, debug),
-        )
-        proc.start()
-        procs.append(proc)
+        click.echo(f"  {worker.label}")
 
+    procs = _spawn_worker_processes(connect, workers, debug)
     try:
         for proc in procs:
             proc.join()
     except KeyboardInterrupt:
         click.echo("\nStopping workers...")
-        for proc in procs:
-            if proc.is_alive():
-                proc.terminate()
-        for proc in procs:
-            proc.join(timeout=5)
+        _stop_worker_processes(procs)
 
 
 _MSA_DBS = {
@@ -1316,14 +1110,14 @@ def msa(db, path, install_tools):
 @click.option("--affinity_checkpoint", type=click.Path(exists=True), default=None)
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
 @click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use (e.g. '0,2')")
-@click.option("--fast", is_flag=True, help="Make some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close")
-@click.option("--disable_watchdog", is_flag=True, help="Disable multi-device watchdog reset/retry logic")
+@click.option("--fast", is_flag=True, help="Use block-fp8 for some operations (slightly lower precision, faster)")
 @click.option("--debug", is_flag=True, help="Debug mode: no Rich display, no output suppression")
 @click.option("--log", is_flag=True, help="With --debug: print per-device stage progress")
-@click.option("--report-energy", "report_energy", is_flag=True, help="Report TT device energy and always write a power-vs-time plot (single-device TT runs)")
-@click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for both power and input_power in --report-energy")
-@click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Select which power channel(s) to measure with --report-energy")
-@click.option("--controller", default=lambda: os.environ.get("TT_BOLTZ_CONTROLLER"), help="Submit this run to a tt-boltz controller URL")
+@click.option("--report-energy", "report_energy", is_flag=True, help="Report TT device energy and write a power-vs-time plot (single-device TT runs)")
+@click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for power reporting")
+@click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
+@click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
+@click.option("--controller", default=None, help="Submit this run to a remote tt-boltz controller URL; do not run local workers")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1331,22 +1125,23 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
-            num_devices, device_ids, fast, disable_watchdog, debug, log,
-            report_energy, energy_sample_hz, energy_metric, controller):
+            num_devices, device_ids, fast, debug, log,
+            report_energy, energy_sample_hz, energy_metric, listen, controller):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
-    Model stays in memory across all predictions. Resume by re-running (skips existing outputs).
+    A scheduler runs in-process and dispatches jobs to local workers; pass
+    --listen to also accept workers from other machines, or --controller URL
+    to submit this run to a scheduler running elsewhere.
 
     \b
     Output:
-        msa/                # MSA cache (keyed by sequence hash, shared across runs)
+        msa/                # MSA cache (keyed by sequence hash)
         boltz_results_<name>/
             structures/     # one CIF per complex (pLDDT in B-factors)
-            results.json    # all confidence metrics + affinity
+            results.json    # confidence metrics + affinity
     """
     use_tt = accelerator == "tenstorrent"
-    if use_tt: accelerator = "cpu"
     if fast and not use_tt:
         click.echo("Note: --fast is only used with --accelerator tenstorrent; ignoring.")
     warnings.filterwarnings("ignore", ".*Tensor Cores.*")
@@ -1356,7 +1151,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     if seed is not None:
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-        if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
     os.environ.setdefault("CUEQ_DISABLE_AOT_TUNING", "1")
@@ -1365,7 +1161,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     cache.mkdir(parents=True, exist_ok=True)
     download_all(cache)
 
-    # Auto-detect local MSA DB (priority: --msa_db_path > ~/.boltz/msa_db)
     if not msa_db_path and not use_msa_server:
         default_msa_db = cache / "msa_db"
         if (default_msa_db / "UNIREF30_READY").exists():
@@ -1373,13 +1168,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     if use_envdb and use_msa_server:
         click.echo("Note: --use_envdb is only used with offline MSA; ignored with --use_msa_server")
-
     if use_envdb and not use_msa_server and not msa_db_path:
         raise RuntimeError(
             "--use_envdb requires offline MSA DB setup.\n"
             "Run: tt-boltz msa --db all  (or use --use_msa_server)"
         )
-
     if msa_db_path and not use_msa_server:
         _validate_offline_msa_db(Path(msa_db_path), require_envdb=use_envdb)
 
@@ -1400,59 +1193,11 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     jobs = discover_jobs(data, struct_dir, output_format, override)
     if not jobs:
         all_jobs = discover_jobs(data, struct_dir, output_format, override=True)
-        if all_jobs:
-            click.echo("All predictions complete")
-        else:
-            click.echo("No input files found")
-        return
-
-    if use_tt:
-        devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=len(jobs))
-        if not devices:
-            raise RuntimeError("No Tenstorrent devices found. Use --accelerator cpu/gpu or check /dev/tenstorrent.")
-        workers = build_local_workers("tenstorrent", jobs, devices)
-        device_assignments = _build_worker_device_assignments([int(w.device_id) for w in workers])
-        workers = [
-            replace(
-                worker,
-                visible_devices=str(device_assignments.get(int(worker.device_id), {}).get("visible_devices", worker.device_id)),
-                logical_device_id=int(device_assignments.get(int(worker.device_id), {}).get("logical_device_id", 0)),
-                mesh_graph_descriptor=device_assignments.get(int(worker.device_id), {}).get("mesh_graph_descriptor"),
-            )
-            for worker in workers
-        ]
-        devices = [int(worker.device_id) for worker in workers]
-    else:
-        devices = [0]
-        workers = build_local_workers(accelerator, jobs, devices)
-
-    plan = RunPlan(
-        data=data,
-        out_dir=out_dir_path,
-        result_dir=out,
-        msa_dir=msa_dir,
-        structure_dir=struct_dir,
-        jobs=jobs,
-        workers=workers,
-    )
-    files = [job.path for job in plan.jobs]
-    worker_assignments = assign_jobs_round_robin(plan.jobs, plan.workers)
-    n_workers = max(1, len(plan.workers))
-
-    if not files:
-        click.echo("No input files found")
+        click.echo("All predictions complete" if all_jobs else "No input files found")
         return
 
     if method and method.lower() not in const.method_types_ids:
         raise ValueError(f"Unknown method: {method}")
-
-    torch_device = torch.device("cuda:0" if accelerator == "gpu" and torch.cuda.is_available() else "cpu")
-
-    click.echo("")
-
-    # --- Model kwargs (built once, shared by single- and multi-device paths) ---
-    conf_ckpt = str(checkpoint or cache / "boltz2_conf.ckpt")
-    aff_ckpt = str(affinity_checkpoint or cache / "boltz2_aff.ckpt")
 
     _diffusion = {"step_scale": step_scale or 1.5, "gamma_0": 0.8, "gamma_min": 1.0,
                   "noise_scale": 1.003, "rho": 7, "sigma_min": 0.0001, "sigma_max": 160.0,
@@ -1462,7 +1207,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     _pairformer = {"num_blocks": 64, "num_heads": 16, "dropout": 0.0, "v2": True}
     _msa = {"subsample_msa": subsample_msa, "num_subsampled_msa": num_subsampled_msa,
             "use_paired_feature": True}
-
     conf_kwargs = dict(
         predict_args={"recycling_steps": recycling_steps, "sampling_steps": sampling_steps,
                       "diffusion_samples": diffusion_samples, "max_parallel_samples": max_parallel_samples},
@@ -1483,64 +1227,66 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     )
 
     results_path = out / "results.json"
-    results = [] if override else _load_results_resilient(results_path)
 
-    controller_worker_cfg = {
-        "conf_ckpt": conf_ckpt, "aff_ckpt": aff_ckpt,
+    worker_cfg = {
+        "conf_ckpt": str(checkpoint or cache / "boltz2_conf.ckpt"),
+        "aff_ckpt": str(affinity_checkpoint or cache / "boltz2_aff.ckpt"),
         "conf_kwargs": conf_kwargs, "aff_kwargs": aff_kwargs,
-        "mol_dir": str(mol_dir), "msa_dir": str(plan.msa_dir), "struct_dir": str(plan.structure_dir),
+        "mol_dir": str(mol_dir), "msa_dir": str(msa_dir), "struct_dir": str(struct_dir),
         "method": method, "output_format": output_format,
         "write_pae": write_pae, "write_pde": write_pde, "write_embeddings": write_embeddings,
         "use_msa_server": use_msa_server, "msa_db_path": msa_db_path, "use_envdb": use_envdb,
         "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
         "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
         "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
-        "results_path": str(results_path),
         "fast": fast,
     }
+    run_payload = {
+        "data": str(data),
+        "out_dir": str(out_dir_path),
+        "result_dir": str(out),
+        "jobs": job_payloads(jobs),
+        "config": worker_cfg,
+    }
+
+    # Mode 1: submit to a remote controller; this process only streams progress.
     if controller:
         if report_energy:
             click.echo("Note: --report-energy is local-only; ignoring for controller run")
         client = ControllerClient(controller)
-        submitted = client.create_run({
-            "data": str(plan.data),
-            "out_dir": str(plan.out_dir),
-            "result_dir": str(plan.result_dir),
-            "jobs": job_payloads(plan.jobs),
-            "config": controller_worker_cfg,
-        })
-        run_id = submitted["run_id"]
+        run_id = client.create_run(run_payload)["run_id"]
         click.echo(f"Submitted run {run_id} to {controller}")
-        from queue import Queue as ThreadQueue
-        pq = ThreadQueue()
-        display = (ProgressDisplay(pq, total=len(files), n_workers=0) if not debug
-                   else DebugDisplay(pq) if log else NullDisplay(pq))
-        display.start()
-        after = 0
-        failed = 0
-        try:
-            while True:
-                snapshot = client.events(run_id, after)
-                for ev in snapshot.get("events", []):
-                    after = max(after, int(ev.get("seq", after)))
-                    if ev.get("event") in ("run", "run_done"):
-                        continue
-                    pq.put(ev)
-                if snapshot.get("status") in ("ok", "failed"):
-                    failed = int(snapshot.get("failed") or 0)
-                    break
-                time.sleep(0.5)
-        finally:
-            display.stop()
-        click.echo(f"\nDone: {len(files) - failed} ok, {failed} failed — {results_path}")
+        failed = _stream_run(client, run_id, total=len(jobs), n_workers=0, debug=debug, log=log)
+        _persist_run_results(client, run_id, results_path)
+        click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
         return
 
+    # Mode 2: in-process scheduler + local workers (and optional --listen for remote workers).
+    workers = _local_workers(
+        "tenstorrent" if use_tt else accelerator,
+        num_devices, device_ids, n_jobs=len(jobs),
+    )
+    devices = [int(w.device_id) for w in workers if w.accelerator == "tenstorrent"]
+
+    listen_host, listen_port = _parse_listen(listen)
+    db_path = out / ".controller.sqlite3"
+    try:
+        db_path.unlink()
+    except FileNotFoundError:
+        pass
+    server = ControllerServer(listen_host, listen_port, db_path)
+    server.serve_in_background()
+    controller_url = f"http://127.0.0.1:{server.port}"
+    if listen:
+        click.echo(
+            f"Workers may join: tt-boltz worker --connect "
+            f"{_public_join_url(listen_host, server.port)}"
+        )
+
     energy_profiler = None
-    energy_csv_path = out / "power_profile.csv"
-    energy_plot_path = out / "power_profile.png"
     if report_energy:
         if not use_tt:
-            click.echo("Energy profiling is currently supported only for --accelerator=tenstorrent; skipping")
+            click.echo("Energy profiling currently requires --accelerator=tenstorrent; skipping")
         elif len(devices) != 1:
             click.echo("Energy profiling currently supports one TT device only; skipping")
         else:
@@ -1553,377 +1299,29 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 )
                 energy_profiler.start()
                 click.echo(
-                    f"Energy profiler: device={devices[0]} metric={energy_metric} target_hz={energy_sample_hz:.2f}"
+                    f"Energy profiler: device={devices[0]} metric={energy_metric} hz={energy_sample_hz:.2f}"
                 )
             except Exception as e:
                 click.echo(f"Energy profiler unavailable: {e}")
                 energy_profiler = None
 
-    # =====================================================================
-    # TT path — reuses _predict_worker for all cases:
-    #   1 device  → call worker directly (no subprocess overhead)
-    #   N devices → one subprocess per card, shared kernel cache
-    # =====================================================================
-    if use_tt:
-        worker_cfg = {
-            "conf_ckpt": conf_ckpt, "aff_ckpt": aff_ckpt,
-            "conf_kwargs": conf_kwargs, "aff_kwargs": aff_kwargs,
-            "mol_dir": str(mol_dir), "msa_dir": str(plan.msa_dir), "struct_dir": str(plan.structure_dir),
-            "method": method, "output_format": output_format,
-            "write_pae": write_pae, "write_pde": write_pde, "write_embeddings": write_embeddings,
-            "use_msa_server": use_msa_server, "msa_db_path": msa_db_path, "use_envdb": use_envdb,
-            "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
-            "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
-            "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
-            "results_path": str(results_path),
-            "fast": fast,
-            "worker_device_assignments": {
-                int(worker.device_id): {
-                    "visible_devices": worker.visible_devices or worker.device_id,
-                    "logical_device_id": worker.logical_device_id,
-                    **({"mesh_graph_descriptor": worker.mesh_graph_descriptor} if worker.mesh_graph_descriptor else {}),
-                }
-                for worker in plan.workers
-                if worker.accelerator == "tenstorrent"
-            },
-            "worker_metadata": {
-                worker.worker_id: {
-                    "host": worker.host,
-                    "accelerator": worker.accelerator,
-                    "label": worker.label,
-                }
-                for worker in plan.workers
-            },
-        }
-        import sys as _sys
-        ctx = mp.get_context("spawn")
-        q = ctx.Queue()
-        failed = 0
+    client = ControllerClient(controller_url)
+    run_id = client.create_run(run_payload)["run_id"]
+    procs = _spawn_worker_processes(controller_url, workers, debug)
+    failed = 0
+    try:
+        failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers), debug=debug, log=log)
+    finally:
+        _stop_worker_processes(procs)
+        server.shutdown()
 
-        pq = ctx.Queue()
-        suppress = not debug
-        display = (ProgressDisplay(pq, total=len(files), n_workers=n_workers) if not debug
-                   else DebugDisplay(pq) if log else NullDisplay(pq))
-        display.start()
-        procs = {}
+    _persist_run_results(client, run_id, results_path)
 
-        def _stop_worker_processes():
-            # Try graceful interrupt first so worker cleanup/finally can close devices.
-            for worker_key, proc in list(procs.items()):
-                if proc.is_alive():
-                    try:
-                        os.kill(proc.pid, signal.SIGINT)
-                    except Exception:
-                        pass
-                    proc.join(timeout=12)
-                    if proc.is_alive():
-                        proc.terminate()
-                        proc.join(timeout=8)
-                    if proc.is_alive():
-                        proc.kill()
-                        proc.join(timeout=3)
-                procs.pop(worker_key, None)
-
-        try:
-            if n_workers == 1:
-                worker = plan.workers[0]
-                os.environ["TT_VISIBLE_DEVICES"] = str(worker.visible_devices or worker.device_id)
-                assigned = worker_assignments[worker.worker_id]
-                _predict_worker(int(worker.device_id), [str(job.path) for job in assigned], worker_cfg, q, pq,
-                                suppress_output=suppress, worker_id=worker.worker_id)
-                msg = q.get()
-                results.extend(msg.get("results", []))
-                failed = msg.get("failed", 0)
-            else:
-                if disable_watchdog:
-                    if debug and log:
-                        click.echo("[watchdog] disabled")
-                    for worker in plan.workers:
-                        bucket = worker_assignments[worker.worker_id]
-                        if not bucket:
-                            continue
-                        dev = int(worker.device_id)
-                        p = ctx.Process(
-                            target=_predict_worker,
-                            args=(dev, [str(job.path) for job in bucket], worker_cfg, q, pq),
-                            kwargs={"suppress_output": suppress, "worker_id": worker.worker_id},
-                        )
-                        p.start()
-                        procs[worker.worker_id] = p
-
-                    while procs:
-                        msg = q.get()
-                        worker_key = str(msg.get("worker", msg.get("dev")))
-                        results.extend(msg.get("results", []))
-                        failed += msg.get("failed", 0)
-                        p = procs.pop(worker_key, None)
-                        if p is not None:
-                            p.join(timeout=1)
-                else:
-                    watchdog_q = ctx.Queue()
-                    worker_cfg["watchdog_queue"] = watchdog_q
-
-                    # Per-worker state for restart-on-hang.
-                    states = {}
-                    max_retries = 2
-                    idle_timeout_s = 900.0
-                    check_log_interval_s = 60.0
-                    if debug and log:
-                        click.echo(f"[watchdog] enabled: reset worker after {int(idle_timeout_s)}s without updates")
-
-                    def _spawn(worker_key: str):
-                        st = states[worker_key]
-                        dev = st["dev"]
-                        remaining = st["bucket"][st["next_idx"]:]
-                        if not remaining:
-                            procs.pop(worker_key, None)
-                            return
-                        p = ctx.Process(
-                            target=_predict_worker,
-                            args=(dev, [str(job.path) for job in remaining], worker_cfg, q, pq),
-                            kwargs={"suppress_output": suppress, "worker_id": worker_key},
-                        )
-                        p.start()
-                        procs[worker_key] = p
-                        st["last_event"] = time.time()
-                        st["current"] = None
-
-                    for worker in plan.workers:
-                        bucket = worker_assignments[worker.worker_id]
-                        if not bucket:
-                            continue
-                        dev = int(worker.device_id)
-                        states[worker.worker_id] = {
-                            "dev": dev,
-                            "label": worker.label,
-                            "bucket": bucket,
-                            "next_idx": 0,
-                            "current": None,
-                            "last_event": time.time(),
-                            "last_check_log": 0.0,
-                            "retries": {},
-                        }
-                        _spawn(worker.worker_id)
-
-                    def _advance_done(st, name: str):
-                        while st["next_idx"] < len(st["bucket"]) and st["bucket"][st["next_idx"]].id != name:
-                            st["next_idx"] += 1
-                        if st["next_idx"] < len(st["bucket"]) and st["bucket"][st["next_idx"]].id == name:
-                            st["next_idx"] += 1
-
-                    def _stop_all_workers():
-                        _stop_worker_processes()
-                        # Let driver handles drain before reset/restart.
-                        time.sleep(1.5)
-                        now = time.time()
-                        for st in states.values():
-                            st["last_event"] = now
-                            st["current"] = None
-
-                    while procs:
-                        # Drain watchdog progress events.
-                        while True:
-                            try:
-                                ev = watchdog_q.get_nowait()
-                            except Empty:
-                                break
-                            worker_key = str(ev.get("worker", ev.get("dev")))
-                            if worker_key not in states:
-                                continue
-                            st = states[worker_key]
-                            st["last_event"] = time.time()
-                            if ev.get("event") == "start":
-                                st["current"] = ev.get("name")
-                            elif ev.get("event") == "done":
-                                _advance_done(st, ev.get("name", ""))
-                                st["current"] = None
-
-                        # Drain worker completion messages.
-                        while True:
-                            try:
-                                msg = q.get_nowait()
-                            except Empty:
-                                break
-                            worker_key = str(msg.get("worker", msg.get("dev")))
-                            results.extend(msg.get("results", []))
-                            failed += msg.get("failed", 0)
-                            if worker_key in states:
-                                # Worker processed all currently assigned files.
-                                states[worker_key]["next_idx"] = len(states[worker_key]["bucket"])
-                                states[worker_key]["current"] = None
-                            p = procs.pop(worker_key, None)
-                            if p is not None:
-                                p.join(timeout=1)
-                            if worker_key in states:
-                                _spawn(worker_key)
-
-                        # Watchdog: no update for timeout => full worker restart + reset all selected devices.
-                        now = time.time()
-                        for worker_key, p in list(procs.items()):
-                            st = states[worker_key]
-                            dev = st["dev"]
-                            if not p.is_alive():
-                                continue
-                            if st["current"] is None:
-                                continue
-                            idle_s = now - st["last_event"]
-                            if idle_s >= 60 and now - st["last_check_log"] >= check_log_interval_s:
-                                click.echo(f"[watchdog] check {st['label']}: {st['current']} idle {int(idle_s)}s")
-                                st["last_check_log"] = now
-                            if idle_s <= idle_timeout_s:
-                                continue
-
-                            target = st["current"]
-                            tries = st["retries"].get(target, 0) + 1
-                            st["retries"][target] = tries
-                            click.echo(f"\n[watchdog] {st['label']} stalled on {target} (>{int(idle_timeout_s)}s no updates)")
-
-                            if tries > max_retries:
-                                click.echo(f"[watchdog] giving up on {target} after {max_retries} retries")
-                                row = {"id": target, "status": "failed", "error": "watchdog timeout"}
-                                results.append(row)
-                                failed += 1
-                                if "results_path" in worker_cfg:
-                                    try:
-                                        _append_result(row, Path(worker_cfg["results_path"]))
-                                    except Exception:
-                                        pass
-                                _advance_done(st, target)
-                                _stop_all_workers()
-                                for restart_worker in list(states):
-                                    _spawn(restart_worker)
-                                continue
-
-                            click.echo(
-                                f"[watchdog] restarting all workers and resetting devices {','.join(str(x) for x in devices)} "
-                                f"(attempt {tries}/{max_retries} for {target})"
-                            )
-                            _stop_all_workers()
-                            try:
-                                reset_ok = _reset_tt_devices(devices)
-                                time.sleep(2.0)
-                            except Exception as e:
-                                reset_ok = False
-                                click.echo(f"[watchdog] reset call raised: {e}; continuing retry")
-                            if not reset_ok:
-                                click.echo("[watchdog] reset unavailable; continuing retry without reset")
-                            for restart_worker in list(states):
-                                _spawn(restart_worker)
-                            break
-
-                        time.sleep(0.5)
-        except KeyboardInterrupt:
-            click.echo("\nInterrupted: stopping TT workers...")
-            _stop_worker_processes()
-            raise
-        finally:
-            _sys.stdout = _sys.__stdout__
-            display.stop()
-
-    # =====================================================================
-    # CPU / GPU path: inline, single process (with progress display)
-    # =====================================================================
-    else:
-        import sys as _sys
-
-        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
-        ccd = load_canonicals(mol_dir)
-        prepare = partial(prepare_features, ccd=ccd, mol_dir=mol_dir, msa_dir=msa_dir,
-                          tokenizer=tokenizer, featurizer=featurizer,
-                          use_msa=use_msa_server, msa_url=msa_server_url,
-                          msa_strategy=msa_pairing_strategy, msa_user=msa_server_username,
-                          msa_pass=msa_server_password, api_key=api_key_value,
-                          max_msa=max_msa_seqs, msa_db_path=msa_db_path,
-                          use_envdb=use_envdb)
-
-        from queue import Queue as ThreadQueue
-        pq = ThreadQueue()
-        worker = plan.workers[0]
-        worker_meta = {
-            "dev": worker.device_id,
-            "worker": worker.worker_id,
-            "host": worker.host,
-            "accelerator": worker.accelerator,
-            "label": worker.label,
-        }
-        display = (ProgressDisplay(pq, total=len(files), n_workers=n_workers) if not debug
-                   else DebugDisplay(pq) if log else NullDisplay(pq))
-        display.start()
-        pq.put({**worker_meta, "event": "init", "assigned": len(files)})
-
-        _saved_stdout = _sys.stdout
-        if not debug:
-            _sys.stdout = open(os.devnull, "w")
-
-        try:
-            pq.put({**worker_meta, "event": "loading"})
-            model = Boltz2.load_from_checkpoint(conf_ckpt, **conf_kwargs).eval().to(torch_device)
-            model.progress_fn = make_progress_fn(pq, worker.device_id, worker.worker_id, worker_meta)
-
-            affinity_queue = []
-            failed = 0
-            for path in files:
-                row = {"id": path.stem, "status": "failed"}
-                t0 = time.time()
-                pq.put({**worker_meta, "event": "start", "name": path.stem})
-                try:
-                    pq.put({**worker_meta, "event": "stage", "stage": "msa"})
-                    feats, input_struct = prepare(path, method=method)
-                    batch = to_batch(feats, torch_device)
-                    with torch.no_grad():
-                        pred = model.predict_step(batch)
-                    pq.put({**worker_meta, "event": "stage", "stage": "saving"})
-                    metrics, best = write_result(pred, batch, input_struct, struct_dir,
-                                                 output_format, write_pae, write_pde, write_embeddings)
-                    if metrics:
-                        row.update(metrics)
-                        row["status"] = "ok"
-                        row["runtime_s"] = round(time.time() - t0, 1)
-                        if feats["record"].affinity and best is not None:
-                            affinity_queue.append((path, best))
-                except Exception as e:
-                    traceback.print_exc()
-                    row["error"] = str(e)[:80]
-                elapsed = round(time.time() - t0, 1)
-                if row["status"] != "ok":
-                    failed += 1
-                pq.put({**worker_meta, "event": "done", "name": path.stem,
-                        "time": elapsed, "status": row["status"],
-                        "error": row.get("error", "")})
-                results.append(row)
-                _save_results(results, results_path)
-            del model
-
-            if affinity_queue:
-                aff_model = Boltz2.load_from_checkpoint(aff_ckpt, **aff_kwargs).eval().to(torch_device)
-                rows_by_id = {r["id"]: r for r in results}
-                aff_keys = ["affinity_pred_value", "affinity_probability_binary",
-                            "affinity_pred_value1", "affinity_probability_binary1",
-                            "affinity_pred_value2", "affinity_probability_binary2"]
-                for path, pred_struct in affinity_queue:
-                    try:
-                        feats, _ = prepare(path, method="other", affinity=True, pred_structure=pred_struct)
-                        batch = to_batch(feats, torch_device)
-                        with torch.no_grad():
-                            pred = aff_model.predict_step(batch)
-                        if not pred["exception"] and path.stem in rows_by_id:
-                            for ak in aff_keys:
-                                if ak in pred:
-                                    rows_by_id[path.stem][ak] = round(pred[ak].item(), 6)
-                    except Exception as e:
-                        traceback.print_exc()
-        finally:
-            _sys.stdout = _saved_stdout
-            display.stop()
-
-    # Preserve per-target rows that may have been atomically appended by workers.
-    existing_rows = _load_results_resilient(results_path)
-    merged = {r["id"]: r for r in existing_rows}
-    merged.update({r["id"]: r for r in results})
-    _save_results(list(merged.values()), results_path)
     if energy_profiler is not None:
         energy_profiler.stop()
         summary = energy_profiler.summarize()
+        energy_csv_path = out / "power_profile.csv"
+        energy_plot_path = out / "power_profile.png"
         energy_profiler.write_csv(energy_csv_path)
         click.echo("\nEnergy summary (one TT device)")
         click.echo(f"  device_id:      {devices[0]}")
@@ -1956,11 +1354,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             energy_plot_path,
             title=f"TT device {devices[0]} power vs time",
         )
-        if wrote_plot:
-            click.echo(f"  power_plot:     {energy_plot_path}")
-        else:
-            click.echo("  power_plot:     failed (matplotlib not available)")
-    click.echo(f"\nDone: {len(files) - failed} ok, {failed} failed — {results_path}")
+        click.echo(f"  power_plot:     {energy_plot_path}" if wrote_plot else "  power_plot:     failed (matplotlib not available)")
+
+    click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
 
 
 @cli.command()

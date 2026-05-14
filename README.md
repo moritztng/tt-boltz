@@ -67,32 +67,29 @@ tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
 
 ### Multi-Machine Prediction
 
-For multiple computers, run one lightweight controller and connect workers to it.
-The command still submits the same folder of YAML/FASTA inputs; the only extra
-piece is the controller URL. Use a shared filesystem so all machines see the
-same input, cache, MSA, and result paths.
+The same `tt-boltz predict` command scales from one machine to many. To accept
+remote workers, add `--listen [PORT]`; on every other machine, point
+`tt-boltz worker` at it. Use a shared filesystem so all hosts see the same
+input, MSA, and result paths.
 
-On the controller machine:
-
-```bash
-tt-boltz serve --host 0.0.0.0 --port 8765 --workdir ~/boltz-controller
-```
-
-On each compute machine:
+On the machine you want to drive the run (also contributes its cards):
 
 ```bash
-tt-boltz worker start --connect http://pc.local:8765
+tt-boltz predict /shared/boltz/proteins --out_dir /shared/boltz/results --listen 8765 --use_msa_server --fast
 ```
 
-Submit a run:
+On every additional compute machine:
 
 ```bash
-tt-boltz predict /shared/boltz/proteins --out_dir /shared/boltz/results --controller http://pc.local:8765 --use_msa_server --fast
+tt-boltz worker --connect http://pc.local:8765
 ```
 
-You can also set `TT_BOLTZ_CONTROLLER=http://pc.local:8765` and keep using the
-regular `tt-boltz predict ...` command. The realtime display shows each active
-worker by host and device, such as `pc:tt0` or `quietbox:tt3`.
+The realtime display shows each active worker by host and device, for example
+`pc:tt0` or `quietbox:tt3`. Models load once per worker process, so jobs flow
+through without per-protein reloads.
+
+If you prefer to run the scheduler separately (e.g. as a persistent service),
+use `tt-boltz serve` instead, then submit runs with `tt-boltz predict --controller URL`.
 
 ### Offline MSA (Optional)
 

@@ -272,6 +272,16 @@ class ControllerStore:
                 self.add_event(conn, run_id, None, {"event": "run_done", "status": run_status, "failed": failed})
         return {"ok": True}
 
+    def results(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [
+                json.loads(row["result_json"])
+                for row in conn.execute(
+                    "SELECT result_json FROM jobs WHERE run_id=? AND result_json IS NOT NULL ORDER BY updated_at",
+                    (run_id,),
+                )
+            ]
+
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         with self._connect() as conn:
             events = [
@@ -335,13 +345,26 @@ class ControllerServer:
                     query = urllib.parse.parse_qs(parsed.query)
                     after = int((query.get("after") or ["0"])[0])
                     _json_response(self, 200, store.events(run_id, after))
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/results"):
+                    run_id = parsed.path.split("/")[2]
+                    _json_response(self, 200, {"results": store.results(run_id)})
                 else:
                     _json_response(self, 404, {"error": "not found"})
 
         self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.host, self.port = self.httpd.server_address[:2]
 
     def serve_forever(self) -> None:
         self.httpd.serve_forever()
+
+    def serve_in_background(self) -> threading.Thread:
+        thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        thread.start()
+        return thread
+
+    def shutdown(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 class ControllerClient:
@@ -381,6 +404,9 @@ class ControllerClient:
 
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         return self._request("GET", f"/runs/{run_id}/events?after={after}")
+
+    def results(self, run_id: str) -> list[dict[str, Any]]:
+        return self._request("GET", f"/runs/{run_id}/results").get("results", [])
 
 
 class HttpProgressQueue:
