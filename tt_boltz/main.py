@@ -1012,6 +1012,14 @@ def _remote_worker_loop(controller_url: str, worker_dict: dict, batch_size: int,
             continue
 
         cfg = dict(lease["config"])
+
+        local_cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
+        local_cache.mkdir(parents=True, exist_ok=True)
+        download_all(local_cache)
+        cfg["conf_ckpt"] = str(local_cache / "boltz2_conf.ckpt")
+        cfg["aff_ckpt"] = str(local_cache / "boltz2_aff.ckpt")
+        cfg["mol_dir"] = str(local_cache / "mols")
+
         cfg["worker_metadata"] = {
             worker_id: {
                 "host": worker_dict["host"],
