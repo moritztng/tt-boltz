@@ -67,6 +67,7 @@ import os
 import random
 import signal
 import shutil
+import tempfile
 import subprocess
 import tarfile
 import time
@@ -950,17 +951,19 @@ def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
 
 
 @contextmanager
-def _scheduler_session(listen: str | None, db_path: Path, workers: list, debug: bool):
+def _scheduler_session(listen: str | None, workers: list, debug: bool):
     """Start an in-process scheduler, spawn local worker subprocesses against
     it, and yield (client, public_join_url) for the duration of the run.
 
-    public_join_url is None unless --listen was passed; when set, it's the
-    address a remote `tt-boltz worker --connect ...` should target."""
+    The scheduler keeps its SQLite state in a private temp directory and
+    discards it on exit, so a run never leaves bookkeeping artifacts in the
+    user's results directory. public_join_url is None unless --listen was
+    passed; when set, it's the address a remote `tt-boltz worker --connect
+    ...` should target.
+    """
     listen_host, listen_port = _parse_listen(listen)
-    try:
-        db_path.unlink()
-    except FileNotFoundError:
-        pass
+    tmpdir = Path(tempfile.mkdtemp(prefix="tt-boltz-scheduler-"))
+    db_path = tmpdir / "controller.sqlite3"
     server = ControllerServer(listen_host, listen_port, db_path)
     server.serve_in_background()
     url = f"http://127.0.0.1:{server.port}"
@@ -971,6 +974,7 @@ def _scheduler_session(listen: str | None, db_path: Path, workers: list, debug: 
     finally:
         _stop_worker_processes(procs)
         server.shutdown()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _persist_run_results(client: ControllerClient, run_id: str, results_path: Path) -> None:
@@ -1321,7 +1325,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 click.echo(f"Energy profiler unavailable: {e}")
                 energy_profiler = None
 
-    with _scheduler_session(listen, out / ".controller.sqlite3", workers, debug) as (client, public_url):
+    with _scheduler_session(listen, workers, debug) as (client, public_url):
         if public_url:
             click.echo(f"Workers may join: tt-boltz worker --connect {public_url}")
         run_id = client.create_run(run_payload)["run_id"]

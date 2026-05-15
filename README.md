@@ -54,40 +54,17 @@ Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 
 `predict` accepts either a single YAML/FASTA file or a directory containing many input files.
 
-Prediction uses one runtime architecture for every scale: inputs become jobs,
-jobs are assigned to workers, and workers write into one result directory. On a
-single machine the workers are local CPU/GPU/TT slots; on a multi-card QuietBox
-each card is shown as its own worker. The live display names each worker by host
-and device, for example `quietbox:tt0`, so it is clear where every protein is
-running while keeping the command the same:
+A live display shows the progress of each protein. On a multi-card machine such
+as a QuietBox or Galaxy server, every card is used in parallel and labelled in
+the display (`quietbox:tt0`, `quietbox:tt1`, ...). Models load once per card
+and stay resident, so jobs flow through without per-protein reloads:
 
 ```bash
 tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
 ```
 
-### Multi-Machine Prediction
-
-The same `tt-boltz predict` command scales from one machine to many. To accept
-remote workers, add `--listen [PORT]`; on every other machine, point
-`tt-boltz worker` at it. No shared filesystem is required — inputs ship to
-workers and output structures ship back over HTTP. Each machine keeps its own
-model cache in `~/.boltz/` so checkpoints are only downloaded once per host.
-
-On the machine driving the run (also contributes its cards):
-
-```bash
-tt-boltz predict ./proteins --out_dir ./results --listen 8765 --use_msa_server --fast
-```
-
-On every additional compute machine:
-
-```bash
-tt-boltz worker --connect http://pc.local:8765
-```
-
-The realtime display names each active worker by host and device, for example
-`pc:tt0` or `quietbox:tt3`. Models load once per worker process, so jobs flow
-through without per-protein reloads.
+If you have additional machines with Tenstorrent cards, you can add them to a
+single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-prediction).
 
 ### Offline MSA (Optional)
 
@@ -315,6 +292,7 @@ templates:
 | `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
 | `--report-energy` | `False` | Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
 | `--energy-metric` | `both` | Choose power channel(s): `tdp`, `input`, or `both` |
+| `--listen` | — | Accept worker connections from other machines; see [Multi-Machine Prediction](#optional-multi-machine-prediction) |
 | `--energy-sample-hz` | `20.0` | Sampling rate in Hz for both `power_w` and `input_power_w` channels |
 
 **Affinity-Specific Options:**
@@ -372,6 +350,31 @@ Runtime for a 686 amino acid protein:
 | Nvidia T4 | ~9 min |
 | Tenstorrent Blackhole p150 | ~1 min |
 | Nvidia RTX 5090 | ~1 min |
+
+## Optional: Multi-Machine Prediction
+
+If you have several Tenstorrent machines (for example a workstation plus a
+QuietBox), the same `predict` run can use cards across all of them. No shared
+filesystem is required — inputs ship to workers and output structures ship
+back over HTTP. Each machine keeps its own model cache in `~/.boltz/` so
+checkpoints are only downloaded once per host.
+
+On the machine driving the run (which also contributes its own cards), add
+`--listen` with a port:
+
+```bash
+tt-boltz predict ./proteins --out_dir ./results --listen 8765 --use_msa_server --fast
+```
+
+On every additional machine:
+
+```bash
+tt-boltz worker --connect http://pc.local:8765
+```
+
+The realtime display names every active worker by host and device, for example
+`pc:tt0` or `quietbox:tt3`. Models load once per worker process, so jobs flow
+through without per-protein reloads.
 
 ## Optional: Energy Measurement
 
