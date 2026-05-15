@@ -1195,6 +1195,8 @@ def msa(db, path, install_tools):
 @click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
 @click.option("--controller", default=None, help="Submit this run to a remote tt-boltz controller URL; do not run local workers")
+@click.option("--disable_watchdog", is_flag=True, hidden=True,
+              help="Deprecated: retries are now handled by the scheduler; kept for backwards compatibility")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1203,7 +1205,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, debug, log,
-            report_energy, energy_sample_hz, energy_metric, listen, controller):
+            report_energy, energy_sample_hz, energy_metric, listen, controller,
+            disable_watchdog):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
