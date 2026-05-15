@@ -73,6 +73,7 @@ import time
 import urllib.request
 import warnings
 import fcntl
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -874,12 +875,15 @@ def _public_join_url(bind_host: str, port: int) -> str:
 
 
 def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: int,
-                debug: bool, log: bool, results_path: Path | None = None) -> int:
+                debug: bool, log: bool, results_path: Path | None = None,
+                struct_dir: Path | None = None) -> int:
     """Stream events from a controller and render progress; return failed count.
 
-    If results_path is given, each completed job's row is merged into
-    results.json on the fly so interrupted runs preserve partial progress.
+    On every done event we fetch that job's output files from the controller
+    and write them under struct_dir, and merge its result row into
+    results.json. Interrupted runs preserve every protein finished so far.
     """
+    import base64
     from queue import Queue as ThreadQueue
 
     pq = ThreadQueue()
@@ -894,6 +898,8 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
     if results_path is not None:
         rows_by_id = {r["id"]: r for r in _load_results_resilient(results_path)
                       if isinstance(r, dict) and "id" in r}
+    if struct_dir is not None:
+        struct_dir.mkdir(parents=True, exist_ok=True)
     try:
         while True:
             snapshot = client.events(run_id, after)
@@ -901,14 +907,17 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
                 after = max(after, int(ev.get("seq", after)))
                 if ev.get("event") in ("run", "run_done"):
                     continue
-                if results_path is not None and ev.get("event") == "done":
+                if ev.get("event") == "done":
                     row = ev.get("row")
                     if isinstance(row, dict) and "id" in row:
-                        rows_by_id[row["id"]] = row
-                        try:
-                            _save_results(list(rows_by_id.values()), results_path)
-                        except Exception:
-                            pass
+                        if results_path is not None:
+                            rows_by_id[row["id"]] = row
+                            try:
+                                _save_results(list(rows_by_id.values()), results_path)
+                            except Exception:
+                                pass
+                        if struct_dir is not None and row.get("status") == "ok":
+                            _write_job_outputs(client, run_id, row["id"], struct_dir, base64)
                 pq.put(ev)
             if snapshot.get("status") in ("ok", "failed"):
                 failed = int(snapshot.get("failed") or 0)
@@ -917,6 +926,58 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
     finally:
         display.stop()
     return failed
+
+
+def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
+                       struct_dir: Path, b64) -> None:
+    """Fetch a completed job's output files and write them under struct_dir."""
+    try:
+        outputs = client.job_outputs(run_id, job_id) or {}
+    except Exception:
+        return
+    for name, content_b64 in outputs.items():
+        if not content_b64:
+            continue
+        rel = Path(name)
+        if rel.is_absolute() or ".." in rel.parts:
+            continue
+        target = struct_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_bytes(b64.b64decode(content_b64))
+        except Exception:
+            pass
+
+
+@contextmanager
+def _scheduler_session(controller: str | None, listen: str | None, db_path: Path,
+                       workers: list, debug: bool):
+    """Yield (client, public_join_url) for the duration of a run.
+
+    With --controller URL we just connect to a remote scheduler and no local
+    workers are started. Otherwise we start an in-process scheduler bound to
+    the requested address and spawn worker subprocesses against it. In both
+    cases the body of predict streams events from the same ControllerClient.
+    """
+    if controller:
+        yield ControllerClient(controller), None
+        return
+
+    listen_host, listen_port = _parse_listen(listen)
+    try:
+        db_path.unlink()
+    except FileNotFoundError:
+        pass
+    server = ControllerServer(listen_host, listen_port, db_path)
+    server.serve_in_background()
+    url = f"http://127.0.0.1:{server.port}"
+    public_url = _public_join_url(listen_host, server.port) if listen else None
+    procs = _spawn_worker_processes(url, workers, debug)
+    try:
+        yield ControllerClient(url), public_url
+    finally:
+        _stop_worker_processes(procs)
+        server.shutdown()
 
 
 def _persist_run_results(client: ControllerClient, run_id: str, results_path: Path) -> None:
@@ -1265,43 +1326,19 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         "config": worker_cfg,
     }
 
-    # Mode 1: submit to a remote controller; this process only streams progress.
     if controller:
+        workers = []
         if report_energy:
             click.echo("Note: --report-energy is local-only; ignoring for controller run")
-        client = ControllerClient(controller)
-        run_id = client.create_run(run_payload)["run_id"]
-        click.echo(f"Submitted run {run_id} to {controller}")
-        failed = _stream_run(client, run_id, total=len(jobs), n_workers=0,
-                             debug=debug, log=log, results_path=results_path)
-        _persist_run_results(client, run_id, results_path)
-        click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
-        return
-
-    # Mode 2: in-process scheduler + local workers (and optional --listen for remote workers).
-    workers = _local_workers(
-        "tenstorrent" if use_tt else accelerator,
-        num_devices, device_ids, max_workers=max(len(jobs), 1),
-    )
+    else:
+        workers = _local_workers(
+            "tenstorrent" if use_tt else accelerator,
+            num_devices, device_ids, max_workers=max(len(jobs), 1),
+        )
     devices = [int(w.device_id) for w in workers if w.accelerator == "tenstorrent"]
 
-    listen_host, listen_port = _parse_listen(listen)
-    db_path = out / ".controller.sqlite3"
-    try:
-        db_path.unlink()
-    except FileNotFoundError:
-        pass
-    server = ControllerServer(listen_host, listen_port, db_path)
-    server.serve_in_background()
-    controller_url = f"http://127.0.0.1:{server.port}"
-    if listen:
-        click.echo(
-            f"Workers may join: tt-boltz worker --connect "
-            f"{_public_join_url(listen_host, server.port)}"
-        )
-
     energy_profiler = None
-    if report_energy:
+    if report_energy and not controller:
         if not use_tt:
             click.echo("Energy profiling currently requires --accelerator=tenstorrent; skipping")
         elif len(devices) != 1:
@@ -1322,18 +1359,18 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 click.echo(f"Energy profiler unavailable: {e}")
                 energy_profiler = None
 
-    client = ControllerClient(controller_url)
-    run_id = client.create_run(run_payload)["run_id"]
-    procs = _spawn_worker_processes(controller_url, workers, debug)
+    db_path = out / ".controller.sqlite3"
     failed = 0
-    try:
+    with _scheduler_session(controller, listen, db_path, workers, debug) as (client, public_url):
+        if public_url:
+            click.echo(f"Workers may join: tt-boltz worker --connect {public_url}")
+        run_id = client.create_run(run_payload)["run_id"]
+        if controller:
+            click.echo(f"Submitted run {run_id} to {controller}")
         failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers),
-                             debug=debug, log=log, results_path=results_path)
-    finally:
-        _stop_worker_processes(procs)
-        server.shutdown()
-
-    _persist_run_results(client, run_id, results_path)
+                             debug=debug, log=log, results_path=results_path,
+                             struct_dir=struct_dir)
+        _persist_run_results(client, run_id, results_path)
 
     if energy_profiler is not None:
         energy_profiler.stop()

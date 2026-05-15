@@ -69,13 +69,14 @@ tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
 
 The same `tt-boltz predict` command scales from one machine to many. To accept
 remote workers, add `--listen [PORT]`; on every other machine, point
-`tt-boltz worker` at it. Use a shared filesystem so all hosts see the same
-input, MSA, and result paths.
+`tt-boltz worker` at it. No shared filesystem is required — inputs ship to
+workers and output structures ship back over HTTP. Each machine keeps its own
+model cache in `~/.boltz/` so checkpoints are only downloaded once per host.
 
-On the machine you want to drive the run (also contributes its cards):
+On the machine driving the run (also contributes its cards):
 
 ```bash
-tt-boltz predict /shared/boltz/proteins --out_dir /shared/boltz/results --listen 8765 --use_msa_server --fast
+tt-boltz predict ./proteins --out_dir ./results --listen 8765 --use_msa_server --fast
 ```
 
 On every additional compute machine:
@@ -84,7 +85,7 @@ On every additional compute machine:
 tt-boltz worker --connect http://pc.local:8765
 ```
 
-The realtime display shows each active worker by host and device, for example
+The realtime display names each active worker by host and device, for example
 `pc:tt0` or `quietbox:tt3`. Models load once per worker process, so jobs flow
 through without per-protein reloads.
 

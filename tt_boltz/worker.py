@@ -8,10 +8,13 @@ multi-host runs; only the scheduler URL differs.
 
 from __future__ import annotations
 
+import base64
 import gc
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import time
 import traceback
 from functools import partial
@@ -46,7 +49,7 @@ def _apply_tt_environment(worker_info: dict[str, Any]) -> None:
 
 
 def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
-    """Make sure model files exist in this worker's local cache."""
+    """Make sure model files and caches exist locally for this worker."""
     from tt_boltz.main import download_all
 
     cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
@@ -55,6 +58,11 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
     cfg["conf_ckpt"] = str(cache / "boltz2_conf.ckpt")
     cfg["aff_ckpt"] = str(cache / "boltz2_aff.ckpt")
     cfg["mol_dir"] = str(cache / "mols")
+    # MSAs are cached locally per-worker; same sequence is never recomputed
+    # within this worker's lifetime.
+    msa_cache = cache / "msa"
+    msa_cache.mkdir(parents=True, exist_ok=True)
+    cfg["msa_dir"] = str(msa_cache)
 
 
 class _WorkerState:
@@ -280,9 +288,9 @@ def _execute_job(
     worker_id: str,
     meta: dict[str, Any],
 ) -> None:
-    name = job["id"]
-    path = Path(job["path"])
-    row: dict[str, Any] = {"id": name, "status": "failed"}
+    job_id = job["id"]
+    filename = job.get("name") or f"{job_id}.yaml"
+    row: dict[str, Any] = {"id": job_id, "status": "failed"}
     t0 = time.time()
 
     def emit(event: str, **kw):
@@ -295,10 +303,24 @@ def _execute_job(
         except Exception:
             pass
 
-    emit("start", name=name)
+    workdir = Path(tempfile.mkdtemp(prefix=f"tt-boltz-{job_id}-"))
+    input_path = workdir / filename
+    output_dir = workdir / "out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    job_cfg = dict(cfg)
+    job_cfg["struct_dir"] = str(output_dir)
+
+    outputs: dict[str, str] = {}
+    emit("start", name=job_id)
     try:
+        try:
+            input_path.write_bytes(base64.b64decode(job.get("input_b64", "")))
+        except Exception as exc:
+            raise RuntimeError(f"failed to decode input bytes: {exc}") from exc
+
         emit("stage", stage="msa")
-        metrics, best, feats = state.predict_one(path, cfg)
+        metrics, best, feats = state.predict_one(input_path, job_cfg)
         emit("stage", stage="saving")
         if metrics:
             row.update(metrics)
@@ -306,13 +328,16 @@ def _execute_job(
             row["runtime_s"] = round(time.time() - t0, 1)
             if feats["record"].affinity and best is not None:
                 try:
-                    aff = state.predict_affinity(path, best, cfg)
+                    aff = state.predict_affinity(input_path, best, job_cfg)
                     row.update(aff)
                 except Exception:
                     traceback.print_exc()
+        outputs = _read_outputs(output_dir)
     except Exception as exc:
         traceback.print_exc()
         row["error"] = str(exc)[:200]
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
     elapsed = round(time.time() - t0, 1)
 
     try:
@@ -325,15 +350,29 @@ def _execute_job(
                 "worker": worker_id,
                 **meta,
                 "event": "done",
-                "name": name,
+                "name": job_id,
                 "time": elapsed,
                 "status": row["status"],
                 "error": row.get("error", ""),
                 "row": row,
             },
+            outputs=outputs or None,
         )
     except Exception:
         traceback.print_exc()
+
+
+def _read_outputs(output_dir: Path) -> dict[str, str]:
+    """Read every file in output_dir and return name -> base64 bytes."""
+    outputs: dict[str, str] = {}
+    if not output_dir.exists():
+        return outputs
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(output_dir).as_posix()
+        outputs[rel] = base64.b64encode(path.read_bytes()).decode("ascii")
+    return outputs
 
 
 def _complete_failure(
