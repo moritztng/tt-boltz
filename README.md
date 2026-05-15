@@ -353,17 +353,13 @@ Runtime for a 686 amino acid protein:
 
 ## Optional: Multi-Machine Prediction
 
-If you have several Tenstorrent machines (for example a workstation plus a
-QuietBox), the same `predict` run can use cards across all of them. No shared
-filesystem is required — inputs ship to workers and output structures ship
-back over HTTP. Each machine keeps its own model cache in `~/.boltz/` so
-checkpoints are only downloaded once per host.
+Combine the cards across any mix of Tenstorrent machines — a workstation, one
+or more QuietBoxes, one or more Galaxy servers — into a single run.
 
-On the machine driving the run (which also contributes its own cards), add
-`--listen` with a port:
+On the machine driving the run:
 
 ```bash
-tt-boltz predict ./proteins --out_dir ./results --listen 8765 --use_msa_server --fast
+tt-boltz predict ./proteins --listen 8765 --use_msa_server --fast
 ```
 
 On every additional machine:
@@ -371,10 +367,6 @@ On every additional machine:
 ```bash
 tt-boltz worker --connect http://pc.local:8765
 ```
-
-The realtime display names every active worker by host and device, for example
-`pc:tt0` or `quietbox:tt3`. Models load once per worker process, so jobs flow
-through without per-protein reloads.
 
 ## Optional: Energy Measurement
 
