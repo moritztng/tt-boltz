@@ -950,19 +950,12 @@ def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
 
 
 @contextmanager
-def _scheduler_session(controller: str | None, listen: str | None, db_path: Path,
-                       workers: list, debug: bool):
-    """Yield (client, public_join_url) for the duration of a run.
+def _scheduler_session(listen: str | None, db_path: Path, workers: list, debug: bool):
+    """Start an in-process scheduler, spawn local worker subprocesses against
+    it, and yield (client, public_join_url) for the duration of the run.
 
-    With --controller URL we just connect to a remote scheduler and no local
-    workers are started. Otherwise we start an in-process scheduler bound to
-    the requested address and spawn worker subprocesses against it. In both
-    cases the body of predict streams events from the same ControllerClient.
-    """
-    if controller:
-        yield ControllerClient(controller), None
-        return
-
+    public_join_url is None unless --listen was passed; when set, it's the
+    address a remote `tt-boltz worker --connect ...` should target."""
     listen_host, listen_port = _parse_listen(listen)
     try:
         db_path.unlink()
@@ -1006,30 +999,6 @@ def install_deps():
     from tt_boltz.install_system_deps import main as install_system_deps
 
     install_system_deps()
-
-
-@cli.command("serve")
-@click.option("--host", default="0.0.0.0", show_default=True, help="Controller bind host")
-@click.option("--port", default=8765, show_default=True, type=int, help="Controller bind port")
-@click.option("--workdir", default="./tt-boltz-controller", type=click.Path(), help="Controller state directory")
-def serve(host, port, workdir):
-    """Run a tt-boltz controller for multi-machine prediction."""
-    db_path = Path(workdir).expanduser() / "controller.sqlite3"
-    try:
-        server = ControllerServer(host, port, db_path)
-    except PermissionError as exc:
-        raise click.ClickException(
-            f"Cannot create controller state directory at {db_path.parent}. "
-            "Choose a writable path, for example: --workdir ~/boltz-controller"
-        ) from exc
-    except OSError as exc:
-        raise click.ClickException(
-            f"Cannot create controller state at {db_path}: {exc}. "
-            "Choose an existing or writable parent directory."
-        ) from exc
-    click.echo(f"tt-boltz controller listening on http://{host}:{port}")
-    click.echo(f"state: {db_path}")
-    server.serve_forever()
 
 
 @cli.command("worker")
@@ -1194,7 +1163,6 @@ def msa(db, path, install_tools):
 @click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for power reporting")
 @click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
-@click.option("--controller", default=None, help="Submit this run to a remote tt-boltz controller URL; do not run local workers")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1203,13 +1171,12 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, debug, log,
-            report_energy, energy_sample_hz, energy_metric, listen, controller):
+            report_energy, energy_sample_hz, energy_metric, listen):
     """Run Boltz-2 structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
     A scheduler runs in-process and dispatches jobs to local workers; pass
-    --listen to also accept workers from other machines, or --controller URL
-    to submit this run to a scheduler running elsewhere.
+    --listen to also accept workers from other machines.
 
     \b
     Output:
@@ -1326,19 +1293,14 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         "config": worker_cfg,
     }
 
-    if controller:
-        workers = []
-        if report_energy:
-            click.echo("Note: --report-energy is local-only; ignoring for controller run")
-    else:
-        workers = _local_workers(
-            "tenstorrent" if use_tt else accelerator,
-            num_devices, device_ids, max_workers=max(len(jobs), 1),
-        )
+    workers = _local_workers(
+        "tenstorrent" if use_tt else accelerator,
+        num_devices, device_ids, max_workers=max(len(jobs), 1),
+    )
     devices = [int(w.device_id) for w in workers if w.accelerator == "tenstorrent"]
 
     energy_profiler = None
-    if report_energy and not controller:
+    if report_energy:
         if not use_tt:
             click.echo("Energy profiling currently requires --accelerator=tenstorrent; skipping")
         elif len(devices) != 1:
@@ -1359,14 +1321,10 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 click.echo(f"Energy profiler unavailable: {e}")
                 energy_profiler = None
 
-    db_path = out / ".controller.sqlite3"
-    failed = 0
-    with _scheduler_session(controller, listen, db_path, workers, debug) as (client, public_url):
+    with _scheduler_session(listen, out / ".controller.sqlite3", workers, debug) as (client, public_url):
         if public_url:
             click.echo(f"Workers may join: tt-boltz worker --connect {public_url}")
         run_id = client.create_run(run_payload)["run_id"]
-        if controller:
-            click.echo(f"Submitted run {run_id} to {controller}")
         failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers),
                              debug=debug, log=log, results_path=results_path,
                              struct_dir=struct_dir)
