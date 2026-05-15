@@ -60,8 +60,8 @@ class DeviceState:
 class ProgressDisplay:
     """Drives a Rich Live display from a multiprocessing.Queue of events.
 
-    Events (dicts sent by workers):
-        {"worker": str, "dev": int, "event": "init",    "assigned": int}
+    Each event carries the worker's identity (host/accelerator/label) plus a
+    kind-specific payload:
         {"worker": str, "dev": int, "event": "loading"}
         {"worker": str, "dev": int, "event": "start",   "name": str}
         {"worker": str, "dev": int, "event": "stage",   "stage": str, "step": int, "total": int}
@@ -134,44 +134,39 @@ class ProgressDisplay:
         worker_id = str(ev.get("worker", dev))
         kind = ev["event"]
 
-        if kind == "init":
-            existing = self.devices.get(worker_id)
-            assigned = ev.get("assigned", 0)
-            self.devices[worker_id] = DeviceState(
-                worker_id=worker_id,
-                device_id=dev,
-                host=ev.get("host", ""),
-                accelerator=ev.get("accelerator", ""),
-                label=ev.get("label", ""),
-                done=existing.done if existing else 0,
-                assigned=(existing.assigned if existing else 0) + assigned,
-            )
-        elif kind == "loading":
-            d = self.devices.setdefault(worker_id, DeviceState(worker_id=worker_id, device_id=dev))
+        # Every event carries the worker's host/accelerator/label in its meta,
+        # so make sure the DeviceState reflects the latest values.
+        d = self.devices.get(worker_id)
+        if d is None:
+            d = DeviceState(worker_id=worker_id, device_id=dev)
+            self.devices[worker_id] = d
+        if "host" in ev:
+            d.host = ev["host"]
+        if "accelerator" in ev:
+            d.accelerator = ev["accelerator"]
+        if "label" in ev:
+            d.label = ev["label"]
+
+        if kind == "loading":
             d.stage = "loading"
             d.name = ""
         elif kind == "start":
-            d = self.devices.get(worker_id)
-            if d:
-                d.name = ev["name"]
-                d.stage = "msa"
-                d.step = 0
-                d.total_steps = 0
+            d.name = ev["name"]
+            d.stage = "msa"
+            d.step = 0
+            d.total_steps = 0
+            d.assigned += 1
         elif kind == "stage":
-            d = self.devices.get(worker_id)
-            if d:
-                d.stage = ev.get("stage", d.stage)
-                d.step = ev.get("step", 0)
-                d.total_steps = ev.get("total", 0)
+            d.stage = ev.get("stage", d.stage)
+            d.step = ev.get("step", 0)
+            d.total_steps = ev.get("total", 0)
         elif kind == "done":
             self.completed += 1
             if ev.get("status") != "ok":
                 self.failed += 1
-            d = self.devices.get(worker_id)
-            if d:
-                d.done += 1
-                d.stage = "idle"
-                d.name = ""
+            d.done += 1
+            d.stage = "idle"
+            d.name = ""
             self.recent.append(ev)
             if len(self.recent) > RECENT_MAX:
                 self.recent.pop(0)
