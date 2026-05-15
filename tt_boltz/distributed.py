@@ -7,6 +7,7 @@ same paths on each host. This keeps the production path simple and predictable.
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import threading
@@ -74,7 +75,8 @@ class ControllerStore:
                 CREATE TABLE IF NOT EXISTS jobs (
                     run_id TEXT NOT NULL,
                     job_id TEXT NOT NULL,
-                    path TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    input_b64 TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     worker_id TEXT,
                     lease_until REAL,
@@ -101,6 +103,15 @@ class ControllerStore:
                 );
                 """
             )
+            for column, ddl in (
+                ("name", "TEXT NOT NULL DEFAULT ''"),
+                ("input_b64", "TEXT NOT NULL DEFAULT ''"),
+                ("outputs_json", "TEXT"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
+                except sqlite3.OperationalError:
+                    pass
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload.get("run_id") or uuid.uuid4().hex[:12]
@@ -129,10 +140,16 @@ class ControllerStore:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO jobs
-                        (run_id, job_id, path, status, updated_at)
-                    VALUES (?, ?, ?, 'pending', ?)
+                        (run_id, job_id, name, input_b64, status, updated_at)
+                    VALUES (?, ?, ?, ?, 'pending', ?)
                     """,
-                    (run_id, job["id"], job["path"], now),
+                    (
+                        run_id,
+                        job["id"],
+                        job.get("name", ""),
+                        job.get("input_b64", ""),
+                        now,
+                    ),
                 )
             self.add_event(conn, run_id, None, {"event": "run", "run_id": run_id, "total": len(jobs)})
         return {"run_id": run_id, "total": len(jobs)}
@@ -197,7 +214,7 @@ class ControllerStore:
             )
             rows = conn.execute(
                 """
-                SELECT j.run_id, j.job_id, j.path, r.config_json
+                SELECT j.run_id, j.job_id, j.name, j.input_b64, r.config_json
                 FROM jobs j
                 JOIN runs r ON r.run_id = j.run_id
                 WHERE r.status = 'running'
@@ -226,7 +243,11 @@ class ControllerStore:
                     """,
                     (worker_id, lease_until, now, row["run_id"], row["job_id"]),
                 )
-                jobs.append({"id": row["job_id"], "path": row["path"]})
+                jobs.append({
+                    "id": row["job_id"],
+                    "name": row["name"],
+                    "input_b64": row["input_b64"],
+                })
             return {"run_id": run_id, "config": json.loads(config_json), "jobs": jobs}
 
     def record_event(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -241,16 +262,25 @@ class ControllerStore:
         run_id = payload["run_id"]
         worker_id = payload["worker_id"]
         row = payload["result"]
+        outputs = payload.get("outputs") or None
         status = row.get("status", "failed")
         now = time.time()
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status=?, result_json=?, error=?, lease_until=NULL, updated_at=?
+                SET status=?, result_json=?, outputs_json=?, error=?, lease_until=NULL, updated_at=?
                 WHERE run_id=? AND job_id=?
                 """,
-                (status, json.dumps(row), row.get("error"), now, run_id, row["id"]),
+                (
+                    status,
+                    json.dumps(row),
+                    json.dumps(outputs) if outputs else None,
+                    row.get("error"),
+                    now,
+                    run_id,
+                    row["id"],
+                ),
             )
             event = payload.get("event")
             if event:
@@ -281,6 +311,20 @@ class ControllerStore:
                     (run_id,),
                 )
             ]
+
+    def job_outputs(self, run_id: str, job_id: str) -> dict[str, str]:
+        """Return the output files this job produced as {name: base64_bytes}."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT outputs_json FROM jobs WHERE run_id=? AND job_id=?",
+                (run_id, job_id),
+            ).fetchone()
+        if not row or not row["outputs_json"]:
+            return {}
+        try:
+            return json.loads(row["outputs_json"]) or {}
+        except Exception:
+            return {}
 
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         with self._connect() as conn:
@@ -348,6 +392,13 @@ class ControllerServer:
                 elif parsed.path.startswith("/runs/") and parsed.path.endswith("/results"):
                     run_id = parsed.path.split("/")[2]
                     _json_response(self, 200, {"results": store.results(run_id)})
+                elif "/jobs/" in parsed.path and parsed.path.endswith("/outputs"):
+                    parts = parsed.path.split("/")
+                    # /runs/<run_id>/jobs/<job_id>/outputs
+                    if len(parts) == 6 and parts[1] == "runs" and parts[3] == "jobs":
+                        _json_response(self, 200, {"outputs": store.job_outputs(parts[2], parts[4])})
+                    else:
+                        _json_response(self, 404, {"error": "not found"})
                 else:
                     _json_response(self, 404, {"error": "not found"})
 
@@ -368,7 +419,7 @@ class ControllerServer:
 
 
 class ControllerClient:
-    def __init__(self, base_url: str, timeout: float = 10.0):
+    def __init__(self, base_url: str, timeout: float = 120.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -399,14 +450,27 @@ class ControllerClient:
     def event(self, run_id: str, worker_id: str, event: dict[str, Any]) -> None:
         self._request("POST", "/events", {"run_id": run_id, "worker_id": worker_id, "event": event})
 
-    def complete(self, run_id: str, worker_id: str, row: dict[str, Any], event: dict[str, Any]) -> None:
-        self._request("POST", "/complete", {"run_id": run_id, "worker_id": worker_id, "result": row, "event": event})
+    def complete(
+        self,
+        run_id: str,
+        worker_id: str,
+        row: dict[str, Any],
+        event: dict[str, Any],
+        outputs: dict[str, str] | None = None,
+    ) -> None:
+        payload = {"run_id": run_id, "worker_id": worker_id, "result": row, "event": event}
+        if outputs:
+            payload["outputs"] = outputs
+        self._request("POST", "/complete", payload)
 
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         return self._request("GET", f"/runs/{run_id}/events?after={after}")
 
     def results(self, run_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/runs/{run_id}/results").get("results", [])
+
+    def job_outputs(self, run_id: str, job_id: str) -> dict[str, str]:
+        return self._request("GET", f"/runs/{run_id}/jobs/{job_id}/outputs").get("outputs", {})
 
 
 class HttpProgressQueue:
@@ -425,7 +489,20 @@ class HttpProgressQueue:
 
 
 def job_payloads(jobs: list[Any]) -> list[dict[str, str]]:
-    return [{"id": job.id, "path": str(job.path)} for job in jobs]
+    """Build self-contained job dicts that carry the input file bytes.
+
+    Each entry is ``{"id": <stem>, "name": <filename>, "input_b64": <base64>}``
+    so a worker can run the job without sharing a filesystem with the controller.
+    """
+    payloads: list[dict[str, str]] = []
+    for job in jobs:
+        path = Path(job.path)
+        payloads.append({
+            "id": job.id,
+            "name": path.name,
+            "input_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        })
+    return payloads
 
 
 def worker_payload(worker: Any) -> dict[str, Any]:
