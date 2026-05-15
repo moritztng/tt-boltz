@@ -89,9 +89,6 @@ The realtime display names each active worker by host and device, for example
 `pc:tt0` or `quietbox:tt3`. Models load once per worker process, so jobs flow
 through without per-protein reloads.
 
-If you prefer to run the scheduler separately (e.g. as a persistent service),
-use `tt-boltz serve` instead, then submit runs with `tt-boltz predict --controller URL`.
-
 ### Offline MSA (Optional)
 
 Use this if you have enough disk and RAM and want local MSA.

@@ -1,9 +1,6 @@
-"""Small controller/worker runtime for multi-host tt-boltz runs.
-
-The distributed control plane intentionally moves only metadata and progress.
-Inputs, model cache, MSA cache, and results live on shared storage visible at the
-same paths on each host. This keeps the production path simple and predictable.
-"""
+"""HTTP scheduler that dispatches Boltz-2 prediction jobs to local and remote
+worker processes. Inputs ship to workers and outputs ship back over the wire,
+so no shared filesystem is required."""
 
 from __future__ import annotations
 
@@ -403,10 +400,7 @@ class ControllerServer:
                     _json_response(self, 404, {"error": "not found"})
 
         self.httpd = ThreadingHTTPServer((host, port), Handler)
-        self.host, self.port = self.httpd.server_address[:2]
-
-    def serve_forever(self) -> None:
-        self.httpd.serve_forever()
+        self.port = self.httpd.server_address[1]
 
     def serve_in_background(self) -> threading.Thread:
         thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
