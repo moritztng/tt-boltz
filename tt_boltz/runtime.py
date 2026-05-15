@@ -1,8 +1,8 @@
-"""Runtime planning primitives for tt-boltz prediction runs.
+"""Tiny runtime primitives used by the scheduler and CLI.
 
-The prediction command treats every invocation as a run made of jobs executed by
-workers.  A single-card local run is therefore the same shape as a multi-card or
-future multi-host run: only the available worker slots change.
+PredictionJob is one input file the user asked us to predict; WorkerSlot is
+one accelerator we can run it on. Discovery and detection helpers live here
+so they can be reused from both the CLI and the worker subprocess.
 """
 
 from __future__ import annotations
@@ -43,26 +43,8 @@ class WorkerSlot:
         return f"{self.host}:{self.accelerator}"
 
 
-@dataclass(frozen=True)
-class RunPlan:
-    """The user-visible run: jobs, workers, and output locations."""
-
-    data: Path
-    out_dir: Path
-    result_dir: Path
-    msa_dir: Path
-    structure_dir: Path
-    jobs: list[PredictionJob]
-    workers: list[WorkerSlot]
-
-    @property
-    def total_jobs(self) -> int:
-        return len(self.jobs)
-
-
 def discover_jobs(data: Path, structure_dir: Path, output_format: str, override: bool) -> list[PredictionJob]:
     """Discover runnable input files, applying resume semantics."""
-
     files = sorted(
         p for p in (data.glob("*") if data.is_dir() else [data])
         if p.suffix.lower() in INPUT_SUFFIXES
@@ -74,7 +56,6 @@ def discover_jobs(data: Path, structure_dir: Path, output_format: str, override:
 
 def detect_tenstorrent_devices(device_ids: str | None, num_devices: int, max_workers: int) -> list[int]:
     """Return TT device IDs selected for this run without importing ttnn."""
-
     all_devices = sorted(int(p.rsplit("/", 1)[-1]) for p in glob.glob("/dev/tenstorrent/[0-9]*"))
     if device_ids:
         devices = [int(d.strip()) for d in device_ids.split(",") if d.strip()]
@@ -85,9 +66,8 @@ def detect_tenstorrent_devices(device_ids: str | None, num_devices: int, max_wor
     return devices[:max_workers]
 
 
-def build_local_workers(accelerator: str, jobs: list[PredictionJob], devices: list[int]) -> list[WorkerSlot]:
-    """Build worker slots for the local host."""
-
+def build_local_workers(accelerator: str, jobs: list, devices: list[int]) -> list[WorkerSlot]:
+    """Build worker slots for the local host (one per device, capped to jobs)."""
     host = socket.gethostname()
     if accelerator == "tenstorrent":
         return [
@@ -100,26 +80,5 @@ def build_local_workers(accelerator: str, jobs: list[PredictionJob], devices: li
             )
             for device in devices[:len(jobs)]
         ]
-    return [
-        WorkerSlot(
-            worker_id=f"{host}:{accelerator}:0",
-            host=host,
-            accelerator=accelerator,
-            device_id=0,
-        )
-    ]
-
-
-def assign_jobs_round_robin(jobs: list[PredictionJob], workers: list[WorkerSlot]) -> dict[str, list[PredictionJob]]:
-    """Assign jobs evenly across available workers."""
-
-    assignments = {worker.worker_id: [] for worker in workers}
-    if not workers:
-        return assignments
-    for idx, job in enumerate(jobs):
-        assignments[workers[idx % len(workers)].worker_id].append(job)
-    return assignments
-
-
-def worker_by_id(workers: list[WorkerSlot]) -> dict[str, WorkerSlot]:
-    return {worker.worker_id: worker for worker in workers}
+    return [WorkerSlot(worker_id=f"{host}:{accelerator}:0", host=host,
+                       accelerator=accelerator, device_id=0)]
