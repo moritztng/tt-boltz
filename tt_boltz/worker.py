@@ -49,7 +49,15 @@ def _apply_tt_environment(worker_info: dict[str, Any]) -> None:
 
 
 def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
-    """Make sure model files and caches exist locally for this worker."""
+    """Make sure model files and caches exist locally for this worker.
+
+    Model checkpoints and the molecule library are always resolved to the
+    worker's own ~/.boltz/ cache. For the MSA directory we prefer the path
+    the controller asked for (so single-machine and shared-filesystem runs
+    keep populating <out_dir>/msa/ exactly like the legacy pipeline) and
+    only fall back to the local cache when that path is not writable on
+    this host (the no-shared-FS multi-machine case).
+    """
     from tt_boltz.main import download_all
 
     cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
@@ -58,11 +66,20 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
     cfg["conf_ckpt"] = str(cache / "boltz2_conf.ckpt")
     cfg["aff_ckpt"] = str(cache / "boltz2_aff.ckpt")
     cfg["mol_dir"] = str(cache / "mols")
-    # MSAs are cached locally per-worker; same sequence is never recomputed
-    # within this worker's lifetime.
-    msa_cache = cache / "msa"
-    msa_cache.mkdir(parents=True, exist_ok=True)
-    cfg["msa_dir"] = str(msa_cache)
+    cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
+
+
+def _resolve_msa_dir(requested: str | None, cache: Path) -> str:
+    """Honor controller's msa_dir if it already exists and is writable on this
+    host (covers single-machine runs and shared-filesystem multi-machine
+    setups); otherwise fall back to ~/.boltz/msa/ on the worker."""
+    if requested:
+        path = Path(requested)
+        if path.is_dir() and os.access(path, os.W_OK):
+            return str(path)
+    fallback = cache / "msa"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return str(fallback)
 
 
 class _WorkerState:
