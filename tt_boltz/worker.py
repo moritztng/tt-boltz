@@ -115,7 +115,7 @@ class _WorkerState:
             except Exception:
                 pass
 
-    def load(self, run_id: str, cfg: dict[str, Any], emit) -> None:
+    def load(self, run_id: str, cfg: dict[str, Any]) -> None:
         from tt_boltz.boltz2 import Boltz2
         from tt_boltz.data.featurizer import Boltz2Featurizer
         from tt_boltz.data.mol import load_canonicals
@@ -145,8 +145,6 @@ class _WorkerState:
             msa_db_path=cfg.get("msa_db_path"),
             use_envdb=cfg.get("use_envdb", False),
         )
-
-        emit("loading")
         self.model = (
             Boltz2.load_from_checkpoint(cfg["conf_ckpt"], **cfg["conf_kwargs"])
             .eval()
@@ -240,21 +238,18 @@ def run_worker_loop(
     _apply_tt_environment(worker_info)
 
     client = ControllerClient(controller_url)
-    client.register_worker(worker_info)
     worker_id = worker_info["worker_id"]
-    label = worker_info["label"]
     meta = {
+        "dev": worker_info["device_id"],
+        "worker": worker_id,
         "host": worker_info["host"],
         "accelerator": worker_info["accelerator"],
-        "label": label,
+        "label": worker_info["label"],
     }
-
-    def progress(client_run_id: str):
-        return HttpProgressQueue(client, client_run_id, worker_id)
 
     def emit(run_id: str, event: str, **kw):
         try:
-            client.event(run_id, worker_id, {"dev": worker_info["device_id"], "worker": worker_id, "event": event, **meta, **kw})
+            client.event(run_id, worker_id, {"event": event, **meta, **kw})
         except Exception:
             pass
 
@@ -274,21 +269,22 @@ def run_worker_loop(
             if not state.configured_for(run_id, cfg):
                 state.reset()
                 try:
-                    emit(run_id, "init", assigned=0)
-                    state.load(run_id, cfg, lambda ev, **kw: emit(run_id, ev, **kw))
+                    emit(run_id, "loading")
+                    state.load(run_id, cfg)
                     from tt_boltz.progress import make_progress_fn
 
                     state.model.progress_fn = make_progress_fn(
-                        progress(run_id), worker_info["device_id"], worker_id, meta
+                        HttpProgressQueue(client, run_id, worker_id),
+                        worker_info["device_id"], worker_id, meta,
                     )
                 except Exception as exc:
                     traceback.print_exc()
-                    _complete_failure(client, run_id, worker_id, worker_info, jobs, str(exc)[:200])
+                    _complete_failure(client, run_id, worker_id, meta, jobs, str(exc)[:200])
                     state.reset()
                     continue
 
             for job in jobs:
-                _execute_job(state, job, cfg, run_id, client, worker_info, worker_id, meta)
+                _execute_job(state, job, cfg, run_id, client, worker_id, meta)
     except KeyboardInterrupt:
         pass
     finally:
@@ -301,7 +297,6 @@ def _execute_job(
     cfg: dict[str, Any],
     run_id: str,
     client: ControllerClient,
-    worker_info: dict[str, Any],
     worker_id: str,
     meta: dict[str, Any],
 ) -> None:
@@ -312,11 +307,7 @@ def _execute_job(
 
     def emit(event: str, **kw):
         try:
-            client.event(
-                run_id,
-                worker_id,
-                {"dev": worker_info["device_id"], "worker": worker_id, "event": event, **meta, **kw},
-            )
+            client.event(run_id, worker_id, {"event": event, **meta, **kw})
         except Exception:
             pass
 
@@ -355,7 +346,6 @@ def _execute_job(
         row["error"] = str(exc)[:200]
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    elapsed = round(time.time() - t0, 1)
 
     try:
         client.complete(
@@ -363,12 +353,10 @@ def _execute_job(
             worker_id,
             row,
             {
-                "dev": worker_info["device_id"],
-                "worker": worker_id,
                 **meta,
                 "event": "done",
                 "name": job_id,
-                "time": elapsed,
+                "time": round(time.time() - t0, 1),
                 "status": row["status"],
                 "error": row.get("error", ""),
                 "row": row,
@@ -396,7 +384,7 @@ def _complete_failure(
     client: ControllerClient,
     run_id: str,
     worker_id: str,
-    worker_info: dict[str, Any],
+    meta: dict[str, Any],
     jobs: list[dict[str, Any]],
     error: str,
 ) -> None:
@@ -408,19 +396,8 @@ def _complete_failure(
                 run_id,
                 worker_id,
                 row,
-                {
-                    "dev": worker_info["device_id"],
-                    "worker": worker_id,
-                    "host": worker_info["host"],
-                    "accelerator": worker_info["accelerator"],
-                    "label": worker_info["label"],
-                    "event": "done",
-                    "name": job["id"],
-                    "status": "failed",
-                    "time": 0,
-                    "error": error,
-                    "row": row,
-                },
+                {**meta, "event": "done", "name": job["id"], "status": "failed",
+                 "time": 0, "error": error, "row": row},
             )
         except Exception:
             pass

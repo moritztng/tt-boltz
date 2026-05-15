@@ -59,6 +59,7 @@ if "--debug" not in _sys.argv:
     _install_nanobind_leak_stderr_filter()
 
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -799,24 +800,24 @@ def _build_worker_device_assignments(devices: list[int]) -> dict[int, dict[str, 
 
 def _local_workers(accelerator: str, num_devices: int, device_ids: str | None, max_workers: int) -> list:
     """Build a list of WorkerSlot objects covering this host's accelerators."""
-    if accelerator == "tenstorrent":
-        devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=max_workers)
-        if not devices:
-            raise RuntimeError(
-                "No Tenstorrent devices found. Use --accelerator cpu/gpu or check /dev/tenstorrent."
-            )
-        workers = build_local_workers("tenstorrent", [object()] * len(devices), devices)
-        assigns = _build_worker_device_assignments([int(w.device_id) for w in workers])
-        return [
-            replace(
-                w,
-                visible_devices=str(assigns.get(int(w.device_id), {}).get("visible_devices", w.device_id)),
-                logical_device_id=int(assigns.get(int(w.device_id), {}).get("logical_device_id", 0)),
-                mesh_graph_descriptor=assigns.get(int(w.device_id), {}).get("mesh_graph_descriptor"),
-            )
-            for w in workers
-        ]
-    return build_local_workers(accelerator, [object()], [0])
+    if accelerator != "tenstorrent":
+        return build_local_workers(accelerator, [object()], [0])
+    devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=max_workers)
+    if not devices:
+        raise RuntimeError(
+            "No Tenstorrent devices found. Use --accelerator cpu/gpu or check /dev/tenstorrent."
+        )
+    workers = build_local_workers("tenstorrent", [object()] * len(devices), devices)
+    assigns = _build_worker_device_assignments([int(w.device_id) for w in workers])
+    return [
+        replace(
+            w,
+            visible_devices=str(assigns[int(w.device_id)]["visible_devices"]),
+            logical_device_id=int(assigns[int(w.device_id)]["logical_device_id"]),
+            mesh_graph_descriptor=assigns[int(w.device_id)].get("mesh_graph_descriptor"),
+        )
+        for w in workers
+    ]
 
 
 def _spawn_worker_processes(controller_url: str, workers: list, debug: bool) -> list:
@@ -884,7 +885,6 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
     and write them under struct_dir, and merge its result row into
     results.json. Interrupted runs preserve every protein finished so far.
     """
-    import base64
     from queue import Queue as ThreadQueue
 
     pq = ThreadQueue()
@@ -918,7 +918,7 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
                             except Exception:
                                 pass
                         if struct_dir is not None and row.get("status") == "ok":
-                            _write_job_outputs(client, run_id, row["id"], struct_dir, base64)
+                            _write_job_outputs(client, run_id, row["id"], struct_dir)
                 pq.put(ev)
             if snapshot.get("status") in ("ok", "failed"):
                 failed = int(snapshot.get("failed") or 0)
@@ -930,7 +930,7 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
 
 
 def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
-                       struct_dir: Path, b64) -> None:
+                       struct_dir: Path) -> None:
     """Fetch a completed job's output files and write them under struct_dir."""
     try:
         outputs = client.job_outputs(run_id, job_id) or {}
@@ -945,7 +945,7 @@ def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
         target = struct_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            target.write_bytes(b64.b64decode(content_b64))
+            target.write_bytes(base64.b64decode(content_b64))
         except Exception:
             pass
 

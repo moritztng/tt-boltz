@@ -79,6 +79,7 @@ class ControllerStore:
                     lease_until REAL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     result_json TEXT,
+                    outputs_json TEXT,
                     error TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (run_id, job_id)
@@ -100,15 +101,6 @@ class ControllerStore:
                 );
                 """
             )
-            for column, ddl in (
-                ("name", "TEXT NOT NULL DEFAULT ''"),
-                ("input_b64", "TEXT NOT NULL DEFAULT ''"),
-                ("outputs_json", "TEXT"),
-            ):
-                try:
-                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
-                except sqlite3.OperationalError:
-                    pass
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload.get("run_id") or uuid.uuid4().hex[:12]
@@ -156,31 +148,6 @@ class ControllerStore:
             "INSERT INTO events (run_id, worker_id, event_json, created_at) VALUES (?, ?, ?, ?)",
             (run_id, worker_id, json.dumps(event), time.time()),
         )
-
-    def register_worker(self, payload: dict[str, Any]) -> dict[str, Any]:
-        now = time.time()
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO workers (worker_id, host, accelerator, device_id, label, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(worker_id) DO UPDATE SET
-                    host=excluded.host,
-                    accelerator=excluded.accelerator,
-                    device_id=excluded.device_id,
-                    label=excluded.label,
-                    last_seen=excluded.last_seen
-                """,
-                (
-                    payload["worker_id"],
-                    payload["host"],
-                    payload["accelerator"],
-                    str(payload["device_id"]),
-                    payload["label"],
-                    now,
-                ),
-            )
-        return {"ok": True}
 
     def lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         worker = payload["worker"]
@@ -366,8 +333,6 @@ class ControllerServer:
                     payload = _read_json(self)
                     if self.path == "/runs":
                         _json_response(self, 200, store.create_run(payload))
-                    elif self.path == "/workers/register":
-                        _json_response(self, 200, store.register_worker(payload))
                     elif self.path == "/lease":
                         _json_response(self, 200, store.lease(payload))
                     elif self.path == "/events":
@@ -434,9 +399,6 @@ class ControllerClient:
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/runs", payload)
-
-    def register_worker(self, worker: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/workers/register", worker)
 
     def lease(self, worker: dict[str, Any], batch_size: int) -> dict[str, Any]:
         return self._request("POST", "/lease", {"worker": worker, "batch_size": batch_size})
