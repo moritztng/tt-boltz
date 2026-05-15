@@ -1006,7 +1006,7 @@ def install_deps():
 
 
 @cli.command("worker")
-@click.option("--connect", required=True, help="Controller URL, e.g. http://pc.local:8765")
+@click.option("--connect", required=True, help="Controller URL, e.g. http://HOST:8765")
 @click.option("--accelerator", type=click.Choice(["gpu", "cpu", "tenstorrent"]), default="tenstorrent")
 @click.option("--num_devices", default=0, type=int, help="Number of TT devices to use (0=all available)")
 @click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use")
