@@ -362,10 +362,11 @@ On the machine driving the run:
 tt-boltz predict ./proteins --listen 8765 --use_msa_server --fast
 ```
 
-On every additional machine:
+On every additional machine, replace `HOST` with the driving machine's
+hostname or IP:
 
 ```bash
-tt-boltz worker --connect http://pc.local:8765
+tt-boltz worker --connect http://HOST:8765
 ```
 
 ## Optional: Energy Measurement
