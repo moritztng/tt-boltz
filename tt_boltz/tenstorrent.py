@@ -141,6 +141,18 @@ def set_fast_mode(enabled: bool) -> None:
 
 _device = None
 
+_DEFAULT_TRACE_REGION_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB, only used when tracing is enabled
+
+
+def _trace_region_size() -> int:
+    raw = os.environ.get("TT_BOLTZ_TRACE_REGION_SIZE")
+    if raw:
+        return int(raw)
+    if os.environ.get("TT_BOLTZ_TRACE", "").lower() in ("1", "true", "on", "yes"):
+        return _DEFAULT_TRACE_REGION_BYTES
+    return 0
+
+
 def get_device():
     """Open (or return cached) TT device 0.
 
@@ -150,7 +162,11 @@ def get_device():
     global _device
     if _device is None:
         device_id = int(os.environ.get("TT_BOLTZ_LOGICAL_DEVICE_ID", "0"))
-        _device = ttnn.open_device(device_id=device_id)
+        open_kwargs = {"device_id": device_id}
+        trace_bytes = _trace_region_size()
+        if trace_bytes:
+            open_kwargs["trace_region_size"] = trace_bytes
+        _device = ttnn.open_device(**open_kwargs)
         _configure_active_compute_grid(_device)
         _device.enable_program_cache()
     return _device
@@ -1735,6 +1751,44 @@ class Diffusion(Module):
         return r_update
 
 
+_MATH_FIDELITY_MAP = {
+    "lofi": ttnn.MathFidelity.LoFi,
+    "hifi2": ttnn.MathFidelity.HiFi2,
+    "hifi3": ttnn.MathFidelity.HiFi3,
+    "hifi4": ttnn.MathFidelity.HiFi4,
+}
+
+
+def _resolve_kernel_config() -> ttnn.types.BlackholeComputeKernelConfig:
+    fidelity = _MATH_FIDELITY_MAP.get(
+        os.environ.get("TT_BOLTZ_MATH_FIDELITY", "hifi4").lower(),
+        ttnn.MathFidelity.HiFi4,
+    )
+    approx = os.environ.get("TT_BOLTZ_MATH_APPROX", "0").lower() in ("1", "true", "on", "yes")
+    fp32_acc = os.environ.get("TT_BOLTZ_FP32_ACC", "1").lower() in ("1", "true", "on", "yes")
+    packer_acc = os.environ.get("TT_BOLTZ_PACKER_ACC", "1").lower() in ("1", "true", "on", "yes")
+    return ttnn.types.BlackholeComputeKernelConfig(
+        math_fidelity=fidelity,
+        math_approx_mode=approx,
+        fp32_dest_acc_en=fp32_acc,
+        packer_l1_acc=packer_acc,
+    )
+
+
+_TRACE_ENABLED_DEFAULT = os.environ.get("TT_BOLTZ_TRACE", "").lower() in ("1", "true", "on", "yes")
+
+
+def _trace_enabled_for(kind: str) -> bool:
+    """Per-module trace toggle. ``TT_BOLTZ_TRACE`` enables all; individual
+    knobs like ``TT_BOLTZ_TRACE_DIFFUSION`` or ``=off`` can override.
+    """
+    key = f"TT_BOLTZ_TRACE_{kind.upper()}"
+    raw = os.environ.get(key)
+    if raw is None:
+        return _TRACE_ENABLED_DEFAULT
+    return raw.lower() in ("1", "true", "on", "yes")
+
+
 class TorchWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1742,12 +1796,7 @@ class TorchWrapper(nn.Module):
         self.tt_device = get_device()
         self._runtime_cache = {}
         self._first_forward_pass = True
-        self.compute_kernel_config = ttnn.types.BlackholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.HiFi4,
-            math_approx_mode=False,
-            fp32_dest_acc_en=True,
-            packer_l1_acc=True,
-        )
+        self.compute_kernel_config = _resolve_kernel_config()
 
     def _from_torch(self, x: torch.Tensor, dtype=ttnn.bfloat16) -> ttnn.Tensor:
         return ttnn.from_torch(
@@ -1810,8 +1859,36 @@ class TorchWrapper(nn.Module):
         self._clear_runtime_cache()
         self._first_forward_pass = True
 
+    # ------------------------------------------------------------------
+    # Trace helpers (shared by DiffusionModule, PairformerModule, MSAModule).
+    # ------------------------------------------------------------------
+    def _alloc_trace_input(self, torch_shape, dtype=None) -> ttnn.Tensor:
+        dt = dtype if dtype is not None else ttnn.bfloat16
+        return ttnn.allocate_tensor_on_device(
+            ttnn.Shape(tuple(torch_shape)),
+            dt,
+            ttnn.TILE_LAYOUT,
+            self.tt_device,
+            ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def _write_trace_input(self, torch_tensor, device_tensor, dtype=None) -> None:
+        dt = dtype if dtype is not None else ttnn.bfloat16
+        host = ttnn.from_torch(torch_tensor, layout=ttnn.TILE_LAYOUT, dtype=dt)
+        ttnn.copy_host_to_device_tensor(host, device_tensor, cq_id=0)
+
+    def _safe_deallocate(self, tensor) -> None:
+        if tensor is None:
+            return
+        try:
+            ttnn.deallocate(tensor)
+        except Exception:
+            pass
+
 
 class PairformerModule(TorchWrapper):
+    _TRACE_WARMUPS_DEFAULT = 1
+
     def __init__(
         self,
         n_blocks: int,
@@ -1830,6 +1907,14 @@ class PairformerModule(TorchWrapper):
         self.att_n_heads = att_n_heads
         self.transform_s = transform_s
         self.affinity = affinity
+        self._trace_enabled = _trace_enabled_for("pairformer")
+        self._trace_warmups = int(os.environ.get("TT_BOLTZ_TRACE_PF_WARMUPS", str(self._TRACE_WARMUPS_DEFAULT)))
+        self._trace_id = None
+        self._trace_s_in = None
+        self._trace_z_in = None
+        self._trace_s_out = None
+        self._trace_z_out = None
+        self._trace_warmup_remaining = 0
 
     def _create_module(self, weights: WeightScope):
         return Pairformer(
@@ -1843,6 +1928,22 @@ class PairformerModule(TorchWrapper):
             self.compute_kernel_config,
             affinity=self.affinity,
         )
+
+    def _release_trace(self) -> None:
+        if self._trace_id is not None:
+            try:
+                ttnn.release_trace(self.tt_device, self._trace_id)
+            except Exception:
+                pass
+            self._trace_id = None
+        for attr in ("_trace_s_in", "_trace_z_in", "_trace_s_out", "_trace_z_out"):
+            self._safe_deallocate(getattr(self, attr, None))
+            setattr(self, attr, None)
+
+    def reset_static_cache(self):
+        self._release_trace()
+        self._trace_warmup_remaining = self._trace_warmups
+        super().reset_static_cache()
 
     def forward(
         self,
@@ -1859,6 +1960,8 @@ class PairformerModule(TorchWrapper):
         if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
             self._clear_runtime_cache()
             self._first_forward_pass = True
+            self._release_trace()
+            self._trace_warmup_remaining = self._trace_warmups
 
         if pad:
             z = torch.nn.functional.pad(z, (0, 0, 0, pad, 0, pad))
@@ -1891,13 +1994,44 @@ class PairformerModule(TorchWrapper):
                 self._cache_set("attn_mask_end_tt", None)
             self._first_forward_pass = False
 
-        s_out, z_out = self.module(
-            self._from_torch(s) if s is not None else None,
-            self._from_torch(z),
-            self._cache_get("mask_tt"),
-            self._cache_get("attn_mask_start_tt"),
-            self._cache_get("attn_mask_end_tt"),
-        )
+        def _run_with(s_in_tt, z_in_tt):
+            return self.module(
+                s_in_tt,
+                z_in_tt,
+                self._cache_get("mask_tt"),
+                self._cache_get("attn_mask_start_tt"),
+                self._cache_get("attn_mask_end_tt"),
+            )
+
+        if not self._trace_enabled:
+            s_out, z_out = _run_with(
+                self._from_torch(s) if s is not None else None,
+                self._from_torch(z),
+            )
+        elif self._trace_id is not None:
+            if s is not None:
+                self._write_trace_input(s, self._trace_s_in)
+            self._write_trace_input(z, self._trace_z_in)
+            ttnn.execute_trace(self.tt_device, self._trace_id, cq_id=0, blocking=False)
+            s_out, z_out = self._trace_s_out, self._trace_z_out
+        elif self._trace_warmup_remaining > 0:
+            self._trace_warmup_remaining -= 1
+            s_out, z_out = _run_with(
+                self._from_torch(s) if s is not None else None,
+                self._from_torch(z),
+            )
+        else:
+            # CAPTURE
+            self._trace_z_in = self._alloc_trace_input(z.shape)
+            self._write_trace_input(z, self._trace_z_in)
+            if s is not None:
+                self._trace_s_in = self._alloc_trace_input(s.shape)
+                self._write_trace_input(s, self._trace_s_in)
+            self._trace_id = ttnn.begin_trace_capture(self.tt_device, cq_id=0)
+            self._trace_s_out, self._trace_z_out = _run_with(self._trace_s_in, self._trace_z_in)
+            ttnn.end_trace_capture(self.tt_device, self._trace_id, cq_id=0)
+            ttnn.synchronize_device(self.tt_device)
+            s_out, z_out = self._trace_s_out, self._trace_z_out
 
         s_result = self._to_torch(s_out)[:, :seq_len, :] if s_out is not None else None
         z_result = self._to_torch(z_out)[:, :seq_len, :seq_len, :]
@@ -1905,11 +2039,52 @@ class PairformerModule(TorchWrapper):
 
 
 class DiffusionModule(TorchWrapper):
+    # How many regular forwards to run before capturing a trace; needs to be
+    # >=1 so that all program-cache entries are populated before capture
+    # records the dispatch commands. 2 is a small safety margin.
+    _TRACE_WARMUPS_DEFAULT = 2
+
     def __init__(self):
         super().__init__()
+        self._trace_enabled = _trace_enabled_for("diffusion")
+        self._trace_warmups = int(os.environ.get("TT_BOLTZ_TRACE_WARMUPS", str(self._TRACE_WARMUPS_DEFAULT)))
+        # populated after first capture
+        self._trace_id = None
+        self._trace_r_in = None
+        self._trace_times_in = None
+        self._trace_output = None
+        self._trace_warmup_remaining = 0  # set on reset
 
     def _create_module(self, weights: WeightScope):
         return Diffusion(weights, self.compute_kernel_config)
+
+    def _release_trace(self) -> None:
+        if self._trace_id is not None:
+            try:
+                ttnn.release_trace(self.tt_device, self._trace_id)
+            except Exception:
+                pass
+            self._trace_id = None
+        for attr in ("_trace_r_in", "_trace_times_in", "_trace_output"):
+            self._safe_deallocate(getattr(self, attr, None))
+            setattr(self, attr, None)
+
+    def _run_regular(self, r_tt, times_tt) -> ttnn.Tensor:
+        return self.module(
+            r_tt,
+            times_tt,
+            self._cache_get("s_inputs"),
+            self._cache_get("s_trunk"),
+            self._cache_get("q"),
+            self._cache_get("c"),
+            self._cache_get("bias_encoder"),
+            self._cache_get("bias_token"),
+            self._cache_get("bias_decoder"),
+            self._cache_get("keys_indexing"),
+            self._cache_get("atom_to_token"),
+            self._cache_get("atom_to_token_normed"),
+            large_seq_len=self._cache_get("_large_seq_len", False),
+        )
 
     def forward(
         self,
@@ -2034,33 +2209,59 @@ class DiffusionModule(TorchWrapper):
             self._cache_set("atom_to_token_normed", atom_to_token_normed_tt)
 
             self._cache_set("atom_pad", atom_pad)
+            self._cache_set("_large_seq_len", seq_len > SEQ_LEN_MORE_CHUNKING)
             self._first_forward_pass = False
+            # New protein → drop any old trace so the new shape gets captured.
+            self._release_trace()
+            self._trace_warmup_remaining = self._trace_warmups
 
         atom_pad_cached = self._cache_get("atom_pad", 0)
         if atom_pad_cached:
             r = torch.nn.functional.pad(r, (0, 0, 0, atom_pad_cached))
 
-        result = self._to_torch(
-            self.module(
-                self._from_torch(r),
-                self._from_torch(times),
-                self._cache_get("s_inputs"),
-                self._cache_get("s_trunk"),
-                self._cache_get("q"),
-                self._cache_get("c"),
-                self._cache_get("bias_encoder"),
-                self._cache_get("bias_token"),
-                self._cache_get("bias_decoder"),
-                self._cache_get("keys_indexing"),
-                self._cache_get("atom_to_token"),
-                self._cache_get("atom_to_token_normed"),
-                large_seq_len=seq_len > SEQ_LEN_MORE_CHUNKING,
+        if not self._trace_enabled:
+            result = self._to_torch(
+                self._run_regular(self._from_torch(r), self._from_torch(times))
             )
-        )
-        result = result[:, :N, :]
-        return result
+            return result[:, :N, :]
+
+        # ------------------------------------------------------------------
+        # Trace path: warm up program cache → capture once → replay.
+        # ------------------------------------------------------------------
+        if self._trace_id is not None:
+            self._write_trace_input(r, self._trace_r_in)
+            self._write_trace_input(times, self._trace_times_in)
+            ttnn.execute_trace(self.tt_device, self._trace_id, cq_id=0, blocking=False)
+            result = self._to_torch(self._trace_output)
+            return result[:, :N, :]
+
+        if self._trace_warmup_remaining > 0:
+            self._trace_warmup_remaining -= 1
+            result = self._to_torch(
+                self._run_regular(self._from_torch(r), self._from_torch(times))
+            )
+            return result[:, :N, :]
+
+        # CAPTURE — allocate persistent input buffers, seed them with the
+        # current host tensors, record the trace, keep the produced output
+        # handle for subsequent replays.
+        self._trace_r_in = self._alloc_trace_input(r.shape)
+        self._trace_times_in = self._alloc_trace_input(times.shape)
+        self._write_trace_input(r, self._trace_r_in)
+        self._write_trace_input(times, self._trace_times_in)
+
+        self._trace_id = ttnn.begin_trace_capture(self.tt_device, cq_id=0)
+        self._trace_output = self._run_regular(self._trace_r_in, self._trace_times_in)
+        ttnn.end_trace_capture(self.tt_device, self._trace_id, cq_id=0)
+        ttnn.synchronize_device(self.tt_device)
+
+        result = self._to_torch(self._trace_output)
+        return result[:, :N, :]
 
     def reset_static_cache(self):
+        # Trace tensors reference these caches, so drop the trace first.
+        self._release_trace()
+        self._trace_warmup_remaining = self._trace_warmups
         super().reset_static_cache()
         if self.module is not None:
             self._clear_cached_attrs(self.module, ("_s_conditioned", "_c_reshaped"))
@@ -2069,6 +2270,8 @@ class DiffusionModule(TorchWrapper):
 
 
 class MSAModule(TorchWrapper):
+    _TRACE_WARMUPS_DEFAULT = 1
+
     def __init__(
         self,
         n_blocks: int,
@@ -2083,6 +2286,28 @@ class MSAModule(TorchWrapper):
         self.avg_n_heads = avg_n_heads
         self.tri_att_head_dim = tri_att_head_dim
         self.tri_att_n_heads = tri_att_n_heads
+        self._trace_enabled = _trace_enabled_for("msa")
+        self._trace_warmups = int(os.environ.get("TT_BOLTZ_TRACE_MSA_WARMUPS", str(self._TRACE_WARMUPS_DEFAULT)))
+        self._trace_id = None
+        self._trace_z_in = None
+        self._trace_out = None
+        self._trace_warmup_remaining = 0
+
+    def _release_trace(self) -> None:
+        if self._trace_id is not None:
+            try:
+                ttnn.release_trace(self.tt_device, self._trace_id)
+            except Exception:
+                pass
+            self._trace_id = None
+        for attr in ("_trace_z_in", "_trace_out"):
+            self._safe_deallocate(getattr(self, attr, None))
+            setattr(self, attr, None)
+
+    def reset_static_cache(self):
+        self._release_trace()
+        self._trace_warmup_remaining = self._trace_warmups
+        super().reset_static_cache()
 
     def _create_module(self, weights: WeightScope):
         return MSA(
@@ -2117,10 +2342,12 @@ class MSAModule(TorchWrapper):
         seq_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
         msa_pad = (-n_msa) % MSA_PAD_MULTIPLE
 
-        required_cache_keys = ("mask_tt", "attn_mask_tt", "msa_mask_tt", "n_msa")
+        required_cache_keys = ("mask_tt", "attn_mask_tt", "msa_mask_tt", "n_msa", "m_tt", "emb_tt")
         if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
             self._clear_runtime_cache()
             self._first_forward_pass = True
+            self._release_trace()
+            self._trace_warmup_remaining = self._trace_warmups
 
         if seq_pad:
             z = torch.nn.functional.pad(z, (0, 0, 0, seq_pad, 0, seq_pad))
@@ -2128,7 +2355,9 @@ class MSAModule(TorchWrapper):
         if seq_pad or msa_pad:
             m = torch.nn.functional.pad(m, (0, 0, 0, seq_pad, 0, msa_pad))
 
-        # Compute masks (once, reused across forward calls)
+        # Compute masks (once, reused across forward calls). m and emb don't
+        # change across recycling iterations, so cache their device tensors
+        # too — this avoids ~10ms host work and a fresh DRAM alloc per call.
         if self._first_forward_pass:
             if seq_pad:
                 padded_seq = seq_len + seq_pad
@@ -2150,19 +2379,39 @@ class MSAModule(TorchWrapper):
             else:
                 self._cache_set("msa_mask_tt", None)
                 self._cache_set("n_msa", None)
+            self._cache_set("m_tt", self._from_torch(m))
+            self._cache_set("emb_tt", self._from_torch(emb))
             self._first_forward_pass = False
 
-        z_out = self._to_torch(
-            self.module(
-                self._from_torch(z),
-                self._from_torch(m),
-                self._from_torch(emb),
+        def _run_with(z_in_tt):
+            return self.module(
+                z_in_tt,
+                self._cache_get("m_tt"),
+                self._cache_get("emb_tt"),
                 self._cache_get("mask_tt"),
                 self._cache_get("attn_mask_tt"),
                 self._cache_get("msa_mask_tt"),
                 self._cache_get("n_msa"),
             )
-        )
 
+        if not self._trace_enabled:
+            out_tt = _run_with(self._from_torch(z))
+        elif self._trace_id is not None:
+            self._write_trace_input(z, self._trace_z_in)
+            ttnn.execute_trace(self.tt_device, self._trace_id, cq_id=0, blocking=False)
+            out_tt = self._trace_out
+        elif self._trace_warmup_remaining > 0:
+            self._trace_warmup_remaining -= 1
+            out_tt = _run_with(self._from_torch(z))
+        else:
+            self._trace_z_in = self._alloc_trace_input(z.shape)
+            self._write_trace_input(z, self._trace_z_in)
+            self._trace_id = ttnn.begin_trace_capture(self.tt_device, cq_id=0)
+            self._trace_out = _run_with(self._trace_z_in)
+            ttnn.end_trace_capture(self.tt_device, self._trace_id, cq_id=0)
+            ttnn.synchronize_device(self.tt_device)
+            out_tt = self._trace_out
+
+        z_out = self._to_torch(out_tt)
         z_out = z_out[:, :seq_len, :seq_len, :]
         return z_out

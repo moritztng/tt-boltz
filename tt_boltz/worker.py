@@ -121,6 +121,9 @@ class _WorkerState:
         from tt_boltz.data.mol import load_canonicals
         from tt_boltz.data.tokenize import Boltz2Tokenizer
         from tt_boltz.main import prepare_features
+        from tt_boltz import _profile  # env-gated; safe no-op when disabled
+
+        _profile.install()
 
         if self.accelerator == "tenstorrent":
             from tt_boltz.tenstorrent import set_fast_mode
