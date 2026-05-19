@@ -34,11 +34,12 @@ dependencies = [
 
 [project.scripts]
 tt-boltz = "tt_boltz.main:cli"
+tt-boltz-demo-quad = "demo_quad.app:main"
 
 [tool.setuptools]
 
 [tool.setuptools.packages.find]
-include = ["tt_boltz*"]
+include = ["tt_boltz*", "demo_quad*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

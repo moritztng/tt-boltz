@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TT-Boltz · Live</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/molstar@4.0.0/build/viewer/molstar.css">
+    <script src="https://cdn.jsdelivr.net/npm/molstar@4.0.0/build/viewer/molstar.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-tertiary: #1a1a24;
+            --accent: #00d4aa;
+            --accent-dim: #00d4aa33;
+            --accent-glow: #00d4aa66;
+            --text-primary: #f0f0f5;
+            --text-secondary: #8888a0;
+            --text-dim: #555566;
+            --error: #ff4466;
+            --border: #2a2a3a;
+            --radius: 10px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            overflow: hidden;
+        }
+        body::before {
+            content: '';
+            position: fixed; inset: 0;
+            background:
+                radial-gradient(ellipse at 20% 20%, var(--accent-dim) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, #4400ff15 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .app {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 1.25rem 1.5rem 1rem;
+            gap: 1.15rem;
+        }
+
+        /* ── Header ─────────────────────────────────────────────────── */
+        header {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 1.75rem;
+            flex: 0 0 auto;
+            padding: 0.25rem 0 0.35rem;
+        }
+        .brand {
+            justify-self: start;
+            height: 48px;
+            display: flex;
+            align-items: center;
+            font-size: 2.25rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+            line-height: 0.9;
+        }
+        .tagline {
+            justify-self: center;
+            font-size: 1.9rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            line-height: 1.05;
+            text-align: center;
+            white-space: nowrap;
+        }
+        .logo-wrap {
+            justify-self: end;
+            height: 48px;
+            display: flex;
+            align-items: center;
+        }
+        .logo {
+            height: 40px;
+            width: auto;
+            display: block;
+        }
+
+        /* ── Card grid ──────────────────────────────────────────────── */
+        .grid {
+            flex: 1 1 auto;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            grid-template-rows: repeat(2, 1fr);
+            gap: 1rem;
+            min-height: 0;
+        }
+        .card {
+            position: relative;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        .card-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0.85rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            background: rgba(0, 0, 0, 0.18);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .card-head .label {
+            color: var(--accent);
+            font-weight: 600;
+            font-size: 1rem;
+            letter-spacing: 0.04em;
+        }
+        .card-head .elapsed { color: var(--text-dim); font-size: 0.85rem; }
+
+        /* Permanent metadata strip — sits below the header and is always
+           visible (independent of cover vs banner state). Lifted out of
+           the overlay so the live structure never has any text on top of
+           it once diffusion starts. */
+        .info {
+            flex: 0 0 auto;
+            padding: 0.55rem 0.85rem;
+            border-bottom: 1px solid var(--border);
+            background: rgba(0, 0, 0, 0.12);
+            min-height: 3.5rem;
+        }
+        .info .name {
+            font-size: 1.05rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            letter-spacing: -0.01em;
+            line-height: 1.2;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .info .meta {
+            margin-top: 0.18rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.74rem;
+            color: var(--text-secondary);
+            letter-spacing: 0.02em;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .info .meta .kind {
+            color: var(--accent);
+            font-weight: 500;
+            text-transform: lowercase;
+        }
+        .info .meta .sep {
+            color: var(--text-dim);
+            margin: 0 0.45rem;
+        }
+        .info.empty .name::after { content: '—'; color: var(--text-dim); }
+        .info.empty .meta { visibility: hidden; }
+
+        .viewer {
+            flex: 1 1 auto;
+            position: relative;
+            background: var(--bg-tertiary);
+            min-height: 0;
+        }
+        .molstar { position: absolute; inset: 0; }
+
+        /* The cover is the *opaque* overlay shown whenever a card has no
+           live structure on screen (loading, MSA, featurize, Pairformer,
+           between predictions, errors). No fade transition so it can never
+           let a previous prediction's leftover peek through. */
+        .cover {
+            position: absolute; inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            text-align: center;
+            z-index: 4;
+        }
+        .cover.hidden { display: none; }
+        .cover.error { color: var(--error); }
+        .cover .stage {
+            color: var(--text-primary);
+            font-size: 1.1rem;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+        .cover.error .stage { color: var(--error); }
+        .cover .count {
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            min-height: 1em;
+        }
+
+        /* The banner is the slim pill that sits on top of a live structure
+           (diffusion, scoring, finalizing, Done flash). */
+        .banner {
+            position: absolute;
+            top: 0.6rem; left: 0.6rem; right: 0.6rem;
+            display: flex;
+            align-items: baseline;
+            gap: 0.7rem;
+            padding: 0.55rem 0.9rem;
+            background: rgba(8, 10, 14, 0.82);
+            border: 1px solid rgba(0, 212, 170, 0.28);
+            border-radius: 8px;
+            backdrop-filter: blur(8px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+            z-index: 3;
+            pointer-events: none;
+        }
+        .banner.hidden { display: none; }
+        .banner.done {
+            border-color: rgba(0, 212, 170, 0.55);
+            background: rgba(0, 60, 50, 0.6);
+        }
+        .banner .stage {
+            flex: 1 1 auto;
+            font-weight: 600;
+            font-size: 0.98rem;
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+        .banner.done .stage { color: var(--accent); }
+        .banner .count {
+            flex: 0 0 auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            color: var(--accent);
+        }
+
+        .spinner {
+            width: 28px; height: 28px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Thin bottom progress strip; no text — the stage is already named
+           in the cover/banner above. */
+        .foot {
+            flex: 0 0 auto;
+            height: 4px;
+            background: var(--bg-tertiary);
+            overflow: hidden;
+        }
+        .foot.error > div { background: var(--error); }
+        .foot > div {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--accent), #00eebb);
+            transition: width 0.3s ease-out;
+        }
+
+        /* Hidden-in-plain-sight admin controls in the footer. */
+        footer {
+            flex: 0 0 auto;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .admin {
+            display: flex;
+            justify-content: center;
+            gap: 0.7rem;
+        }
+        .admin-btn {
+            font-family: inherit;
+            font-size: 0.68rem;
+            font-weight: 500;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: var(--text-dim);
+            cursor: pointer;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .admin-btn:hover { color: var(--accent); }
+        .admin-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
+
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; grid-template-rows: repeat(4, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header>
+            <h1 class="brand">TT-Boltz</h1>
+            <p class="tagline">Higher Boltz-2 throughput than GPUs, at a fraction of the cost</p>
+            <div class="logo-wrap">
+                <img src="{{ url_for('static', filename='logo.png') }}" alt="Tenstorrent" class="logo">
+            </div>
+        </header>
+
+        <main class="grid">
+            {% for card in cards %}
+            <section class="card" data-card="{{ card.card }}">
+                <div class="card-head">
+                    <span class="label">{{ card.label }}</span>
+                    <span class="elapsed" data-role="elapsed"></span>
+                </div>
+                <div class="info empty" data-role="info">
+                    <div class="name" data-role="info-name"></div>
+                    <div class="meta" data-role="info-meta"></div>
+                </div>
+                <div class="viewer">
+                    <div class="molstar" data-role="molstar"></div>
+                    <div class="banner hidden" data-role="banner">
+                        <div class="stage" data-role="banner-stage">—</div>
+                        <div class="count" data-role="banner-count"></div>
+                    </div>
+                    <div class="cover" data-role="cover">
+                        <div class="spinner"></div>
+                        <div class="stage" data-role="cover-stage">starting up</div>
+                        <div class="count" data-role="cover-count"></div>
+                    </div>
+                </div>
+                <div class="foot" data-role="foot"><div data-role="bar"></div></div>
+            </section>
+            {% endfor %}
+        </main>
+
+        <footer>
+            <div class="admin">
+                <button class="admin-btn" id="start-btn">Start</button>
+                <button class="admin-btn" id="stop-btn">Stop</button>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+    /*
+     * Client-side state machine.
+     *
+     * Every card has exactly two possible views: the opaque ``cover`` (no
+     * live structure on screen) or the slim ``banner`` (a live structure is
+     * visible behind it). The view is *only* changed in three places:
+     *
+     *   1. ``startNew`` flips to ``cover`` (and stays there until the first
+     *      render of this prediction lands).
+     *   2. ``render`` flips to ``banner`` right after a new structure has
+     *      been committed to Mol* — never before.
+     *   3. Idle / error events flip to ``cover``.
+     *
+     * Stage events only update text and the progress bar; they never flip
+     * views by themselves. That keeps the cover↔banner transition tied to
+     * the actual Mol* rendering, not to the SSE event timing, which is what
+     * eliminates "structure peeking through cover" races.
+     */
+    (() => {
+        // ── Stage vocabulary (mirrors the single-card demo verbatim) ────
+        const STAGES = {
+            loading:    { label: 'Loading model',    start: 0.00, end: 0.05 },
+            msa:        { label: 'Generating MSA',   start: 0.05, end: 0.15 },
+            prep:       { label: 'Featurizing',      start: 0.15, end: 0.20 },
+            trunk:      { label: 'Pairformer',       start: 0.20, end: 0.50 },
+            diffusion:  { label: 'Diffusion module', start: 0.50, end: 0.90 },
+            confidence: { label: 'Scoring',          start: 0.90, end: 0.95 },
+            saving:     { label: 'Finalizing',       start: 0.95, end: 1.00 },
+        };
+
+        const VIEWER_OPTIONS = {
+            layoutIsExpanded: false, layoutShowControls: false,
+            layoutShowRemoteState: false, layoutShowSequence: false,
+            layoutShowLog: false, layoutShowLeftPanel: false,
+            viewportShowExpand: false, viewportShowSelectionMode: false,
+            viewportShowAnimation: false,
+            collapseLeftPanel: true, collapseRightPanel: true,
+        };
+        const RENDER_INTERVAL_MS = 400;  // throttle for intermediate frames
+
+        // ── CIF helpers (ported from demo/) ─────────────────────────────
+        const tokenSpans = (line) => {
+            const out = [];
+            const re = /'[^']*'|"[^"]*"|\S+/g;
+            let m;
+            while ((m = re.exec(line)) !== null) out.push({ start: m.index, end: m.index + m[0].length });
+            return out;
+        };
+        function buildCifFromCoords(template, coords, atomCount) {
+            const expected = Number(atomCount) || Math.floor((coords?.length || 0) / 3);
+            if (!template || !Array.isArray(coords) || coords.length < expected * 3) return null;
+            const lines = template.split('\n');
+            let inLoop = false, headers = [], atomIdx = 0;
+            for (let i = 0; i < lines.length; i++) {
+                const t = lines[i].trim();
+                if (!t || t.startsWith('#')) continue;
+                if (t === 'loop_') { inLoop = false; headers = []; continue; }
+                if (t.startsWith('_atom_site.')) { headers.push(t.split(/\s+/)[0]); inLoop = true; continue; }
+                if (!inLoop || !headers.length || t.startsWith('_')) continue;
+                const xi = headers.indexOf('_atom_site.Cartn_x');
+                const yi = headers.indexOf('_atom_site.Cartn_y');
+                const zi = headers.indexOf('_atom_site.Cartn_z');
+                if (xi < 0 || yi < 0 || zi < 0 || atomIdx >= expected) continue;
+                const toks = tokenSpans(lines[i]);
+                if (toks.length <= Math.max(xi, yi, zi)) continue;
+                const off = atomIdx * 3;
+                const subs = [
+                    [toks[xi], coords[off]],
+                    [toks[yi], coords[off + 1]],
+                    [toks[zi], coords[off + 2]],
+                ].sort((a, b) => b[0].start - a[0].start);
+                let line = lines[i];
+                for (const [tok, value] of subs) {
+                    line = line.slice(0, tok.start) + Number(value).toFixed(3) + line.slice(tok.end);
+                }
+                lines[i] = line;
+                atomIdx++;
+            }
+            return atomIdx === expected ? lines.join('\n') : null;
+        }
+        function bboxFromCif(cif) {
+            const lines = cif.split('\n');
+            let inLoop = false, headers = [];
+            const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+            let any = false;
+            for (const raw of lines) {
+                const t = raw.trim();
+                if (!t || t.startsWith('#')) continue;
+                if (t === 'loop_') { inLoop = false; headers = []; continue; }
+                if (t.startsWith('_atom_site.')) { headers.push(t.split(/\s+/)[0]); inLoop = true; continue; }
+                if (!inLoop || !headers.length || t.startsWith('_')) continue;
+                const xi = headers.indexOf('_atom_site.Cartn_x');
+                const yi = headers.indexOf('_atom_site.Cartn_y');
+                const zi = headers.indexOf('_atom_site.Cartn_z');
+                if (xi < 0 || yi < 0 || zi < 0) continue;
+                const toks = t.match(/(?:'[^']*'|"[^"]*"|\S+)/g) || [];
+                const x = Number(toks[xi]), y = Number(toks[yi]), z = Number(toks[zi]);
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+                if (x < lo[0]) lo[0] = x; if (y < lo[1]) lo[1] = y; if (z < lo[2]) lo[2] = z;
+                if (x > hi[0]) hi[0] = x; if (y > hi[1]) hi[1] = y; if (z > hi[2]) hi[2] = z;
+                any = true;
+            }
+            if (!any) return null;
+            const center = lo.map((v, i) => (v + hi[i]) / 2);
+            const radius = Math.max(
+                Math.hypot(hi[0] - center[0], hi[1] - center[1], hi[2] - center[2]),
+                0.01,
+            );
+            return { center, radius };
+        }
+        function fitCamera(snap, next, prev, el) {
+            if (!snap || !next) return snap;
+            const pos = Array.from(snap.position);
+            const tgt = Array.from(snap.target);
+            const delta = prev
+                ? next.center.map((v, i) => v - prev.center[i])
+                : next.center.map((v, i) => v - tgt[i]);
+            const newTgt = tgt.map((v, i) => v + delta[i]);
+            let newPos = pos.map((v, i) => v + delta[i]);
+            const dir = newPos.map((v, i) => v - newTgt[i]);
+            const dist = Math.hypot(...dir);
+            const aspect = (el?.clientWidth || 1) / (el?.clientHeight || 1);
+            const vFov = snap.fov || Math.PI / 4;
+            const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+            const limit = Math.max(Math.min(vFov, hFov), 0.01);
+            // 1.05× the geometric fit (5% padding) instead of the original
+            // 1.34× — each card is only a quarter of the screen, so a tight
+            // crop matters a lot more here than in the single-card demo.
+            const minDist = Math.max((next.radius / Math.sin(limit / 2)) * 1.05, 12);
+            if (dist > 0) {
+                const k = minDist / dist;
+                newPos = newTgt.map((v, i) => v + dir[i] * k);
+            }
+            return {
+                ...snap,
+                position: newPos,
+                target: newTgt,
+                radius: Math.max(next.radius * 1.02, 1),
+                radiusMax: Math.max(next.radius * 1.5, 10),
+                fog: 0, clipFar: false, minNear: 0.01, minFar: 0,
+            };
+        }
+
+        // ── Per-card panel ──────────────────────────────────────────────
+        class CardPanel {
+            constructor(root) {
+                this.id = Number(root.dataset.card);
+                this.el = {
+                    molstar:     root.querySelector('[data-role="molstar"]'),
+                    info:        root.querySelector('[data-role="info"]'),
+                    infoName:    root.querySelector('[data-role="info-name"]'),
+                    infoMeta:    root.querySelector('[data-role="info-meta"]'),
+                    cover:       root.querySelector('[data-role="cover"]'),
+                    coverStage:  root.querySelector('[data-role="cover-stage"]'),
+                    coverCount:  root.querySelector('[data-role="cover-count"]'),
+                    banner:      root.querySelector('[data-role="banner"]'),
+                    bannerStage: root.querySelector('[data-role="banner-stage"]'),
+                    bannerCount: root.querySelector('[data-role="banner-count"]'),
+                    elapsed:     root.querySelector('[data-role="elapsed"]'),
+                    foot:        root.querySelector('[data-role="foot"]'),
+                    bar:         root.querySelector('[data-role="bar"]'),
+                };
+
+                this.viewer = null;
+                this.view = 'cover';        // 'cover' | 'banner'
+                this.currentName = null;    // protein this card is predicting
+                this.generation = 0;        // bumped on every new prediction
+                this.template = null;       // first-frame CIF (used as delta base)
+                this.lastFrame = null;
+                this.pending = null;
+                this.rendering = false;
+                this.lastRenderAt = 0;
+                this.startedAt = 0;
+                this.elapsedTimer = null;
+
+                this.setCover('starting up', '');
+            }
+
+            // ── view primitives ─────────────────────────────────────
+            setCover(stage, count = '', isError = false) {
+                this.el.coverStage.textContent = stage;
+                this.el.coverCount.textContent = count;
+                this.el.cover.classList.toggle('error', !!isError);
+            }
+            setBanner(stage, count = '', done = false) {
+                this.el.bannerStage.textContent = stage;
+                this.el.bannerCount.textContent = count;
+                this.el.banner.classList.toggle('done', !!done);
+            }
+
+            // ── Permanent info strip (name + metadata, no overlay) ────
+            setInfo(meta) {
+                if (!meta) {
+                    this.el.info.classList.add('empty');
+                    this.el.infoName.textContent = '';
+                    this.el.infoMeta.textContent = '';
+                    return;
+                }
+                this.el.info.classList.remove('empty');
+                this.el.infoName.textContent = meta.name;
+                // Build the meta line: kind · NNN aa · K chains · PDB · LIG …
+                const sep = () => {
+                    const s = document.createElement('span');
+                    s.className = 'sep';
+                    s.textContent = '·';
+                    return s;
+                };
+                const parts = [];
+                const kind = document.createElement('span');
+                kind.className = 'kind';
+                kind.textContent = meta.kind;
+                parts.push(kind);
+                parts.push(document.createTextNode(`${meta.seq_len} aa`));
+                if (meta.chain_count > 1) {
+                    parts.push(document.createTextNode(`${meta.chain_count} chains`));
+                }
+                if (meta.pdb) parts.push(document.createTextNode(meta.pdb));
+                if (meta.ligand_ccds && meta.ligand_ccds.length) {
+                    parts.push(document.createTextNode(meta.ligand_ccds.join(' + ')));
+                }
+                this.el.infoMeta.replaceChildren();
+                parts.forEach((p, i) => {
+                    if (i > 0) this.el.infoMeta.appendChild(sep());
+                    this.el.infoMeta.appendChild(p);
+                });
+            }
+            showCover() {
+                this.el.cover.classList.remove('hidden');
+                this.el.banner.classList.add('hidden');
+                this.view = 'cover';
+            }
+            showBanner() {
+                this.el.cover.classList.add('hidden');
+                this.el.banner.classList.remove('hidden');
+                this.view = 'banner';
+            }
+            setProgress(frac, isError = false) {
+                this.el.foot.classList.toggle('error', !!isError);
+                this.el.bar.style.width = (Math.max(0, Math.min(1, frac)) * 100).toFixed(1) + '%';
+            }
+
+            // ── elapsed timer ───────────────────────────────────────
+            startElapsed() {
+                this.stopElapsed();
+                this.startedAt = performance.now();
+                this.elapsedTimer = setInterval(() => {
+                    const s = (performance.now() - this.startedAt) / 1000;
+                    this.el.elapsed.textContent = `${s.toFixed(1)}s`;
+                }, 200);
+            }
+            stopElapsed() {
+                if (this.elapsedTimer) {
+                    clearInterval(this.elapsedTimer);
+                    this.elapsedTimer = null;
+                }
+            }
+
+            // ── prediction lifecycle ────────────────────────────────
+            startNew(name) {
+                this.generation++;
+                this.currentName = name || this.currentName;
+                this.template = null;
+                this.lastFrame = null;
+                this.pending = null;
+
+                this.setInfo(complexMeta(this.currentName));
+                this.setCover('Starting', '');
+                this.setBanner('Starting', '');
+                this.setProgress(0);
+                this.showCover();
+                this.startElapsed();
+
+                // Clear Mol* synchronously so even a missed cover hide can
+                // never reveal a stale structure under the (now opaque)
+                // cover during the brief window before the first render.
+                if (this.viewer) {
+                    try {
+                        const hier = this.viewer.plugin.managers.structure.hierarchy;
+                        const prev = [...hier.current.structures];
+                        if (prev.length) hier.remove(prev);
+                    } catch {}
+                }
+            }
+
+            // ── single event dispatcher ─────────────────────────────
+            handle(ev) {
+                // Missed-start recovery: if a stage/intermediate arrives for
+                // a different protein than we last started, treat it as a
+                // brand-new prediction.
+                if ((ev.event === 'stage' || ev.event === 'intermediate')
+                        && ev.name && ev.name !== this.currentName) {
+                    this.startNew(ev.name);
+                }
+
+                switch (ev.event) {
+                    case 'loading':
+                        this.currentName = null;
+                        this.setInfo(null);
+                        this.setCover('Loading model', ev.message || '');
+                        this.setProgress(0);
+                        this.showCover();
+                        return;
+                    case 'ready':
+                        this.currentName = null;
+                        this.setInfo(null);
+                        this.setCover('Ready', 'press Start');
+                        this.setProgress(0);
+                        this.showCover();
+                        return;
+                    case 'stopped':
+                        this.currentName = null;
+                        this.setInfo(null);
+                        this.setCover('Stopped', '');
+                        this.setProgress(0);
+                        this.showCover();
+                        this.stopElapsed();
+                        return;
+                    case 'error':
+                        // Leave the info strip alone — the user can still
+                        // see which complex failed. Only the cover/footer
+                        // change state.
+                        this.setCover('Error', ev.message || 'unknown', /*isErr*/ true);
+                        this.setProgress(0, true);
+                        this.showCover();
+                        this.stopElapsed();
+                        return;
+                    case 'start':
+                        this.startNew(ev.name);
+                        return;
+                    case 'stage': {
+                        const s = STAGES[ev.stage] || { label: ev.stage, start: 0, end: 1 };
+                        const count = ev.total > 0 ? `${ev.step}/${ev.total}` : '';
+                        const frac = ev.total > 0 ? ev.step / ev.total : 0;
+                        const overall = s.start + (s.end - s.start) * Math.min(frac, 1);
+                        // Update content for *both* surfaces; whichever is
+                        // visible will show it.
+                        this.setCover(s.label, count);
+                        this.setBanner(s.label, count);
+                        this.setProgress(overall);
+                        return;
+                    }
+                    case 'intermediate':
+                        if (ev.cif) {
+                            this.template = ev.cif;
+                            this.queueRender({ kind: 'cif', cif: ev.cif, isFinal: false });
+                        } else if (ev.coords) {
+                            this.queueRender({ kind: 'coords', coords: ev.coords, atomCount: ev.atom_count });
+                        }
+                        return;
+                    case 'complete':
+                        this.stopElapsed();
+                        this.setProgress(1);
+                        // "Done" stays up until the next prediction's
+                        // `start` event re-covers the card. The worker sits
+                        // for `linger_seconds` after sending complete, so
+                        // viewers always get to see the final structure.
+                        this.setBanner('Done', `${ev.elapsed}s`, /*done*/ true);
+                        if (ev.cif) {
+                            this.queueRender({ kind: 'cif', cif: ev.cif, isFinal: true });
+                        } else if (this.view === 'cover') {
+                            // No final CIF (shouldn't happen) and nothing
+                            // was rendered — show the Done flash on the
+                            // cover so the user at least sees it.
+                            this.setCover('Done', `${ev.elapsed}s`);
+                        }
+                        return;
+                }
+            }
+
+            // ── render pipeline ─────────────────────────────────────
+            queueRender(req) {
+                req.generation = this.generation;
+                this.pending = req;
+                if (!this.rendering) this._drain();
+            }
+            async _drain() {
+                this.rendering = true;
+                try {
+                    while (this.pending) {
+                        const next = this.pending;
+                        this.pending = null;
+                        if (next.generation !== this.generation) continue;
+                        if (!next.isFinal) {
+                            const dt = performance.now() - this.lastRenderAt;
+                            const wait = Math.max(0, RENDER_INTERVAL_MS - dt);
+                            if (wait) await new Promise(r => setTimeout(r, wait));
+                            // After the throttle wait, if a newer frame is
+                            // queued or the prediction moved on, skip this
+                            // stale one.
+                            if (next.generation !== this.generation || this.pending) continue;
+                        }
+                        const cif = next.kind === 'cif'
+                            ? next.cif
+                            : buildCifFromCoords(this.template, next.coords, next.atomCount);
+                        if (!cif) continue;
+                        this.lastRenderAt = performance.now();
+                        try {
+                            await this._render(cif, next.isFinal, next.generation);
+                        } catch (e) {
+                            console.warn('render failed', e);
+                        }
+                    }
+                } finally {
+                    this.rendering = false;
+                }
+            }
+            async _render(cif, isFinal, generation) {
+                if (generation !== this.generation) return;
+                if (!this.viewer) {
+                    this.viewer = await molstar.Viewer.create(this.el.molstar, VIEWER_OPTIONS);
+                }
+                const hier = this.viewer.plugin.managers.structure.hierarchy;
+                const previous = [...hier.current.structures];
+                const nextBox = bboxFromCif(cif);
+                const preserve = previous.length > 0 && !isFinal;
+                let camera = preserve
+                    ? fitCamera(this.viewer.plugin.canvas3d?.camera.getSnapshot(),
+                                nextBox, this.lastFrame, this.el.molstar)
+                    : null;
+
+                const data = await this.viewer.plugin.builders.data.rawData({ data: cif });
+                const traj = await this.viewer.plugin.builders.structure.parseTrajectory(data, 'mmcif');
+                const model = await this.viewer.plugin.builders.structure.createModel(traj);
+                const structure = await this.viewer.plugin.builders.structure.createStructure(model);
+                if (generation !== this.generation) {
+                    try { await hier.remove([structure]); } catch {}
+                    return;
+                }
+                const repr = isFinal
+                    ? { type: 'cartoon', color: 'plddt-confidence' }
+                    : { type: 'cartoon', color: 'uniform', colorParams: { value: 0x00D4AA } };
+                await this.viewer.plugin.builders.structure.representation.addRepresentation(structure, repr);
+                // Ligands (HETATM non-polymer / non-water / non-ion) are invisible under
+                // a pure cartoon representation. Pull them into a separate component and
+                // draw ball-and-stick with element colouring so co-crystal ligands actually
+                // appear in protein-ligand complexes. Returns null for ligand-free complexes.
+                try {
+                    const ligand = await this.viewer.plugin.builders.structure
+                        .tryCreateComponentStatic(structure, 'ligand');
+                    if (ligand) {
+                        await this.viewer.plugin.builders.structure.representation.addRepresentation(
+                            ligand,
+                            { type: 'ball-and-stick', color: 'element-symbol' },
+                        );
+                    }
+                } catch (err) {
+                    console.warn('ligand representation failed', err);
+                }
+                if (!camera) {
+                    camera = fitCamera(this.viewer.plugin.canvas3d?.camera.getSnapshot(),
+                                       nextBox, null, this.el.molstar);
+                }
+                if (camera) {
+                    this.viewer.plugin.canvas3d?.camera.setState(camera, 0);
+                    requestAnimationFrame(() => this.viewer.plugin.canvas3d?.camera.setState(camera, 0));
+                }
+                if (previous.length) {
+                    await hier.remove(previous);
+                    if (camera) this.viewer.plugin.canvas3d?.camera.setState(camera, 0);
+                }
+                this.lastFrame = nextBox || this.lastFrame;
+
+                // Reveal the live structure only after Mol* has actually
+                // committed it. A late-arriving start event that bumped the
+                // generation while we were awaiting Mol* must not cause the
+                // cover to lift — that would expose the new prediction's
+                // pre-diffusion state to the previous structure.
+                if (generation !== this.generation) return;
+                this.showBanner();
+            }
+        }
+
+        // ── Complex metadata lookup ─────────────────────────────────────
+        // Populated from the snapshot's `complexes` list so every panel
+        // can render rich info (kind / seq_len / chain count / PDB ID /
+        // ligands) just from the complex name in card events.
+        const COMPLEXES = new Map();
+        function complexMeta(name) { return name ? COMPLEXES.get(name) || null : null; }
+
+        // ── Snapshot replay (on connect / reconnect) ────────────────────
+        function applySnapshot(panels, snap) {
+            setPlaying(snap.playing);
+            COMPLEXES.clear();
+            for (const c of snap.complexes || []) COMPLEXES.set(c.name, c);
+
+            for (const c of snap.cards || []) {
+                const p = panels.get(c.card);
+                if (!p) continue;
+                if (c.protein) p.currentName = c.protein;
+                p.setInfo(complexMeta(p.currentName));
+                if (c.stage === 'ready') {
+                    p.setCover('Ready', 'press Start');
+                    p.setProgress(0);
+                    p.showCover();
+                } else if (c.stage === 'stopped') {
+                    p.setCover('Stopped', '');
+                    p.setProgress(0);
+                    p.showCover();
+                } else if (c.stage === 'loading') {
+                    p.setInfo(null);
+                    p.setCover('Loading model', '');
+                    p.setProgress(0);
+                    p.showCover();
+                } else if (c.stage === 'error') {
+                    p.setCover('Error', c.error || 'unknown', true);
+                    p.setProgress(0, true);
+                    p.showCover();
+                } else if (STAGES[c.stage]) {
+                    // Mid-prediction. Safe default is cover — the next
+                    // intermediate event will lift it once Mol* has the
+                    // structure.
+                    const s = STAGES[c.stage];
+                    const count = c.total > 0 ? `${c.step}/${c.total}` : '';
+                    const frac = c.total > 0 ? c.step / c.total : 0;
+                    const overall = s.start + (s.end - s.start) * Math.min(frac, 1);
+                    p.setCover(s.label, count);
+                    p.setBanner(s.label, count);
+                    p.setProgress(overall);
+                    p.showCover();
+                }
+            }
+        }
+
+        // ── Boot ────────────────────────────────────────────────────────
+        const panels = new Map();
+        for (const root of document.querySelectorAll('.card')) {
+            const p = new CardPanel(root);
+            panels.set(p.id, p);
+        }
+
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn  = document.getElementById('stop-btn');
+        function setPlaying(playing) {
+            startBtn.disabled = !!playing;
+            stopBtn.disabled = !playing;
+        }
+        async function control(path) {
+            try {
+                const r = await fetch(path, { method: 'POST' });
+                if (r.ok) setPlaying((await r.json()).playing);
+            } catch {}
+        }
+        startBtn.addEventListener('click', () => control('/start'));
+        stopBtn .addEventListener('click', () => control('/stop'));
+
+        // ── SSE with auto-reconnect ────────────────────────────────────
+        function connect() {
+            const es = new EventSource('/events');
+            es.onerror = () => { es.close(); setTimeout(connect, 1500); };
+            es.onmessage = (msg) => {
+                let ev;
+                try { ev = JSON.parse(msg.data); } catch { return; }
+                if (ev.event === 'snapshot') return applySnapshot(panels, ev);
+                if (ev.event === 'control')  return setPlaying(!!ev.playing);
+                const p = panels.get(ev.card);
+                if (p) p.handle(ev);
+            };
+        }
+        connect();
+
+        // Expose for debugging in the console.
+        window.demoQuad = { panels };
+    })();
+    </script>
+</body>
+</html>

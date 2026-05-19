@@ -118,6 +118,63 @@ def _build_intermediate_frame_maker(base_struct: StructureV2, atom_mask: torch.T
     return make
 
 
+def prepare_sequence_features(
+    sequence: str,
+    ccd,
+    mol_dir: Path,
+    msa_dir: Path,
+    tokenizer,
+    featurizer,
+    use_msa_server: bool = True,
+    msa_server_url: str = "https://api.colabfold.com",
+) -> tuple[dict, StructureV2]:
+    """Build features for a single protein chain. MSA results land in
+    ``msa_dir`` keyed by sequence hash, so repeat calls re-use the cache."""
+    msa_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        yaml_path = Path(tmp) / "input.yaml"
+        yaml_path.write_text(
+            "version: 1\n"
+            "sequences:\n"
+            "  - protein:\n"
+            "      id: A\n"
+            f"      sequence: {sequence}\n"
+        )
+        return prepare_features(
+            yaml_path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
+            use_msa=use_msa_server, msa_url=msa_server_url, msa_strategy="greedy",
+            msa_user=None, msa_pass=None, api_key=None,
+            max_msa=const.max_msa_seqs,
+        )
+
+
+def finalize_prediction(pred: dict, input_struct: StructureV2) -> tuple[str, dict]:
+    """Turn the model's raw prediction dict into a final CIF + confidence."""
+    struct = input_struct.remove_invalid_chains()
+    mask_1d = pred["masks"].squeeze(0) if pred["masks"].dim() > 1 else pred["masks"]
+    coords = pred["coords"][0][mask_1d.bool()].cpu().numpy()
+
+    atoms = struct.atoms.copy()
+    residues = struct.residues.copy()
+    atoms["coords"] = coords
+    atoms["is_present"] = True
+    residues["is_present"] = True
+    new_struct = replace(
+        struct, atoms=atoms, residues=residues,
+        interfaces=np.array([], dtype=Interface),
+        coords=np.array([(x,) for x in coords], dtype=Coords),
+    )
+
+    plddt = pred.get("plddt", [None])[0]
+    cif = to_mmcif(new_struct, plddt, boltz2=True)
+    confidence = {
+        k: float(pred[k][0].item())
+        for k in ("confidence_score", "ptm", "iptm", "complex_plddt")
+        if k in pred
+    }
+    return cif, confidence
+
+
 def predict_structure(
     sequence: str,
     cache_dir: Optional[Path] = None,
@@ -150,158 +207,119 @@ def predict_structure(
 
     mol_dir = cache / "mols"
     msa_dir = cache / "demo_msa"
-    msa_dir.mkdir(parents=True, exist_ok=True)
     use_tt = accelerator == "tenstorrent"
     if use_tt:
         from tt_boltz.tenstorrent import set_fast_mode
         set_fast_mode(fast)
     device = torch.device("cpu")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        yaml_path = tmp / "input.yaml"
-        yaml_path.write_text(
-            "version: 1\n"
-            "sequences:\n"
-            "  - protein:\n"
-            "      id: A\n"
-            f"      sequence: {sequence}\n"
+    try:
+        yield {"type": "progress", "stage": "msa", "step": 0, "total": 1}
+        ccd = load_canonicals(mol_dir)
+        feats, input_struct = prepare_sequence_features(
+            sequence, ccd, mol_dir, msa_dir,
+            Boltz2Tokenizer(), Boltz2Featurizer(),
+            use_msa_server=use_msa_server, msa_server_url=msa_server_url,
         )
+    except Exception as e:
+        yield {"type": "error", "message": f"Preprocessing failed: {e}"}
+        return
+
+    yield {"type": "progress", "stage": "prep", "step": 1, "total": 1}
+    batch = to_batch(feats, device)
+
+    yield {"type": "progress", "stage": "loading", "step": 1, "total": 1}
+    model = Boltz2.load_from_checkpoint(
+        cache / "boltz2_conf.ckpt",
+        predict_args={
+            "recycling_steps": recycling_steps,
+            "sampling_steps": sampling_steps,
+            "diffusion_samples": 1,
+            "max_parallel_samples": 1,
+        },
+        diffusion_process_args=_DIFFUSION_ARGS,
+        pairformer_args=_PAIRFORMER_ARGS,
+        msa_args=_MSA_ARGS,
+        steering_args=_STEERING_ARGS,
+        use_kernels=False,
+        use_tenstorrent=use_tt,
+    ).eval().to(device)
+
+    atom_mask = batch["atom_pad_mask"].squeeze(0).bool()
+    make_intermediate_frame = _build_intermediate_frame_maker(
+        input_struct.remove_invalid_chains(), atom_mask,
+    )
+
+    # Bridge the model's progress_fn (called from the model thread) to
+    # this generator (running on the request thread).
+    events: queue.Queue = queue.Queue()
+    sent_intermediate_template = False
+
+    def progress_fn(stage: str, step: int = 0, total: int = 0,
+                    coords: Optional[torch.Tensor] = None, **_):
+        nonlocal sent_intermediate_template
+        event = {"type": "progress", "stage": stage, "step": step, "total": total}
+        should_stream_coords = (
+            coords is not None
+            and stage == "diffusion"
+            and (step % INTERMEDIATE_FRAME_INTERVAL == 0 or step >= total)
+        )
+        if should_stream_coords:
+            frame = make_intermediate_frame(coords, include_cif=not sent_intermediate_template)
+            if frame is not None:
+                sent_intermediate_template = sent_intermediate_template or "cif" in frame
+                event = {
+                    "type": "intermediate", "stage": stage,
+                    "step": step, "total": total, **frame,
+                }
+        events.put(event)
+
+    model.progress_fn = progress_fn
+
+    result: dict = {"pred": None, "error": None}
+
+    def run_inference():
         try:
-            yield {"type": "progress", "stage": "msa", "step": 0, "total": 1}
-            ccd = load_canonicals(mol_dir)
-            feats, input_struct = prepare_features(
-                yaml_path, ccd, mol_dir, msa_dir,
-                Boltz2Tokenizer(), Boltz2Featurizer(),
-                use_msa=use_msa_server, msa_url=msa_server_url, msa_strategy="greedy",
-                msa_user=None, msa_pass=None, api_key=None,
-                max_msa=const.max_msa_seqs,
-            )
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                result["pred"] = model.predict_step(batch)
         except Exception as e:
-            yield {"type": "error", "message": f"Preprocessing failed: {e}"}
-            return
-
-        yield {"type": "progress", "stage": "prep", "step": 1, "total": 1}
-        batch = to_batch(feats, device)
-
-        # Load model
-        yield {"type": "progress", "stage": "loading", "step": 1, "total": 1}
-        model = Boltz2.load_from_checkpoint(
-            cache / "boltz2_conf.ckpt",
-            predict_args={
-                "recycling_steps": recycling_steps,
-                "sampling_steps": sampling_steps,
-                "diffusion_samples": 1,
-                "max_parallel_samples": 1,
-            },
-            diffusion_process_args=_DIFFUSION_ARGS,
-            pairformer_args=_PAIRFORMER_ARGS,
-            msa_args=_MSA_ARGS,
-            steering_args=_STEERING_ARGS,
-            use_kernels=False,
-            use_tenstorrent=use_tt,
-        ).eval().to(device)
-
-        # Intermediate-coord renderer needs the un-padded template structure.
-        atom_mask = batch["atom_pad_mask"].squeeze(0).bool()
-        make_intermediate_frame = _build_intermediate_frame_maker(
-            input_struct.remove_invalid_chains(), atom_mask,
-        )
-
-        # Bridge the model's progress_fn (called from the model thread) to
-        # this generator (running on the request thread).
-        events: queue.Queue = queue.Queue()
-        sent_intermediate_template = False
-
-        def progress_fn(stage: str, step: int = 0, total: int = 0,
-                        coords: Optional[torch.Tensor] = None, **_):
-            nonlocal sent_intermediate_template
-            event = {"type": "progress", "stage": stage, "step": step, "total": total}
-            should_stream_coords = (
-                coords is not None
-                and stage == "diffusion"
-                and (step % INTERMEDIATE_FRAME_INTERVAL == 0 or step >= total)
-            )
-            if should_stream_coords:
-                frame = make_intermediate_frame(coords, include_cif=not sent_intermediate_template)
-                if frame is not None:
-                    sent_intermediate_template = sent_intermediate_template or "cif" in frame
-                    event = {
-                        "type": "intermediate", "stage": stage,
-                        "step": step, "total": total, **frame,
-                    }
-            events.put(event)
-
-        model.progress_fn = progress_fn
-
-        result: dict = {"pred": None, "error": None}
-
-        def run_inference():
-            try:
-                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    result["pred"] = model.predict_step(batch)
-            except Exception as e:
-                result["error"] = str(e)
-            finally:
-                events.put(None)
-
-        thread = threading.Thread(target=run_inference, daemon=True)
-        thread.start()
-
-        try:
-            while True:
-                try:
-                    ev = events.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if ev is None:
-                    break
-                yield ev
+            result["error"] = str(e)
         finally:
-            # If the browser disconnects mid-stream, keep this generator alive
-            # until the TT inference thread finishes so the demo never starts a
-            # second prediction while the device is still busy.
-            thread.join()
+            events.put(None)
 
-        if result["error"]:
-            yield {"type": "error", "message": f"Prediction failed: {result['error']}"}
-            return
+    thread = threading.Thread(target=run_inference, daemon=True)
+    thread.start()
 
-        pred = result["pred"]
-        if pred is None or pred.get("exception"):
-            yield {"type": "error", "message": "Prediction failed"}
-            return
+    try:
+        while True:
+            try:
+                ev = events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if ev is None:
+                break
+            yield ev
+    finally:
+        # If the browser disconnects mid-stream, keep this generator alive
+        # until the TT inference thread finishes so the demo never starts a
+        # second prediction while the device is still busy.
+        thread.join()
 
-        yield {"type": "progress", "stage": "saving", "step": 0, "total": 1}
+    if result["error"]:
+        yield {"type": "error", "message": f"Prediction failed: {result['error']}"}
+        return
 
-        # Assemble the final structure from predicted coordinates.
-        struct = input_struct.remove_invalid_chains()
-        mask_1d = pred["masks"].squeeze(0) if pred["masks"].dim() > 1 else pred["masks"]
-        coords = pred["coords"][0][mask_1d.bool()].cpu().numpy()
+    pred = result["pred"]
+    if pred is None or pred.get("exception"):
+        yield {"type": "error", "message": "Prediction failed"}
+        return
 
-        atoms = struct.atoms.copy()
-        residues = struct.residues.copy()
-        atoms["coords"] = coords
-        atoms["is_present"] = True
-        residues["is_present"] = True
-        new_struct = replace(
-            struct, atoms=atoms, residues=residues,
-            interfaces=np.array([], dtype=Interface),
-            coords=np.array([(x,) for x in coords], dtype=Coords),
-        )
+    yield {"type": "progress", "stage": "saving", "step": 0, "total": 1}
 
-        plddt = pred.get("plddt", [None])[0]
-        cif = to_mmcif(new_struct, plddt, boltz2=True)
-
-        confidence = {
-            k: float(pred[k][0].item())
-            for k in ("confidence_score", "ptm", "iptm", "complex_plddt")
-            if k in pred
-        }
-
-        yield {
-            "type": "complete",
-            "cif": cif,
-            "confidence": confidence,
-            "sequence_length": len(sequence),
-        }
+    cif, confidence = finalize_prediction(pred, input_struct)
+    yield {
+        "type": "complete",
+        "cif": cif,
+        "confidence": confidence,
+        "sequence_length": len(sequence),
+    }
