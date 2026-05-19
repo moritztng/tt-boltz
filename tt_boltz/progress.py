@@ -44,7 +44,11 @@ RECENT_MAX = 8
 
 @dataclass
 class DeviceState:
-    device_id: int
+    worker_id: str
+    device_id: int | str
+    host: str = ""
+    accelerator: str = ""
+    label: str = ""
     name: str = ""
     stage: str = "idle"
     step: int = 0
@@ -56,20 +60,20 @@ class DeviceState:
 class ProgressDisplay:
     """Drives a Rich Live display from a multiprocessing.Queue of events.
 
-    Events (dicts sent by workers):
-        {"dev": int, "event": "init",    "assigned": int}
-        {"dev": int, "event": "loading"}
-        {"dev": int, "event": "start",   "name": str}
-        {"dev": int, "event": "stage",   "stage": str, "step": int, "total": int}
-        {"dev": int, "event": "done",    "name": str, "time": float, "status": str}
+    Each event carries the worker's identity (host/accelerator/label) plus a
+    kind-specific payload:
+        {"worker": str, "dev": int, "event": "loading"}
+        {"worker": str, "dev": int, "event": "start",   "name": str}
+        {"worker": str, "dev": int, "event": "stage",   "stage": str, "step": int, "total": int}
+        {"worker": str, "dev": int, "event": "done",    "name": str, "time": float, "status": str}
     """
 
-    def __init__(self, queue, total: int, n_devices: int):
+    def __init__(self, queue, total: int, n_workers: int):
         self.queue = queue
         self.total = total
-        self.n_devices = n_devices
+        self.n_workers = n_workers
 
-        self.devices: dict[int, DeviceState] = {}
+        self.devices: dict[str, DeviceState] = {}
         self.completed = 0
         self.failed = 0
         self.recent: list[dict] = []
@@ -127,38 +131,42 @@ class ProgressDisplay:
 
     def _handle(self, ev: dict):
         dev = ev.get("dev", 0)
+        worker_id = str(ev.get("worker", dev))
         kind = ev["event"]
 
-        if kind == "init":
-            self.devices[dev] = DeviceState(
-                device_id=dev, assigned=ev.get("assigned", 0),
-            )
-        elif kind == "loading":
-            d = self.devices.setdefault(dev, DeviceState(device_id=dev))
+        # Every event carries the worker's host/accelerator/label in its meta,
+        # so make sure the DeviceState reflects the latest values.
+        d = self.devices.get(worker_id)
+        if d is None:
+            d = DeviceState(worker_id=worker_id, device_id=dev)
+            self.devices[worker_id] = d
+        if "host" in ev:
+            d.host = ev["host"]
+        if "accelerator" in ev:
+            d.accelerator = ev["accelerator"]
+        if "label" in ev:
+            d.label = ev["label"]
+
+        if kind == "loading":
             d.stage = "loading"
             d.name = ""
         elif kind == "start":
-            d = self.devices.get(dev)
-            if d:
-                d.name = ev["name"]
-                d.stage = "msa"
-                d.step = 0
-                d.total_steps = 0
+            d.name = ev["name"]
+            d.stage = "msa"
+            d.step = 0
+            d.total_steps = 0
+            d.assigned += 1
         elif kind == "stage":
-            d = self.devices.get(dev)
-            if d:
-                d.stage = ev.get("stage", d.stage)
-                d.step = ev.get("step", 0)
-                d.total_steps = ev.get("total", 0)
+            d.stage = ev.get("stage", d.stage)
+            d.step = ev.get("step", 0)
+            d.total_steps = ev.get("total", 0)
         elif kind == "done":
             self.completed += 1
             if ev.get("status") != "ok":
                 self.failed += 1
-            d = self.devices.get(dev)
-            if d:
-                d.done += 1
-                d.stage = "idle"
-                d.name = ""
+            d.done += 1
+            d.stage = "idle"
+            d.name = ""
             self.recent.append(ev)
             if len(self.recent) > RECENT_MAX:
                 self.recent.pop(0)
@@ -211,7 +219,8 @@ class ProgressDisplay:
         pct = f"{self.completed * 100 // self.total}%" if self.total else "–"
         hdr = Text("  ")
         hdr.append("tt-boltz", style="bold cyan")
-        hdr.append(f"  {self.n_devices} device{'s' if self.n_devices != 1 else ''}", style="dim")
+        visible_workers = self.n_workers or len(self.devices)
+        hdr.append(f"  {visible_workers} worker{'s' if visible_workers != 1 else ''}", style="dim")
         hdr.append(f"  {self.completed}/{self.total}", style="bold")
         hdr.append(f" ({pct})", style="dim")
         if self.failed:
@@ -227,18 +236,18 @@ class ProgressDisplay:
         # ── device rows ───────────────────────────────────────────────────
         tbl = Table(show_header=False, box=None, padding=(0, 1),
                     pad_edge=False, expand=False)
-        tbl.add_column("d", style="dim", width=9, justify="right")
+        tbl.add_column("worker", style="dim", width=18, justify="right")
         tbl.add_column("name", width=18, no_wrap=True)
         tbl.add_column("bar", width=BAR_WIDTH, no_wrap=True)
         tbl.add_column("stage", width=18, no_wrap=True)
         tbl.add_column("cnt", style="dim", width=6, justify="right")
 
-        for dev_id in sorted(self.devices):
-            d = self.devices[dev_id]
+        for worker_id in sorted(self.devices):
+            d = self.devices[worker_id]
             frac = self._frac(d)
             active = d.stage not in ("idle", "loading")
             tbl.add_row(
-                f"device {dev_id}",
+                d.label or f"device {d.device_id}",
                 Text(d.name[:18] if d.name else "·",
                      style="bold" if active else "dim"),
                 self._bar(frac),
@@ -249,7 +258,8 @@ class ProgressDisplay:
 
         # ── recent log ────────────────────────────────────────────────────
         log_lines = []
-        for r in self.recent[-self.n_devices:]:
+        recent_count = self.n_workers or max(1, len(self.devices))
+        for r in self.recent[-recent_count:]:
             ln = Text("  ")
             if r.get("status") == "ok":
                 ln.append("✓ ", style="green")
@@ -318,32 +328,36 @@ class DebugDisplay:
             except (Empty, EOFError):
                 break
             dev = ev.get("dev", 0)
+            who = ev.get("label") or ev.get("worker") or f"dev {dev}"
             kind = ev["event"]
             if kind == "loading":
-                print(f"[dev {dev}] loading model…", flush=True)
+                print(f"[{who}] loading model…", flush=True)
             elif kind == "start":
-                print(f"[dev {dev}] {ev.get('name', '?')}", flush=True)
+                print(f"[{who}] {ev.get('name', '?')}", flush=True)
             elif kind == "stage":
                 s, step, total = ev.get("stage", ""), ev.get("step", 0), ev.get("total", 0)
-                print(f"[dev {dev}]   {s} {step}/{total}" if total else f"[dev {dev}]   {s}", flush=True)
+                print(f"[{who}]   {s} {step}/{total}" if total else f"[{who}]   {s}", flush=True)
             elif kind == "done":
                 sym = "✓" if ev.get("status") == "ok" else "✗"
-                print(f"[dev {dev}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.0f}s", flush=True)
+                print(f"[{who}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.0f}s", flush=True)
 
 
-def make_progress_fn(queue, device_id: int):
+def make_progress_fn(queue, device_id: int | str, worker_id: str | None = None, metadata: dict | None = None):
     """Return a lightweight callback for Boltz2.progress_fn.
 
-    Workers call: model.progress_fn = make_progress_fn(queue, dev_id)
+    Workers call: model.progress_fn = make_progress_fn(queue, dev_id, worker_id, metadata)
     The model then calls progress_fn("stage", step=N, total=M) at key points.
     """
+    metadata = metadata or {}
+
     def _fn(stage: str, step: int = 0, total: int = 0, **_extra):
         # Extra kwargs (e.g. ``coords`` for live visualization) are ignored:
         # they are not safe to ship across a multiprocessing queue.
         try:
             queue.put_nowait({
-                "dev": device_id, "event": "stage",
+                "dev": device_id, "worker": str(worker_id or device_id), "event": "stage",
                 "stage": stage, "step": step, "total": total,
+                **metadata,
             })
         except Exception:
             pass  # never block the model

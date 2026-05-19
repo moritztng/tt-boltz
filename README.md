@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards).
+TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -53,6 +53,18 @@ Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--fast` makes some operations use block-fp8, a lower-precision numeric format that runs faster. Accuracy is typically very close.
 
 `predict` accepts either a single YAML/FASTA file or a directory containing many input files.
+
+A live display shows the progress of each protein. On a multi-card machine such
+as a QuietBox or Galaxy server, every card is used in parallel and labelled in
+the display (`quietbox:tt0`, `quietbox:tt1`, ...). Models load once per card
+and stay resident, so jobs flow through without per-protein reloads:
+
+```bash
+tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
+```
+
+If you have additional machines with Tenstorrent cards, you can add them to a
+single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-prediction).
 
 ### Offline MSA (Optional)
 
@@ -280,6 +292,7 @@ templates:
 | `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
 | `--report-energy` | `False` | Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
 | `--energy-metric` | `both` | Choose power channel(s): `tdp`, `input`, or `both` |
+| `--listen` | — | Accept worker connections from other machines; see [Multi-Machine Prediction](#optional-multi-machine-prediction) |
 | `--energy-sample-hz` | `20.0` | Sampling rate in Hz for both `power_w` and `input_power_w` channels |
 
 **Affinity-Specific Options:**
@@ -337,6 +350,24 @@ Runtime for a 686 amino acid protein:
 | Nvidia T4 | ~9 min |
 | Tenstorrent Blackhole p150 | ~1 min |
 | Nvidia RTX 5090 | ~1 min |
+
+## Optional: Multi-Machine Prediction
+
+Combine the cards across any mix of Tenstorrent machines — a workstation, one
+or more QuietBoxes, one or more Galaxy servers — into a single run.
+
+On the machine driving the run:
+
+```bash
+tt-boltz predict ./proteins --listen 8765 --use_msa_server --fast
+```
+
+On every additional machine, replace `HOST` with the driving machine's
+hostname or IP:
+
+```bash
+tt-boltz worker --connect http://HOST:8765
+```
 
 ## Optional: Energy Measurement
 
