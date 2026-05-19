@@ -126,8 +126,6 @@
             font-size: 1rem;
             letter-spacing: 0.04em;
         }
-        .card-head .elapsed { color: var(--text-dim); font-size: 0.85rem; }
-
         /* Permanent metadata strip — sits below the header and is always
            visible (independent of cover vs banner state). Lifted out of
            the overlay so the live structure never has any text on top of
@@ -323,7 +321,6 @@
             <section class="card" data-card="{{ card.card }}">
                 <div class="card-head">
                     <span class="label">{{ card.label }}</span>
-                    <span class="elapsed" data-role="elapsed"></span>
                 </div>
                 <div class="info empty" data-role="info">
                     <div class="name" data-role="info-name"></div>
@@ -513,7 +510,6 @@
                     banner:      root.querySelector('[data-role="banner"]'),
                     bannerStage: root.querySelector('[data-role="banner-stage"]'),
                     bannerCount: root.querySelector('[data-role="banner-count"]'),
-                    elapsed:     root.querySelector('[data-role="elapsed"]'),
                     foot:        root.querySelector('[data-role="foot"]'),
                     bar:         root.querySelector('[data-role="bar"]'),
                 };
@@ -527,8 +523,6 @@
                 this.pending = null;
                 this.rendering = false;
                 this.lastRenderAt = 0;
-                this.startedAt = 0;
-                this.elapsedTimer = null;
 
                 this.setCover('starting up', '');
             }
@@ -596,22 +590,6 @@
                 this.el.bar.style.width = (Math.max(0, Math.min(1, frac)) * 100).toFixed(1) + '%';
             }
 
-            // ── elapsed timer ───────────────────────────────────────
-            startElapsed() {
-                this.stopElapsed();
-                this.startedAt = performance.now();
-                this.elapsedTimer = setInterval(() => {
-                    const s = (performance.now() - this.startedAt) / 1000;
-                    this.el.elapsed.textContent = `${s.toFixed(1)}s`;
-                }, 200);
-            }
-            stopElapsed() {
-                if (this.elapsedTimer) {
-                    clearInterval(this.elapsedTimer);
-                    this.elapsedTimer = null;
-                }
-            }
-
             // ── prediction lifecycle ────────────────────────────────
             startNew(name) {
                 this.generation++;
@@ -625,7 +603,6 @@
                 this.setBanner('Starting', '');
                 this.setProgress(0);
                 this.showCover();
-                this.startElapsed();
 
                 // Clear Mol* synchronously so even a missed cover hide can
                 // never reveal a stale structure under the (now opaque)
@@ -670,7 +647,6 @@
                         this.setCover('Stopped', '');
                         this.setProgress(0);
                         this.showCover();
-                        this.stopElapsed();
                         return;
                     case 'error':
                         // Leave the info strip alone — the user can still
@@ -679,7 +655,6 @@
                         this.setCover('Error', ev.message || 'unknown', /*isErr*/ true);
                         this.setProgress(0, true);
                         this.showCover();
-                        this.stopElapsed();
                         return;
                     case 'start':
                         this.startNew(ev.name);
@@ -705,20 +680,19 @@
                         }
                         return;
                     case 'complete':
-                        this.stopElapsed();
                         this.setProgress(1);
                         // "Done" stays up until the next prediction's
                         // `start` event re-covers the card. The worker sits
                         // for `linger_seconds` after sending complete, so
                         // viewers always get to see the final structure.
-                        this.setBanner('Done', `${ev.elapsed}s`, /*done*/ true);
+                        this.setBanner('Done', '', /*done*/ true);
                         if (ev.cif) {
                             this.queueRender({ kind: 'cif', cif: ev.cif, isFinal: true });
                         } else if (this.view === 'cover') {
                             // No final CIF (shouldn't happen) and nothing
                             // was rendered — show the Done flash on the
                             // cover so the user at least sees it.
-                            this.setCover('Done', `${ev.elapsed}s`);
+                            this.setCover('Done', '');
                         }
                         return;
                 }
