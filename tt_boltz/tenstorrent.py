@@ -141,6 +141,13 @@ def set_fast_mode(enabled: bool) -> None:
 
 _device = None
 
+# Pairformer-only tracing knob. When TT_BOLTZ_TRACE=1, the device is opened
+# with a reserved trace region and PairformerModule.forward captures one
+# trace per protein and replays it for the remaining recycling iterations.
+_TRACE_ENABLED = os.environ.get("TT_BOLTZ_TRACE", "").lower() in ("1", "true", "on", "yes")
+_TRACE_REGION_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB — enough headroom for the Pairformer trace
+
+
 def get_device():
     """Open (or return cached) TT device 0.
 
@@ -150,7 +157,10 @@ def get_device():
     global _device
     if _device is None:
         device_id = int(os.environ.get("TT_BOLTZ_LOGICAL_DEVICE_ID", "0"))
-        _device = ttnn.open_device(device_id=device_id)
+        open_kwargs = {"device_id": device_id}
+        if _TRACE_ENABLED:
+            open_kwargs["trace_region_size"] = _TRACE_REGION_BYTES
+        _device = ttnn.open_device(**open_kwargs)
         _configure_active_compute_grid(_device)
         _device.enable_program_cache()
     return _device
@@ -1812,6 +1822,11 @@ class TorchWrapper(nn.Module):
 
 
 class PairformerModule(TorchWrapper):
+    # First forward populates the program cache; the second captures the trace;
+    # all remaining recycling iterations replay it. One warmup is sufficient
+    # because every op in the recorded subgraph runs identically across iters.
+    _TRACE_WARMUPS = 1
+
     def __init__(
         self,
         n_blocks: int,
@@ -1830,6 +1845,16 @@ class PairformerModule(TorchWrapper):
         self.att_n_heads = att_n_heads
         self.transform_s = transform_s
         self.affinity = affinity
+        # Trace state (only populated when _TRACE_ENABLED). Allocated lazily
+        # so existing callers that instantiate PairformerModule but never call
+        # forward (e.g. weight-loading tests) pay nothing.
+        self._trace_enabled = _TRACE_ENABLED
+        self._trace_id = None
+        self._trace_s_in = None
+        self._trace_z_in = None
+        self._trace_s_out = None
+        self._trace_z_out = None
+        self._trace_warmups_left = self._TRACE_WARMUPS
 
     def _create_module(self, weights: WeightScope):
         return Pairformer(
@@ -1844,6 +1869,41 @@ class PairformerModule(TorchWrapper):
             affinity=self.affinity,
         )
 
+    def _alloc_trace_input(self, shape) -> ttnn.Tensor:
+        """Persistent DRAM buffer the captured trace will read from each replay."""
+        return ttnn.allocate_tensor_on_device(
+            ttnn.Shape(tuple(shape)),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            self.tt_device,
+            ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def _write_trace_input(self, host_t: torch.Tensor, dev_t: ttnn.Tensor) -> None:
+        """Update a pre-allocated trace input in place — no device alloc."""
+        host = ttnn.from_torch(host_t, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        ttnn.copy_host_to_device_tensor(host, dev_t, cq_id=0)
+
+    def _release_trace(self) -> None:
+        if self._trace_id is not None:
+            try:
+                ttnn.release_trace(self.tt_device, self._trace_id)
+            except Exception:
+                pass
+            self._trace_id = None
+        for attr in ("_trace_s_in", "_trace_z_in", "_trace_s_out", "_trace_z_out"):
+            self._deallocate_tensor_like(getattr(self, attr, None))
+            setattr(self, attr, None)
+        self._trace_warmups_left = self._TRACE_WARMUPS
+
+    def reset_static_cache(self):
+        # Always release the trace and persistent input buffers between
+        # proteins: each protein may have a different padded sequence
+        # length and the program cache is wiped by Boltz2.forward, so
+        # the captured trace would no longer be valid anyway.
+        self._release_trace()
+        super().reset_static_cache()
+
     def forward(
         self,
         s: torch.Tensor | None,
@@ -1857,6 +1917,7 @@ class PairformerModule(TorchWrapper):
 
         required_cache_keys = ("mask_tt", "attn_mask_start_tt", "attn_mask_end_tt")
         if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
+            self._release_trace()
             self._clear_runtime_cache()
             self._first_forward_pass = True
 
@@ -1889,15 +1950,53 @@ class PairformerModule(TorchWrapper):
                 self._cache_set("mask_tt", None)
                 self._cache_set("attn_mask_start_tt", None)
                 self._cache_set("attn_mask_end_tt", None)
+            # Pre-allocate persistent trace input buffers next to the masks,
+            # so the captured trace reads from stable DRAM addresses on every
+            # replay. Done unconditionally (cheap) only when tracing is on.
+            if self._trace_enabled:
+                self._trace_z_in = self._alloc_trace_input(z.shape)
+                if s is not None:
+                    self._trace_s_in = self._alloc_trace_input(s.shape)
             self._first_forward_pass = False
 
-        s_out, z_out = self.module(
-            self._from_torch(s) if s is not None else None,
-            self._from_torch(z),
-            self._cache_get("mask_tt"),
-            self._cache_get("attn_mask_start_tt"),
-            self._cache_get("attn_mask_end_tt"),
-        )
+        def _run_eager():
+            return self.module(
+                self._from_torch(s) if s is not None else None,
+                self._from_torch(z),
+                self._cache_get("mask_tt"),
+                self._cache_get("attn_mask_start_tt"),
+                self._cache_get("attn_mask_end_tt"),
+            )
+
+        if not self._trace_enabled:
+            s_out, z_out = _run_eager()
+        elif self._trace_id is not None:
+            # Replay: refresh persistent inputs in place, fire the trace.
+            self._write_trace_input(z, self._trace_z_in)
+            if s is not None:
+                self._write_trace_input(s, self._trace_s_in)
+            ttnn.execute_trace(self.tt_device, self._trace_id, cq_id=0, blocking=False)
+            s_out, z_out = self._trace_s_out, self._trace_z_out
+        elif self._trace_warmups_left > 0:
+            # Warmup: run eager so every op's program is in the cache before
+            # the next call captures the trace.
+            self._trace_warmups_left -= 1
+            s_out, z_out = _run_eager()
+        else:
+            # Capture: seed the pre-allocated input buffers, record once.
+            self._write_trace_input(z, self._trace_z_in)
+            if s is not None:
+                self._write_trace_input(s, self._trace_s_in)
+            self._trace_id = ttnn.begin_trace_capture(self.tt_device, cq_id=0)
+            self._trace_s_out, self._trace_z_out = self.module(
+                self._trace_s_in if s is not None else None,
+                self._trace_z_in,
+                self._cache_get("mask_tt"),
+                self._cache_get("attn_mask_start_tt"),
+                self._cache_get("attn_mask_end_tt"),
+            )
+            ttnn.end_trace_capture(self.tt_device, self._trace_id, cq_id=0)
+            s_out, z_out = self._trace_s_out, self._trace_z_out
 
         s_result = self._to_torch(s_out)[:, :seq_len, :] if s_out is not None else None
         z_result = self._to_torch(z_out)[:, :seq_len, :seq_len, :]
