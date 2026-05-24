@@ -93,6 +93,7 @@ tt-boltz predict examples/prot.yaml --use_envdb --override
 - `--use_envdb`: Include EnvDB in offline MSA (`tt-boltz msa --db all`)
 - `--accelerator=tenstorrent`: Use Tenstorrent hardware (default, or use `cpu`/`gpu`)
 - `--fast`: Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close
+- `--no-tracing`: Disable default Pairformer TT-NN trace replay on Tenstorrent
 - `--debug`: Show all raw output from the hardware and libraries instead of the progress display
 - `--debug --log`: Same as `--debug`, but also print what each device is currently working on
 
@@ -290,6 +291,8 @@ templates:
 | `--num_devices` | `0` | Number of TT devices (0=all available) |
 | `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
 | `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
+| `--no-tracing` | `False` | Disable default Pairformer TT-NN trace replay on Tenstorrent |
+| `--trace` | `False` | Print Boltz2 module-stage debug messages |
 | `--report-energy` | `False` | Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
 | `--energy-metric` | `both` | Choose power channel(s): `tdp`, `input`, or `both` |
 | `--listen` | — | Accept worker connections from other machines; see [Multi-Machine Prediction](#optional-multi-machine-prediction) |
