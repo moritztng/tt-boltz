@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import base64
 import gc
+import hashlib
 import os
+import random
 import shutil
 import signal
 import sys
@@ -21,6 +23,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from tt_boltz.distributed import ControllerClient, HttpProgressQueue
@@ -80,6 +83,21 @@ def _resolve_msa_dir(requested: str | None, cache: Path) -> str:
     fallback = cache / "msa"
     fallback.mkdir(parents=True, exist_ok=True)
     return str(fallback)
+
+
+def _seed_worker_for_job(seed: int | None, path: Path, phase: str) -> int:
+    """Seed RNGs in the spawned worker before per-job randomness is consumed."""
+    if seed is None:
+        return 42
+    digest = hashlib.blake2s(f"{path.stem}:{phase}".encode("utf-8"), digest_size=4).digest()
+    job_offset = int.from_bytes(digest, "little")
+    job_seed = (int(seed) + job_offset) % (2**32)
+    random.seed(job_seed)
+    np.random.seed(job_seed)
+    torch.manual_seed(job_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(job_seed)
+    return job_seed
 
 
 class _WorkerState:
@@ -157,7 +175,8 @@ class _WorkerState:
     def predict_one(self, path: Path, cfg: dict[str, Any]):
         from tt_boltz.main import to_batch, write_result
 
-        feats, input_struct = self.prepare(path, method=cfg.get("method"))
+        rng_seed = _seed_worker_for_job(cfg.get("seed"), path, "structure")
+        feats, input_struct = self.prepare(path, method=cfg.get("method"), rng_seed=rng_seed)
         batch = to_batch(feats, self.torch_device)
         with torch.no_grad():
             pred = self.model.predict_step(batch)
@@ -177,6 +196,7 @@ class _WorkerState:
         from tt_boltz.boltz2 import Boltz2
         from tt_boltz.main import to_batch
 
+        rng_seed = _seed_worker_for_job(cfg.get("seed"), path, "affinity")
         if self.aff_model is None:
             self.aff_model = (
                 Boltz2.load_from_checkpoint(cfg["aff_ckpt"], **cfg["aff_kwargs"])
@@ -184,7 +204,7 @@ class _WorkerState:
                 .to(self.torch_device)
             )
 
-        feats, _ = self.prepare(path, method="other", affinity=True, pred_structure=pred_structure)
+        feats, _ = self.prepare(path, method="other", affinity=True, pred_structure=pred_structure, rng_seed=rng_seed)
         batch = to_batch(feats, self.torch_device)
         with torch.no_grad():
             pred = self.aff_model.predict_step(batch)

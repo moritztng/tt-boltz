@@ -160,7 +160,7 @@ def get_device():
     global _device
     if _device is None:
         device_id = int(os.environ.get("TT_BOLTZ_LOGICAL_DEVICE_ID", "0"))
-        _device = ttnn.open_device(device_id=device_id, trace_region_size=2 << 30 if _TRACE_ENABLED else 0)
+        _device = ttnn.open_device(device_id=device_id, trace_region_size=1 << 30 if _TRACE_ENABLED else 0)
         _configure_active_compute_grid(_device)
         _device.enable_program_cache()
     return _device

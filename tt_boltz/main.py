@@ -443,7 +443,7 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
 def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      use_msa, msa_url, msa_strategy, msa_user, msa_pass, api_key,
                      max_msa, msa_db_path=None, use_envdb=False, method=None,
-                     affinity=False, pred_structure=None):
+                     affinity=False, pred_structure=None, rng_seed=42):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
     MSA files are cached in msa_dir by sequence hash — the same
@@ -558,7 +558,7 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
 
     # Featurize
     feats = featurizer.process(
-        tok, np.random.default_rng(42), mols, False, const.max_msa_seqs,
+        tok, np.random.default_rng(rng_seed), mols, False, const.max_msa_seqs,
         pad_to_max_seqs=False, single_sequence_prop=0.0, compute_frames=True,
         inference_pocket_constraints=pocket, inference_contact_constraints=contact,
         compute_constraint_features=True, override_method=method, compute_affinity=affinity
@@ -1289,6 +1289,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
         "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
         "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+        "seed": seed,
         "fast": fast,
         "no_tracing": no_tracing,
     }
