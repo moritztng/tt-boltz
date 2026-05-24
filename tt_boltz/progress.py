@@ -264,7 +264,7 @@ class ProgressDisplay:
             if r.get("status") == "ok":
                 ln.append("✓ ", style="green")
                 ln.append(r.get("name", "?"))
-                ln.append(f"  {r.get('time', 0):.0f}s", style="dim")
+                ln.append(f"  {r.get('time', 0):.1f}s", style="dim")
             else:
                 ln.append("✗ ", style="red")
                 ln.append(r.get("name", "?"), style="red")
@@ -339,7 +339,7 @@ class DebugDisplay:
                 print(f"[{who}]   {s} {step}/{total}" if total else f"[{who}]   {s}", flush=True)
             elif kind == "done":
                 sym = "✓" if ev.get("status") == "ok" else "✗"
-                print(f"[{who}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.0f}s", flush=True)
+                print(f"[{who}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.1f}s", flush=True)
 
 
 def make_progress_fn(queue, device_id: int | str, worker_id: str | None = None, metadata: dict | None = None):

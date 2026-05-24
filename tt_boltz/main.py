@@ -878,12 +878,17 @@ def _public_join_url(bind_host: str, port: int) -> str:
 
 def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: int,
                 debug: bool, log: bool, results_path: Path | None = None,
-                struct_dir: Path | None = None) -> int:
+                struct_dir: Path | None = None,
+                worker_procs: list | None = None) -> int:
     """Stream events from a controller and render progress; return failed count.
 
     On every done event we fetch that job's output files from the controller
     and write them under struct_dir, and merge its result row into
     results.json. Interrupted runs preserve every protein finished so far.
+
+    If ``worker_procs`` is given, abort with a clear error when every local
+    worker has died (e.g. SIGKILL from the kernel OOM-killer) instead of
+    polling forever for a completion event that will never arrive.
     """
     from queue import Queue as ThreadQueue
 
@@ -922,6 +927,17 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
                 pq.put(ev)
             if snapshot.get("status") in ("ok", "failed"):
                 failed = int(snapshot.get("failed") or 0)
+                break
+            if worker_procs and all(not p.is_alive() for p in worker_procs):
+                # Surface dead-worker failures (most often host OOM-kill, exitcode
+                # -9/137) so the CLI exits with an error instead of polling forever.
+                reasons = [
+                    f"pid {p.pid}: SIGKILL (likely host OOM-killer)"
+                    if p.exitcode in (-9, 137) else f"pid {p.pid}: exit {p.exitcode}"
+                    for p in worker_procs
+                ]
+                click.echo("\nAll workers died: " + ", ".join(reasons), err=True)
+                failed = max(total - len(rows_by_id), 0) or 1
                 break
             time.sleep(0.5)
     finally:
@@ -970,7 +986,7 @@ def _scheduler_session(listen: str | None, workers: list, debug: bool):
     public_url = _public_join_url(listen_host, server.port) if listen else None
     procs = _spawn_worker_processes(url, workers, debug)
     try:
-        yield ControllerClient(url), public_url
+        yield ControllerClient(url), public_url, procs
     finally:
         _stop_worker_processes(procs)
         server.shutdown()
@@ -1329,13 +1345,14 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 click.echo(f"Energy profiler unavailable: {e}")
                 energy_profiler = None
 
-    with _scheduler_session(listen, workers, debug) as (client, public_url):
+    with _scheduler_session(listen, workers, debug) as (client, public_url, worker_procs):
         if public_url:
             click.echo(f"Workers may join: tt-boltz worker --connect {public_url}")
         run_id = client.create_run(run_payload)["run_id"]
         failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers),
                              debug=debug, log=log, results_path=results_path,
-                             struct_dir=struct_dir)
+                             struct_dir=struct_dir,
+                             worker_procs=worker_procs if not listen else None)
         _persist_run_results(client, run_id, results_path)
 
     if energy_profiler is not None:

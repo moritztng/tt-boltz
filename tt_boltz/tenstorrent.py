@@ -2141,6 +2141,10 @@ class DiffusionModule(TorchWrapper):
 
 
 class MSAModule(TorchWrapper):
+    _trace_id = None
+    _trace_warmed = False
+    _trace_z_in = _trace_z_out = None
+
     def __init__(
         self,
         n_blocks: int,
@@ -2167,6 +2171,55 @@ class MSAModule(TorchWrapper):
             self.compute_kernel_config,
         )
 
+    def _release_trace(self):
+        if self._trace_id is not None:
+            try:
+                ttnn.release_trace(self.tt_device, self._trace_id)
+            except Exception:
+                pass
+        for t in (self._trace_z_in, self._trace_z_out):
+            self._deallocate_tensor_like(t)
+        self._trace_id = None
+        self._trace_warmed = False
+        self._trace_z_in = self._trace_z_out = None
+
+    def reset_static_cache(self):
+        self._release_trace()
+        super().reset_static_cache()
+
+    def _run_msa(self, z):
+        """Dispatch one MSA call: eager, warmup, capture, or replay."""
+        args = (
+            self._cache_get("m_tt"), self._cache_get("emb_tt"),
+            self._cache_get("mask_tt"), self._cache_get("attn_mask_tt"),
+            self._cache_get("msa_mask_tt"), self._cache_get("n_msa"),
+        )
+
+        if not _TRACE_ENABLED or not self._trace_warmed:
+            self._trace_warmed = True
+            return self.module(self._from_torch(z), *args)
+
+        def _write(host_t, dev_t):
+            ttnn.copy_host_to_device_tensor(
+                ttnn.from_torch(host_t, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16),
+                dev_t, cq_id=0,
+            )
+
+        if self._trace_id is not None:
+            _write(z, self._trace_z_in)
+            ttnn.execute_trace(self.tt_device, self._trace_id, cq_id=0, blocking=False)
+            return self._trace_z_out
+
+        self._trace_z_in = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(tuple(z.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+            self.tt_device, ttnn.DRAM_MEMORY_CONFIG,
+        )
+        _write(z, self._trace_z_in)
+        self._trace_id = ttnn.begin_trace_capture(self.tt_device, cq_id=0)
+        self._trace_z_out = self.module(self._trace_z_in, *args)
+        ttnn.end_trace_capture(self.tt_device, self._trace_id, cq_id=0)
+        return self._trace_z_out
+
     def forward(
         self,
         z: torch.Tensor,
@@ -2189,8 +2242,9 @@ class MSAModule(TorchWrapper):
         seq_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
         msa_pad = (-n_msa) % MSA_PAD_MULTIPLE
 
-        required_cache_keys = ("mask_tt", "attn_mask_tt", "msa_mask_tt", "n_msa")
+        required_cache_keys = ("mask_tt", "attn_mask_tt", "msa_mask_tt", "n_msa", "m_tt", "emb_tt")
         if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
+            self._release_trace()
             self._clear_runtime_cache()
             self._first_forward_pass = True
 
@@ -2200,7 +2254,7 @@ class MSAModule(TorchWrapper):
         if seq_pad or msa_pad:
             m = torch.nn.functional.pad(m, (0, 0, 0, seq_pad, 0, msa_pad))
 
-        # Compute masks (once, reused across forward calls)
+        # Cache masks and static device inputs once; m and emb don't change across recycling.
         if self._first_forward_pass:
             if seq_pad:
                 padded_seq = seq_len + seq_pad
@@ -2222,19 +2276,10 @@ class MSAModule(TorchWrapper):
             else:
                 self._cache_set("msa_mask_tt", None)
                 self._cache_set("n_msa", None)
+            self._cache_set("m_tt", self._from_torch(m))
+            self._cache_set("emb_tt", self._from_torch(emb))
             self._first_forward_pass = False
 
-        z_out = self._to_torch(
-            self.module(
-                self._from_torch(z),
-                self._from_torch(m),
-                self._from_torch(emb),
-                self._cache_get("mask_tt"),
-                self._cache_get("attn_mask_tt"),
-                self._cache_get("msa_mask_tt"),
-                self._cache_get("n_msa"),
-            )
-        )
-
+        z_out = self._to_torch(self._run_msa(z))
         z_out = z_out[:, :seq_len, :seq_len, :]
         return z_out

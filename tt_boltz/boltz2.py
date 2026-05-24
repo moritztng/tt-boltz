@@ -5277,6 +5277,12 @@ class Boltz2(nn.Module):
                 )
                 dict_out.update(struct_out)
 
+            # Free ~2 GB of CPU tensors (token_trans_bias alone is ~1.7 GB on
+            # 1500 residues) before confidence runs; otherwise they stay refcounted
+            # through the rest of this scope and tip the worker into the host
+            # OOM-killer on long sequences.
+            del q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias, diffusion_conditioning
+
             if self.predict_bfactor:
                 pbfactor = self.bfactor_module(s)
                 dict_out["pbfactor"] = pbfactor
