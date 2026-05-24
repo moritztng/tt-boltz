@@ -1151,6 +1151,7 @@ def msa(db, path, install_tools):
 @click.option("--num_subsampled_msa", default=1024, type=int)
 @click.option("--no_kernels", is_flag=True)
 @click.option("--trace", is_flag=True)
+@click.option("--no-tracing", "no_tracing", is_flag=True, help="Disable Pairformer TT-NN trace capture+replay")
 @click.option("--write_pae", is_flag=True, help="Write PAE matrix per target")
 @click.option("--write_pde", is_flag=True, help="Write PDE matrix per target")
 @click.option("--write_embeddings", is_flag=True, help="Write s/z embeddings per target")
@@ -1172,6 +1173,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
             msa_server_username, msa_server_password, api_key_value, use_potentials,
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
+            no_tracing,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, debug, log,
@@ -1288,6 +1290,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
         "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
         "fast": fast,
+        "no_tracing": no_tracing,
     }
     run_payload = {
         "data": str(data),

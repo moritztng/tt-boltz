@@ -123,9 +123,10 @@ class _WorkerState:
         from tt_boltz.main import prepare_features
 
         if self.accelerator == "tenstorrent":
-            from tt_boltz.tenstorrent import set_fast_mode
+            from tt_boltz.tenstorrent import set_fast_mode, set_tracing
 
             set_fast_mode(cfg.get("fast", False))
+            set_tracing(not cfg.get("no_tracing", False))
         tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
         ccd = load_canonicals(Path(cfg["mol_dir"]))
         self.prepare = partial(
@@ -205,7 +206,7 @@ def _hash_run_config(cfg: dict[str, Any]) -> str:
     import hashlib
     import json
 
-    keep = {k: cfg.get(k) for k in ("conf_kwargs", "aff_kwargs", "fast", "method")}
+    keep = {k: cfg.get(k) for k in ("conf_kwargs", "aff_kwargs", "fast", "no_tracing", "method")}
     blob = json.dumps(keep, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
