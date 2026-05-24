@@ -1167,7 +1167,7 @@ def msa(db, path, install_tools):
 @click.option("--num_subsampled_msa", default=1024, type=int)
 @click.option("--no_kernels", is_flag=True)
 @click.option("--trace", is_flag=True, help="Print Boltz2 module-stage debug messages")
-@click.option("--no-tracing", "no_tracing", is_flag=True, help="Disable Pairformer TT-NN trace capture+replay")
+@click.option("--no-tracing", "no_tracing", is_flag=True, help="Disable trace replay; dispatch every MSA + Pairformer op individually each recycling iteration instead of replaying a recorded trace (slower, only useful for debugging)")
 @click.option("--write_pae", is_flag=True, help="Write PAE matrix per target")
 @click.option("--write_pde", is_flag=True, help="Write PDE matrix per target")
 @click.option("--write_embeddings", is_flag=True, help="Write s/z embeddings per target")
