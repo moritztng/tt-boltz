@@ -5183,6 +5183,12 @@ class Boltz2(nn.Module):
         # Compute pairwise mask
         mask = feats["token_pad_mask"].float()
         pair_mask = mask[:, :, None] * mask[:, None, :]
+        template_mask = feats.get("template_mask")
+        has_templates = (
+            self.use_templates
+            and template_mask is not None
+            and bool(template_mask.any().item())
+        )
         if self.run_trunk_and_structure:
             for i in range(recycling_steps + 1):
                 if _pfn:
@@ -5192,7 +5198,7 @@ class Boltz2(nn.Module):
                 z = z_init + self.z_recycle(self.z_norm(z))
 
                 # Compute pairwise stack
-                if self.use_templates:
+                if has_templates:
                     if self.trace:
                         print("[boltz2] template_module")
                     if self.is_template_compiled:
