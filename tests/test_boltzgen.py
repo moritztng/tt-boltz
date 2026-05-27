@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from tt_boltz.tenstorrent import PairformerModule, MSAModule, DiffusionModule
+from tt_boltz.tenstorrent import (
+    DiffusionModule,
+    MiniformerModule,
+    MSAModule,
+    PairformerModule,
+)
 from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
 
 
@@ -73,6 +78,44 @@ def test_pairformer_matches_boltzgen_reference(seq_len: int) -> None:
         att_head_dim=24,
         att_n_heads=16,
         transform_s=True,
+    )
+
+    sd = ref.state_dict()
+    tt.load_state_dict(sd, strict=False)
+
+    s = 8 * torch.randn(1, seq_len, 384)
+    z = 26 * torch.randn(1, seq_len, seq_len, 128)
+    mask = torch.ones(1, seq_len)
+    pair_mask = torch.ones(1, seq_len, seq_len)
+
+    s_tt, z_tt = tt(s, z, mask=mask, pair_mask=pair_mask)
+    s_ref, z_ref = ref(s, z, mask, pair_mask)
+
+    check(s_tt, s_ref)
+    check(z_tt, z_ref)
+
+
+@pytest.mark.parametrize("seq_len", [100])
+def test_miniformer_matches_boltzgen_reference(seq_len: int) -> None:
+    """tt-boltz ttnn MiniformerModule vs BoltzGen's reference MiniformerModule.
+
+    Miniformer is BoltzGen's design-stage pairformer variant: replaces the 4
+    triangular ops (out/in mul, start/end attention) with a single
+    MiniTriangularUpdate that does a fused bi-directional update at D/4 width.
+    The rest of the layer (pre_norm_s, attention, transitions, s_post_norm)
+    matches Pairformer exactly.
+    """
+    from boltzgen.model.layers.miniformer import MiniformerModule as BGMiniformer
+
+    ref = BGMiniformer(
+        token_s=384, token_z=128, num_blocks=2, num_heads=16,
+        dropout=0.0, post_layer_norm=False, activation_checkpointing=False,
+    ).eval()
+
+    tt = MiniformerModule(
+        n_blocks=2,
+        att_head_dim=24,  # token_s // num_heads
+        att_n_heads=16,
     )
 
     sd = ref.state_dict()
@@ -282,6 +325,43 @@ def test_convert_to_tt_swap_round_trips() -> None:
     z_msa_ref = ref.msa_module(z2, emb, feats)
     z_msa_tt = swapped.msa_module(z2, emb, feats)
     check(z_msa_tt, z_msa_ref)
+
+
+def test_convert_to_tt_swaps_miniformer() -> None:
+    """convert_to_tt routes a Miniformer-based Boltz to the ttnn Miniformer.
+    Verifies the duck-typed dispatch in convert_to_tt and the state_dict
+    flow into the Miniformer wrapper."""
+    from boltzgen.model.layers.miniformer import MiniformerModule as BGMiniformer
+
+    from tt_boltz.boltzgen import convert_to_tt
+    from tt_boltz.tenstorrent import MiniformerModule as TTMiniformer
+
+    class StubDesign(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.pairformer_module = BGMiniformer(
+                token_s=384, token_z=128, num_blocks=2, num_heads=16,
+                dropout=0.0,
+            )
+
+    ref = StubDesign().eval()
+    saved = {k: v.clone() for k, v in ref.state_dict().items()}
+
+    swapped = StubDesign().eval()
+    convert_to_tt(swapped)
+    assert isinstance(swapped.pairformer_module, TTMiniformer)
+    swapped.load_state_dict(saved, strict=False)
+
+    seq_len = 100
+    s = 8 * torch.randn(1, seq_len, 384)
+    z = 26 * torch.randn(1, seq_len, seq_len, 128)
+    mask = torch.ones(1, seq_len)
+    pair_mask = torch.ones(1, seq_len, seq_len)
+
+    s_ref, z_ref = ref.pairformer_module(s, z, mask, pair_mask)
+    s_tt, z_tt = swapped.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+    check(s_tt, s_ref)
+    check(z_tt, z_ref)
 
 
 def _load_real_boltz():
