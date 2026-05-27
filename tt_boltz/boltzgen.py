@@ -164,8 +164,21 @@ def _tt_load_from_checkpoint(checkpoint_path, *, strict=True, map_location="cpu"
     hp.update({k: v for k, v in kwargs.items() if k in sig})
     model = Boltz(**hp)
     convert_to_tt(model)
-    model.load_state_dict(ckpt["state_dict"], strict=False)
+    state = _remap_legacy_state_dict_keys(ckpt["state_dict"])
+    model.load_state_dict(state, strict=False)
     return model.eval()
+
+
+def _remap_legacy_state_dict_keys(state: dict) -> dict:
+    """Mirror ``Boltz.on_load_checkpoint``'s key remap, which Lightning's
+    ``load_from_checkpoint`` would normally apply. Older checkpoints wrapped
+    the diffusion token transformer in a ``token_transformer_layers`` ModuleList;
+    current Boltz code stores it as ``token_transformer`` directly. The
+    BoltzGen design checkpoint (boltzgen1_diverse.ckpt) is the older format."""
+    return {
+        k.replace(".token_transformer_layers.0.", ".token_transformer."): v
+        for k, v in state.items()
+    }
 
 
 def cli_main() -> None:

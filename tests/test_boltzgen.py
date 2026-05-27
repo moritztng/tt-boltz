@@ -20,18 +20,22 @@ from tt_boltz.tenstorrent import (
 from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
 
 
-# Real-checkpoint tests are gated on the presence of the BoltzGen folding
-# checkpoint (~2 GB). Set BOLTZGEN_FOLD_CKPT to point at boltz2_conf_final.ckpt
-# to enable them.
-_DEFAULT_CKPT = (
+# Real-checkpoint tests are gated on the presence of BoltzGen checkpoints
+# (each ~2 GB). Override paths via BOLTZGEN_FOLD_CKPT / BOLTZGEN_DESIGN_CKPT.
+_CKPT_ROOT = (
     Path.home()
     / ".cache/huggingface/hub/models--boltzgen--boltzgen-1"
-    / "snapshots/c1be29e1f82ffcc72264f64b993c43fb4e0d17f0/boltz2_conf_final.ckpt"
+    / "snapshots/c1be29e1f82ffcc72264f64b993c43fb4e0d17f0"
 )
-BOLTZGEN_FOLD_CKPT = Path(os.environ.get("BOLTZGEN_FOLD_CKPT", _DEFAULT_CKPT))
+BOLTZGEN_FOLD_CKPT = Path(os.environ.get("BOLTZGEN_FOLD_CKPT", _CKPT_ROOT / "boltz2_conf_final.ckpt"))
+BOLTZGEN_DESIGN_CKPT = Path(os.environ.get("BOLTZGEN_DESIGN_CKPT", _CKPT_ROOT / "boltzgen1_diverse.ckpt"))
 requires_fold_ckpt = pytest.mark.skipif(
     not BOLTZGEN_FOLD_CKPT.exists(),
     reason=f"BoltzGen folding checkpoint not found at {BOLTZGEN_FOLD_CKPT}",
+)
+requires_design_ckpt = pytest.mark.skipif(
+    not BOLTZGEN_DESIGN_CKPT.exists(),
+    reason=f"BoltzGen design checkpoint not found at {BOLTZGEN_DESIGN_CKPT}",
 )
 
 # Imported lazily inside tests so collection works even if a sibling import breaks.
@@ -390,23 +394,27 @@ def test_convert_to_tt_swaps_miniformer() -> None:
     check(z_tt, z_ref)
 
 
-def _load_real_boltz():
-    """Build a BoltzGen ``Boltz`` model from the real folding checkpoint.
+def _load_real_boltz(ckpt_path=None):
+    """Build a BoltzGen ``Boltz`` model from a real checkpoint.
 
-    Returns a fresh model each call — call twice when you need both a PyTorch
-    reference and a separately-swapped ttnn version, since convert_to_tt is
-    destructive.
+    Returns a fresh model and the legacy-remapped state_dict each call —
+    call twice when you need both a PyTorch reference and a separately-
+    swapped ttnn version, since convert_to_tt is destructive.
     """
     import inspect
     from boltzgen.model.models.boltz import Boltz
 
+    from tt_boltz.boltzgen import _remap_legacy_state_dict_keys
+
     ckpt = torch.load(
-        BOLTZGEN_FOLD_CKPT, map_location="cpu", weights_only=False, mmap=True
+        ckpt_path or BOLTZGEN_FOLD_CKPT,
+        map_location="cpu", weights_only=False, mmap=True,
     )
     sig = inspect.signature(Boltz.__init__).parameters
     hp = {k: v for k, v in ckpt["hyper_parameters"].items() if k in sig}
     model = Boltz(**hp).eval()
-    return model, ckpt["state_dict"]
+    state = _remap_legacy_state_dict_keys(ckpt["state_dict"])
+    return model, state
 
 
 @requires_fold_ckpt
@@ -461,3 +469,30 @@ def test_real_checkpoint_pairformer_numerical() -> None:
     # bfloat16-vs-fp32 floor of the ttnn implementation on Blackhole.
     check(s_tt, s_ref, tol=0.10)
     check(z_tt, z_ref, tol=0.30)
+
+
+@requires_design_ckpt
+def test_design_checkpoint_loads_after_swap() -> None:
+    """boltzgen1_diverse.ckpt (design model) loads cleanly with convert_to_tt.
+
+    Surprise we found while building this: the production design ckpt uses
+    *standard* Pairformer/MSA, not Miniformer — the default training config
+    boltzgen.yaml sets use_miniformer=false. So convert_to_tt does the same
+    swap pattern as for folding. The legacy token_transformer_layers.0.*
+    key remap (mirroring Boltz.on_load_checkpoint) is what makes this work.
+    """
+    from tt_boltz.boltzgen import convert_to_tt
+    from tt_boltz.tenstorrent import (
+        DiffusionModule as TTD,
+        MSAModule as TTM,
+        PairformerModule as TTP,
+    )
+
+    model, state = _load_real_boltz(BOLTZGEN_DESIGN_CKPT)
+    convert_to_tt(model)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    assert len(missing) == 0, f"missing keys: {missing[:5]}"
+    assert len(unexpected) == 0, f"unexpected keys: {unexpected[:5]}"
+    assert isinstance(model.pairformer_module, TTP)
+    assert isinstance(model.msa_module, TTM)
+    assert isinstance(model.structure_module.score_model, TTD)
