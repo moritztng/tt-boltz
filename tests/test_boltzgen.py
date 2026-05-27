@@ -327,6 +327,32 @@ def test_convert_to_tt_swap_round_trips() -> None:
     check(z_msa_tt, z_msa_ref)
 
 
+@pytest.mark.parametrize("seq_len", [100])
+def test_pairformer_noseq_matches_boltzgen_reference(seq_len: int) -> None:
+    """tt-boltz's no-seq Pairformer adapter vs BoltzGen's PairformerNoSeqModule.
+    This is the variant inside BoltzGen's TemplateModule.pairformer."""
+    from boltzgen.model.layers.pairformer import (
+        PairformerNoSeqModule as BGPairformerNoSeq,
+    )
+
+    from tt_boltz.boltzgen import TTPairformerNoSeqModule
+
+    ref = BGPairformerNoSeq(
+        token_z=64, num_blocks=2,
+        dropout=0.0, pairwise_head_width=32, pairwise_num_heads=4,
+    ).eval()
+
+    tt = TTPairformerNoSeqModule(n_blocks=2)
+    tt.load_state_dict(ref.state_dict(), strict=False)
+
+    z = 26 * torch.randn(1, seq_len, seq_len, 64)
+    pair_mask = torch.ones(1, seq_len, seq_len)
+
+    z_ref = ref(z, pair_mask)
+    z_tt = tt(z, pair_mask)
+    check(z_tt, z_ref)
+
+
 def test_convert_to_tt_swaps_miniformer() -> None:
     """convert_to_tt routes a Miniformer-based Boltz to the ttnn Miniformer.
     Verifies the duck-typed dispatch in convert_to_tt and the state_dict
