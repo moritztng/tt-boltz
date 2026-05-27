@@ -142,6 +142,58 @@ class TTPairformerNoSeqModule(TTPairformerModule):
         return z_out
 
 
+def _tt_load_from_checkpoint(checkpoint_path, *, strict=True, map_location="cpu",
+                              weights_only=False, **kwargs):
+    """Replacement for ``Boltz.load_from_checkpoint`` that:
+      1. loads the checkpoint manually (avoiding Lightning's ``.to(device)``
+         which trips on torchmetrics' CUDA dummy tensor when PyTorch is CPU-only),
+      2. filters legacy hparams the current Boltz signature no longer accepts,
+      3. applies ``convert_to_tt`` BEFORE ``load_state_dict`` so the ttnn
+         wrappers capture their weights via ``_load_from_state_dict``.
+    """
+    import inspect
+
+    import torch as _torch
+    from boltzgen.model.models.boltz import Boltz
+
+    ckpt = _torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False, mmap=True
+    )
+    sig = inspect.signature(Boltz.__init__).parameters
+    hp = {k: v for k, v in ckpt["hyper_parameters"].items() if k in sig}
+    hp.update({k: v for k, v in kwargs.items() if k in sig})
+    model = Boltz(**hp)
+    convert_to_tt(model)
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+    return model.eval()
+
+
+def cli_main() -> None:
+    """Entry point: run ``boltzgen <args>`` with ``Boltz.load_from_checkpoint``
+    monkey-patched to apply convert_to_tt, and ``--no_subprocess`` forced
+    so the patch carries through every pipeline step.
+
+    Use exactly like ``boltzgen``:
+        tt-boltzgen run example/prot.yaml --output out/ ...
+    """
+    import sys
+
+    from boltzgen.cli.boltzgen import main as _bg_main
+    from boltzgen.model.models.boltz import Boltz
+
+    Boltz.load_from_checkpoint = _tt_load_from_checkpoint  # type: ignore[assignment]
+
+    args = sys.argv[1:]
+    if args and args[0] == "run" and "--no_subprocess" not in args:
+        args.insert(1, "--no_subprocess")
+    sys.argv = [sys.argv[0]] + args
+    _bg_main()
+
+
+if __name__ == "__main__":
+    cli_main()
+
+
 def _att_head_dim(pairformer: nn.Module) -> int:
     """Read the AttentionPairBias head_dim off the first Pairformer layer."""
     layer0 = pairformer.layers[0]
