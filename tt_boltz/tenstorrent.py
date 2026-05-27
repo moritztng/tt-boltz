@@ -969,6 +969,236 @@ class Pairformer(Module):
         return s, z
 
 
+class MiniTriangularUpdate(Module):
+    """Bi-directional triangular multiplicative update (BoltzGen Miniformer).
+
+    Equivalent to PyTorch reference (boltzgen/.../triangular.py:MiniTriangularUpdate):
+
+        x = norm_in(x)
+        x = p_in(x) * sigmoid(g_in(x))        # (B, N, N, D)
+        x = x * mask.unsqueeze(-1)
+        a1, b1, a2, b2 = chunk(x, 4, dim=-1)  # 4 x (B, N, N, D/4)
+        x1 = einsum("bikd,bjkd->bijd", a1, b1)  # outgoing-style
+        x2 = einsum("bkid,bkjd->bijd", a2, b2)  # incoming-style
+        x = cat([x1, x2], -1)                 # (B, N, N, D/2)
+        x = norm_out(x)
+        return p_out(x) * sigmoid(g_out(x))   # (B, N, N, D)
+
+    Each einsum decomposes to a permute-matmul-permute, reusing the same
+    permutation pattern as TriangleMultiplication (outgoing=False / incoming=True).
+    """
+
+    def __init__(
+        self,
+        state_dict: Weights,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.norm_in_weight = self.torch_to_tt("norm_in.weight")
+        self.norm_in_bias = self.torch_to_tt("norm_in.bias")
+        self.p_in_weight = self.torch_to_tt("p_in.weight")
+        self.g_in_weight = self.torch_to_tt("g_in.weight")
+        self.norm_out_weight = self.torch_to_tt("norm_out.weight")
+        self.norm_out_bias = self.torch_to_tt("norm_out.bias")
+        self.p_out_weight = self.torch_to_tt("p_out.weight")
+        self.g_out_weight = self.torch_to_tt("g_out.weight")
+
+    @staticmethod
+    def _matmul_einsum(
+        a: ttnn.Tensor,
+        b: ttnn.Tensor,
+        ending: bool,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+        memory_config: ttnn.MemoryConfig,
+    ) -> ttnn.Tensor:
+        """Compute the einsum bikd,bjkd->bijd (ending=False, outgoing) or
+        bkid,bkjd->bijd (ending=True, incoming) via permute-matmul-permute."""
+        a_perm = (0, 3) + ((2, 1) if ending else (1, 2))
+        b_perm = (0, 3) + ((1, 2) if ending else (2, 1))
+        ap = ttnn.permute(a, a_perm, memory_config=memory_config)
+        bp = ttnn.permute(b, b_perm, memory_config=memory_config)
+        ttnn.deallocate(a)
+        ttnn.deallocate(b)
+        out = ttnn.matmul(
+            ap,
+            bp,
+            compute_kernel_config=compute_kernel_config,
+            memory_config=memory_config,
+            dtype=ttnn.bfloat16,
+        )
+        ttnn.deallocate(ap)
+        ttnn.deallocate(bp)
+        return ttnn.permute(out, (0, 2, 3, 1), memory_config=memory_config)
+
+    def __call__(self, x: ttnn.Tensor, mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
+        seq_len = x.shape[1]
+        memory_config = _triangle_mul_memory_config(seq_len)
+
+        x_norm = ttnn.layer_norm(
+            x,
+            weight=self.norm_in_weight,
+            bias=self.norm_in_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        p = ttnn.linear(
+            x_norm,
+            self.p_in_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat16,
+            core_grid=CORE_GRID_MAIN,
+        )
+        g = ttnn.linear(
+            x_norm,
+            self.g_in_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat16,
+            core_grid=CORE_GRID_MAIN,
+        )
+        ttnn.deallocate(x_norm)
+        x_gated = ttnn.multiply_(
+            p, g, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID]
+        )
+        ttnn.deallocate(g)
+        if mask is not None:
+            x_gated = ttnn.multiply_(x_gated, ttnn.unsqueeze(mask, -1))
+
+        a1, b1, a2, b2 = ttnn.chunk(x_gated, chunks=4, dim=-1)
+        ttnn.deallocate(x_gated)
+
+        x1 = self._matmul_einsum(
+            a1, b1, ending=False,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
+        )
+        x2 = self._matmul_einsum(
+            a2, b2, ending=True,
+            compute_kernel_config=self.compute_kernel_config,
+            memory_config=memory_config,
+        )
+        x = ttnn.concat([x1, x2], dim=-1)
+        ttnn.deallocate(x1)
+        ttnn.deallocate(x2)
+
+        x = ttnn.layer_norm(
+            x,
+            weight=self.norm_out_weight,
+            bias=self.norm_out_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        p_out = ttnn.linear(
+            x,
+            self.p_out_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat16,
+            core_grid=CORE_GRID_MAIN,
+        )
+        g_out = ttnn.linear(
+            x,
+            self.g_out_weight,
+            compute_kernel_config=self.compute_kernel_config,
+            dtype=ttnn.bfloat16,
+            core_grid=CORE_GRID_MAIN,
+        )
+        ttnn.deallocate(x)
+        return ttnn.multiply_(
+            p_out, g_out, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID]
+        )
+
+
+class MiniformerLayer(Module):
+    """One Miniformer block: triangular + attention on s + transitions."""
+
+    def __init__(
+        self,
+        att_head_dim: int,
+        att_n_heads: int,
+        state_dict: Weights,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.triangular = MiniTriangularUpdate(
+            self.scope("triangular"), compute_kernel_config
+        )
+        self.transition_z = Transition(self.scope("transition_z"), compute_kernel_config)
+        self.pre_norm_s_weight = self.torch_to_tt("pre_norm_s.weight")
+        self.pre_norm_s_bias = self.torch_to_tt("pre_norm_s.bias")
+        self.attention_pair_bias = AttentionPairBias(
+            att_head_dim,
+            att_n_heads,
+            True,
+            False,
+            self.scope("attention"),
+            compute_kernel_config,
+        )
+        self.transition_s = Transition(self.scope("transition_s"), compute_kernel_config)
+
+    def __call__(
+        self,
+        s: ttnn.Tensor,
+        z: ttnn.Tensor,
+        mask: ttnn.Tensor | None = None,
+        seq_mask: ttnn.Tensor | None = None,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        z_update = self.triangular(z, mask)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
+
+        z_update = self.transition_z(z)
+        z = ttnn.add_(z, z_update)
+        ttnn.deallocate(z_update)
+
+        s_norm = ttnn.layer_norm(
+            s,
+            weight=self.pre_norm_s_weight,
+            bias=self.pre_norm_s_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        s_update = self.attention_pair_bias(s_norm, z, seq_mask=seq_mask)
+        ttnn.deallocate(s_norm)
+        s = ttnn.add_(s, s_update)
+        ttnn.deallocate(s_update)
+
+        s_update = self.transition_s(s)
+        s = ttnn.add_(s, s_update)
+        ttnn.deallocate(s_update)
+        return s, z
+
+
+class Miniformer(Module):
+    def __init__(
+        self,
+        n_blocks: int,
+        att_head_dim: int,
+        att_n_heads: int,
+        state_dict: Weights,
+        compute_kernel_config: ttnn.DeviceComputeKernelConfig,
+    ):
+        super().__init__(state_dict, compute_kernel_config)
+        self.blocks = [
+            MiniformerLayer(
+                att_head_dim,
+                att_n_heads,
+                self.scope(f"layers.{i}"),
+                compute_kernel_config,
+            )
+            for i in range(n_blocks)
+        ]
+
+    def __call__(
+        self,
+        s: ttnn.Tensor,
+        z: ttnn.Tensor,
+        mask: ttnn.Tensor | None = None,
+        seq_mask: ttnn.Tensor | None = None,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        for block in self.blocks:
+            s, z = block(s, z, mask, seq_mask)
+        return s, z
+
+
 class AdaLN(Module):
     def __init__(
         self,
@@ -1936,6 +2166,79 @@ class PairformerModule(TorchWrapper):
         )
 
         s_result = self._to_torch(s_out)[:, :seq_len, :] if s_out is not None else None
+        z_result = self._to_torch(z_out)[:, :seq_len, :seq_len, :]
+        return s_result, z_result
+
+
+class MiniformerModule(TorchWrapper):
+    """Public wrapper for BoltzGen's Miniformer (design-stage pairformer).
+
+    Same interface as PairformerModule.forward(s, z, mask, pair_mask, ...) but
+    drives the lighter Miniformer stack: one MiniTriangularUpdate per layer
+    instead of 4 triangular ops.
+    """
+
+    def __init__(self, n_blocks: int, att_head_dim: int, att_n_heads: int):
+        super().__init__()
+        self.n_blocks = n_blocks
+        self.att_head_dim = att_head_dim
+        self.att_n_heads = att_n_heads
+
+    def _create_module(self, weights: WeightScope):
+        return Miniformer(
+            self.n_blocks,
+            self.att_head_dim,
+            self.att_n_heads,
+            weights,
+            self.compute_kernel_config,
+        )
+
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        pair_mask: torch.Tensor | None = None,
+        use_kernels: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = z.shape[1]
+        pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
+
+        required_cache_keys = ("mask_tt", "seq_mask_tt")
+        if (not self._first_forward_pass) and (not self._cache_has_all(required_cache_keys)):
+            self._clear_runtime_cache()
+            self._first_forward_pass = True
+
+        if pad:
+            z = torch.nn.functional.pad(z, (0, 0, 0, pad, 0, pad))
+            s = torch.nn.functional.pad(s, (0, 0, 0, pad))
+
+        if self._first_forward_pass:
+            mask_1d = mask if mask is not None else z.new_ones(1, seq_len)
+            if pad:
+                mask_1d = torch.nn.functional.pad(mask_1d, (0, pad))
+                if pair_mask is not None:
+                    pair_mask = torch.nn.functional.pad(pair_mask, (0, pad, 0, pad))
+            # 2D pair-mask if provided, otherwise the 1D token mask (Miniformer
+            # masks the bi-directional update by token, not by pair).
+            self._cache_set(
+                "mask_tt",
+                self._from_torch(pair_mask if pair_mask is not None else mask_1d),
+            )
+            self._cache_set(
+                "seq_mask_tt",
+                self._from_torch((1 - mask_1d).unsqueeze(1).unsqueeze(1) * -1e9),
+            )
+            self._first_forward_pass = False
+
+        s_out, z_out = self.module(
+            self._from_torch(s),
+            self._from_torch(z),
+            self._cache_get("mask_tt"),
+            self._cache_get("seq_mask_tt"),
+        )
+
+        s_result = self._to_torch(s_out)[:, :seq_len, :]
         z_result = self._to_torch(z_out)[:, :seq_len, :seq_len, :]
         return s_result, z_result
 
