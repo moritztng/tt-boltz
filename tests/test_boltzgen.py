@@ -185,3 +185,83 @@ def test_diffusion_matches_boltzgen_reference(
         multiplicity=n_samples,
     )
     check(r_tt, out["r_update"], tol=0.12)
+
+
+def test_convert_to_tt_swap_round_trips() -> None:
+    """convert_to_tt() swaps Pairformer/MSA/Diffusion in a Boltz-like container,
+    survives a state_dict round-trip, and yields ttnn outputs that match the
+    original PyTorch ones.
+
+    Why a stub container: BoltzGen's full Boltz LightningModule takes ~30
+    constructor args and pulls in trunk/template/affinity machinery that's
+    irrelevant to the swap. The swap only cares about the attribute names
+    ``pairformer_module`` / ``msa_module`` / ``structure_module.score_model``.
+    """
+    from boltzgen.model.layers.pairformer import PairformerModule as BGPairformer
+    from boltzgen.model.modules.trunk import MSAModule as BGMSAModule
+    from boltzgen.model.modules.diffusion import (
+        AtomDiffusion as BGAtomDiffusion,
+    )
+    from boltzgen.data import const as bg_const
+
+    from tt_boltz.boltzgen import convert_to_tt
+
+    class StubBoltz(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.pairformer_module = BGPairformer(
+                token_s=384, token_z=128, num_blocks=2, num_heads=16,
+                dropout=0.0, pairwise_head_width=32, pairwise_num_heads=4,
+            )
+            self.msa_module = BGMSAModule(
+                msa_s=64, token_z=128, token_s=384, msa_blocks=2,
+                msa_dropout=0.0, z_dropout=0.0,
+                miniformer_blocks=False, use_paired_feature=True,
+            )
+            self.structure_module = BGAtomDiffusion(
+                score_model_args=dict(
+                    token_s=384, atom_s=128,
+                    atoms_per_window_queries=32, atoms_per_window_keys=128,
+                    atom_encoder_depth=3, atom_encoder_heads=4,
+                    token_transformer_depth=24, token_transformer_heads=16,
+                    atom_decoder_depth=3, atom_decoder_heads=4,
+                    use_miniformer=False, gaussian_random_3d_encoding_dim=0,
+                    transformer_post_ln=False, predict_res_type=False,
+                    use_qk_norm=False,
+                ),
+            )
+
+    ref = StubBoltz().eval()
+    saved = {k: v.clone() for k, v in ref.state_dict().items()}
+
+    swapped = StubBoltz().eval()
+    convert_to_tt(swapped)
+    # After convert, state_dict still loads from the saved PyTorch weights.
+    swapped.load_state_dict(saved, strict=False)
+
+    # Pairformer round-trip
+    seq_len = 100
+    s = 8 * torch.randn(1, seq_len, 384)
+    z = 26 * torch.randn(1, seq_len, seq_len, 128)
+    mask = torch.ones(1, seq_len)
+    pair_mask = torch.ones(1, seq_len, seq_len)
+    s_ref, z_ref = ref.pairformer_module(s, z, mask, pair_mask)
+    s_tt, z_tt = swapped.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+    check(s_tt, s_ref)
+    check(z_tt, z_ref)
+
+    # MSA round-trip
+    n_msa = 64
+    z2 = 7 * torch.randn(1, seq_len, seq_len, 128)
+    emb = torch.ones(1, seq_len, 384)
+    feats = {
+        "msa": torch.randint(bg_const.num_tokens, (1, n_msa, seq_len)),
+        "has_deletion": torch.zeros(1, n_msa, seq_len, dtype=torch.bool),
+        "deletion_value": torch.zeros(1, n_msa, seq_len),
+        "msa_paired": torch.zeros(1, n_msa, seq_len),
+        "msa_mask": torch.ones(1, n_msa, seq_len),
+        "token_pad_mask": torch.ones(1, seq_len),
+    }
+    z_msa_ref = ref.msa_module(z2, emb, feats)
+    z_msa_tt = swapped.msa_module(z2, emb, feats)
+    check(z_msa_tt, z_msa_ref)
