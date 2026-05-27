@@ -21,6 +21,9 @@ _FAST_MODE = False
 TRIANGLE_MULT_L1_MAX_SEQ_FAST = 640
 TRIANGLE_MULT_L1_MAX_SEQ_FAST_13X10 = 704
 TRIANGLE_MULT_L1_MAX_SEQ = 352
+# Set by _apply_grid_thresholds: True on grids smaller than 11x10 (e.g. Wormhole).
+# Tightens the L1-edge chunking thresholds and chunk sizes above this comment block.
+_IS_SMALL_GRID = False
 SDPA_CHUNK_TILE = 32
 SDPA_CHUNK_MAX = 256
 
@@ -110,25 +113,46 @@ def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReus
     )
 
 
+def _apply_grid_thresholds(grid: tuple[int, int]) -> None:
+    """Retune L1-edge thresholds and chunk sizes for grids smaller than the
+    11x10 Blackhole baseline (e.g. Wormhole 8x8 has ~55% of its aggregate L1),
+    so chunking kicks in early enough to avoid L1/CB clashes."""
+    global _IS_SMALL_GRID, SEQ_LEN_MORE_CHUNKING, TRANSITION_BATCH_CHUNKING_THRESHOLD
+    global TRANSITION_W_CHUNKING_THRESHOLD, TRIANGLE_ATT_CHUNK_SIZE_FAST
+    global TRANSITION_W_CHUNK_SIZE, TRIANGLE_MULT_L1_MAX_SEQ_FAST
+    _IS_SMALL_GRID = grid[0] * grid[1] < COMPUTE_GRID_X_11 * COMPUTE_GRID_Y
+    if not _IS_SMALL_GRID:
+        return  # Keep Blackhole baseline values
+    SEQ_LEN_MORE_CHUNKING = 512
+    TRANSITION_BATCH_CHUNKING_THRESHOLD = 512
+    TRANSITION_W_CHUNKING_THRESHOLD = 512
+    TRIANGLE_ATT_CHUNK_SIZE_FAST = 512
+    TRANSITION_W_CHUNK_SIZE = 512
+    TRIANGLE_MULT_L1_MAX_SEQ_FAST = 320  # half of 640, snapped to TRIANGLE_MULT_CHUNK_SIZE
+
+
 def _configure_active_compute_grid(device: ttnn.Device) -> None:
-    """Select one of two supported compute grids: 11x10 or 13x10."""
+    """Snap to a tuned 13x10 or 11x10 Blackhole grid when available; on smaller
+    archs (e.g. Wormhole B0 8x8 with ETH dispatch) adopt the device's grid."""
     global CORE_GRID_MAIN, COMPUTE_GRID_MAIN
 
-    is_13x10 = False
+    gx, gy = COMPUTE_GRID_X_11, COMPUTE_GRID_Y
     try:
-        active_grid = device.compute_with_storage_grid_size()
-        is_13x10 = int(active_grid.x) >= COMPUTE_GRID_X_13
+        a = device.compute_with_storage_grid_size()
+        ax, ay = int(a.x), int(a.y)
+        if ax >= COMPUTE_GRID_X_13:
+            gx = COMPUTE_GRID_X_13
+        elif ax < COMPUTE_GRID_X_11 or ay < COMPUTE_GRID_Y:
+            gx, gy = ax, ay
     except Exception:
-        # Keep conservative 11x10 fallback if introspection is unavailable.
         pass
 
-    gx = COMPUTE_GRID_X_13 if is_13x10 else COMPUTE_GRID_X_11
-
-    if (gx, COMPUTE_GRID_Y) == COMPUTE_GRID_MAIN:
+    if (gx, gy) == COMPUTE_GRID_MAIN:
         return
 
-    CORE_GRID_MAIN = ttnn.CoreGrid(y=COMPUTE_GRID_Y, x=gx)
-    COMPUTE_GRID_MAIN = (gx, COMPUTE_GRID_Y)
+    CORE_GRID_MAIN = ttnn.CoreGrid(y=gy, x=gx)
+    COMPUTE_GRID_MAIN = (gx, gy)
+    _apply_grid_thresholds((gx, gy))
     _sdpa_program_config.cache_clear()
     _sdpa_program_config_for_lengths.cache_clear()
     _triangle_mul_program_config.cache_clear()
@@ -138,6 +162,7 @@ def set_fast_mode(enabled: bool) -> None:
     """Set fast block-fp8 mode for the current worker process."""
     global _FAST_MODE
     _FAST_MODE = bool(enabled)
+
 
 _device = None
 
@@ -150,7 +175,13 @@ def get_device():
     global _device
     if _device is None:
         device_id = int(os.environ.get("TT_BOLTZ_LOGICAL_DEVICE_ID", "0"))
-        _device = ttnn.open_device(device_id=device_id)
+        # Wormhole: dispatch on Ethernet cores so the full 8x8 Tensix grid
+        # (rather than 8x7 after worker-dispatch reservation) is available.
+        kwargs = (
+            {"dispatch_core_config": ttnn.DispatchCoreConfig(ttnn.DispatchCoreType.ETH)}
+            if ttnn.get_arch_name() == "wormhole_b0" else {}
+        )
+        _device = ttnn.open_device(device_id=device_id, **kwargs)
         _configure_active_compute_grid(_device)
         _device.enable_program_cache()
     return _device
@@ -478,7 +509,7 @@ class TriangleAttention(Module):
             return x_out
 
         S = x.shape[0]
-        need_chunk = S > SEQ_LEN_MORE_CHUNKING and (self.affinity or not _FAST_MODE)
+        need_chunk = S > SEQ_LEN_MORE_CHUNKING and (self.affinity or not _FAST_MODE or _IS_SMALL_GRID)
         if need_chunk:
             if not self.affinity and attn_mask is not None:
                 triangle_bias = ttnn.add(triangle_bias, attn_mask)
@@ -1742,7 +1773,12 @@ class TorchWrapper(nn.Module):
         self.tt_device = get_device()
         self._runtime_cache = {}
         self._first_forward_pass = True
-        self.compute_kernel_config = ttnn.types.BlackholeComputeKernelConfig(
+        kernel_cls = (
+            ttnn.types.WormholeComputeKernelConfig
+            if self.tt_device.arch() == ttnn.Arch.WORMHOLE_B0
+            else ttnn.types.BlackholeComputeKernelConfig
+        )
+        self.compute_kernel_config = kernel_cls(
             math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
