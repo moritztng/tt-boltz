@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from tt_boltz.tenstorrent import (
     DiffusionModule as TTDiffusionModule,
+    MiniformerModule as TTMiniformerModule,
     MSAModule as TTMSAModule,
     PairformerModule as TTPairformerModule,
 )
@@ -42,24 +43,28 @@ def convert_to_tt(model: nn.Module) -> nn.Module:
     its weights via ``_load_from_state_dict`` during the load.
     """
     pair = getattr(model, "pairformer_module", None)
-    if pair is not None and not _is_miniformer(pair):
+    if pair is not None:
         n_blocks = pair.num_blocks
         n_heads = pair.num_heads
-        # BoltzGen folding uses token_s=384; att_head_dim = token_s // num_heads.
-        # We read num_heads off the existing module; head_dim is fixed at construction
-        # time via token_s, so look it up on the first AttentionPairBias instance.
         att_head_dim = _att_head_dim(pair)
-        model.pairformer_module = TTPairformerModule(
-            n_blocks=n_blocks,
-            tri_att_head_dim=_PAIRFORMER_TRI_HEAD_DIM,
-            tri_att_n_heads=_PAIRFORMER_TRI_N_HEADS,
-            att_head_dim=att_head_dim,
-            att_n_heads=n_heads,
-            transform_s=True,
-        )
+        if _is_miniformer(pair):
+            model.pairformer_module = TTMiniformerModule(
+                n_blocks=n_blocks,
+                att_head_dim=att_head_dim,
+                att_n_heads=n_heads,
+            )
+        else:
+            model.pairformer_module = TTPairformerModule(
+                n_blocks=n_blocks,
+                tri_att_head_dim=_PAIRFORMER_TRI_HEAD_DIM,
+                tri_att_n_heads=_PAIRFORMER_TRI_N_HEADS,
+                att_head_dim=att_head_dim,
+                att_n_heads=n_heads,
+                transform_s=True,
+            )
 
     msa = getattr(model, "msa_module", None)
-    if msa is not None:
+    if msa is not None and not _has_miniformer_inner(msa):
         model.msa_module = TTMSAModule(
             n_blocks=msa.msa_blocks,
             avg_head_dim=_MSA_AVG_HEAD_DIM,
@@ -84,6 +89,17 @@ def _is_miniformer(pairformer: nn.Module) -> bool:
     if layers is None or len(layers) == 0:
         return False
     return hasattr(layers[0], "triangular")
+
+
+def _has_miniformer_inner(msa: nn.Module) -> bool:
+    """MSAModule uses MiniformerNoSeqLayer (design stage) when miniformer_blocks=True;
+    tt-boltz's TTMSAModule only knows the PairformerNoSeqLayer variant, so we
+    leave such modules on PyTorch."""
+    layers = getattr(msa, "layers", None)
+    if layers is None or len(layers) == 0:
+        return False
+    inner = getattr(layers[0], "pairformer_layer", None)
+    return inner is not None and hasattr(inner, "triangular")
 
 
 def _att_head_dim(pairformer: nn.Module) -> int:
