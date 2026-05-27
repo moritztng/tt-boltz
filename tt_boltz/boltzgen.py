@@ -76,7 +76,8 @@ def convert_to_tt(model: nn.Module) -> nn.Module:
     structure = getattr(model, "structure_module", None)
     score = getattr(structure, "score_model", None) if structure is not None else None
     if score is not None:
-        structure.score_model = TTDiffusionModule()
+        structure.score_model = TTScoreModelAdapter()
+        _patch_atom_diffusion_device()
 
     template = getattr(model, "template_module", None)
     inner = getattr(template, "pairformer", None) if template is not None else None
@@ -167,6 +168,92 @@ def _tt_load_from_checkpoint(checkpoint_path, *, strict=True, map_location="cpu"
     state = _remap_legacy_state_dict_keys(ckpt["state_dict"])
     model.load_state_dict(state, strict=False)
     return model.eval()
+
+
+class TTScoreModelAdapter(TTDiffusionModule):
+    """Score-model adapter for BoltzGen's AtomDiffusion.preconditioned_network_forward.
+
+    BoltzGen calls the score model as::
+
+        net_out = self.score_model(
+            r_noisy=...,
+            times=...,
+            s_inputs=..., s_trunk=...,
+            feats={..., "atom_pad_mask": ..., "atom_to_token": ...},
+            diffusion_conditioning={
+                "q": ..., "c": ...,
+                "atom_enc_bias": ..., "token_trans_bias": ..., "atom_dec_bias": ...,
+                "to_keys": partial(single_to_keys, indexing_matrix=K, W=32, H=128),
+            },
+            multiplicity=1,
+        )
+        # then reads net_out["r_update"]
+
+    tt-boltz's TTDiffusionModule.forward expects the conditioning tensors as
+    positional args and the raw indexing matrix instead of a to_keys partial,
+    and returns the coordinate update directly. This subclass adapts the two
+    calling conventions while inheriting TorchWrapper's state_dict mechanism
+    (so checkpoint weights still load via _load_from_state_dict).
+    """
+
+    def forward(  # type: ignore[override]
+        self,
+        *,
+        r_noisy,
+        times,
+        s_inputs,
+        s_trunk,
+        feats,
+        diffusion_conditioning,
+        multiplicity: int = 1,
+        **_unused,  # tolerate any future BoltzGen kwarg additions
+    ):
+        dc = diffusion_conditioning
+        to_keys = dc["to_keys"]
+        # to_keys is always partial(single_to_keys, indexing_matrix=K, W=32, H=128)
+        # constructed in encoders.py:498. Extract the raw indexing matrix.
+        keys_indexing = to_keys.keywords["indexing_matrix"]
+
+        r_update = super().forward(
+            r_noisy,
+            times,
+            s_inputs,
+            s_trunk,
+            dc["q"],
+            dc["c"],
+            dc["atom_enc_bias"],
+            dc["token_trans_bias"],
+            dc["atom_dec_bias"],
+            keys_indexing,
+            feats["atom_pad_mask"],
+            feats["atom_to_token"],
+        )
+        # BoltzGen reads only ["r_update"] from the design path; "token_a" and
+        # "res_type" are unused (predict_res_type=False on shipping ckpts).
+        return {"r_update": r_update, "token_a": None, "res_type": None}
+
+
+def _patch_atom_diffusion_device() -> None:
+    """``AtomDiffusion.device`` is defined as
+    ``return next(self.score_model.parameters()).device``. After convert_to_tt
+    swaps score_model for a TTDiffusionModule (TorchWrapper, no nn.Parameters —
+    ttnn tensors aren't Parameters), that iterator is empty and ``next`` raises
+    StopIteration. The diffusion sampler then dies silently because Lightning
+    swallows StopIteration from inside predict_step as "end of iteration".
+
+    The sampler uses ``self.device`` only to allocate noise/timestep tensors on
+    the same device as the PyTorch-side scaffolding around the score model. With
+    the ttnn swap, that scaffolding runs on CPU (ttnn handles its own device
+    internally), so CPU is the right answer.
+
+    Idempotent class-level patch — safe to call from every convert_to_tt."""
+    import torch as _torch
+    from boltzgen.model.modules.diffusion import AtomDiffusion
+
+    if getattr(AtomDiffusion, "_tt_device_patched", False):
+        return
+    AtomDiffusion.device = property(lambda self: _torch.device("cpu"))
+    AtomDiffusion._tt_device_patched = True
 
 
 def _remap_legacy_state_dict_keys(state: dict) -> dict:
