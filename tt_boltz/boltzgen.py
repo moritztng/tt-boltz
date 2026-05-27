@@ -78,6 +78,13 @@ def convert_to_tt(model: nn.Module) -> nn.Module:
     if score is not None:
         structure.score_model = TTDiffusionModule()
 
+    template = getattr(model, "template_module", None)
+    inner = getattr(template, "pairformer", None) if template is not None else None
+    # PairformerNoSeqLayer has tri_mul_out; MiniformerNoSeqLayer has triangular.
+    # tt-boltz only ports the PairformerNoSeq variant today.
+    if inner is not None and _is_pairformer_noseq(inner):
+        template.pairformer = TTPairformerNoSeqModule(n_blocks=inner.num_blocks)
+
     return model
 
 
@@ -100,6 +107,39 @@ def _has_miniformer_inner(msa: nn.Module) -> bool:
         return False
     inner = getattr(layers[0], "pairformer_layer", None)
     return inner is not None and hasattr(inner, "triangular")
+
+
+def _is_pairformer_noseq(module: nn.Module) -> bool:
+    """PairformerNoSeqLayer has tri_mul_out; MiniformerNoSeqLayer has triangular."""
+    layers = getattr(module, "layers", None)
+    if layers is None or len(layers) == 0:
+        return False
+    return hasattr(layers[0], "tri_mul_out")
+
+
+class TTPairformerNoSeqModule(TTPairformerModule):
+    """No-seq Pairformer for BoltzGen's template_module.pairformer.
+
+    Same ttnn pairformer stack as the trunk, but constructed with
+    ``transform_s=False`` (skips the s-track) and a forward signature that
+    matches ``PairformerNoSeqModule.forward(z, pair_mask, use_kernels=...)``.
+    """
+
+    def __init__(self, n_blocks: int):
+        super().__init__(
+            n_blocks=n_blocks,
+            tri_att_head_dim=_PAIRFORMER_TRI_HEAD_DIM,
+            tri_att_n_heads=_PAIRFORMER_TRI_N_HEADS,
+            att_head_dim=None,
+            att_n_heads=None,
+            transform_s=False,
+        )
+
+    def forward(  # type: ignore[override]
+        self, z, pair_mask, use_kernels: bool = False,
+    ):
+        _, z_out = super().forward(None, z, mask=None, pair_mask=pair_mask)
+        return z_out
 
 
 def _att_head_dim(pairformer: nn.Module) -> int:
