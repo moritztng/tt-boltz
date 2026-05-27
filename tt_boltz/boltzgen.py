@@ -191,6 +191,8 @@ def cli_main() -> None:
     """
     import sys
 
+    _patch_cuda_for_cpu_only()
+
     from boltzgen.cli.boltzgen import main as _bg_main
     from boltzgen.model.models.boltz import Boltz
 
@@ -201,6 +203,18 @@ def cli_main() -> None:
         args.insert(1, "--no_subprocess")
     sys.argv = [sys.argv[0]] + args
     _bg_main()
+
+
+def _patch_cuda_for_cpu_only() -> None:
+    """BoltzGen's pipeline configurator calls ``torch.cuda.get_device_capability``
+    and ``torch.cuda.device_count`` unconditionally. On CPU-only PyTorch builds
+    those raise; substitute safe values that select use_kernels=False (we don't
+    need cuequivariance kernels — ttnn replaces those ops anyway) and 1 device."""
+    import torch as _torch
+
+    if not _torch.cuda.is_available():
+        _torch.cuda.get_device_capability = lambda *a, **k: (0, 0)  # type: ignore[assignment]
+        _torch.cuda.device_count = lambda *a, **k: 1  # type: ignore[assignment]
 
 
 if __name__ == "__main__":
