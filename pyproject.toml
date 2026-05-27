@@ -33,6 +33,7 @@ dependencies = [
 
 [project.scripts]
 tt-boltz = "tt_boltz.main:cli"
+tt-boltzgen = "tt_boltz.boltzgen:cli_main"
 
 [tool.setuptools]
 
