@@ -4,13 +4,30 @@ PyTorch reference modules on random weights.
 If a test here passes, the corresponding tt-boltz ttnn module can be dropped
 into BoltzGen's Boltz class as a same-state_dict replacement.
 """
+import os
+from functools import partial
+from pathlib import Path
+
 import pytest
 import torch
 
-from functools import partial
-
 from tt_boltz.tenstorrent import PairformerModule, MSAModule, DiffusionModule
 from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
+
+
+# Real-checkpoint tests are gated on the presence of the BoltzGen folding
+# checkpoint (~2 GB). Set BOLTZGEN_FOLD_CKPT to point at boltz2_conf_final.ckpt
+# to enable them.
+_DEFAULT_CKPT = (
+    Path.home()
+    / ".cache/huggingface/hub/models--boltzgen--boltzgen-1"
+    / "snapshots/c1be29e1f82ffcc72264f64b993c43fb4e0d17f0/boltz2_conf_final.ckpt"
+)
+BOLTZGEN_FOLD_CKPT = Path(os.environ.get("BOLTZGEN_FOLD_CKPT", _DEFAULT_CKPT))
+requires_fold_ckpt = pytest.mark.skipif(
+    not BOLTZGEN_FOLD_CKPT.exists(),
+    reason=f"BoltzGen folding checkpoint not found at {BOLTZGEN_FOLD_CKPT}",
+)
 
 # Imported lazily inside tests so collection works even if a sibling import breaks.
 
@@ -265,3 +282,76 @@ def test_convert_to_tt_swap_round_trips() -> None:
     z_msa_ref = ref.msa_module(z2, emb, feats)
     z_msa_tt = swapped.msa_module(z2, emb, feats)
     check(z_msa_tt, z_msa_ref)
+
+
+def _load_real_boltz():
+    """Build a BoltzGen ``Boltz`` model from the real folding checkpoint.
+
+    Returns a fresh model each call — call twice when you need both a PyTorch
+    reference and a separately-swapped ttnn version, since convert_to_tt is
+    destructive.
+    """
+    import inspect
+    from boltzgen.model.models.boltz import Boltz
+
+    ckpt = torch.load(
+        BOLTZGEN_FOLD_CKPT, map_location="cpu", weights_only=False, mmap=True
+    )
+    sig = inspect.signature(Boltz.__init__).parameters
+    hp = {k: v for k, v in ckpt["hyper_parameters"].items() if k in sig}
+    model = Boltz(**hp).eval()
+    return model, ckpt["state_dict"]
+
+
+@requires_fold_ckpt
+def test_real_checkpoint_loads_after_swap() -> None:
+    """boltz2_conf_final.ckpt loads cleanly after convert_to_tt — zero missing,
+    zero unexpected keys. This is the production state_dict seam test."""
+    from tt_boltz.boltzgen import convert_to_tt
+
+    model, state_dict = _load_real_boltz()
+    convert_to_tt(model)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # Both should be zero; unrelated affinity/training keys were filtered above.
+    assert len(missing) == 0, f"missing keys after swap: {missing[:5]}"
+    assert len(unexpected) == 0, f"unexpected keys after swap: {unexpected[:5]}"
+    # Confirm the swap actually happened.
+    from tt_boltz.tenstorrent import (
+        PairformerModule as TTP,
+        MSAModule as TTM,
+        DiffusionModule as TTD,
+    )
+    assert isinstance(model.pairformer_module, TTP)
+    assert isinstance(model.msa_module, TTM)
+    assert isinstance(model.structure_module.score_model, TTD)
+
+
+@requires_fold_ckpt
+def test_real_checkpoint_pairformer_numerical() -> None:
+    """Run swapped Pairformer with the real checkpoint weights and compare
+    against the pure-PyTorch reference. Loose tolerance because production
+    Pairformer is 48 blocks deep and bfloat16 error accumulates."""
+    from tt_boltz.boltzgen import convert_to_tt
+
+    ref, state_dict = _load_real_boltz()
+    ref.load_state_dict(state_dict, strict=False)
+
+    tt, _ = _load_real_boltz()
+    convert_to_tt(tt)
+    tt.load_state_dict(state_dict, strict=False)
+
+    seq_len = 100
+    s = 8 * torch.randn(1, seq_len, 384)
+    z = 26 * torch.randn(1, seq_len, seq_len, 128)
+    mask = torch.ones(1, seq_len)
+    pair_mask = torch.ones(1, seq_len, seq_len)
+
+    with torch.no_grad():
+        s_ref, z_ref = ref.pairformer_module(s, z, mask, pair_mask)
+        s_tt, z_tt = tt.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+
+    # Production-depth (48-block) Pairformer accumulates more bfloat16 error
+    # than the 2-block random-weight test. These tolerances reflect the
+    # bfloat16-vs-fp32 floor of the ttnn implementation on Blackhole.
+    check(s_tt, s_ref, tol=0.10)
+    check(z_tt, z_ref, tol=0.30)
