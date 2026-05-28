@@ -9,7 +9,7 @@ from tt_boltz.boltzgen.model.layers.confidence_utils import (
     compute_ptms,
 )
 
-from tt_boltz.boltzgen.model.layers.pairformer import PairformerModule
+from tt_boltz.tenstorrent import PairformerModule as TTPairformerModule
 from tt_boltz.boltzgen.model.modules.encoders import RelativePositionEncoder
 from tt_boltz.boltzgen.model.modules.trunk import (
     ContactConditioning,
@@ -87,10 +87,15 @@ class ConfidenceModule(nn.Module):
                 cutoff_max=conditioning_cutoff_max,
             )
 
-        self.pairformer_stack = PairformerModule(
-            token_s,
-            token_z,
-            **pairformer_args,
+        # Direct ttnn — confidence runs its own (smaller, 8-block) pairformer.
+        num_heads = pairformer_args.get("num_heads", 16)
+        self.pairformer_stack = TTPairformerModule(
+            n_blocks=pairformer_args["num_blocks"],
+            tri_att_head_dim=pairformer_args.get("pairwise_head_width", 32),
+            tri_att_n_heads=pairformer_args.get("pairwise_num_heads", 4),
+            att_head_dim=token_s // num_heads,
+            att_n_heads=num_heads,
+            transform_s=True,
         )
         self.return_latent_feats = return_latent_feats
 

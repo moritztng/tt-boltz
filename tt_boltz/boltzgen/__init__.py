@@ -90,15 +90,12 @@ class _DeletedModuleFinder:
 _sys.meta_path.append(_DeletedModuleFinder())
 
 from tt_boltz.boltzgen.adapter import (
-    convert_to_tt,
     load_boltz_checkpoint,
     TTPairformerNoSeqModule,
     TTScoreModelAdapter,
-    _remap_legacy_state_dict_keys,
 )
 
 __all__ = [
-    "convert_to_tt",
     "load_boltz_checkpoint",
     "TTPairformerNoSeqModule",
     "TTScoreModelAdapter",

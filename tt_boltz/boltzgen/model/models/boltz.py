@@ -22,12 +22,16 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from tt_boltz.tenstorrent import (
+    MiniformerModule as TTMiniformerModule,
+    MSAModule as TTMSAModule,
+    PairformerModule as TTPairformerModule,
+)
+
 from tt_boltz.boltzgen.data.rmsd_computation import get_true_coordinates
 import tt_boltz.boltzgen.model.layers.initialize as init
 from tt_boltz.boltzgen.data import const
 from tt_boltz.boltzgen.data.mol import minimum_lddt_symmetry_dist
-from tt_boltz.boltzgen.model.layers.miniformer import MiniformerModule
-from tt_boltz.boltzgen.model.layers.pairformer import PairformerModule
 from tt_boltz.boltzgen.model.modules.confidence import ConfidenceModule
 from tt_boltz.boltzgen.model.modules.diffusion import AtomDiffusion
 from tt_boltz.boltzgen.model.modules.diffusion_conditioning import (
@@ -41,7 +45,6 @@ from tt_boltz.boltzgen.model.modules.trunk import (
     ContactConditioning,
     DistogramModule,
     InputEmbedder,
-    MSAModule,
     TemplateModule,
     TokenDistanceModule,
 )
@@ -235,15 +238,30 @@ class Boltz(nn.Module):
             self.template_module = TemplateModule(token_z, **template_args)
 
         if not self.inverse_fold:
-            self.msa_module = MSAModule(
-                token_z=token_z,
-                token_s=token_s,
-                **msa_args,
+            # Direct ttnn construction — no PyTorch fallback path. MSA + Pairformer
+            # are the heavy modules and run on the TT device; their state_dict
+            # layout is byte-identical to BoltzGen's PyTorch versions, so the
+            # production checkpoints load cleanly via the TorchWrapper.
+            self.msa_module = TTMSAModule(
+                n_blocks=msa_args["msa_blocks"],
+                avg_head_dim=32, avg_n_heads=8,
+                tri_att_head_dim=32, tri_att_n_heads=4,
             )
-            pairformer_class = MiniformerModule if use_miniformer else PairformerModule
-            self.pairformer_module = pairformer_class(
-                token_s, token_z, **pairformer_args
-            )
+            num_heads = pairformer_args.get("num_heads", 16)
+            att_head_dim = token_s // num_heads
+            if use_miniformer:
+                self.pairformer_module = TTMiniformerModule(
+                    n_blocks=pairformer_args["num_blocks"],
+                    att_head_dim=att_head_dim, att_n_heads=num_heads,
+                )
+            else:
+                self.pairformer_module = TTPairformerModule(
+                    n_blocks=pairformer_args["num_blocks"],
+                    tri_att_head_dim=pairformer_args.get("pairwise_head_width", 32),
+                    tri_att_n_heads=pairformer_args.get("pairwise_num_heads", 4),
+                    att_head_dim=att_head_dim, att_n_heads=num_heads,
+                    transform_s=True,
+                )
             self.checkpoint_diffusion_conditioning = checkpoint_diffusion_conditioning
 
             self.diffusion_conditioning = DiffusionConditioning(
@@ -331,16 +349,6 @@ class Boltz(nn.Module):
             self.predict_bfactor = False
             self.inverse_folding_encoder = InverseFoldingEncoder(**inverse_fold_args)
             self.structure_module = InverseFoldingDecoder(**inverse_fold_args)
-
-        # Inference-only: no requires_grad gymnastics needed since we never
-        # back-prop through this model. (Original BoltzGen froze non-confidence
-        # / non-affinity params here for DDP training; irrelevant for us.)
-
-        # Tenstorrent-only: swap heavy modules to ttnn equivalents in place.
-        # convert_to_tt is idempotent and safe across all model configurations
-        # (inverse-fold, affinity, design, folding).
-        from tt_boltz.boltzgen.adapter import convert_to_tt
-        convert_to_tt(self)
 
     def setup_for_inference(self, dataloader) -> None:
         """Compute per-run inference schedules from the loaded dataloader.

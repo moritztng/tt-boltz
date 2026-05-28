@@ -1,141 +1,39 @@
-"""Swap BoltzGen's heavy PyTorch modules for tt-boltz's ttnn equivalents.
+"""Two calling-convention adapters around tt-boltz's ttnn modules.
 
-The vendored BoltzGen model classes (Pairformer / MSA / DiffusionModule /
-template Pairformer) have the same state_dict layout as tt-boltz's ttnn
-equivalents in :mod:`tt_boltz.tenstorrent`. ``convert_to_tt`` replaces the
-matching attributes on a constructed model in place; weights then flow into
-ttnn during the standard ``load_state_dict`` call (TorchWrapper intercepts
-``_load_from_state_dict``).
+Each adapter subclasses a tt-boltz ttnn module and only rewrites
+``forward()`` to accept the calling convention BoltzGen's surrounding
+code expects. They inherit ``TorchWrapper``'s state_dict mechanism so
+production checkpoint weights flow in via the standard ``load_state_dict``.
 
-Two small calling-convention adapters live here too:
-
-* :class:`TTScoreModelAdapter` — BoltzGen calls the diffusion score model with
-  kwargs (`r_noisy=`, `feats=`, `diffusion_conditioning=`, …) and reads
-  ``net_out["r_update"]``. tt-boltz's :class:`TTDiffusionModule` takes
-  positional args and returns the raw tensor.
-
-* :class:`TTPairformerNoSeqModule` — BoltzGen's TemplateModule.pairformer
-  ignores the sequence track; we construct the underlying ttnn Pairformer
-  with ``transform_s=False`` and adapt ``forward(z, pair_mask)``.
-
-The legacy state-dict key remap (``token_transformer_layers.0.*`` →
-``token_transformer.*``) is also here, because some older shipping
-checkpoints predate BoltzGen's renaming and we want to load them cleanly.
+Also exports :func:`load_boltz_checkpoint` — the inference entry point
+that materialises a ``Boltz`` with all ttnn modules already constructed
+(hard-wired in ``Boltz.__init__``) and loads weights, with a small remap
+for the older ``token_transformer_layers.0.*`` key naming some shipping
+design checkpoints still use.
 """
 from __future__ import annotations
 
 import inspect
+
 import torch
 import torch.nn as nn
 
 from tt_boltz.tenstorrent import (
     DiffusionModule as TTDiffusionModule,
-    MiniformerModule as TTMiniformerModule,
-    MSAModule as TTMSAModule,
     PairformerModule as TTPairformerModule,
 )
 
-# Constants baked into BoltzGen's MSALayer (PairWeightedAveraging c_h=32, num_heads=8).
-_MSA_AVG_HEAD_DIM = 32
-_MSA_AVG_N_HEADS = 8
-# BoltzGen Pairformer default pairwise_head_width=32, pairwise_num_heads=4.
-_PAIRFORMER_TRI_HEAD_DIM = 32
-_PAIRFORMER_TRI_N_HEADS = 4
-
-
-def convert_to_tt(model: nn.Module) -> nn.Module:
-    """Replace BoltzGen's heavy PyTorch modules with tt-boltz ttnn modules in place.
-
-    Idempotent: a second call on an already-converted model is a no-op.
-    Safe to call on any BoltzGen ``Boltz`` instance — modules that don't exist
-    (e.g. ``msa_module`` is absent when ``inverse_fold=True``) are skipped. Must
-    be called BEFORE ``load_state_dict``: the ttnn ``TorchWrapper`` captures its
-    weights via ``_load_from_state_dict`` during the load.
-    """
-    if getattr(model, "_tt_converted", False):
-        return model
-    pair = getattr(model, "pairformer_module", None)
-    if pair is not None:
-        att_head_dim = _att_head_dim(pair)
-        if _is_miniformer(pair):
-            model.pairformer_module = TTMiniformerModule(
-                n_blocks=pair.num_blocks,
-                att_head_dim=att_head_dim,
-                att_n_heads=pair.num_heads,
-            )
-        else:
-            model.pairformer_module = TTPairformerModule(
-                n_blocks=pair.num_blocks,
-                tri_att_head_dim=_PAIRFORMER_TRI_HEAD_DIM,
-                tri_att_n_heads=_PAIRFORMER_TRI_N_HEADS,
-                att_head_dim=att_head_dim,
-                att_n_heads=pair.num_heads,
-                transform_s=True,
-            )
-
-    msa = getattr(model, "msa_module", None)
-    if msa is not None and not _has_miniformer_inner(msa):
-        model.msa_module = TTMSAModule(
-            n_blocks=msa.msa_blocks,
-            avg_head_dim=_MSA_AVG_HEAD_DIM,
-            avg_n_heads=_MSA_AVG_N_HEADS,
-            tri_att_head_dim=_PAIRFORMER_TRI_HEAD_DIM,
-            tri_att_n_heads=_PAIRFORMER_TRI_N_HEADS,
-        )
-
-    structure = getattr(model, "structure_module", None)
-    score = getattr(structure, "score_model", None) if structure is not None else None
-    if score is not None:
-        structure.score_model = TTScoreModelAdapter()
-
-    template = getattr(model, "template_module", None)
-    inner = getattr(template, "pairformer", None) if template is not None else None
-    if inner is not None and _is_pairformer_noseq(inner):
-        template.pairformer = TTPairformerNoSeqModule(n_blocks=inner.num_blocks)
-
-    model._tt_converted = True
-    return model
-
-
-def load_boltz_checkpoint(
-    checkpoint_path: str,
-    *,
-    strict: bool = False,
-    map_location: str = "cpu",
-    **constructor_overrides,
-) -> nn.Module:
-    """Build a ``Boltz`` model from a checkpoint with ``convert_to_tt`` applied.
-
-    Filters legacy hyper_parameters the current Boltz signature no longer
-    accepts, applies ``convert_to_tt`` before ``load_state_dict``, and remaps
-    the legacy ``token_transformer_layers.0.*`` keys some older design
-    checkpoints (e.g. ``boltzgen1_diverse.ckpt``) use.
-    """
-    from tt_boltz.boltzgen.model.models.boltz import Boltz
-
-    ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False, mmap=True)
-    sig = inspect.signature(Boltz.__init__).parameters
-    hp = {k: v for k, v in ckpt["hyper_parameters"].items() if k in sig}
-    hp.update({k: v for k, v in constructor_overrides.items() if k in sig})
-
-    model = Boltz(**hp)
-    convert_to_tt(model)
-    state = _remap_legacy_state_dict_keys(ckpt["state_dict"])
-    model.load_state_dict(state, strict=strict)
-    return model.eval()
-
 
 class TTScoreModelAdapter(TTDiffusionModule):
-    """Adapt the BoltzGen score-model calling convention to ``TTDiffusionModule``.
+    """Adapt the BoltzGen score-model calling convention to TTDiffusionModule.
 
     BoltzGen's ``AtomDiffusion.preconditioned_network_forward`` calls
     ``score_model(r_noisy=..., times=..., s_inputs=..., s_trunk=...,
     feats=..., diffusion_conditioning=..., multiplicity=...)`` and reads
-    ``net_out["r_update"]``. ``TTDiffusionModule`` takes positional args and
-    returns the raw tensor, so this subclass shuffles kwargs into positional
-    args, unwraps ``to_keys`` to its raw indexing matrix, and wraps the result
-    in a dict. Inherits ``TorchWrapper``'s state_dict mechanism so weights
-    still flow in during ``load_state_dict``.
+    ``net_out["r_update"]``. ``TTDiffusionModule`` takes positional args
+    and returns the raw tensor; this subclass shuffles kwargs into
+    positional args, unwraps ``to_keys`` to its raw indexing matrix, and
+    wraps the result in a dict.
     """
 
     def forward(  # type: ignore[override]
@@ -167,20 +65,17 @@ class TTScoreModelAdapter(TTDiffusionModule):
 
 
 class TTPairformerNoSeqModule(TTPairformerModule):
-    """No-seq Pairformer for BoltzGen's ``TemplateModule.pairformer``.
+    """No-seq Pairformer for BoltzGen's template / token-distance / affinity stacks.
 
     Same ttnn pairformer stack as the trunk, but ``transform_s=False`` (no
-    s-track) and a forward signature that matches
-    ``PairformerNoSeqModule.forward(z, pair_mask, use_kernels=...)``.
+    s-track) and a forward signature that matches ``PairformerNoSeqModule.forward(z, pair_mask, use_kernels=...)``.
     """
 
     def __init__(self, n_blocks: int):
         super().__init__(
             n_blocks=n_blocks,
-            tri_att_head_dim=_PAIRFORMER_TRI_HEAD_DIM,
-            tri_att_n_heads=_PAIRFORMER_TRI_N_HEADS,
-            att_head_dim=None,
-            att_n_heads=None,
+            tri_att_head_dim=32, tri_att_n_heads=4,
+            att_head_dim=None, att_n_heads=None,
             transform_s=False,
         )
 
@@ -201,36 +96,28 @@ def _remap_legacy_state_dict_keys(state: dict) -> dict:
     }
 
 
-def _is_miniformer(pairformer: nn.Module) -> bool:
-    """Miniformer layers have a single ``triangular`` op; Pairformer has four ``tri_*`` ops."""
-    layers = getattr(pairformer, "layers", None)
-    if layers is None or len(layers) == 0:
-        return False
-    return hasattr(layers[0], "triangular")
+def load_boltz_checkpoint(
+    checkpoint_path: str,
+    *,
+    strict: bool = False,
+    map_location: str = "cpu",
+    **constructor_overrides,
+) -> nn.Module:
+    """Build a ``Boltz`` model from a checkpoint and load its weights.
 
+    Filters legacy hyper_parameters the current Boltz signature no longer
+    accepts, then remaps the legacy state-dict keys before loading.
+    ``Boltz.__init__`` constructs ttnn modules directly — there is no
+    PyTorch fallback path.
+    """
+    from tt_boltz.boltzgen.model.models.boltz import Boltz
 
-def _has_miniformer_inner(msa: nn.Module) -> bool:
-    """True when MSALayer's inner pairformer is Miniformer (design ckpts only)."""
-    layers = getattr(msa, "layers", None)
-    if layers is None or len(layers) == 0:
-        return False
-    inner = getattr(layers[0], "pairformer_layer", None)
-    return inner is not None and hasattr(inner, "triangular")
+    ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False, mmap=True)
+    sig = inspect.signature(Boltz.__init__).parameters
+    hp = {k: v for k, v in ckpt["hyper_parameters"].items() if k in sig}
+    hp.update({k: v for k, v in constructor_overrides.items() if k in sig})
 
-
-def _is_pairformer_noseq(module: nn.Module) -> bool:
-    """PairformerNoSeqLayer has ``tri_mul_out``; MiniformerNoSeqLayer has ``triangular``."""
-    layers = getattr(module, "layers", None)
-    if layers is None or len(layers) == 0:
-        return False
-    return hasattr(layers[0], "tri_mul_out")
-
-
-def _att_head_dim(pairformer: nn.Module) -> int:
-    """Read the per-head dim of the layer's AttentionPairBias."""
-    layer0 = pairformer.layers[0]
-    attn = layer0.attention
-    proj_q = getattr(attn, "proj_q", None)
-    if proj_q is not None:
-        return proj_q.out_features // attn.num_heads
-    return layer0.pre_norm_s.normalized_shape[0] // pairformer.num_heads
+    model = Boltz(**hp)
+    state = _remap_legacy_state_dict_keys(ckpt["state_dict"])
+    model.load_state_dict(state, strict=strict)
+    return model.eval()
