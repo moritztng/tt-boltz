@@ -37,7 +37,7 @@ from tt_boltz.boltzgen.data.data import (
     Tokenized,
 )
 from tt_boltz.boltzgen.data.parse.pdb_parser import parse_pdb
-from tt_boltz.boltzgen.data.tokenize.tokenizer import TokenData
+from tt_boltz.boltzgen.data.tokenizer import TokenData
 from dataclasses import replace
 
 ####################################################################################################

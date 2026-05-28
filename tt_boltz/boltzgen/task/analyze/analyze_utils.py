@@ -21,7 +21,7 @@ mpl.rcParams["figure.max_open_warning"] = 100
 from Bio import Align
 
 from tt_boltz.boltzgen.data.rmsd_computation import get_true_coordinates
-from tt_boltz.boltzgen.model.loss.diffusion import weighted_rigid_align
+from tt_boltz.boltzgen.model.geometry import weighted_rigid_align
 from tt_boltz.boltzgen.task.predict.data_from_generated import collate
 
 import torch
@@ -31,8 +31,8 @@ from tqdm import tqdm
 
 from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import Structure, biotite_array_from_feat
-from tt_boltz.boltzgen.data.write.mmcif import to_mmcif
-from tt_boltz.boltzgen.model.loss.validation import factored_lddt_loss, compute_subset_rmsd
+from tt_boltz.boltzgen.data.write_mmcif import to_mmcif
+from tt_boltz.boltzgen.model.geometry import factored_lddt_loss, compute_subset_rmsd
 
 from biotite.structure.sasa import sasa
 from biotite.structure.info import vdw_radius_single, vdw_radius_protor

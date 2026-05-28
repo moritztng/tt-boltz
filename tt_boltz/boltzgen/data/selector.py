@@ -5,8 +5,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 from tt_boltz.data import const
-from tt_boltz.boltzgen.data.select.selector import Selector
-from tt_boltz.boltzgen.data.crop.multimer import MultimerCropper
+from tt_boltz.boltzgen.data.cropper import MultimerCropper
 from tt_boltz.boltzgen.data.data import (
     Atom,
     Tokenized,
@@ -44,7 +43,7 @@ def min_distances(
     return noisy_distances
 
 
-class ProteinSelector(Selector):
+class ProteinSelector:
     """Select design tokens from protein chains."""
 
     def __init__(

@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""
-This script orchestrates work. It sets up an output directory with yaml files of pipeline steps that need to be run, and launches processes that run the pipeline steps.
+"""BoltzGen pipeline CLI (Tenstorrent-only build).
 
-Mainly it:
-1) **Writes to yaml files** when `configure_command(...)` is executed
-   - For each `PipelineStep`, the resolved Hydra config is written to
-     `OUTPUT/config/<step>.yaml`.
-   - A manifest `OUTPUT/steps.yaml` is also written, listing the enabled steps
-     and their config files in execution order.
+Two halves:
 
-2) **Executes from YAML** when `execute_command(...)` is executed
-   - Each step is launched **as a subprocess** (`python main.py <config.yaml>`)
-     unless `--no_subprocess` is set (not the default).
-   - If `--no_subprocess` is specified, the config is instantiated in-process
-     and the `Task.run(...)` method is called directly.
+1. ``configure`` resolves the per-step YAML configs and writes an
+   ``OUTPUT/config/<step>.yaml`` for each enabled pipeline step, plus a
+   manifest ``OUTPUT/steps.yaml`` listing them in execution order.
 
-The actual code that is exectued in each pipeline step is found in `main.py` which a wrapper for running the .run() function of our `Task` class.
-If you run the pipeline (for example via `boltzgen run design_spec.yaml ...`) then this function reads the yaml files of the individual pipeline steps and executes the pipeline steps.
+2. ``execute`` reads the manifest and runs each step in-process by
+   instantiating the YAML config and calling ``Task.run(...)``. Steps share
+   the Tenstorrent device handle and program cache across the whole
+   pipeline — spawning subprocesses would discard both and re-pay model
+   load per step.
 
-The possible tasks (and code files you want to inspect to understand what they are running):
-    - Predict src/boltzgen/task/predict/predict.py (GPU: Running BoltzGen diffusion, inverse folding, refolding, designfolding, or affinity prediction)
-    - Analyze src/boltzgen/task/analyze/analyze.py (CPU: Compute CPU Metrics and aggregate metrics from GPU steps)
-    - Filter src/boltzgen/task/filter/filter.py (CPU: Very fast (20s) computes ranking and writes final output files)
+``run`` configures and executes in one shot.
+
+Pipeline tasks live alongside this file:
+    * Predict — tt_boltz/boltzgen/task/predict/predict.py
+    * Analyze — tt_boltz/boltzgen/task/analyze/analyze.py
+    * Filter  — tt_boltz/boltzgen/task/filter/filter.py
 """
 
 from tt_boltz.boltzgen.utils.quiet import quiet_startup
@@ -32,8 +29,6 @@ import collections
 import huggingface_hub
 import argparse
 from dataclasses import dataclass
-import shlex
-import subprocess
 import os
 import time
 import math
@@ -59,7 +54,7 @@ from tt_boltz.boltzgen._config import (
 from tt_boltz.data import const
 from tt_boltz.data.mol import load_canonicals
 from tt_boltz.boltzgen.data.parse.schema import YamlDesignParser
-from tt_boltz.boltzgen.data.write.mmcif import to_mmcif
+from tt_boltz.boltzgen.data.write_mmcif import to_mmcif
 from tt_boltz.boltzgen.task.task import Task
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 
@@ -71,7 +66,6 @@ project_root = (
     path_to_script.parent.parent
 )  # Go up from src/boltzgen/cli to project root
 config_dir = project_root / "resources/config"
-main_script = project_root / "resources/main.py"
 
 step_names = [
     "design",
@@ -378,10 +372,6 @@ def add_models_download_options(p: argparse.ArgumentParser) -> None:
 
 
 def add_execute_core_arguments(p: argparse.ArgumentParser) -> None:
-    # Tenstorrent always runs each step in-process: spawning a subprocess
-    # would discard the Tenstorrent device handle + program cache and re-pay
-    # the model-load cost per step. Subprocess mode is intentionally unreachable.
-    p.set_defaults(subprocess=False)
     p.add_argument(
         "--steps",
         nargs="+",
@@ -450,8 +440,6 @@ def build_configure_parser(subparsers) -> argparse.ArgumentParser:
 
     add_configure_arguments(configure_parser, output_required=True)
     add_models_download_options(configure_parser)
-
-    configure_parser.set_defaults(subprocess=False)
 
     return configure_parser
 
@@ -735,12 +723,12 @@ def execute_command(args: argparse.Namespace) -> None:
     """
     Execute a **pre-configured binder design pipeline** from a directory of YAML files.
 
-    Reads the `steps.yaml` manifest written by `configure_command(...)` and executes
-    each step sequentially, either in subprocesses or directly in-process.
+    Reads the `steps.yaml` manifest written by `configure_command(...)` and runs
+    each step sequentially in-process (sharing the Tenstorrent device handle and
+    program cache across the whole pipeline).
 
     Options
     --------
-    * `--no_subprocess` : Run in the main process instead of spawning Python subprocesses.
     * `--steps` : Restrict to specific pipeline steps.
     * `--reuse` : Skip recomputation for existing results.
 
@@ -809,21 +797,12 @@ def execute_command(args: argparse.Namespace) -> None:
         os.environ["BOLTZGEN_PIPELINE_STEP"] = step_name
 
         start = time.time()
-        if args.subprocess:
-            command = [
-                sys.executable,
-                str(main_script),
-                str(config_path),
-            ]
-            print(f"Running command: {shlex.join(command)}")
-            subprocess.check_call(command)
-        else:
-            config = _load_yaml(config_path)
-            config = _resolve_interpolations(config)
-            task = _instantiate(config)
-            if not isinstance(task, Task):
-                raise TypeError("Config must be an instance of Task.")
-            task.run(config)
+        config = _load_yaml(config_path)
+        config = _resolve_interpolations(config)
+        task = _instantiate(config)
+        if not isinstance(task, Task):
+            raise TypeError("Config must be an instance of Task.")
+        task.run(config)
 
         elapsed = time.time() - start
         print(f"✓ Step {step_name} completed successfully in {elapsed:.1f}s")
@@ -862,25 +841,22 @@ class BinderDesignPipeline:
     structured list of `PipelineStep` objects (name + config path + dot-list args)
     corresponding to the selected protocol and user flags. Those steps are then:
 
-    1) **Writtent to yaml files** when `configure_command(...)` is executed
-       - For each `PipelineStep`, the resolved Hydra config is written to
+    1) **Written to yaml files** when `configure_command(...)` is executed
+       - For each `PipelineStep`, the resolved config is written to
          `OUTPUT/config/<step>.yaml`.
-       - A manifest `OUTPUT/steps.yaml` is also written, listing the enabled steps
-         and their config files in execution order.
+       - A manifest `OUTPUT/steps.yaml` is also written, listing the enabled
+         steps and their config files in execution order.
 
-    2) **Executed from YAML** when `execute_command(...)` is executed
-       - Each step is launched **as a subprocess** (`python main.py <config.yaml>`)
-         unless `--no_subprocess` is set (not the default).
-       - If `--no_subprocess` is specified, the config is instantiated in-process
-         and the `Task.run(...)` method is called directly.
+    2) **Executed from YAML** when `execute_command(...)` is executed —
+       each step's config is instantiated in-process and ``Task.run(...)``
+       is called directly. Subprocess mode existed in upstream BoltzGen
+       for multi-GPU scheduling; on Tenstorrent we always run in-process
+       so the device handle and program cache survive across steps.
 
-    The actual code that is exectued in each pipeline step is found in `main.py` which a wrapper for running the .run() function of our `Task` class.
-    If you run the pipeline (for example via `boltzgen run design_spec.yaml ...`) then this function reads the yaml files of the individual pipeline steps and executes the pipeline steps.
-
-    The possible tasks are:
-        - Predict src/boltzgen/task/predict/predict.py (GPU: Running BoltzGen diffusion, inverse folding, refolding, designfolding, or affinity prediction)
-        - Analyze src/boltzgen/task/analyze/analyze.py (CPU: Compute CPU Metrics and aggregate metrics from GPU steps)
-        - Filter src/boltzgen/task/filter/filter.py (CPU: Very fast (20s) computes ranking and writes final output files)
+    Pipeline task implementations live alongside this file:
+        - Predict — tt_boltz/boltzgen/task/predict/predict.py
+        - Analyze — tt_boltz/boltzgen/task/analyze/analyze.py
+        - Filter  — tt_boltz/boltzgen/task/filter/filter.py
 
     Usage
     -----
