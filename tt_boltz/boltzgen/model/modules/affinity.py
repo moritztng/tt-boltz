@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 import tt_boltz.boltzgen.model.layers.initialize as init
-from tt_boltz.boltzgen.model.layers.pairformer import PairformerNoSeqModule
+from tt_boltz.boltzgen.adapter import TTPairformerNoSeqModule
 from tt_boltz.boltzgen.model.modules.encoders import PairwiseConditioning
 from tt_boltz.boltzgen.model.modules.utils import LinearNoBias
 
@@ -62,7 +62,7 @@ class AffinityModule(nn.Module):
             num_transitions=2,
         )
 
-        self.pairformer_stack = PairformerNoSeqModule(token_z, **pairformer_args)
+        self.pairformer_stack = TTPairformerNoSeqModule(n_blocks=pairformer_args["num_blocks"])
         self.affinity_heads = AffinityHeadsTransformer(
             token_z,
             transformer_args["token_s"],
