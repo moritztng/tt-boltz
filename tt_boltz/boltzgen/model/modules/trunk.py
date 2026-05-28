@@ -4,24 +4,13 @@ import torch
 from torch import Tensor, nn
 from torch.nn.functional import one_hot
 
+from tt_boltz.boltzgen.adapter import TTPairformerNoSeqModule
 from tt_boltz.boltzgen.data import const
-from tt_boltz.boltzgen.model.layers.miniformer import (
-    MiniformerNoSeqLayer,
-    MiniformerNoSeqModule,
-)
-from tt_boltz.boltzgen.model.layers.outer_product_mean import OuterProductMean
-from tt_boltz.boltzgen.model.layers.pair_averaging import PairWeightedAveraging
-from tt_boltz.boltzgen.model.layers.pairformer import (
-    PairformerNoSeqLayer,
-    PairformerNoSeqModule,
-    get_dropout_mask,
-)
-from tt_boltz.boltzgen.model.layers.transition import Transition
 from tt_boltz.boltzgen.model.modules.encoders import (
     AtomAttentionEncoder,
     AtomEncoder,
-    FourierEmbedding,
     DistanceTokenEncoder,
+    FourierEmbedding,
 )
 
 
@@ -287,24 +276,9 @@ class TemplateModule(nn.Module):
         self.u_proj = nn.Linear(template_dim, token_z, bias=False)
 
 
-        if miniformer_blocks:
-            self.pairformer = MiniformerNoSeqModule(
-                template_dim,
-                num_blocks=template_blocks,
-                dropout=dropout,
-                post_layer_norm=post_layer_norm,
-                activation_checkpointing=activation_checkpointing,
-            )
-        else:
-            self.pairformer = PairformerNoSeqModule(
-                template_dim,
-                num_blocks=template_blocks,
-                dropout=dropout,
-                pairwise_head_width=pairwise_head_width,
-                pairwise_num_heads=pairwise_num_heads,
-                post_layer_norm=post_layer_norm,
-                activation_checkpointing=activation_checkpointing,
-            )
+        # Direct ttnn no-seq pairformer — no PyTorch fallback.
+        # Shipping ckpts always use the standard (non-miniformer) variant here.
+        self.pairformer = TTPairformerNoSeqModule(n_blocks=template_blocks)
 
     def forward(
         self,
@@ -451,24 +425,8 @@ class TokenDistanceModule(nn.Module):
         )
         self.u_proj = nn.Linear(token_distance_dim, token_z, bias=False)
 
-        if miniformer_blocks:
-            self.pairformer = MiniformerNoSeqModule(
-                token_distance_dim,
-                num_blocks=token_distance_blocks,
-                dropout=dropout,
-                post_layer_norm=post_layer_norm,
-                activation_checkpointing=activation_checkpointing,
-            )
-        else:
-            self.pairformer = PairformerNoSeqModule(
-                token_distance_dim,
-                num_blocks=token_distance_blocks,
-                dropout=dropout,
-                pairwise_head_width=pairwise_head_width,
-                pairwise_num_heads=pairwise_num_heads,
-                post_layer_norm=post_layer_norm,
-                activation_checkpointing=activation_checkpointing,
-            )
+        # Direct ttnn no-seq pairformer for the token-distance module.
+        self.pairformer = TTPairformerNoSeqModule(n_blocks=token_distance_blocks)
 
         if use_token_distance_feats:
             self.token_distance_encoder = DistanceTokenEncoder(
@@ -538,252 +496,6 @@ class TokenDistanceModule(nn.Module):
         # Compute output projection
         u = self.u_proj(self.relu(v))
         return u
-
-
-class MSAModule(nn.Module):
-    """MSA module."""
-
-    def __init__(
-        self,
-        msa_s: int,
-        token_z: int,
-        token_s: int,
-        msa_blocks: int,
-        msa_dropout: float,
-        z_dropout: float,
-        miniformer_blocks: bool = True,
-        pairwise_head_width: int = 32,
-        pairwise_num_heads: int = 4,
-        activation_checkpointing: bool = False,
-        use_paired_feature: bool = False,
-    ) -> None:
-        """Initialize the MSA module.
-
-        Parameters
-        ----------
-        token_z : int
-            The token pairwise embedding size.
-
-        """
-        super().__init__()
-        self.msa_blocks = msa_blocks
-        self.msa_dropout = msa_dropout
-        self.z_dropout = z_dropout
-        self.use_paired_feature = use_paired_feature
-        self.activation_checkpointing = activation_checkpointing
-
-        self.s_proj = nn.Linear(token_s, msa_s, bias=False)
-        self.msa_proj = nn.Linear(
-            const.num_tokens + 2 + int(use_paired_feature),
-            msa_s,
-            bias=False,
-        )
-        self.layers = nn.ModuleList()
-        for i in range(msa_blocks):
-            self.layers.append(
-                MSALayer(
-                    msa_s,
-                    token_z,
-                    msa_dropout,
-                    z_dropout,
-                    miniformer_blocks,
-                    pairwise_head_width,
-                    pairwise_num_heads,
-                )
-            )
-
-    def forward(
-        self,
-        z: Tensor,
-        emb: Tensor,
-        feats: Dict[str, Tensor],
-        use_kernels: bool = False,
-    ) -> Tensor:
-        """Perform the forward pass.
-
-        Parameters
-        ----------
-        z : Tensor
-            The pairwise embeddings
-        emb : Tensor
-            The input embeddings
-        feats : Dict[str, Tensor]
-            Input features
-
-        Returns
-        -------
-        Tensor
-            The output pairwise embeddings.
-
-        """
-        # Set chunk sizes
-        if not self.training:
-            if z.shape[1] > const.chunk_size_threshold:
-                chunk_heads_pwa = True
-                chunk_size_transition_z = 64
-                chunk_size_transition_msa = 32
-                chunk_size_outer_product = 4
-                chunk_size_tri_attn = 128
-            else:
-                chunk_heads_pwa = False
-                chunk_size_transition_z = None
-                chunk_size_transition_msa = None
-                chunk_size_outer_product = None
-                chunk_size_tri_attn = 512
-        else:
-            chunk_heads_pwa = False
-            chunk_size_transition_z = None
-            chunk_size_transition_msa = None
-            chunk_size_outer_product = None
-            chunk_size_tri_attn = None
-
-        # Load relevant features
-        msa = feats["msa"]
-        msa = torch.nn.functional.one_hot(msa, num_classes=const.num_tokens)
-        has_deletion = feats["has_deletion"].unsqueeze(-1)
-        deletion_value = feats["deletion_value"].unsqueeze(-1)
-        is_paired = feats["msa_paired"].unsqueeze(-1)
-        msa_mask = feats["msa_mask"]
-        token_mask = feats["token_pad_mask"].float()
-        token_mask = token_mask[:, :, None] * token_mask[:, None, :]
-
-        # Compute MSA embeddings
-        if self.use_paired_feature:
-            m = torch.cat([msa, has_deletion, deletion_value, is_paired], dim=-1)
-        else:
-            m = torch.cat([msa, has_deletion, deletion_value], dim=-1)
-
-        # Compute input projections
-        m = self.msa_proj(m)
-        m = m + self.s_proj(emb).unsqueeze(1)
-
-        # Perform MSA blocks
-        for i in range(self.msa_blocks):
-            if self.activation_checkpointing:
-                z, m = torch.utils.checkpoint.checkpoint(
-                    self.layers[i],
-                    z,
-                    m,
-                    token_mask,
-                    msa_mask,
-                    chunk_heads_pwa,
-                    chunk_size_transition_z,
-                    chunk_size_transition_msa,
-                    chunk_size_outer_product,
-                    chunk_size_tri_attn,
-                    use_kernels=use_kernels,
-                    use_reentrant=False,
-                )
-            else:
-                z, m = self.layers[i](
-                    z,
-                    m,
-                    token_mask,
-                    msa_mask,
-                    chunk_heads_pwa,
-                    chunk_size_transition_z,
-                    chunk_size_transition_msa,
-                    chunk_size_outer_product,
-                    chunk_size_tri_attn,
-                    use_kernels=use_kernels,
-                )
-        return z
-
-
-class MSALayer(nn.Module):
-    """MSA module."""
-
-    def __init__(
-        self,
-        msa_s: int,
-        token_z: int,
-        msa_dropout: float,
-        z_dropout: float,
-        miniformer_blocks: bool = True,
-        pairwise_head_width: int = 32,
-        pairwise_num_heads: int = 4,
-    ) -> None:
-        """Initialize the MSA module.
-
-        Parameters
-        ----------
-        token_z : int
-            The token pairwise embedding size.
-
-        """
-        super().__init__()
-        self.msa_dropout = msa_dropout
-        self.msa_transition = Transition(dim=msa_s, hidden=msa_s * 4)
-        self.pair_weighted_averaging = PairWeightedAveraging(
-            c_m=msa_s,
-            c_z=token_z,
-            c_h=32,
-            num_heads=8,
-        )
-
-        if miniformer_blocks:
-            self.pairformer_layer = MiniformerNoSeqLayer(
-                token_z=token_z, dropout=z_dropout
-            )
-        else:
-            self.pairformer_layer = PairformerNoSeqLayer(
-                token_z=token_z,
-                dropout=z_dropout,
-                pairwise_head_width=pairwise_head_width,
-                pairwise_num_heads=pairwise_num_heads,
-            )
-
-        self.outer_product_mean = OuterProductMean(
-            c_in=msa_s,
-            c_hidden=32,
-            c_out=token_z,
-        )
-
-    def forward(
-        self,
-        z: Tensor,
-        m: Tensor,
-        token_mask: Tensor,
-        msa_mask: Tensor,
-        chunk_heads_pwa: bool = False,
-        chunk_size_transition_z: int = None,
-        chunk_size_transition_msa: int = None,
-        chunk_size_outer_product: int = None,
-        chunk_size_tri_attn: int = None,
-        use_kernels: bool = False,
-    ) -> Tuple[Tensor, Tensor]:
-        """Perform the forward pass.
-
-        Parameters
-        ----------
-        z : Tensor
-            The pairwise embeddings
-        emb : Tensor
-            The input embeddings
-        feats : Dict[str, Tensor]
-            Input features
-
-        Returns
-        -------
-        Tensor
-            The output pairwise embeddings.
-
-        """
-        # Communication to MSA stack
-        msa_dropout = get_dropout_mask(self.msa_dropout, m, self.training)
-        m = m + msa_dropout * self.pair_weighted_averaging(
-            m, z, token_mask, chunk_heads_pwa
-        )
-        m = m + self.msa_transition(m, chunk_size_transition_msa)
-
-        z = z + self.outer_product_mean(m, msa_mask, chunk_size_outer_product)
-
-        # Compute pairwise stack
-        z = self.pairformer_layer(
-            z, token_mask, chunk_size_tri_attn, use_kernels=use_kernels
-        )
-
-        return z, m
 
 
 class BFactorModule(nn.Module):

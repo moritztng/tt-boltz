@@ -1,7 +1,7 @@
 import torch
 from einops.layers.torch import Rearrange
 from torch import Tensor, nn
-import tt_boltz.boltzgen.model.layers.initialize as init
+import boltzgen.model.layers.initialize as init
 
 
 class AttentionPairBias(nn.Module):

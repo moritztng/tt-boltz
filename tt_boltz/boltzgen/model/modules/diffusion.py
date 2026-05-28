@@ -16,29 +16,18 @@ from torch.nn import Module
 from typing import Any, Dict, Optional, List
 
 from tqdm import tqdm
-import tt_boltz.boltzgen.model.layers.initialize as init
+# The PyTorch ``DiffusionModule`` (score model) lived in this file; it's now
+# replaced by ``TTScoreModelAdapter`` (see :mod:`tt_boltz.boltzgen.adapter`).
+# ``AtomDiffusion`` below keeps the surrounding Euler-Maruyama sampler +
+# alignment logic in PyTorch.
 from tt_boltz.boltzgen.data import const
-from tt_boltz.boltzgen.model.layers.miniformer import MiniformerModule
-from tt_boltz.boltzgen.model.layers.pairformer import PairformerModule
 from tt_boltz.boltzgen.model.loss.diffusion import (
     compute_bond_loss,
     smooth_lddt_loss,
     weighted_rigid_align,
     weighted_rigid_centering,
 )
-from tt_boltz.boltzgen.model.modules.encoders import (
-    AtomAttentionDecoder,
-    AtomAttentionEncoder,
-    CoordinateConditioning,
-    FourierEmbedding,
-    SingleConditioning,
-)
-from tt_boltz.boltzgen.model.modules.transformers import (
-    ConditionedTransitionBlock,
-    DiffusionTransformer,
-)
 from tt_boltz.boltzgen.model.modules.utils import (
-    LinearNoBias,
     center,
     center_random_augmentation,
     compute_random_augmentation,
@@ -63,204 +52,6 @@ tz - feature dimension (pairwise)
 as - feature dimension (atompair)
 az - feature dimension (atompair input)
 """
-
-
-class DiffusionModule(Module):
-    """Algorithm 20."""
-
-    def __init__(
-        self,
-        token_s: int,
-        atom_s: int,
-        atoms_per_window_queries: int = 32,
-        atoms_per_window_keys: int = 128,
-        sigma_data: int = 16,
-        dim_fourier: int = 256,
-        atom_encoder_depth: int = 3,
-        atom_encoder_heads: int = 4,
-        token_layers: int = 1,
-        token_transformer_depth: int = 6,
-        token_transformer_heads: int = 8,
-        use_miniformer: bool = False,
-        diffusion_pairformer_args: Dict[str, Any] = None,
-        atom_decoder_depth: int = 3,
-        atom_decoder_heads: int = 4,
-        conditioning_transition_layers: int = 2,
-        activation_checkpointing: bool = False,
-        gaussian_random_3d_encoding_dim: int = 0,
-        transformer_post_ln: bool = False,
-        tfmr_s: Optional[int] = None,
-        predict_res_type: bool = False,
-        use_qk_norm: bool = False,
-    ) -> None:
-        super().__init__()
-
-        self.atoms_per_window_queries = atoms_per_window_queries
-        self.atoms_per_window_keys = atoms_per_window_keys
-        self.sigma_data = sigma_data
-        self.activation_checkpointing = activation_checkpointing
-        if tfmr_s is None:
-            tfmr_s = 2 * token_s
-        self.tfmr_s = tfmr_s
-
-        # conditioning
-        self.single_conditioner = SingleConditioning(
-            sigma_data=sigma_data,
-            tfmr_s=tfmr_s,
-            token_s=token_s,
-            dim_fourier=dim_fourier,
-            num_transitions=conditioning_transition_layers,
-        )
-
-        self.atom_attention_encoder = AtomAttentionEncoder(
-            atom_s=atom_s,
-            token_s=token_s,
-            atoms_per_window_queries=atoms_per_window_queries,
-            atoms_per_window_keys=atoms_per_window_keys,
-            atom_encoder_depth=atom_encoder_depth,
-            atom_encoder_heads=atom_encoder_heads,
-            structure_prediction=True,
-            activation_checkpointing=activation_checkpointing,
-            gaussian_random_3d_encoding_dim=gaussian_random_3d_encoding_dim,
-            transformer_post_layer_norm=transformer_post_ln,
-            tfmr_s=tfmr_s,
-            use_qk_norm=use_qk_norm,
-        )
-
-        self.s_to_a_linear = nn.Sequential(
-            nn.LayerNorm(tfmr_s), LinearNoBias(tfmr_s, tfmr_s)
-        )
-        init.final_init_(self.s_to_a_linear[1].weight)
-
-        self.token_transformer_layers = nn.ModuleList()
-        self.token_pairformer_layers = nn.ModuleList()
-
-        self.token_transformer = DiffusionTransformer(
-            dim=tfmr_s,
-            dim_single_cond=tfmr_s,
-            depth=token_transformer_depth,
-            heads=token_transformer_heads,
-            activation_checkpointing=activation_checkpointing,
-            use_qk_norm=use_qk_norm,
-        )
-
-        self.a_norm = nn.LayerNorm(tfmr_s)
-
-        self.atom_attention_decoder = AtomAttentionDecoder(
-            atom_s=atom_s,
-            tfmr_s=tfmr_s,
-            attn_window_queries=atoms_per_window_queries,
-            attn_window_keys=atoms_per_window_keys,
-            atom_decoder_depth=atom_decoder_depth,
-            atom_decoder_heads=atom_decoder_heads,
-            activation_checkpointing=activation_checkpointing,
-            predict_res_type=predict_res_type,
-            use_qk_norm=use_qk_norm,
-        )
-
-    def forward(
-        self,
-        s_inputs,  # Float['b n ts']
-        s_trunk,  # Float['b n ts']
-        r_noisy,  # Float['bm m 3']
-        times,  # Float['bm 1 1']
-        feats,
-        diffusion_conditioning,
-        multiplicity=1,
-    ):
-        if self.activation_checkpointing:
-            s, normed_fourier = torch.utils.checkpoint.checkpoint(
-                self.single_conditioner,
-                times,
-                s_trunk.repeat_interleave(multiplicity, 0),
-                s_inputs.repeat_interleave(multiplicity, 0),
-            )
-        else:
-            s, normed_fourier = self.single_conditioner(
-                times,
-                s_trunk.repeat_interleave(multiplicity, 0),
-                s_inputs.repeat_interleave(multiplicity, 0),
-            )
-
-        # Sequence-local Atom Attention and aggregation to coarse-grained tokens
-        a, q_skip, c_skip, to_keys = self.atom_attention_encoder(
-            feats=feats,
-            q=diffusion_conditioning["q"].float(),
-            c=diffusion_conditioning["c"].float(),
-            atom_enc_bias=diffusion_conditioning["atom_enc_bias"].float(),
-            to_keys=diffusion_conditioning["to_keys"],
-            r=r_noisy,  # Float['b m 3'],
-            multiplicity=multiplicity,
-        )
-
-        # Full self-attention on token level
-        a = a + self.s_to_a_linear(s)
-
-        mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
-
-        # run token level transformations
-        a = self.token_transformer(
-            a,
-            mask=mask.float(),
-            s=s,
-            bias=diffusion_conditioning["token_trans_bias"].float(),
-            multiplicity=multiplicity,
-        )
-        a = self.a_norm(a)
-
-        # Broadcast token activations to atoms and run Sequence-local Atom Attention
-        r_update, res_type = self.atom_attention_decoder(
-            a=a,
-            q=q_skip,
-            c=c_skip,
-            atom_dec_bias=diffusion_conditioning["atom_dec_bias"].float(),
-            feats=feats,
-            multiplicity=multiplicity,
-            to_keys=to_keys,
-        )
-
-        return {
-            "r_update": r_update,
-            "token_a": a.detach(),
-            "res_type": res_type,
-        }
-
-
-class OutTokenFeatUpdate(Module):
-    def __init__(
-        self,
-        sigma_data: float,
-        token_s=384,
-        dim_fourier=256,
-    ):
-        super().__init__()
-        self.sigma_data = sigma_data
-
-        self.norm_next = nn.LayerNorm(2 * token_s)
-        self.fourier_embed = FourierEmbedding(dim_fourier)
-        self.norm_fourier = nn.LayerNorm(dim_fourier)
-        self.transition_block = ConditionedTransitionBlock(
-            2 * token_s, 2 * token_s + dim_fourier
-        )
-
-    def forward(
-        self,
-        times,
-        acc_a,
-        next_a,
-    ):
-        next_a = self.norm_next(next_a)
-        fourier_embed = self.fourier_embed(times)
-        normed_fourier = (
-            self.norm_fourier(fourier_embed)
-            .unsqueeze(1)
-            .expand(-1, next_a.shape[1], -1)
-        )
-        cond_a = torch.cat((acc_a, normed_fourier), dim=-1)
-
-        acc_a = acc_a + self.transition_block(next_a, cond_a)
-
-        return acc_a
 
 
 class AtomDiffusion(Module):
@@ -303,9 +94,11 @@ class AtomDiffusion(Module):
         pred_threshold: Optional[float] = None,
     ):
         super().__init__()
-        self.score_model = DiffusionModule(
-            **score_model_args,
-        )
+        # Direct ttnn — the diffusion score model is the per-step compute heart
+        # of design / folding. TTScoreModelAdapter wraps tt-boltz's
+        # TTDiffusionModule with BoltzGen's kwarg+dict calling convention.
+        from tt_boltz.boltzgen.adapter import TTScoreModelAdapter
+        self.score_model = TTScoreModelAdapter()
 
         # parameters
         self.sigma_min = sigma_min
