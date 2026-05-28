@@ -14,17 +14,25 @@ dependencies = [
     "requests",
     "pandas",
     "einops",
+    "einx",
     "mashumaro",
     "modelcif",
     "click",
     "pyyaml",
-    "omegaconf",
+    "omegaconf",  # only needed to unpickle DictConfig objects baked into upstream ckpts
     "biopython",
+    "biotite",
     "scipy",
     "numba",
     "gemmi",
     "scikit-learn",
     "chembl_structure_pipeline",
+    "pdbeccdutils",
+    "hydride",
+    "pydssp",
+    "logomaker",
+    "edit_distance",
+    "huggingface_hub",
     "tqdm",
     "rich",
     "pytest",
@@ -33,7 +41,7 @@ dependencies = [
 
 [project.scripts]
 tt-boltz = "tt_boltz.main:cli"
-tt-boltzgen = "tt_boltz.boltzgen:cli_main"
+tt-boltzgen = "tt_boltz.boltzgen.cli.boltzgen:main"
 
 [tool.setuptools]
 
