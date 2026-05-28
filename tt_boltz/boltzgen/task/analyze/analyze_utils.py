@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import Structure, biotite_array_from_feat
 from tt_boltz.boltzgen.data.write.mmcif import to_mmcif
 from tt_boltz.boltzgen.model.loss.validation import factored_lddt_loss, compute_subset_rmsd

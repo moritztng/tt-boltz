@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import logomaker
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 
 # Define amino acid properties for peptide visualization
 HYDROPHOBIC = set("ACILMFWV")

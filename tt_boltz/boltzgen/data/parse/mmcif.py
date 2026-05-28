@@ -11,7 +11,7 @@ from rdkit.Chem import AllChem
 from rdkit.Chem.rdchem import Mol
 from sklearn.neighbors import KDTree
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import (
     Atom,
     Bond,
@@ -23,7 +23,7 @@ from tt_boltz.boltzgen.data.data import (
     Structure,
     StructureInfo,
 )
-from tt_boltz.boltzgen.data.mol import load_molecules
+from tt_boltz.data.mol import load_molecules
 from collections import defaultdict
 
 

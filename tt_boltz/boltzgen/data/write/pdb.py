@@ -2,7 +2,7 @@ import re
 import string
 from typing import Iterator
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import Structure
 
 

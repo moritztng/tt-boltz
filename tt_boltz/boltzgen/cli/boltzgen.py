@@ -56,8 +56,8 @@ from tt_boltz.boltzgen._config import (
     save_yaml as _save_yaml,
 )
 
-from tt_boltz.boltzgen.data import const
-from tt_boltz.boltzgen.data.mol import load_canonicals
+from tt_boltz.data import const
+from tt_boltz.data.mol import load_canonicals
 from tt_boltz.boltzgen.data.parse.schema import YamlDesignParser
 from tt_boltz.boltzgen.data.write.mmcif import to_mmcif
 from tt_boltz.boltzgen.task.task import Task

@@ -16,8 +16,8 @@ from rdkit.Chem.rdMolDescriptors import CalcNumHeavyAtoms
 from scipy.spatial.distance import cdist
 import yaml
 
-from tt_boltz.boltzgen.data import const
-from tt_boltz.boltzgen.data.mol import load_molecules
+from tt_boltz.data import const
+from tt_boltz.data.mol import load_molecules
 from tt_boltz.boltzgen.data.parse.mmcif import parse_mmcif
 from tt_boltz.boltzgen.data.data import (
     Atom,

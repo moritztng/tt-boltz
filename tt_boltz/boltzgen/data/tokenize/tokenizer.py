@@ -2,8 +2,8 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
-from tt_boltz.boltzgen.data import const
-from tt_boltz.boltzgen.data.const import (
+from tt_boltz.data import const
+from tt_boltz.data.const import (
     prot_letter_to_token,
     protein_letters_3to1_extended,
     nucleic_letters_3to1_extended,

@@ -13,8 +13,8 @@ from tt_boltz.boltzgen.data.data import (
     Structure,
 )
 from tt_boltz.boltzgen.data.feature.featurizer import Featurizer
-from tt_boltz.boltzgen.data.pad import pad_to_max
-from tt_boltz.boltzgen.data.mol import (
+from tt_boltz.data.pad import pad_to_max
+from tt_boltz.data.mol import (
     load_canonicals,
     load_molecules,
 )

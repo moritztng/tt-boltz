@@ -1,23 +1,64 @@
 import itertools
+import os
 import pickle
-import random
 from pathlib import Path
+import random
+from typing import Dict, List
+import zipfile
 
 import numpy as np
 import torch
-from rdkit.Chem import Mol
+from rdkit.Chem import Mol, AllChem
+from tqdm import tqdm
 
 from tt_boltz.data import const
 from tt_boltz.data.pad import pad_dim
+from tt_boltz.boltzgen.model.loss.confidence import lddt_dist
 
 
-def load_molecules(moldir: str, molecules: list[str]) -> dict[str, Mol]:
+MOLDIR_ZIP_CACHE: Dict[
+    tuple[int, Path], zipfile.ZipFile
+] = {}  # moldir -> open zip file
+
+
+def _get_zipfile(moldir: Path) -> zipfile.ZipFile:
+    """
+    Retrieve a cached ZipFile object for the given molecule directory zip file.
+
+    If the ZipFile for the provided path and current process does not exist in the cache,
+    it is created and stored. Otherwise, the cached instance is returned.
+
+    Parameters
+    ----------
+    moldir : Path
+        Path to the .zip file containing molecule data.
+
+    Returns
+    -------
+    zipfile.ZipFile
+        An open ZipFile object for reading molecule data.
+
+    Notes
+    -----
+    The cache is keyed by both process ID and zip file path to prevent issues with forked processes.
+    """
+    pid = os.getpid()
+    key = (pid, moldir)
+
+    zf = MOLDIR_ZIP_CACHE.get(key)
+    if zf is None:
+        zf = zipfile.ZipFile(moldir, "r")
+        MOLDIR_ZIP_CACHE[key] = zf
+    return zf
+
+
+def load_molecules(moldir: str, molecules: List[str]) -> Dict[str, Mol]:
     """Load the given input data.
 
     Parameters
     ----------
     moldir : str
-        The path to the molecules directory.
+        The path to the molecules directory or zip file.
     molecules : list[str]
         The molecules to load.
 
@@ -26,14 +67,22 @@ def load_molecules(moldir: str, molecules: list[str]) -> dict[str, Mol]:
     dict[str, Mol]
         The loaded molecules.
     """
-    loaded_mols = {}
-    for molecule in molecules:
-        path = Path(moldir) / f"{molecule}.pkl"
-        if not path.exists():
-            msg = f"CCD component {molecule} not found!"
-            raise ValueError(msg)
-        with path.open("rb") as f:
-            loaded_mols[molecule] = pickle.load(f)  # noqa: S301
+    moldir = Path(moldir)
+    loaded_mols: Dict[str, Mol] = {}
+
+    if moldir.is_file() and moldir.suffix == ".zip":
+        zip_file = _get_zipfile(moldir)
+        for molecule in molecules:
+            pkl_filename = f"{molecule}.pkl"
+            with zip_file.open(pkl_filename, "r") as f:
+                loaded_mols[molecule] = pickle.load(f)  # noqa: S301
+    elif moldir.is_dir():
+        for molecule in molecules:
+            path = moldir / f"{molecule}.pkl"
+            with path.open("rb") as f:
+                loaded_mols[molecule] = pickle.load(f)  # noqa: S301
+    else:
+        raise ValueError(f"Invalid moldir. Expected directory or zip file: {moldir}")
     return loaded_mols
 
 
@@ -54,7 +103,45 @@ def load_canonicals(moldir: str) -> dict[str, Mol]:
     return load_molecules(moldir, const.canonical_tokens)
 
 
-def get_symmetries(mols: dict[str, Mol]) -> dict:  # noqa: PLR0912
+def load_all_molecules(moldir: str) -> dict[str, Mol]:
+    """Load all molecular data from directory or zip file.
+
+    Parameters
+    ----------
+    moldir : str
+        The path to the molecules directory or zip file.
+
+    Returns
+    -------
+    dict[str, Mol]
+        The loaded molecules.
+
+    """
+    moldir = Path(moldir)
+    loaded_mols = {}
+
+    if moldir.is_file() and moldir.suffix == ".zip":
+        with zipfile.ZipFile(moldir, "r") as zip_file:
+            pkl_files = [name for name in zip_file.namelist() if name.endswith(".pkl")]
+            for pkl_filename in tqdm(
+                pkl_files, desc="Loading molecules from zip", leave=False
+            ):
+                mol_name = Path(pkl_filename).stem
+                with zip_file.open(pkl_filename) as f:
+                    loaded_mols[mol_name] = pickle.load(f)  # noqa: S301
+    else:
+        files = list(moldir.glob("*.pkl"))
+        for path in tqdm(
+            files, total=len(files), desc="Loading molecules", leave=False
+        ):
+            mol_name = path.stem
+            with path.open("rb") as f:
+                loaded_mols[mol_name] = pickle.load(f)  # noqa: S301
+
+    return loaded_mols
+
+
+def get_symmetries(mols: dict[str, Mol]) -> Dict:  # noqa: PLR0912
     """Create a dictionary for the ligand symmetries.
 
     Parameters
@@ -64,7 +151,7 @@ def get_symmetries(mols: dict[str, Mol]) -> dict:  # noqa: PLR0912
 
     Returns
     -------
-    dict
+    Dict
         The ligand symmetries.
 
     """
@@ -231,6 +318,7 @@ def minimum_lddt_symmetry_coords(
         for start1, end1, start2, end2, chainidx1, chainidx2 in c:
             true_all_coords[:, start1:end1] = all_coords[:, start2:end2]
             true_all_resolved_mask[start1:end1] = all_resolved_mask[start2:end2]
+
         true_coords = true_all_coords[:, crop_to_all_atom_map]
         true_resolved_mask = true_all_resolved_mask[crop_to_all_atom_map]
         dmat_true = torch.cdist(true_coords, true_coords)
@@ -240,7 +328,10 @@ def minimum_lddt_symmetry_coords(
             * (1 - torch.eye(len(true_resolved_mask))).to(true_resolved_mask)
         )
 
-        lddt = 0.0
+        lddt = lddt_dist(
+            dmat_predicted, dmat_true, pair_mask, cutoff=15.0, per_atom=False
+        )[0]
+        lddt = lddt.item()
 
         if lddt > best_lddt and torch.sum(true_resolved_mask) > 3:
             best_lddt = lddt
@@ -294,8 +385,20 @@ def minimum_lddt_symmetry_coords(
                 * (1 - torch.eye(len(indices))).to(sub_true_pair_lddt).bool()
             )
 
-            lddt, total = 0.0
-            new_lddt, new_total = 0.0
+            lddt, total = lddt_dist(
+                sub_dmat_pred,
+                sub_dmat_true,
+                sub_true_pair_lddt,
+                cutoff=15.0,
+                per_atom=False,
+            )
+            new_lddt, new_total = lddt_dist(
+                sub_dmat_pred,
+                sub_dmat_new_true,
+                sub_new_true_pair_lddt,
+                cutoff=15.0,
+                per_atom=False,
+            )
 
             lddt_improvement = new_lddt - lddt
 
@@ -432,7 +535,7 @@ def compute_all_coords_mask(structure):
     return all_coords, all_coords_crop_mask, all_resolved_mask
 
 
-def get_chain_symmetries(cropped, max_n_symmetries=100):
+def get_chain_symmetries(cropped, backbone_only, atom14, atom37, max_n_symmetries=100):
     # get all coordinates and resolved mask
     structure = cropped.structure
     all_coords = []
@@ -451,14 +554,8 @@ def get_chain_symmetries(cropped, max_n_symmetries=100):
         )
 
         # compute coordinates and resolved mask
-        resolved_mask = structure.atoms["is_present"][
-            atom_idx : atom_idx + atom_num
-        ]  # Whether each atom in the chain is actually resolved
-
-        # ensemble_atom_starts = [structure.ensemble[idx]["atom_coord_idx"] for idx in cropped.ensemble_ref_idxs]
-        # coords = np.array(
-        #    [structure.coords[ensemble_atom_start + atom_idx: ensemble_atom_start + atom_idx + atom_num]["coords"] for
-        #     ensemble_atom_start in ensemble_atom_starts])
+        # Whether each atom in the chain is actually resolved
+        resolved_mask = structure.atoms["is_present"][atom_idx : atom_idx + atom_num]
 
         coords = structure.atoms["coords"][atom_idx : atom_idx + atom_num]
 
@@ -486,7 +583,69 @@ def get_chain_symmetries(cropped, max_n_symmetries=100):
         start = (
             chain_atom_idx[chain_idx] - original_atom_idx[chain_idx] + token["atom_idx"]
         )
-        crop_to_all_atom_map.append(np.arange(start, start + token["atom_num"]))
+
+        # add logic for backbone_only and atom14
+        if bool(token["is_standard"]) and bool(token["design_mask"]) and backbone_only:
+            if token["mol_type"] == const.chain_type_ids["PROTEIN"]:
+                atom_num = min(4, token["atom_num"])
+            elif token["mol_type"] == const.chain_type_ids["DNA"]:
+                atom_num = min(11, token["atom_num"])
+            elif token["mol_type"] == const.chain_type_ids["RNA"]:
+                atom_num = min(12, token["atom_num"])
+        elif (
+            bool(token["is_standard"])
+            and bool(token["design_mask"])
+            and (atom14 or atom37)
+        ):
+            if token["mol_type"] == const.chain_type_ids["PROTEIN"]:
+                atom_num = 14 if atom14 else 37
+            elif token["mol_type"] == const.chain_type_ids["DNA"]:
+                atom_num = 22
+            elif token["mol_type"] == const.chain_type_ids["RNA"]:
+                atom_num = 23
+        else:
+            atom_num = token["atom_num"]
+
+        res_type = const.tokens[token["res_type"]]
+
+        # special handling for atom14: real atoms map back with offset, fake atoms map back to the center rep atom
+        if (
+            bool(token["is_standard"])
+            and bool(token["design_mask"])
+            and (atom14 or atom37)
+        ):
+            if atom14:
+                local_array = np.arange(start, start + atom_num)
+                placements = np.array(const.fake_atom_placements[res_type])
+
+                oxygen_offset = const.ref_atoms[res_type].index("O")
+                nitrogen_offset = const.ref_atoms[res_type].index("N")
+
+                local_array[placements == "O"] = start + oxygen_offset
+                local_array[placements == "N"] = start + nitrogen_offset
+            elif atom37:
+                ca_offset = const.ref_atoms[res_type].index("CA")
+                local_array = np.array(
+                    [
+                        start + const.ref_atoms[res_type].index(name)
+                        if name in const.ref_atoms[res_type]
+                        else start + ca_offset
+                        for name in const.atom_types
+                    ]
+                )
+            else:
+                real_range = np.arange(start, start + token["atom_num"])
+                # need to add in offset for the rep atom
+                rep_atom_offset = token["center_idx"] - token["atom_idx"]
+                fake_range = np.array(
+                    [start + rep_atom_offset] * (atom_num - token["atom_num"])
+                )
+                local_array = np.concatenate([real_range, fake_range])
+        # for backbone_only and without backbone_only or atom14
+        else:
+            local_array = np.arange(start, start + atom_num)
+        crop_to_all_atom_map.append(local_array)
+
     crop_to_all_atom_map = np.concatenate(crop_to_all_atom_map, axis=0)
 
     # Compute the connections edge index for covalent bonds
@@ -495,12 +654,16 @@ def get_chain_symmetries(cropped, max_n_symmetries=100):
         crop_to_all_atom_map.shape[0]
     )
     connections_edge_index = []
+    crop_atom_set = set(crop_to_all_atom_map.astype(np.int64))
     for connection in structure.bonds:
         if (connection["chain_1"] == connection["chain_2"]) and (
             connection["res_1"] == connection["res_2"]
         ):
             continue
-        connections_edge_index.append([connection["atom_1"], connection["atom_2"]])
+        atom_1, atom_2 = connection["atom_1"], connection["atom_2"]
+        # Only include bonds where BOTH atoms are in the crop
+        if atom_1 in crop_atom_set and atom_2 in crop_atom_set:
+            connections_edge_index.append([atom_1, atom_2])
     if len(connections_edge_index) > 0:
         connections_edge_index = np.array(connections_edge_index, dtype=np.int64).T
         connections_edge_index = all_atom_to_crop_map[connections_edge_index]
@@ -573,12 +736,35 @@ def get_chain_symmetries(cropped, max_n_symmetries=100):
     return features
 
 
-def get_amino_acids_symmetries(cropped):
+def get_amino_acids_symmetries(cropped, backbone_only, atom14, atom37):
     # Compute standard amino-acids symmetries
     swaps = []
     start_index_crop = 0
     for token in cropped.tokens:
         symmetries = const.ref_symmetries.get(const.tokens[token["res_type"]], [])
+
+        # add atom_num logic for backbone_only and atom14
+        if bool(token["is_standard"]) and bool(token["design_mask"]) and backbone_only:
+            if token["mol_type"] == const.chain_type_ids["PROTEIN"]:
+                atom_num = min(4, token["atom_num"])
+            elif token["mol_type"] == const.chain_type_ids["DNA"]:
+                atom_num = min(11, token["atom_num"])
+            elif token["mol_type"] == const.chain_type_ids["RNA"]:
+                atom_num = min(12, token["atom_num"])
+        elif (
+            bool(token["is_standard"])
+            and bool(token["design_mask"])
+            and (atom14 or atom37)
+        ):
+            if token["mol_type"] == const.chain_type_ids["PROTEIN"]:
+                atom_num = 14 if atom14 else 37
+            elif token["mol_type"] == const.chain_type_ids["DNA"]:
+                atom_num = 22
+            elif token["mol_type"] == const.chain_type_ids["RNA"]:
+                atom_num = 23
+        else:
+            atom_num = token["atom_num"]
+
         if len(symmetries) > 0:
             residue_swaps = []
             for sym in symmetries:
@@ -587,7 +773,8 @@ def get_amino_acids_symmetries(cropped):
                 ]
                 residue_swaps.append(sym_new_idx)
             swaps.append(residue_swaps)
-        start_index_crop += token["atom_num"]
+        # start_index_crop += token["atom_num"]
+        start_index_crop += atom_num
 
     features = {"amino_acids_symmetries": swaps}
     return features
@@ -804,7 +991,7 @@ def get_ligand_symmetries(cropped, symmetries, return_physical_metrics=False):
             )
             all_planar_double_bond_index = np.empty(
                 (6, 0), dtype=np.int64
-            )  # TODO remove np.concatenate(all_planar_double_bond_index, axis=1)
+            )
         else:
             all_edge_index = np.empty((2, 0), dtype=np.int64)
             all_lower_bounds = np.array([], dtype=np.float32)
@@ -856,3 +1043,103 @@ def get_ligand_symmetries(cropped, symmetries, return_physical_metrics=False):
             "ligand_symmetries": molecule_symmetries,
         }
     return features
+
+
+def mol_from_smile(smiles_list: list[str]) -> list[Mol]:
+    """Load the smiles.
+
+    Parameters
+    ----------
+    smiles : str
+        Path to the smiles file.
+
+    Returns
+    -------
+    List[Mol]
+
+    """
+
+    mols_processed = []
+    failed = 0
+    for smile in tqdm(smiles_list):
+        try:
+            mol = AllChem.MolFromSmiles(smile)
+            mol = AllChem.AddHs(mol)
+            mol.SetProp("MOL_NAME", "RANDO")
+            mol.SetProp("SMILES", smile)
+            canonical_order = AllChem.CanonicalRankAtoms(mol)
+            for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
+                atom.SetProp("name", atom.GetSymbol().upper() + str(can_idx + 1))
+            mols_processed.append(mol)
+        except Exception as e:  # noqa: PERF203, BLE001
+            failed += 1
+    print(f"Failed to process {failed} molecules.")
+    return mols_processed
+
+
+def compute_3d(mol: Mol, num_conformers: int = 10) -> bool:
+    """Generate 3D coordinates using EKTDG method.
+
+    Taken from `pdbeccdutils.core.component.Component`.
+
+    Parameters
+    ----------
+    mol: Mol
+        The RDKit molecule to process
+    num_conformers: int, optional
+        Number of conformers to generate, defaults to 10
+
+    Returns
+    -------
+    bool
+        Whether computation was successful.
+
+    """
+    try:
+        # Generate multiple conformers
+        params = AllChem.ETKDGv3()
+        params.numThreads = 0
+        params.timeout = 60
+        conf_ids = AllChem.EmbedMultipleConfs(
+            mol, numConfs=num_conformers, params=params
+        )
+
+        if len(conf_ids) < num_conformers:
+            params.useRandomCoords = True
+            conf_ids = AllChem.EmbedMultipleConfs(
+                mol, numConfs=num_conformers, params=params
+            )
+
+        if len(conf_ids) < 1:
+            return False
+
+        # Optimize each conformer
+        conf_ids_final = []
+        for conf_id in conf_ids:
+            try:
+                AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
+            except:  # noqa: E722
+                # Remove failed conformer
+                mol.RemoveConformer(conf_id)
+                continue
+            conf_ids_final.append(conf_id)
+
+        if len(conf_ids_final) < 1:
+            return False
+
+    except:  # noqa: E722
+        # Handle force field or sanitization issues
+        return False
+
+    return True
+
+
+def get_moldir_atomic_numbers(moldir: str) -> list[int]:
+    counter = set()
+    mols = load_all_molecules(moldir)
+    z_set = set()
+    for mol in mols.values():
+        z_set.update(a.GetAtomicNum() for a in mol.GetAtoms())
+    z_set.discard(0)
+    whitelist = sorted(z_set)
+    return whitelist

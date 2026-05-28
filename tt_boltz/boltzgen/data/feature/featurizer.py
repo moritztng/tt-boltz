@@ -12,7 +12,7 @@ from rdkit.Chem import Mol
 from torch import Tensor, from_numpy
 from torch.nn.functional import one_hot as one_hot_torch
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import (
     MSA,
     Atom,
@@ -24,13 +24,13 @@ from tt_boltz.boltzgen.data.data import (
     convert_ccd,
     elem_from_name,
 )
-from tt_boltz.boltzgen.data.mol import (
+from tt_boltz.data.mol import (
     get_amino_acids_symmetries,
     get_chain_symmetries,
     get_ligand_symmetries,
     get_symmetries,
 )
-from tt_boltz.boltzgen.data.pad import pad_dim
+from tt_boltz.data.pad import pad_dim
 from tt_boltz.boltzgen.model.modules.utils import center_random_augmentation
 
 ####################################################################################################

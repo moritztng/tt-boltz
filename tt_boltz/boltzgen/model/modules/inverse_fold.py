@@ -5,7 +5,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.functional import one_hot
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 
 # Replace torch_scatter with native PyTorch implementation
 from tt_boltz.boltzgen.model.modules.scatter_utils import scatter_sum, scatter_softmax

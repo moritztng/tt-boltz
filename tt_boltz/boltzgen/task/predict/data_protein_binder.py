@@ -10,11 +10,11 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 from rdkit.Chem import Mol
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import Input, Structure, Record, MSA
 from tt_boltz.boltzgen.data.feature.featurizer import Featurizer
-from tt_boltz.boltzgen.data.pad import pad_to_max
-from tt_boltz.boltzgen.data.mol import load_canonicals, load_molecules
+from tt_boltz.data.pad import pad_to_max
+from tt_boltz.data.mol import load_canonicals, load_molecules
 from tt_boltz.boltzgen.data.tokenize.tokenizer import Tokenizer
 from tt_boltz.boltzgen.data.template.features import (
     load_dummy_templates,
