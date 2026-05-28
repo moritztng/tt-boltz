@@ -25,10 +25,10 @@ import inspect, time, torch
 torch.set_grad_enabled(False)
 torch.set_num_threads(8)
 
-from boltzgen.task.predict.data_from_yaml import FromYamlDataModule, DataConfig
-from boltzgen.data.tokenize.tokenizer import Tokenizer
-from boltzgen.data.feature.featurizer import Featurizer
-from boltzgen.model.models.boltz import Boltz
+from tt_boltz.boltzgen.task.predict.data_from_yaml import FromYamlDataModule, DataConfig
+from tt_boltz.boltzgen.data.tokenize.tokenizer import Tokenizer
+from tt_boltz.boltzgen.data.feature.featurizer import Featurizer
+from tt_boltz.boltzgen.model.models.boltz import Boltz
 from tt_boltz.boltzgen import _remap_legacy_state_dict_keys, convert_to_tt
 
 CKPT = "/home/ttuser/.cache/huggingface/hub/models--boltzgen--boltzgen-1/snapshots/c1be29e1f82ffcc72264f64b993c43fb4e0d17f0/boltzgen1_diverse.ckpt"

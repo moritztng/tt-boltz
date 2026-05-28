@@ -63,7 +63,7 @@ def test_pairformer_matches_boltzgen_reference(seq_len: int) -> None:
     head_width=32, pairwise_num_heads=4). Random-init the BoltzGen reference;
     load its state_dict into the ttnn module; compare forward outputs.
     """
-    from boltzgen.model.layers.pairformer import PairformerModule as BGPairformer
+    from tt_boltz.boltzgen.model.layers.pairformer import PairformerModule as BGPairformer
 
     ref = BGPairformer(
         token_s=384,
@@ -109,7 +109,7 @@ def test_miniformer_matches_boltzgen_reference(seq_len: int) -> None:
     The rest of the layer (pre_norm_s, attention, transitions, s_post_norm)
     matches Pairformer exactly.
     """
-    from boltzgen.model.layers.miniformer import MiniformerModule as BGMiniformer
+    from tt_boltz.boltzgen.model.layers.miniformer import MiniformerModule as BGMiniformer
 
     ref = BGMiniformer(
         token_s=384, token_z=128, num_blocks=2, num_heads=16,
@@ -141,8 +141,8 @@ def test_miniformer_matches_boltzgen_reference(seq_len: int) -> None:
 def test_msa_matches_boltzgen_reference(seq_len: int, n_sequences: int) -> None:
     """tt-boltz ttnn MSAModule vs BoltzGen reference MSAModule (folding-mode,
     miniformer_blocks=False — what the Boltz-2 folding checkpoint uses)."""
-    from boltzgen.model.modules.trunk import MSAModule as BGMSAModule
-    from boltzgen.data import const as bg_const
+    from tt_boltz.boltzgen.model.modules.trunk import MSAModule as BGMSAModule
+    from tt_boltz.boltzgen.data import const as bg_const
 
     ref = BGMSAModule(
         msa_s=64,
@@ -191,7 +191,7 @@ def test_diffusion_matches_boltzgen_reference(
 ) -> None:
     """tt-boltz ttnn DiffusionModule vs BoltzGen inner DiffusionModule
     (score_model) configured for folding mode."""
-    from boltzgen.model.modules.diffusion import DiffusionModule as BGDiffusion
+    from tt_boltz.boltzgen.model.modules.diffusion import DiffusionModule as BGDiffusion
 
     ref = BGDiffusion(
         token_s=384,
@@ -261,12 +261,12 @@ def test_convert_to_tt_swap_round_trips() -> None:
     irrelevant to the swap. The swap only cares about the attribute names
     ``pairformer_module`` / ``msa_module`` / ``structure_module.score_model``.
     """
-    from boltzgen.model.layers.pairformer import PairformerModule as BGPairformer
-    from boltzgen.model.modules.trunk import MSAModule as BGMSAModule
-    from boltzgen.model.modules.diffusion import (
+    from tt_boltz.boltzgen.model.layers.pairformer import PairformerModule as BGPairformer
+    from tt_boltz.boltzgen.model.modules.trunk import MSAModule as BGMSAModule
+    from tt_boltz.boltzgen.model.modules.diffusion import (
         AtomDiffusion as BGAtomDiffusion,
     )
-    from boltzgen.data import const as bg_const
+    from tt_boltz.boltzgen.data import const as bg_const
 
     from tt_boltz.boltzgen import convert_to_tt
 
@@ -335,7 +335,7 @@ def test_convert_to_tt_swap_round_trips() -> None:
 def test_pairformer_noseq_matches_boltzgen_reference(seq_len: int) -> None:
     """tt-boltz's no-seq Pairformer adapter vs BoltzGen's PairformerNoSeqModule.
     This is the variant inside BoltzGen's TemplateModule.pairformer."""
-    from boltzgen.model.layers.pairformer import (
+    from tt_boltz.boltzgen.model.layers.pairformer import (
         PairformerNoSeqModule as BGPairformerNoSeq,
     )
 
@@ -361,7 +361,7 @@ def test_convert_to_tt_swaps_miniformer() -> None:
     """convert_to_tt routes a Miniformer-based Boltz to the ttnn Miniformer.
     Verifies the duck-typed dispatch in convert_to_tt and the state_dict
     flow into the Miniformer wrapper."""
-    from boltzgen.model.layers.miniformer import MiniformerModule as BGMiniformer
+    from tt_boltz.boltzgen.model.layers.miniformer import MiniformerModule as BGMiniformer
 
     from tt_boltz.boltzgen import convert_to_tt
     from tt_boltz.tenstorrent import MiniformerModule as TTMiniformer
@@ -402,7 +402,7 @@ def _load_real_boltz(ckpt_path=None):
     swapped ttnn version, since convert_to_tt is destructive.
     """
     import inspect
-    from boltzgen.model.models.boltz import Boltz
+    from tt_boltz.boltzgen.model.models.boltz import Boltz
 
     from tt_boltz.boltzgen import _remap_legacy_state_dict_keys
 
