@@ -5,7 +5,6 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 from tt_boltz.data import const
-from tt_boltz.boltzgen.data.crop.cropper import Cropper
 from tt_boltz.boltzgen.data.data import Input, Token, TokenBond, Tokenized
 
 
@@ -155,7 +154,7 @@ def pick_initial_crop_token(
     return tokens[np.argmin(dists[:, 0])]
 
 
-class MultimerCropper(Cropper):
+class MultimerCropper:
     """Interpolate between contiguous and spatial crops."""
 
     def __init__(

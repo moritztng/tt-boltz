@@ -3,7 +3,7 @@ from typing import Dict
 import torch
 
 from tt_boltz.data.mol import minimum_lddt_symmetry_coords
-from tt_boltz.boltzgen.model.loss.validation import weighted_minimum_rmsd
+from tt_boltz.boltzgen.model.geometry import weighted_minimum_rmsd
 
 
 def get_true_coordinates(

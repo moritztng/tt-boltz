@@ -13,7 +13,10 @@ design checkpoints still use.
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
+import sys
+import types
 
 import torch
 import torch.nn as nn
@@ -22,6 +25,52 @@ from tt_boltz.tenstorrent import (
     DiffusionModule as TTDiffusionModule,
     PairformerModule as TTPairformerModule,
 )
+
+
+class _LegacyPickleStub:
+    """Unpickle target for training-only classes referenced by old hparams.
+
+    The shipping BoltzGen checkpoints were saved at training time and carry
+    pickled references to validator dataclasses + ``torchmetrics`` loggers
+    inside their ``hyper_parameters`` dict. None of those values are read at
+    inference — ``load_boltz_checkpoint`` filters by ``Boltz.__init__``'s
+    signature — but unpickling has to *find* the classes to construct
+    placeholder instances and throw them away. This stub absorbs whatever
+    state pickle hands it and returns ``None`` for any attribute access.
+    """
+    def __init__(self, *args, **kwargs): pass
+    def __setstate__(self, state): self.__dict__.update(state if isinstance(state, dict) else {})
+    def __getattr__(self, name): return None
+
+
+@contextlib.contextmanager
+def _legacy_pickle_compat():
+    """Briefly satisfy ``torch.load`` for upstream checkpoints with deleted refs."""
+    finder = _LegacyModuleFinder()
+    sys.meta_path.append(finder)
+    try:
+        yield
+    finally:
+        sys.meta_path.remove(finder)
+
+
+class _LegacyModuleFinder:
+    PREFIXES = ("boltzgen.model.validation", "torchmetrics")
+
+    def find_module(self, fullname, path=None):
+        for p in self.PREFIXES:
+            if fullname == p or fullname.startswith(p + "."):
+                return self
+        return None
+
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            return sys.modules[fullname]
+        m = types.ModuleType(fullname)
+        m.__path__ = []
+        m.__getattr__ = lambda name: _LegacyPickleStub
+        sys.modules[fullname] = m
+        return m
 
 
 class TTScoreModelAdapter(TTDiffusionModule):
@@ -112,7 +161,8 @@ def load_boltz_checkpoint(
     """
     from tt_boltz.boltzgen.model.models.boltz import Boltz
 
-    ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False, mmap=True)
+    with _legacy_pickle_compat():
+        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False, mmap=True)
     sig = inspect.signature(Boltz.__init__).parameters
     hp = {k: v for k, v in ckpt["hyper_parameters"].items() if k in sig}
     hp.update({k: v for k, v in constructor_overrides.items() if k in sig})

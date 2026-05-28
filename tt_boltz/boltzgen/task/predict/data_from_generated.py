@@ -16,16 +16,16 @@ from torch.utils.data import DataLoader
 
 from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import Input, Structure, Tokenized
-from tt_boltz.boltzgen.data.feature.featurizer import Featurizer
+from tt_boltz.boltzgen.data.featurizer import Featurizer
 from tt_boltz.data.mol import load_canonicals, load_molecules
 from tt_boltz.data.pad import pad_to_max
 from tt_boltz.boltzgen.data.parse import mmcif
 from tt_boltz.boltzgen.data.parse.pdb_parser import parse_pdb
-from tt_boltz.boltzgen.data.template.features import (
+from tt_boltz.boltzgen.data.template import (
     load_dummy_templates,
 )
 from tt_boltz.boltzgen.data.parse.schema import parse_redesign_yaml
-from tt_boltz.boltzgen.data.tokenize.tokenizer import Tokenizer
+from tt_boltz.boltzgen.data.tokenizer import Tokenizer
 
 
 class DataFetchException(Exception):
