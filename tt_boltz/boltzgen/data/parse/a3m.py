@@ -5,7 +5,7 @@ from typing import Optional, TextIO
 import numpy as np
 from redis import Redis
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import MSA, MSADeletion, MSAResidue, MSASequence
 
 

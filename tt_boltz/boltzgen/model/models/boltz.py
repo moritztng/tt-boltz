@@ -30,8 +30,8 @@ from tt_boltz.tenstorrent import (
 
 from tt_boltz.boltzgen.data.rmsd_computation import get_true_coordinates
 import tt_boltz.boltzgen.model.layers.initialize as init
-from tt_boltz.boltzgen.data import const
-from tt_boltz.boltzgen.data.mol import minimum_lddt_symmetry_dist
+from tt_boltz.data import const
+from tt_boltz.data.mol import minimum_lddt_symmetry_dist
 from tt_boltz.boltzgen.model.modules.confidence import ConfidenceModule
 from tt_boltz.boltzgen.model.modules.diffusion import AtomDiffusion
 from tt_boltz.boltzgen.model.modules.diffusion_conditioning import (

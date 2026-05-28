@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import (
     Structure,
     convert_ccd,

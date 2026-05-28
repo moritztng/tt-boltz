@@ -4,7 +4,7 @@ from collections import defaultdict
 
 import gemmi
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.data import Structure, elem_from_name
 
 

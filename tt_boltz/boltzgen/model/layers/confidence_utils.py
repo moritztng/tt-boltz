@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 
 
 def compute_collinear_mask(v1, v2):

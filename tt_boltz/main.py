@@ -994,7 +994,26 @@ def _persist_run_results(client: ControllerClient, run_id: str, results_path: Pa
 
 @click.group()
 def cli():
-    """Run Boltz-2 inference on Tenstorrent hardware."""
+    """Run Boltz-2 (predict / msa) or BoltzGen (gen) inference on Tenstorrent."""
+
+
+@cli.command(
+    "gen",
+    context_settings=dict(ignore_unknown_options=True, allow_extra_args=True),
+    help=(
+        "Run the BoltzGen binder-design pipeline. All remaining arguments are "
+        "forwarded to BoltzGen's CLI; see `tt-boltz gen run --help` for the "
+        "design pipeline, `tt-boltz gen download` for model artifacts, etc."
+    ),
+)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def gen(args):
+    import sys
+
+    from tt_boltz.boltzgen.cli.boltzgen import main as _bg_main
+
+    sys.argv = ["tt-boltz gen", *args]
+    _bg_main()
 
 
 @cli.command("install-deps")

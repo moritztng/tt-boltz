@@ -5,7 +5,7 @@ from torch import Tensor, nn
 from torch.nn.functional import one_hot
 
 from tt_boltz.boltzgen.adapter import TTPairformerNoSeqModule
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.model.modules.encoders import (
     AtomAttentionEncoder,
     AtomEncoder,

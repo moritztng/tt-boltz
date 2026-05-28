@@ -47,7 +47,7 @@ import pandas as pd
 from tqdm import tqdm
 from collections import defaultdict
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.task.task import Task
 from tt_boltz.boltzgen.data.data import Structure
 from tt_boltz.boltzgen.data.write.mmcif import to_mmcif

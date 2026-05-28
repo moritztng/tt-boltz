@@ -13,7 +13,7 @@ from mashumaro.mixins.dict import DataClassDictMixin
 from rdkit.Chem import Mol
 import torch
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 
 ####################################################################################################
 # SERIALIZABLE

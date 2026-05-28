@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.model.layers.confidence_utils import tm_function, compute_frame_pred
 
 
