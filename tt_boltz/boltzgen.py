@@ -288,8 +288,32 @@ def cli_main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "run" and "--no_subprocess" not in args:
         args.insert(1, "--no_subprocess")
+    if args and args[0] == "run":
+        args = _force_fp32_for_design_stages(args)
     sys.argv = [sys.argv[0]] + args
     _bg_main()
+
+
+# Stages whose shipped configs use Lightning ``precision: bf16-mixed`` — that
+# autocasts the PyTorch CPU code surrounding the ttnn modules to bfloat16,
+# including the diffusion sampler's noise generation, weighted_rigid_align
+# SVD, and per-step coord accumulation. On TT we let ttnn manage its own
+# precision internally; the scaffolding must stay fp32 or the geometry
+# accumulates ~0.1 Å of error per step and bonds break. inverse_fold.yaml
+# explicitly sets precision: 32 — the BoltzGen author already hit this for
+# that stage. affinity also ships with bf16-mixed.
+_BF16_STAGES = ("design", "folding", "design_folding", "affinity")
+
+
+def _force_fp32_for_design_stages(args: list) -> list:
+    """Append ``--config <stage> trainer.precision=32`` for each stage that
+    ships with bf16-mixed. boltzgen's parse_config_args accumulates multiple
+    --config blocks per stage and later values win, so a user-supplied
+    ``trainer.precision=<x>`` still overrides this injection."""
+    out = list(args)
+    for stage in _BF16_STAGES:
+        out.extend(["--config", stage, "trainer.precision=32"])
+    return out
 
 
 def _patch_cuda_for_cpu_only() -> None:
