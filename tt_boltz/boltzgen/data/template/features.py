@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch.nn.functional import one_hot
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 
 
 def load_dummy_templates(tdim: int, num_tokens: int) -> list[dict]:

@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn.functional import pad
 
 import tt_boltz.boltzgen.model.layers.initialize as init
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.model.layers.confidence_utils import (
     compute_aggregated_metric,
     compute_ptms,

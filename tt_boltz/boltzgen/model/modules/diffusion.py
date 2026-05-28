@@ -20,7 +20,7 @@ from tqdm import tqdm
 # replaced by ``TTScoreModelAdapter`` (see :mod:`tt_boltz.boltzgen.adapter`).
 # ``AtomDiffusion`` below keeps the surrounding Euler-Maruyama sampler +
 # alignment logic in PyTorch.
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.model.loss.diffusion import (
     compute_bond_loss,
     smooth_lddt_loss,

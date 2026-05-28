@@ -8,7 +8,7 @@ from torch import nn
 from torch.nn import Linear, Module, ModuleList
 from torch.nn.functional import one_hot
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 import tt_boltz.boltzgen.model.layers.initialize as init
 from tt_boltz.boltzgen.model.layers.transition import Transition
 from tt_boltz.boltzgen.model.modules.transformers import (

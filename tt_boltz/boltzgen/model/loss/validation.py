@@ -2,7 +2,7 @@ from typing import Dict
 import torch
 from torch import Tensor, nn
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.model.loss.confidence import (
     compute_frame_pred,
     express_coordinate_in_frame,

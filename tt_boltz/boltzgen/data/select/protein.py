@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from scipy.spatial.distance import cdist
 
-from tt_boltz.boltzgen.data import const
+from tt_boltz.data import const
 from tt_boltz.boltzgen.data.select.selector import Selector
 from tt_boltz.boltzgen.data.crop.multimer import MultimerCropper
 from tt_boltz.boltzgen.data.data import (
