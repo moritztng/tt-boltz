@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from tt_boltz.data import const
 from tt_boltz.data.pad import pad_dim
-from tt_boltz.boltzgen.model.loss.confidence import lddt_dist
+from tt_boltz.boltzgen.model.geometry import lddt_dist
 
 
 MOLDIR_ZIP_CACHE: Dict[

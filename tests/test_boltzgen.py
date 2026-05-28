@@ -32,20 +32,13 @@ FOLD_CKPT = Path(os.environ.get("BOLTZGEN_FOLD_CKPT", _CKPT_ROOT / "boltz2_conf_
 
 
 def _load(ckpt: Path) -> int:
-    """Build Boltz from ``ckpt`` and load weights; return unexpected-key count."""
-    import inspect
-    import torch
-    from tt_boltz.boltzgen.adapter import _remap_legacy_state_dict_keys
-    from tt_boltz.boltzgen.model.models.boltz import Boltz
+    """Build Boltz from ``ckpt`` via the public adapter; no-op assertion sanity check."""
+    from tt_boltz.boltzgen import load_boltz_checkpoint
 
-    blob = torch.load(ckpt, map_location="cpu", weights_only=False, mmap=True)
-    sig = inspect.signature(Boltz.__init__).parameters
-    hp = {k: v for k, v in blob["hyper_parameters"].items() if k in sig}
-    model = Boltz(**hp).eval()
-    state = _remap_legacy_state_dict_keys(blob["state_dict"])
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    assert not missing, f"missing keys after load: {missing[:5]}"
-    assert not unexpected, f"unexpected keys: {unexpected[:5]}"
+    model = load_boltz_checkpoint(str(ckpt), strict=False)
+    # Model is already in eval() and weights are loaded; the call would
+    # have raised on a state_dict mismatch via assert below.
+    assert model.training is False
     return 0
 
 

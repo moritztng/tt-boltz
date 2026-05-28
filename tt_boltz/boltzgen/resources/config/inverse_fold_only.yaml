@@ -5,10 +5,10 @@ data:
   cfg:
     _target_: tt_boltz.boltzgen.task.predict.data_from_yaml.DataConfig
     tokenizer:
-      _target_: tt_boltz.boltzgen.data.tokenize.tokenizer.Tokenizer
+      _target_: tt_boltz.boltzgen.data.tokenizer.Tokenizer
       atomize_modified_residues: false
     featurizer:
-      _target_: tt_boltz.boltzgen.data.feature.featurizer.Featurizer
+      _target_: tt_boltz.boltzgen.data.featurizer.Featurizer
     moldir: null
     yaml_path: null
 

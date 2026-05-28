@@ -12,14 +12,14 @@ from tt_boltz.boltzgen.data.data import (
     Structure,
     convert_ccd,
 )
-from tt_boltz.boltzgen.data.feature.featurizer import (
+from tt_boltz.boltzgen.data.featurizer import (
     res_from_atom14,
     res_from_atom37,
     res_all_gly,
 )
-from tt_boltz.boltzgen.data.write.mmcif import to_mmcif
-from tt_boltz.boltzgen.data.write.pdb import to_pdb
-from tt_boltz.boltzgen.model.loss.diffusion import weighted_rigid_align
+from tt_boltz.boltzgen.data.write_mmcif import to_mmcif
+from tt_boltz.boltzgen.data.write_pdb import to_pdb
+from tt_boltz.boltzgen.model.geometry import weighted_rigid_align
 from tt_boltz.boltzgen.model.modules.masker import BoltzMasker
 
 
