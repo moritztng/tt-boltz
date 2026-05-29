@@ -394,7 +394,7 @@ Behavior:
 
 ## BoltzGen
 
-[BoltzGen](https://github.com/jwohlwend/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`.
+[BoltzGen](https://github.com/HannesStark/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`.
 
 ```bash
 tt-boltz gen run examples/binder.yaml --num_designs 10
@@ -420,7 +420,7 @@ entities:
             id: A
 ```
 
-`80..120` randomises the binder length per design; a fixed integer pins it. Ligand, DNA, and RNA targets use the same YAML grammar as `tt-boltz predict`. See the [BoltzGen examples](https://github.com/jwohlwend/boltzgen/tree/main/example) for binding sites, scaffolds, and residue constraints.
+`80..120` randomises the binder length per design; a fixed integer pins it. Ligand, DNA, and RNA targets use the same YAML grammar as `tt-boltz predict`. See the [BoltzGen examples](https://github.com/HannesStark/boltzgen/tree/main/example) for binding sites, scaffolds, and residue constraints.
 
 ### Protocols
 
@@ -469,6 +469,14 @@ If you use this code or the models in your research, please cite the following p
   title = {Boltz-2: Towards Accurate and Efficient Binding Affinity Prediction},
   year = {2025},
   doi = {10.1101/2025.06.14.659707},
+  journal = {bioRxiv}
+}
+
+@article{stark2025boltzgen,
+  author = {Stark, Hannes and Faltings, Felix and Choi, MinGyu and Xie, Yuxin and Hur, Eunsu and O'Donnell, Timothy John and Bushuiev, Anton and U{\c c}ar, Talip and Passaro, Saro and Mao, Weian and Reveiz, Mateo and Bushuiev, Roman and Pluskal, Tom{\'a}{\v s} and Sivic, Josef and Kreis, Karsten and Vahdat, Arash and Ray, Shamayeeta and Goldstein, Jonathan T. and Savinov, Andrew and Hambalek, Jacob A. and Gupta, Anshika and Taquiri-Diaz, Diego A. and Zhang, Yaotian and Hatstat, A. Katherine and Arada, Angelika and Kim, Nam Hyeong and Tackie-Yarboi, Ethel and Boselli, Dylan and Schnaider, Lee and Liu, Chang C. and Li, Gene-Wei and Hnisz, Denes and Sabatini, David M. and DeGrado, William F. and Wohlwend, Jeremy and Corso, Gabriele and Barzilay, Regina and Jaakkola, Tommi},
+  title = {BoltzGen: Toward Universal Binder Design},
+  year = {2025},
+  doi = {10.1101/2025.11.20.689494},
   journal = {bioRxiv}
 }
 
