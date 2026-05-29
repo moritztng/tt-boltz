@@ -45,17 +45,31 @@ class _LegacyPickleStub:
 
 @contextlib.contextmanager
 def _legacy_pickle_compat():
-    """Briefly satisfy ``torch.load`` for upstream checkpoints with deleted refs."""
-    finder = _LegacyModuleFinder()
+    """Briefly satisfy ``torch.load`` for upstream checkpoints with deleted refs.
+
+    Installs a ``sys.meta_path`` finder that fabricates placeholder modules for
+    ``boltzgen.model.validation.*`` and ``torchmetrics.*`` so unpickling can
+    find the (training-only) classes those names reference. Both the finder
+    *and* the placeholder modules are removed on exit — leaving them in
+    ``sys.modules`` past the load would pollute ``inspect``-based introspection
+    (e.g. ``torch._library`` queries module ``__file__``).
+    """
+    installed = []
+    finder = _LegacyModuleFinder(installed)
     sys.meta_path.append(finder)
     try:
         yield
     finally:
         sys.meta_path.remove(finder)
+        for name in installed:
+            sys.modules.pop(name, None)
 
 
 class _LegacyModuleFinder:
     PREFIXES = ("boltzgen.model.validation", "torchmetrics")
+
+    def __init__(self, installed):
+        self._installed = installed
 
     def find_module(self, fullname, path=None):
         for p in self.PREFIXES:
@@ -68,8 +82,16 @@ class _LegacyModuleFinder:
             return sys.modules[fullname]
         m = types.ModuleType(fullname)
         m.__path__ = []
-        m.__getattr__ = lambda name: _LegacyPickleStub
+        # Raise AttributeError on dunder names so introspection tools that
+        # probe ``__file__``/``__spec__``/etc. don't receive the stub class
+        # and try to call string methods on it.
+        def _module_getattr(name, _stub=_LegacyPickleStub):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return _stub
+        m.__getattr__ = _module_getattr
         sys.modules[fullname] = m
+        self._installed.append(fullname)
         return m
 
 
