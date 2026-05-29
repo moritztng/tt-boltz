@@ -22,6 +22,7 @@ from tqdm import tqdm
 # alignment logic in PyTorch.
 from tt_boltz.data import const
 from tt_boltz.boltzgen.model.geometry import weighted_rigid_align
+from tt_boltz.boltzgen.progress import progress as _emit_progress
 from tt_boltz.boltzgen.model.modules.utils import (
     center,
     center_random_augmentation,
@@ -351,6 +352,7 @@ class AtomDiffusion(Module):
         # gradually denoise
         coords_traj = [atom_coords]
         x0_coords_traj = []
+        _total_diff_steps = len(sigmas_gammas_ss_ns)
         for step_idx, (
             sigma_tm,
             sigma_t,
@@ -362,6 +364,7 @@ class AtomDiffusion(Module):
             use_tqdm=inference_logging,
             desc="Denoising steps.",
         ):
+            _emit_progress("diffusion", step_idx, _total_diff_steps)
             sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
             # sigma_tm is sigma_t-1 and sigma_t is sigma_t
             t_hat = sigma_tm * (1 + gamma)
@@ -413,6 +416,7 @@ class AtomDiffusion(Module):
             atom_coords = atom_coords_next
         coords_traj.append(atom_coords)
 
+        _emit_progress("diffusion", _total_diff_steps, _total_diff_steps)
         result = dict(
             sample_atom_coords=atom_coords,
             coords_traj=coords_traj,

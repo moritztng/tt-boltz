@@ -411,6 +411,16 @@ def add_execute_core_arguments(p: argparse.ArgumentParser) -> None:
         choices=step_names,
         help="Run only the specified pipeline steps (default: run all steps)",
     )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode: no Rich display, no output suppression",
+    )
+    p.add_argument(
+        "--log",
+        action="store_true",
+        help="With --debug: print per-stage progress lines",
+    )
 
 
 def build_run_parser(subparsers) -> argparse.ArgumentParser:
@@ -820,28 +830,43 @@ def execute_command(args: argparse.Namespace) -> None:
         return
 
     total_steps = len(resolved_steps)
-    for index, (step_name, config_path) in enumerate(resolved_steps, start=1):
-        print("**************************************************")
-        print(f"Pipeline step {index} of {total_steps}: {step_name}")
+    stage_names = [name for name, _ in resolved_steps]
 
-        os.environ["BOLTZGEN_PIPELINE_PROGRESS"] = f"Step {index}/{total_steps}"
-        os.environ["BOLTZGEN_PIPELINE_STEP"] = step_name
+    from tt_boltz.boltzgen.progress import (
+        DebugDisplay,
+        RichDisplay,
+        SilentDisplay,
+        set_display,
+        suppress_output,
+    )
 
-        start = time.time()
-        config = _load_yaml(config_path)
-        config = _resolve_interpolations(config)
-        task = _instantiate(config)
-        if not isinstance(task, Task):
-            raise TypeError("Config must be an instance of Task.")
-        task.run(config)
+    debug = getattr(args, "debug", False)
+    log = getattr(args, "log", False)
+    if debug:
+        display = DebugDisplay(stages=stage_names) if log else SilentDisplay()
+    else:
+        display = RichDisplay(stages=stage_names)
+    set_display(display)
 
-        elapsed = time.time() - start
-        print(f"✓ Step {step_name} completed successfully in {elapsed:.1f}s")
-
-    if "BOLTZGEN_PIPELINE_PROGRESS" in os.environ:
-        del os.environ["BOLTZGEN_PIPELINE_PROGRESS"]
-    if "BOLTZGEN_PIPELINE_STEP" in os.environ:
-        del os.environ["BOLTZGEN_PIPELINE_STEP"]
+    # In Rich mode we hide task stdout/stderr so the live display stays clean.
+    # In debug mode everything passes through unchanged.
+    with display, suppress_output(active=not debug):
+        for index, (step_name, config_path) in enumerate(resolved_steps, start=1):
+            display.on_stage_start(step_name, index, total_steps)
+            start = time.time()
+            ok = True
+            try:
+                config = _load_yaml(config_path)
+                config = _resolve_interpolations(config)
+                task = _instantiate(config)
+                if not isinstance(task, Task):
+                    raise TypeError("Config must be an instance of Task.")
+                task.run(config)
+            except Exception:
+                ok = False
+                raise
+            finally:
+                display.on_stage_done(step_name, time.time() - start, ok=ok)
 
 
 #### Pipeline implementation ####
@@ -904,14 +929,8 @@ class BinderDesignPipeline:
 
     Methods
     -------
-    filter_steps(enabled_steps: list[str]) -> None
-        Restrict the pipeline to a subset of steps (used by `--steps ...`).
-
     Notes
     -----
-    * Subprocess execution sets environment variables
-      `BOLTZGEN_PIPELINE_PROGRESS` and `BOLTZGEN_PIPELINE_STEP` for downstream
-      logging/UX.
     * The pipeline distinguishes *where* configurations are **written** (in
       `configure_command`) from **how** they are **executed** (in `execute_command`).
       This separation makes it easy to tweak or re-run any step by editing the
