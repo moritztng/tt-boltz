@@ -641,10 +641,10 @@ def run_command(args: argparse.Namespace) -> None:
     then the shards are merged and filtered once so the final output directory
     is identical in layout to a single-device run.
     """
-    # Validate required arguments for running from design specs
+    # Default the output dir to ./<design-spec basename>/ (as documented), so a
+    # bare `tt-boltz gen run spec.yaml` works without an explicit --output.
     if not args.output:
-        print("No output directory specified. Exiting.")
-        return
+        args.output = Path(Path(args.design_spec[0]).stem or "boltzgen_output")
 
     from tt_boltz.boltzgen.progress import print_header, print_summary, suppress_output
 
