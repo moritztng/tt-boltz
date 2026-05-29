@@ -804,6 +804,17 @@ class Boltz(nn.Module):
             print(f"WARNING: Skipping batch. Skip was set true for {batch['id'][0]}")
             return {"skip": True}
 
+        # Tenstorrent: the ttnn modules cache per-design static data (masks,
+        # biases, q/c projections, atom padding) so it is computed once and
+        # reused across the diffusion sampling steps. That cache is only valid
+        # for a single design — reset it for each new design. Otherwise a design
+        # with a different atom/token count reuses the previous design's cached
+        # atom padding, mismatching tensor shapes and crashing ttnn.add with
+        # "Invalid subtile broadcast type". Mirrors the main path (boltz2.py).
+        for m in self.modules():
+            if hasattr(m, "reset_static_cache"):
+                m.reset_static_cache()
+
         # Checkpoint switching logic
         if self.checkpoints and self.next_switch_point is not None:
             if self.inference_counter == self.next_switch_point:
