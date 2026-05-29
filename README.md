@@ -392,91 +392,72 @@ Behavior:
   - `power_profile.csv`
   - `power_profile.png`
 
-## Binder Design
+## BoltzGen
 
-Design protein binders against a target structure. Wraps the [BoltzGen](https://github.com/jwohlwend/boltzgen) pipeline (design → inverse folding → folding → analysis → filtering) for inference on Tenstorrent.
-
-```bash
-tt-boltz gen run binder.yaml --num_designs 10
-```
-
-`tt-boltz gen run` downloads the BoltzGen weights on first use (~6 GB, cached at `~/.boltz/boltzgen/`) and writes outputs to `./<basename>/`. The top-ranked designs end up in `<basename>/final_ranked_designs/`.
-
-A live display shows per-stage progress (design dominates the runtime, ~5 min per binder at the default `sampling_steps=500`). On a multi-card machine, fan a single run across cards:
+[BoltzGen](https://github.com/jwohlwend/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`.
 
 ```bash
-tt-boltz gen run binder.yaml --num_designs 100 --device_ids 0,1,2,3
+tt-boltz gen run examples/binder.yaml --num_designs 10
 ```
 
-Designs are split evenly across the selected cards; analysis and filtering run once at the end on the combined output.
+Fan a single run across multiple cards:
+
+```bash
+tt-boltz gen run examples/binder.yaml --num_designs 100 --device_ids 0,1,2,3
+```
 
 ### Input Format
 
 ```yaml
 entities:
   - protein:
-      id: C
-      sequence: 80..140       # designed chain, sampled length per design
+      id: B
+      sequence: 80..120         # designed chain, sampled length per design
   - file:
-      path: target.cif        # target structure (path relative to this yaml)
+      path: target.cif          # target structure (path relative to this yaml)
       include:
         - chain:
-            id: A             # which chain(s) of the target to use
+            id: A
 ```
 
-`sequence: 80..140` randomises the binder length per design within `[80, 140]`. A fixed integer pins it. Other entity types (`ligand`, `dna`, `rna`) follow the same YAML grammar as `tt-boltz predict`. See the [BoltzGen examples](https://github.com/jwohlwend/boltzgen/tree/main/example) for richer specs (binding sites, scaffolds, residue constraints).
-
-### Output Structure
-
-```
-<output_dir>/
-├── intermediate_designs/                   # raw design output (.cif per binder)
-├── intermediate_designs_inverse_folded/    # backbones after inverse folding
-├── final_ranked_designs/
-│   ├── final_<budget>_designs/             # top designs (default budget=30)
-│   ├── final_designs_metrics_<budget>.csv
-│   ├── all_designs_metrics.csv
-│   └── results_overview.pdf                # summary plots
-├── config/                                 # resolved per-stage YAMLs
-└── steps.yaml                              # pipeline manifest
-```
+`80..120` randomises the binder length per design; a fixed integer pins it. Ligand, DNA, and RNA targets use the same YAML grammar as `tt-boltz predict`. See the [BoltzGen examples](https://github.com/jwohlwend/boltzgen/tree/main/example) for binding sites, scaffolds, and residue constraints.
 
 ### Protocols
 
-`--protocol` selects defaults appropriate for the target / binder type:
+`--protocol` sets defaults appropriate for the binder type.
 
 | Protocol | Use for |
 |----------|---------|
-| `protein-anything` (default) | de-novo protein binder against any target |
+| `protein-anything` (default) | de-novo protein binder |
 | `peptide-anything` | peptide binder |
 | `nanobody-anything` | nanobody / VHH |
 | `antibody-anything` | antibody |
 | `protein-small_molecule` | binder against a small-molecule target (adds affinity step) |
 | `protein-redesign` | re-design existing residues (e.g. symmetric dimers) |
 
-### Re-running Stages
+### Running a Subset
 
-`--steps` restricts the pipeline to specific stages. Only the artifacts those stages need get downloaded.
+`--steps` restricts the pipeline.
 
 ```bash
-tt-boltz gen run binder.yaml --steps design --num_designs 10            # design only
-tt-boltz gen run binder.yaml --output existing/ --steps analysis filtering   # re-rank
+tt-boltz gen run examples/binder.yaml --steps design --num_designs 10
+tt-boltz gen run examples/binder.yaml --output existing/ --steps analysis filtering
 ```
 
 ### Command-Line Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--protocol` | `protein-anything` | Protocol; sets defaults appropriate for the target/binder type |
+| `--protocol` | `protein-anything` | Protocol; sets defaults appropriate for the binder type |
 | `--num_designs` | `10000` | Number of binders to generate |
-| `--budget` | `30` | Number of top designs to keep after filtering |
+| `--budget` | `30` | Number of top designs kept after filtering |
 | `--output` | `./<basename>/` | Output directory |
 | `--steps` | (all) | Run only specific stages |
 | `--config STEP key=val` | — | Override per-stage config (e.g. `--config design sampling_steps=200`) |
 | `--device_ids` | (all) | Comma-separated TT device IDs (e.g. `0,2`) |
-| `--cache` | `~/.boltz/boltzgen` | Where to cache downloaded weights |
+| `--cache` | `~/.boltz/boltzgen` | Cache for downloaded weights |
 | `--debug` | `False` | Disable live display; show raw stage output |
-| `--debug --log` | `False` | Add per-stage progress markers (`>>> [N/M] stage`) |
+| `--debug --log` | `False` | Add per-stage progress markers |
 
 ## Cite
 

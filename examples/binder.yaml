@@ -1,0 +1,9 @@
+entities:
+  - protein:
+      id: B
+      sequence: 80..120
+  - file:
+      path: ground_truth_structures/prot.cif
+      include:
+        - chain:
+            id: A
