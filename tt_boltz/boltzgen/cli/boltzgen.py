@@ -646,6 +646,16 @@ def run_command(args: argparse.Namespace) -> None:
     if not args.output:
         args.output = Path(Path(args.design_spec[0]).stem or "boltzgen_output")
 
+    # A fresh run (no --reuse) into an existing output dir must not inherit a
+    # previous run's intermediate designs: the stages append rather than clean,
+    # so leftovers inflate per-device counts (e.g. a card showing 6/6 instead of
+    # 5). Clear the intermediate + shard dirs unless resuming. (filter cleans its
+    # own final_ranked_designs; config is regenerated.)
+    if not getattr(args, "reuse", False) and args.output.exists():
+        for _sub in ("shards", "intermediate_designs",
+                     "intermediate_designs_inverse_folded"):
+            shutil.rmtree(args.output / _sub, ignore_errors=True)
+
     from tt_boltz.boltzgen.progress import print_header, print_summary, suppress_output
 
     devices = _device_id_list(args.device_ids)
