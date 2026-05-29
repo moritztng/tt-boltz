@@ -775,7 +775,9 @@ def _run_multi_device(args: argparse.Namespace, devices: list[int]) -> None:
     filter_args.reuse = True
     with suppress_output(active=not debug):
         configure_command(filter_args)
-    execute_command(filter_args)
+    # Run the global filter without its own live display — the per-device view
+    # already covered the run; the final summary panel reports the result.
+    execute_command(filter_args, headless=True)
 
 
 def download_command(args: argparse.Namespace) -> list[Path]:
@@ -925,7 +927,7 @@ def check_command(args: argparse.Namespace) -> None:
     check_design_specs(args, moldir, mols)
 
 
-def execute_command(args: argparse.Namespace) -> None:
+def execute_command(args: argparse.Namespace, *, headless: bool = False) -> None:
     """
     Execute a **pre-configured binder design pipeline** from a directory of YAML files.
 
@@ -1015,7 +1017,13 @@ def execute_command(args: argparse.Namespace) -> None:
     device_label = f"device {_vd}" if _vd else "device"
 
     with contextlib.ExitStack() as stack:
-        if progress_file:
+        if headless and not debug:
+            # Run quietly with no live display (used for the multi-device global
+            # filter, which the parent already covered in its per-device view) —
+            # output still goes to the log, the summary panel reports the result.
+            stack.enter_context(redirect_low_level_io(config_dir / "run.log"))
+            display = SilentDisplay()
+        elif progress_file:
             # Multi-device shard worker: emit structured events for the parent
             # to render. The parent's Popen already routes our fd 1/2 to a log.
             display = FileDisplay(progress_file)
