@@ -15,10 +15,10 @@ from typing import List, Optional, Union
 import torch
 
 from tt_boltz.boltzgen.adapter import load_boltz_checkpoint
+from tt_boltz.boltzgen.progress import progress
 from tt_boltz.boltzgen.task.predict.data_from_generated import FromGeneratedDataModule
 from tt_boltz.boltzgen.task.predict.writer import DesignWriter, FoldingWriter
 from tt_boltz.boltzgen.task.task import Task
-from tt_boltz.boltzgen.utils.pipeline_progress_bar import PipelineProgressBar
 
 
 class Predict(Task):
@@ -90,19 +90,12 @@ class Predict(Task):
         # Replaces the predict-stage half of the old LightningModule.setup() hook.
         model.setup_for_inference(dataloader)
 
-        import os
-        show_progress = bool(os.environ.get("BOLTZGEN_PIPELINE_STEP"))
-        progress = PipelineProgressBar() if show_progress else None
-        if progress is not None:
-            progress.on_start(total=len(dataloader))
-
+        total_batches = len(dataloader)
+        progress("batch", 0, total_batches)
         for batch_idx, batch in enumerate(dataloader):
             prediction = model.predict_step(batch, batch_idx=batch_idx)
             self.writer.write(prediction, batch, batch_idx)
-            if progress is not None:
-                progress.on_batch_end(batch_idx)
+            progress("batch", batch_idx + 1, total_batches)
 
         self.writer.finalize()
-        if progress is not None:
-            progress.on_end()
         del model
