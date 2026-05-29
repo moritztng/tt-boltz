@@ -64,8 +64,10 @@ quiet_startup()
 
 import collections
 import argparse
+import copy
 from dataclasses import dataclass
 import os
+import subprocess
 import time
 import math
 import re
@@ -397,10 +399,12 @@ def add_device_arguments(p: argparse.ArgumentParser) -> None:
         "--device_ids",
         type=str,
         default=None,
-        metavar="ID",
-        help="Tenstorrent device ID to run on (e.g. '2'). boltzgen uses a single "
-        "logical device; the selected chip is made the only one ttnn sees, via "
-        "TT_VISIBLE_DEVICES. Default: device 0 / TT_VISIBLE_DEVICES if set.",
+        metavar="IDS",
+        help="Tenstorrent device ID(s) to run on. A single ID (e.g. '2') runs on "
+        "that chip (made the only one ttnn sees, via TT_VISIBLE_DEVICES). A "
+        "comma-separated list (e.g. '0,1,2,3') splits the designs evenly across "
+        "those cards and merges the results — the output is identical in layout "
+        "to a single-device run. Default: device 0 / TT_VISIBLE_DEVICES if set.",
     )
 
 
@@ -592,6 +596,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 #### Commands ####
+def _device_id_list(device_ids: str | None) -> list[int]:
+    """Parse ``--device_ids`` (e.g. '0,2,3') into a list of TT device IDs."""
+    if not device_ids:
+        return []
+    return [int(d) for d in (p.strip() for p in device_ids.split(",")) if d]
+
+
+def _rewrite_run_argv(argv: list[str], strip: set[str], additions: list[str]) -> list[str]:
+    """Drop ``strip`` options (and their values) from a ``run`` argv, then append
+    ``additions``. Positionals (design specs) come before options, so skipping
+    value tokens up to the next ``-`` handles both single- and multi-value opts."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok.split("=", 1)[0] in strip:
+            i += 1
+            if "=" not in tok:
+                while i < len(argv) and not argv[i].startswith("-"):
+                    i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out + additions
+
+
 def run_command(args: argparse.Namespace) -> None:
     """
     Run the **complete binder design pipeline** end-to-end by running:
@@ -600,10 +630,20 @@ def run_command(args: argparse.Namespace) -> None:
 
     Typical CLI usage:
         $ boltzgen run path/to/design.yaml --output out_dir --protocol protein-anything
+
+    With several TT devices (``--device_ids 0,1,2,3``) the designs are split
+    evenly across the cards: one single-device run per card on its own shard,
+    then the shards are merged and filtered once so the final output directory
+    is identical in layout to a single-device run.
     """
     # Validate required arguments for running from design specs
     if not args.output:
         print("No output directory specified. Exiting.")
+        return
+
+    devices = _device_id_list(args.device_ids)
+    if len(devices) > 1:
+        _run_multi_device(args, devices)
         return
 
     print("\n=== Configuring pipeline ===")
@@ -611,6 +651,86 @@ def run_command(args: argparse.Namespace) -> None:
 
     print("\n=== Executing pipeline ===")
     execute_command(args)
+
+
+def _run_multi_device(args: argparse.Namespace, devices: list[int]) -> None:
+    """Fan the design set out across ``devices``, then merge + filter once."""
+    n = len(devices)
+    total = args.num_designs
+    # Split designs as evenly as possible; the first few cards take the remainder.
+    counts = [total // n + (1 if i < total % n else 0) for i in range(n)]
+
+    output = args.output
+    shard_root = output / "shards"
+    base_argv = sys.argv[1:]  # the user's "run <spec> ..." argv
+
+    print(f"\n=== Distributing {total} designs across {n} devices {devices} ===")
+    for dev, count in zip(devices, counts):
+        print(f"  device {dev}: {count} designs -> {shard_root / f'device_{dev}'}")
+
+    procs = []
+    for dev, count in zip(devices, counts):
+        shard_dir = shard_root / f"device_{dev}"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        argv = _rewrite_run_argv(
+            base_argv,
+            strip={"--output", "--num_designs", "--device_ids"},
+            additions=["--output", str(shard_dir),
+                       "--num_designs", str(count),
+                       "--device_ids", str(dev)],
+        )
+        # Pin the worker to its physical chip up front (TT_VISIBLE_DEVICES is read
+        # at ttnn import); don't let the parent's multi-id value leak in.
+        env = {**os.environ, "TT_VISIBLE_DEVICES": str(dev)}
+        log_file = open(shard_dir / "run.log", "w")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "tt_boltz.boltzgen.cli.boltzgen", *argv],
+            stdout=log_file, stderr=subprocess.STDOUT, env=env,
+        )
+        procs.append({"dev": dev, "dir": shard_dir, "proc": proc, "log": log_file})
+
+    _wait_for_shards(procs)
+
+    failed = [p["dev"] for p in procs if p["proc"].returncode != 0]
+    if failed:
+        raise RuntimeError(
+            f"Design shard(s) on device(s) {failed} failed; see "
+            f"{shard_root}/device_<id>/run.log. Re-run with --reuse to resume."
+        )
+
+    # Global reduce: combine all shards, then filter once over the union so the
+    # diversity-optimized final set is selected across every design.
+    print(f"\n=== Merging {n} shards into {output} ===")
+    merge_command(argparse.Namespace(
+        sources=[p["dir"] for p in procs], output=output, overwrite=False))
+
+    if args.steps and "filtering" not in args.steps:
+        print("Skipping global filtering (not requested in --steps).")
+        return
+    print("\n=== Filtering merged designs ===")
+    filter_args = copy.copy(args)
+    filter_args.steps = ["filtering"]
+    filter_args.reuse = True
+    configure_command(filter_args)
+    execute_command(filter_args)
+
+
+def _wait_for_shards(procs: list[dict]) -> None:
+    """Block until all shard processes exit, printing periodic progress."""
+    def _count(d: Path, pattern: str) -> int:
+        sub = d / "intermediate_designs"
+        return len(list(sub.glob(pattern))) if sub.exists() else 0
+
+    while any(p["proc"].poll() is None for p in procs):
+        time.sleep(30)
+        status = "  ".join(
+            f"dev{p['dev']}:{'done' if p['proc'].poll() == 0 else ('FAILED' if p['proc'].poll() else 'run')}"
+            f"({_count(p['dir'], 'input_*.cif')} designs)"
+            for p in procs
+        )
+        print(f"[shards] {status}", flush=True)
+    for p in procs:
+        p["log"].close()
 
 
 def download_command(args: argparse.Namespace) -> list[Path]:
