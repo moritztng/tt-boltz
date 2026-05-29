@@ -479,6 +479,8 @@ class Boltz(nn.Module):
 
             if not self.inverse_fold:
                 for i in range(recycling_steps + 1):
+                    from tt_boltz.boltzgen.progress import progress as _emit_progress
+                    _emit_progress("trunk", i + 1, recycling_steps + 1)
                     with torch.set_grad_enabled(
                         (
                             self.training
