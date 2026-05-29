@@ -118,25 +118,17 @@ assert all(
 
 
 ### Model checkpoints and other artifacts ####
+# All BoltzGen weights + mols are mirrored on the same GCP bucket as the
+# tt-boltz core artifacts. Direct URLs are the default; the ``huggingface:``
+# prefix still works as a fallback when ``get_artifact_path`` sees it.
+BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen"
 ARTIFACTS: dict[str, tuple[str, str]] = {
-    "design-diverse": (
-        "huggingface:boltzgen/boltzgen-1:boltzgen1_diverse.ckpt",
-        "model",
-    ),
-    "design-adherence": (
-        "huggingface:boltzgen/boltzgen-1:boltzgen1_adherence.ckpt",
-        "model",
-    ),
-    "inverse-fold": (
-        "huggingface:boltzgen/boltzgen-1:boltzgen1_ifold.ckpt",
-        "model",
-    ),
-    "folding": (
-        "huggingface:boltzgen/boltzgen-1:boltz2_conf_final.ckpt",
-        "model",
-    ),
-    "affinity": ("huggingface:boltzgen/boltzgen-1:boltz2_aff.ckpt", "model"),
-    "moldir": ("huggingface:boltzgen/inference-data:mols.zip", "dataset"),
+    "design-diverse":   (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_diverse.ckpt",   "model"),
+    "design-adherence": (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_adherence.ckpt", "model"),
+    "inverse-fold":     (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_ifold.ckpt",     "model"),
+    "folding":          (f"{BOLTZGEN_ARTIFACTS_URL}/boltz2_conf_final.ckpt",   "model"),
+    "affinity":         (f"{BOLTZGEN_ARTIFACTS_URL}/boltz2_aff.ckpt",          "model"),
+    "moldir":           (f"{BOLTZGEN_ARTIFACTS_URL}/mols.zip",                 "dataset"),
 }
 
 
@@ -1331,15 +1323,33 @@ def check_design_spec(
 def get_artifact_path(
     args, artifact: str, repo_type: str = "model", verbose: bool = True
 ) -> Path:
-    """Get the local path to an artifact that is either a local file or hosted on Hugging Face."""
-    if artifact.startswith("huggingface:"):
+    """Resolve an artifact spec to a local file path.
+
+    Three accepted forms:
+      * ``http(s)://...``  — fetched once via ``urllib`` into the local cache
+        (default ``~/.boltz/boltzgen/``; override with ``--cache``). Used by
+        the GCP-hosted defaults in ``ARTIFACTS``.
+      * ``huggingface:<repo_id>:<filename>`` — fetched via huggingface_hub.
+        Kept as a fallback for users who prefer HF or who need a private mirror.
+      * Anything else — treated as a local file path.
+    """
+    if artifact.startswith(("http://", "https://")):
+        import urllib.request
+
+        cache = args.cache if args.cache is not None else (Path.home() / ".boltz" / "boltzgen")
+        cache.mkdir(parents=True, exist_ok=True)
+        result = cache / artifact.rsplit("/", 1)[-1]
+        if args.force_download or not result.exists():
+            print(f"Downloading {artifact} → {result}")
+            urllib.request.urlretrieve(artifact, result)
+    elif artifact.startswith("huggingface:"):
         try:
             _, repo_id, filename = artifact.split(":")
         except ValueError:
             raise ValueError(
                 f"Invalid artifact: {artifact}. Expected format: huggingface:<repo_id>:<filename>"
             )
-        result = huggingface_hub.hf_hub_download(
+        result = Path(huggingface_hub.hf_hub_download(
             repo_id,
             filename,
             repo_type=repo_type,
@@ -1347,8 +1357,7 @@ def get_artifact_path(
             force_download=args.force_download,
             token=args.models_token,
             cache_dir=args.cache,
-        )
-        result = Path(result)
+        ))
     else:
         result = Path(artifact)
     if not result.exists():
