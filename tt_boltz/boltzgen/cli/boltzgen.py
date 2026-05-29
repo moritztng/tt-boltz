@@ -700,6 +700,16 @@ def _run_multi_device(args: argparse.Namespace, devices: list[int]) -> None:
     shard_root = output / "shards"
     base_argv = sys.argv[1:]  # the user's "run <spec> ..." argv
 
+    # CPU-bound stages (notably inverse folding's autoregressive decode) run on
+    # the host, not the TT device. Each worker's torch defaults to all cores, so
+    # N workers oversubscribe the CPU N× and thrash — which is why inverse
+    # folding got *slower* with more cards. Give each worker an equal slice.
+    try:
+        n_cpu = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n_cpu = os.cpu_count() or n
+    per_worker_threads = str(max(1, n_cpu // n))
+
     procs, files = [], {}
     for dev in devices:
         shard_dir = shard_root / f"device_{dev}"
@@ -714,6 +724,11 @@ def _run_multi_device(args: argparse.Namespace, devices: list[int]) -> None:
         # Pin the worker to its chip (read at import; explicit env stops the
         # parent's multi-id value leaking in).
         env = {**os.environ, "TT_VISIBLE_DEVICES": str(dev)}
+        # Cap host threads per worker so N workers share the CPU instead of each
+        # grabbing all of it (respect an explicit user setting if present).
+        for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                     "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            env.setdefault(_var, per_worker_threads)
         if debug:
             # --debug: stream every worker's raw output to the terminal,
             # interleaved. Nothing is hidden or routed to a log.
