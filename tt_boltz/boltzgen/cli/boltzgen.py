@@ -628,9 +628,6 @@ def configure_command(args: argparse.Namespace) -> None:
     check_design_specs(args, moldir, mols)
 
     pipeline = BinderDesignPipeline(args, moldir)
-    if args.steps is not None:
-        pipeline.filter_steps(args.steps)
-
     pipeline.pretty_print()
 
     # Check that tasks can be instantiated
@@ -906,6 +903,14 @@ class BinderDesignPipeline:
         devices = args.devices if args.devices is not None else 1
         print(f"Using {devices} devices")
 
+        # ``--steps`` restricts which pipeline stages run; checking enabled
+        # *before* building each stage's config means we never resolve (and
+        # so never download) artifacts for stages we won't execute.
+        enabled = set(args.steps) if args.steps else None
+
+        def _enabled(name: str) -> bool:
+            return enabled is None or name in enabled
+
         self.steps = []
 
         # Design generation
@@ -918,24 +923,25 @@ class BinderDesignPipeline:
         print(f"Using diffusion batch size: {diffusion_batch_size}")
         print(f"Number of diffusion batches: {num_batches}")
 
-        # Configure design checkpoint arguments.
+        # Configure design checkpoint arguments. Only resolve (and download)
+        # the design checkpoints if the design step will actually run.
         checkpoint_args = []
-        # First checkpoint is specified differently than others.
-        first_checkpoint_path = get_artifact_path(args, args.design_checkpoints[0])
-        checkpoint_args.append(f"checkpoint={first_checkpoint_path}")
-        if len(args.design_checkpoints) > 1:
-            fraction_per_checkpoint = 1.0 / len(args.design_checkpoints)
-            checkpoint_args.append(
-                f"override.checkpoints.first_checkpoint_num_samples={fraction_per_checkpoint}"
-            )
-            checkpoint_args.append(
-                f"override.checkpoints.checkpoint_list=["
-                + ",".join(
-                    f"{{'checkpoint': {{'num_samples': {fraction_per_checkpoint}, 'path': '{get_artifact_path(args, checkpoint)}'}}}}"
-                    for checkpoint in args.design_checkpoints[1:]
+        if not args.only_inverse_fold and _enabled("design"):
+            first_checkpoint_path = get_artifact_path(args, args.design_checkpoints[0])
+            checkpoint_args.append(f"checkpoint={first_checkpoint_path}")
+            if len(args.design_checkpoints) > 1:
+                fraction_per_checkpoint = 1.0 / len(args.design_checkpoints)
+                checkpoint_args.append(
+                    f"override.checkpoints.first_checkpoint_num_samples={fraction_per_checkpoint}"
                 )
-                + "]"
-            )
+                checkpoint_args.append(
+                    f"override.checkpoints.checkpoint_list=["
+                    + ",".join(
+                        f"{{'checkpoint': {{'num_samples': {fraction_per_checkpoint}, 'path': '{get_artifact_path(args, checkpoint)}'}}}}"
+                        for checkpoint in args.design_checkpoints[1:]
+                    )
+                    + "]"
+                )
         design_step_and_noise_scale_args = []
         if args.step_scale is not None:
             design_step_and_noise_scale_args.append(
@@ -979,47 +985,49 @@ class BinderDesignPipeline:
                 )
             print(f"Inverse-folded designs will be saved to: {output_dir}")
             # Designs from inverse folding
-            self.steps.append(
-                PipelineStep(
-                    name="inverse_folding",
-                    config_path=args.config_dir / "inverse_fold_only.yaml",
-                    args=[
-                        f"output={output_dir}",
-                        f"data.cfg.yaml_path=[{', '.join(str(s) for s in args.design_spec)}]",
-                        f"trainer.devices={devices}",
-                        f"data.cfg.multiplicity={getattr(args, 'inverse_fold_num_sequences', 10)}",
-                        f"data.cfg.skip_existing={args.reuse}",
-                        f"data.cfg.output_dir={output_dir}",
-                        f"override.use_kernels={use_kernels}",
-                        f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
-                        f"data.cfg.moldir={moldir}",
-                        f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
-                    ]
-                    + config_args_by_step.get("inverse_folding", []),
+            if _enabled("inverse_folding"):
+                self.steps.append(
+                    PipelineStep(
+                        name="inverse_folding",
+                        config_path=args.config_dir / "inverse_fold_only.yaml",
+                        args=[
+                            f"output={output_dir}",
+                            f"data.cfg.yaml_path=[{', '.join(str(s) for s in args.design_spec)}]",
+                            f"trainer.devices={devices}",
+                            f"data.cfg.multiplicity={getattr(args, 'inverse_fold_num_sequences', 10)}",
+                            f"data.cfg.skip_existing={args.reuse}",
+                            f"data.cfg.output_dir={output_dir}",
+                            f"override.use_kernels={use_kernels}",
+                            f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
+                            f"data.cfg.moldir={moldir}",
+                            f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
+                        ]
+                        + config_args_by_step.get("inverse_folding", []),
+                    )
                 )
-            )
         else:
             # Designs from diffusion model
-            self.steps.append(
-                PipelineStep(
-                    name="design",
-                    config_path=args.config_dir / "design.yaml",
-                    args=[
-                        f"output={output_dir}",
-                        f"data.cfg.yaml_path=[{', '.join(str(s) for s in args.design_spec)}]",
-                        f"trainer.devices={devices}",
-                        f"data.num_workers={args.num_workers}",
-                        f"data.cfg.skip_existing={args.reuse}",
-                        f"data.cfg.multiplicity={num_batches}",
-                        f"diffusion_samples={diffusion_batch_size}",
-                        f"override.use_kernels={use_kernels}",
-                        f"data.cfg.moldir={moldir}",
-                    ]
-                    + design_step_and_noise_scale_args
-                    + checkpoint_args
-                    + config_args_by_step["design"],
+            if _enabled("design"):
+                self.steps.append(
+                    PipelineStep(
+                        name="design",
+                        config_path=args.config_dir / "design.yaml",
+                        args=[
+                            f"output={output_dir}",
+                            f"data.cfg.yaml_path=[{', '.join(str(s) for s in args.design_spec)}]",
+                            f"trainer.devices={devices}",
+                            f"data.num_workers={args.num_workers}",
+                            f"data.cfg.skip_existing={args.reuse}",
+                            f"data.cfg.multiplicity={num_batches}",
+                            f"diffusion_samples={diffusion_batch_size}",
+                            f"override.use_kernels={use_kernels}",
+                            f"data.cfg.moldir={moldir}",
+                        ]
+                        + design_step_and_noise_scale_args
+                        + checkpoint_args
+                        + config_args_by_step["design"],
+                    )
                 )
-            )
 
             # Inverse folding of diffusion-generated backbones.
             if not args.skip_inverse_folding:
@@ -1045,52 +1053,54 @@ class BinderDesignPipeline:
                 input_dir = output_dir
                 output_dir = args.output / "intermediate_designs_inverse_folded"
                 print(f"Inverse-folded designs will be saved to: {output_dir}")
-                self.steps.append(
-                    PipelineStep(
-                        name="inverse_folding",
-                        config_path=args.config_dir / "inverse_fold.yaml",
-                        args=[
-                            f"output={output_dir}",
-                            f"data.design_dir={input_dir}",
-                            f"data.cfg.multiplicity={args.inverse_fold_num_sequences}",
-                            f"data.cfg.num_workers={args.num_workers}",
-                            f"data.skip_existing={args.reuse}",
-                            f"data.skip_existing_kind=inverse_fold",
-                            f"override.use_kernels={use_kernels}",
-                            f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
-                            f"data.cfg.moldir={moldir}",
-                            f"trainer.devices={devices}",
-                            f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
-                        ]
-                        + config_args_by_step["inverse_folding"],
+                if _enabled("inverse_folding"):
+                    self.steps.append(
+                        PipelineStep(
+                            name="inverse_folding",
+                            config_path=args.config_dir / "inverse_fold.yaml",
+                            args=[
+                                f"output={output_dir}",
+                                f"data.design_dir={input_dir}",
+                                f"data.cfg.multiplicity={args.inverse_fold_num_sequences}",
+                                f"data.cfg.num_workers={args.num_workers}",
+                                f"data.skip_existing={args.reuse}",
+                                f"data.skip_existing_kind=inverse_fold",
+                                f"override.use_kernels={use_kernels}",
+                                f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
+                                f"data.cfg.moldir={moldir}",
+                                f"trainer.devices={devices}",
+                                f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
+                            ]
+                            + config_args_by_step["inverse_folding"],
+                        )
                     )
-                )
 
         # Folding
         input_dir = output_dir
-        self.steps.append(
-            PipelineStep(
-                name="folding",
-                config_path=args.config_dir / "fold.yaml",
-                args=[
-                    f"output={output_dir}",
-                    f"data.design_dir={input_dir}",
-                    f"trainer.devices={devices}",
-                    f"data.cfg.num_workers={args.num_workers}",
-                    f"data.skip_existing={args.reuse}",
-                    f"data.skip_existing_kind=folded",
-                    f"override.use_kernels={use_kernels}",
-                    f"checkpoint={get_artifact_path(args, args.folding_checkpoint)}",
-                    f"data.cfg.moldir={moldir}",
-                ]
-                + config_args_by_step["folding"],
+        if _enabled("folding"):
+            self.steps.append(
+                PipelineStep(
+                    name="folding",
+                    config_path=args.config_dir / "fold.yaml",
+                    args=[
+                        f"output={output_dir}",
+                        f"data.design_dir={input_dir}",
+                        f"trainer.devices={devices}",
+                        f"data.cfg.num_workers={args.num_workers}",
+                        f"data.skip_existing={args.reuse}",
+                        f"data.skip_existing_kind=folded",
+                        f"override.use_kernels={use_kernels}",
+                        f"checkpoint={get_artifact_path(args, args.folding_checkpoint)}",
+                        f"data.cfg.moldir={moldir}",
+                    ]
+                    + config_args_by_step["folding"],
+                )
             )
-        )
 
         # Design folding
         input_dir = output_dir
         do_design_folding = protocol in ["protein-anything", "protein-small_molecule"]
-        if do_design_folding:
+        if do_design_folding and _enabled("design_folding"):
             self.steps.append(
                 PipelineStep(
                     name="design_folding",
@@ -1114,7 +1124,7 @@ class BinderDesignPipeline:
 
         # Affinity
         use_affinity = protocol in ["protein-small_molecule"]
-        if use_affinity:
+        if use_affinity and _enabled("affinity"):
             self.steps.append(
                 PipelineStep(
                     name="affinity",
@@ -1135,23 +1145,24 @@ class BinderDesignPipeline:
             )
 
         # Analysis
-        self.steps.append(
-            PipelineStep(
-                name="analysis",
-                config_path=args.config_dir / "analysis.yaml",
-                args=[
-                    f"design_dir={input_dir}",
-                    f"data.skip_existing={args.reuse}",
-                    f"data.skip_existing_kind=analyzed",
-                    f"data.cfg.moldir={moldir}",
-                    f"designfolding_metrics={do_design_folding}",
-                    f"delta_sasa_original={args.skip_inverse_folding}",
-                    f"noncovalents_original={args.skip_inverse_folding}",
-                    f"allatom_fold_metrics={args.skip_inverse_folding}",
-                ]
-                + config_args_by_step["analysis"],
+        if _enabled("analysis"):
+            self.steps.append(
+                PipelineStep(
+                    name="analysis",
+                    config_path=args.config_dir / "analysis.yaml",
+                    args=[
+                        f"design_dir={input_dir}",
+                        f"data.skip_existing={args.reuse}",
+                        f"data.skip_existing_kind=analyzed",
+                        f"data.cfg.moldir={moldir}",
+                        f"designfolding_metrics={do_design_folding}",
+                        f"delta_sasa_original={args.skip_inverse_folding}",
+                        f"noncovalents_original={args.skip_inverse_folding}",
+                        f"allatom_fold_metrics={args.skip_inverse_folding}",
+                    ]
+                    + config_args_by_step["analysis"],
+                )
             )
-        )
 
         # Filtering
         output_dir = args.output / "final_ranked_designs"
@@ -1189,16 +1200,14 @@ class BinderDesignPipeline:
             print(f"Filtering size buckets: {parsed_size_buckets}")
             filter_args.append(f"size_buckets={parsed_size_buckets}")
 
-        self.steps.append(
-            PipelineStep(
-                name="filtering",
-                config_path=args.config_dir / "filtering.yaml",
-                args=filter_args + config_args_by_step["filtering"],
+        if _enabled("filtering"):
+            self.steps.append(
+                PipelineStep(
+                    name="filtering",
+                    config_path=args.config_dir / "filtering.yaml",
+                    args=filter_args + config_args_by_step["filtering"],
+                )
             )
-        )
-
-    def filter_steps(self, enabled_steps: List[str]):
-        self.steps = [s for s in self.steps if s.name in enabled_steps]
 
     def pretty_print(self):
         for i, step in enumerate(self.steps):
