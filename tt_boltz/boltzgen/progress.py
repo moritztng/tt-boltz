@@ -132,11 +132,16 @@ def _stage_fraction(st: "_DeviceProgress") -> float:
 
 
 def _total_fraction(st: "_DeviceProgress") -> float:
+    # Completed-stage fraction only — strictly monotonic. The current stage's
+    # sub-progress is NOT folded in: one stage emits several sub-phases
+    # (batch → trunk → diffusion, repeating per design), each resetting 0→1, so
+    # mixing them into the total made it jump backwards (e.g. 50% → 33%). The
+    # per-stage bar carries that fine-grained progress instead.
     if st.status == "done":
         return 1.0
     if not st.total_stages:
         return 0.0
-    return min(1.0, (max(0, st.done_stages) + _stage_fraction(st)) / st.total_stages)
+    return min(1.0, max(0, st.done_stages) / st.total_stages)
 
 
 def _device_icon(st: "_DeviceProgress") -> Text:
