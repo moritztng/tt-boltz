@@ -411,8 +411,17 @@ class Boltz(nn.Module):
 
     def load_checkpoint_weights(self, checkpoint_path):
         """Hot-swap weights mid-pipeline (used by the multi-ckpt schedule)."""
-        from tt_boltz.boltzgen.adapter import _remap_legacy_state_dict_keys
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        from tt_boltz.boltzgen.adapter import (
+            _legacy_pickle_compat,
+            _remap_legacy_state_dict_keys,
+        )
+        # Same legacy-pickle shim load_boltz_checkpoint() uses: shipping
+        # checkpoints pickle hyper_parameters referencing deleted training-only
+        # classes (boltzgen.model.validation.*), so torch.load needs the finder.
+        with _legacy_pickle_compat():
+            checkpoint = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
         state = _remap_legacy_state_dict_keys(checkpoint["state_dict"])
         self.load_state_dict(state, strict=False)
         print(f"Loaded weights from {checkpoint_path}")
