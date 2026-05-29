@@ -63,7 +63,6 @@ from tt_boltz.boltzgen.utils.quiet import quiet_startup
 quiet_startup()
 
 import collections
-import huggingface_hub
 import argparse
 from dataclasses import dataclass
 import os
@@ -156,8 +155,7 @@ assert all(
 
 ### Model checkpoints and other artifacts ####
 # All BoltzGen weights + mols are mirrored on the same GCP bucket as the
-# tt-boltz core artifacts. Direct URLs are the default; the ``huggingface:``
-# prefix still works as a fallback when ``get_artifact_path`` sees it.
+# tt-boltz core artifacts and fetched directly over HTTPS.
 BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen"
 ARTIFACTS: dict[str, tuple[str, str]] = {
     "design-diverse":   (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_diverse.ckpt",   "model"),
@@ -294,7 +292,7 @@ def add_configure_arguments(
     p.add_argument(
         "--inverse_fold_checkpoint",
         type=str,
-        help="Path or huggingface repo and filename for the inverse fold checkpoint. Default: %(default)s",
+        help="Path to the inverse fold checkpoint. Default: %(default)s",
         default=ARTIFACTS["inverse-fold"][0],
     )
     p.add_argument(
@@ -385,12 +383,6 @@ def add_models_download_options(p: argparse.ArgumentParser) -> None:
         help="Force a (re)-download of models and data.",
         action="store_true",
         default=False,
-    )
-    p.add_argument(
-        "--models_token",
-        type=str,
-        help="Secret token to use for our models hosting service (Hugging Face). Default: %(default)s",
-        default=os.environ.get("HF_TOKEN"),
     )
     p.add_argument(
         "--cache",
@@ -613,14 +605,12 @@ def run_command(args: argparse.Namespace) -> None:
 
 def download_command(args: argparse.Namespace) -> list[Path]:
     """
-    Download **BoltzGen model checkpoints and the molecules directory** (hosted on HuggingFace).
+    Download **BoltzGen model checkpoints and the molecules directory** from the GCP bucket.
 
     Parameters
     ----------
     args.artifacts : list[str]
         List of artifact keys to download, or `["all"]` to fetch all available assets.
-    args.models_token : str
-        Optional authentication token for private model access (default: env var `HF_TOKEN`).
     args.cache : Path
         Cache directory for storing downloaded artifacts.
 
@@ -1386,12 +1376,10 @@ def get_artifact_path(
 ) -> Path:
     """Resolve an artifact spec to a local file path.
 
-    Three accepted forms:
+    Two accepted forms:
       * ``http(s)://...``  — fetched once via ``urllib`` into the local cache
         (default ``~/.boltz/boltzgen/``; override with ``--cache``). Used by
         the GCP-hosted defaults in ``ARTIFACTS``.
-      * ``huggingface:<repo_id>:<filename>`` — fetched via huggingface_hub.
-        Kept as a fallback for users who prefer HF or who need a private mirror.
       * Anything else — treated as a local file path.
     """
     if artifact.startswith(("http://", "https://")):
@@ -1403,22 +1391,6 @@ def get_artifact_path(
         if args.force_download or not result.exists():
             print(f"Downloading {artifact} → {result}")
             urllib.request.urlretrieve(artifact, result)
-    elif artifact.startswith("huggingface:"):
-        try:
-            _, repo_id, filename = artifact.split(":")
-        except ValueError:
-            raise ValueError(
-                f"Invalid artifact: {artifact}. Expected format: huggingface:<repo_id>:<filename>"
-            )
-        result = Path(huggingface_hub.hf_hub_download(
-            repo_id,
-            filename,
-            repo_type=repo_type,
-            library_name="boltzgen",
-            force_download=args.force_download,
-            token=args.models_token,
-            cache_dir=args.cache,
-        ))
     else:
         result = Path(artifact)
     if not result.exists():
