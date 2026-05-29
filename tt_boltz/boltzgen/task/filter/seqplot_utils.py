@@ -5,7 +5,6 @@ import matplotlib.colors as mcolors
 from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
-import logomaker
 
 from tt_boltz.data import const
 
@@ -230,6 +229,8 @@ def counts_matrix_from_msa(msa, alphabet):
 
 def draw_logo(counts, title, width=10):
     """Draw sequence logo using logomaker."""
+    import logomaker
+
     probs = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
     entropy = (
         -(probs.replace(0, np.nan) * np.log2(probs.replace(0, np.nan)))
@@ -265,6 +266,7 @@ def draw_logo(counts, title, width=10):
 
 
 def cdr_logo(sequences, name):
+    import logomaker
     from abnumber import Chain
 
     # Create temporary FASTA
