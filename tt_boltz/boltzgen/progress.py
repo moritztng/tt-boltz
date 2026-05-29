@@ -53,16 +53,19 @@ _KIND_LABELS = {
 class _DeviceProgress:
     """Unified per-device state, shared by the single- and multi-card views.
 
-    A run is one row per device showing two bars: overall pipeline progress
-    (stages done + fraction of the current stage) and the current stage's own
-    sub-progress (e.g. Trunk i/N, Diffusion step/500).
+    A run is one row per device: an overall bar (completed stages), plus the
+    current stage's progress — how many proteins/designs of this stage are
+    done (batch i/N) and the current protein's sub-phase (trunk i/N, diff
+    step/500).
     """
     label: str = "device"
     total_stages: int = 0
     done_stages: int = 0
     stage_idx: int = 0          # 1-based current stage
     stage_name: str = ""
-    sub_kind: str = ""
+    batch_step: int = 0         # proteins/designs done in the current stage
+    batch_total: int = 0
+    sub_kind: str = ""          # within-protein phase: trunk / diffusion
     sub_step: int = 0
     sub_total: int = 0
     status: str = "starting"    # starting | running | done | failed
@@ -124,8 +127,12 @@ def _fmt_time(seconds: float) -> str:
 
 
 def _stage_fraction(st: "_DeviceProgress") -> float:
+    # Stage bar = proteins/designs done in this stage (batch i/N); fall back to
+    # the within-protein sub-phase if no batch counter has arrived yet.
     if st.status == "done":
         return 1.0
+    if st.batch_total > 0:
+        return min(1.0, st.batch_step / st.batch_total)
     if st.sub_total > 0:
         return min(1.0, st.sub_step / st.sub_total)
     return 0.0
@@ -165,10 +172,14 @@ def _stage_name_text(st: "_DeviceProgress") -> Text:
 def _stage_step_text(st: "_DeviceProgress") -> Text:
     if st.status in ("starting", "done", "failed"):
         return Text("")
-    kind = _KIND_LABELS.get(st.sub_kind, st.sub_kind or "")
+    parts = []
+    if st.batch_total > 0:
+        parts.append(f"{st.batch_step}/{st.batch_total}")  # proteins done / total
     if st.sub_total > 0:
-        return Text(f"{kind} {st.sub_step}/{st.sub_total}".strip(), style="cyan")
-    return Text("…", style="dim")
+        kind = _KIND_LABELS.get(st.sub_kind, st.sub_kind or "")
+        parts.append(f"{kind} {st.sub_step}/{st.sub_total}".strip())
+    return Text("  ".join(parts) if parts else "…",
+                style="cyan" if parts else "dim")
 
 
 def render_devices(states: List["_DeviceProgress"], start: float, *, multi: bool) -> Group:
@@ -192,12 +203,12 @@ def render_devices(states: List["_DeviceProgress"], start: float, *, multi: bool
     tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
     tbl.add_column("icon", width=2)
     tbl.add_column("device", width=9, no_wrap=True)
-    tbl.add_column("total", width=14, no_wrap=True)
+    tbl.add_column("total", width=12, no_wrap=True)
     tbl.add_column("pct", width=4, justify="right", no_wrap=True)
     tbl.add_column("sep", width=1)
     tbl.add_column("stage", width=15, no_wrap=True)
     tbl.add_column("stagebar", width=8, no_wrap=True)
-    tbl.add_column("step", width=12, no_wrap=True)
+    tbl.add_column("step", width=19, no_wrap=True)
 
     for st in states:
         done = st.status == "done"
@@ -208,7 +219,7 @@ def render_devices(states: List["_DeviceProgress"], start: float, *, multi: bool
         tbl.add_row(
             _device_icon(st),
             Text(st.label, style="bold" if running else ("" if done else "dim")),
-            _bar(total_frac, width=14, done=done),
+            _bar(total_frac, width=12, done=done),
             Text(f"{int(total_frac * 100)}%", style="dim"),
             Text("│", style="bright_black"),
             _stage_name_text(st),
@@ -326,13 +337,17 @@ class SingleDeviceDisplay(_Display):
         st.total_stages = total or st.total_stages
         st.stage_name = name
         st.done_stages = idx - 1
+        st.batch_step = st.batch_total = 0
         st.sub_kind = ""
         st.sub_step = st.sub_total = 0
         self._refresh()
 
     def on_stage_progress(self, kind: str, step: int, total: int) -> None:
         st = self._st
-        st.sub_kind, st.sub_step, st.sub_total = kind, step, total
+        if kind == "batch":           # proteins/designs done in this stage
+            st.batch_step, st.batch_total = step, total
+        else:                         # within-protein phase (trunk / diffusion)
+            st.sub_kind, st.sub_step, st.sub_total = kind, step, total
         self._refresh()
 
     def on_stage_done(self, name: str, elapsed: float, ok: bool = True) -> None:
@@ -428,12 +443,17 @@ class MultiDeviceDisplay:
                     st.stage_idx = ev.get("idx", st.stage_idx)
                     st.total_stages = ev.get("total", st.total_stages)
                     st.stage_name = ev.get("name", "")
+                    st.batch_step = st.batch_total = 0
                     st.sub_kind = ""
                     st.sub_step = st.sub_total = 0
                 elif kind == "progress":
-                    st.sub_kind = ev.get("kind", "")
-                    st.sub_step = ev.get("step", 0)
-                    st.sub_total = ev.get("total", 0)
+                    if ev.get("kind") == "batch":
+                        st.batch_step = ev.get("step", 0)
+                        st.batch_total = ev.get("total", 0)
+                    else:
+                        st.sub_kind = ev.get("kind", "")
+                        st.sub_step = ev.get("step", 0)
+                        st.sub_total = ev.get("total", 0)
                 elif kind == "done":
                     st.done_stages = max(st.done_stages, st.stage_idx)
                     if not ev.get("ok", True):
