@@ -400,10 +400,11 @@ Behavior:
 tt-boltz gen run examples/binder.yaml --num_designs 10
 ```
 
-Fan a single run across multiple cards:
+By default the designs are split across every available card and merged into
+one result. To restrict to specific cards:
 
 ```bash
-tt-boltz gen run examples/binder.yaml --num_designs 100 --device_ids 0,1,2,3
+tt-boltz gen run examples/binder.yaml --num_designs 100 --device_ids 0,2
 ```
 
 ### Input Format
