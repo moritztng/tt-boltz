@@ -79,7 +79,6 @@ import pandas as pd
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import yaml
-import torch
 
 from tt_boltz.boltzgen._config import (
     deep_merge as _deep_merge,
@@ -213,13 +212,6 @@ def add_configure_arguments(
         type=Path,
         help=f"Path to the directory of default config files. Default: %(default)s",
         default=config_dir,
-    )
-    p.add_argument(
-        "--use_kernels",
-        help="Whether to use kernels. One of 'auto', 'true', or 'false'. Default: %(default)s. "
-        "If 'auto', will use kernels if the device capability is >= 8.",
-        choices=["auto", "true", "false"],
-        default="auto",
     )
     p.add_argument(
         "--moldir",
@@ -560,11 +552,6 @@ def build_merge_parser(subparsers) -> argparse.ArgumentParser:
         required=True,
         help="Destination directory for the merged outputs",
     )
-    merge_parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Ignored: kept temporarily for backwards compatibility. In all cases, the destination data is overwritten.",
-    )
     return merge_parser
 
 
@@ -771,7 +758,7 @@ def _run_distributed(args: argparse.Namespace, devices: list[int]) -> None:
     # Global reduce: combine all shards, then filter once over the union.
     with _quiet(not debug):
         merge_command(argparse.Namespace(
-            sources=[w["dir"] for w in workers], output=args.output, overwrite=False))
+            sources=[w["dir"] for w in workers], output=args.output))
     if args.steps and "filtering" not in args.steps:
         return
     filter_args = copy.copy(args)
@@ -1116,8 +1103,7 @@ class BinderDesignPipeline:
             )
 
         # Tenstorrent runs the heavy modules through ttnn; cuequivariance
-        # kernels are GPU-only and would never fire here. Force use_kernels=False
-        # regardless of the --use_kernels CLI flag.
+        # kernels are GPU-only and would never fire here, so they're always off.
         use_kernels = False
         print(f"Using kernels: {use_kernels} (Tenstorrent backend)")
 
