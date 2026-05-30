@@ -64,6 +64,7 @@ quiet_startup()
 
 import collections
 import argparse
+import contextlib
 import copy
 from dataclasses import dataclass
 import os
@@ -627,182 +628,159 @@ def _planned_batches(num_designs: int, diffusion_batch_size: int | None) -> int:
     return math.ceil(num_designs / max(1, dbs))
 
 
+def _device_label() -> str:
+    """Row label for the local device, from TT_VISIBLE_DEVICES (set by the pre-scan)."""
+    vd = (os.environ.get("TT_VISIBLE_DEVICES") or "").split(",")[0].strip()
+    return f"device {vd}" if vd else "device"
+
+
+@contextlib.contextmanager
+def _quiet(active: bool):
+    """Silence stdout (configure/merge chatter) while a spinner/summary owns the
+    terminal. No-op when ``active`` is False (e.g. --debug)."""
+    if not active:
+        yield
+        return
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+        yield
+
+
 def run_command(args: argparse.Namespace) -> None:
-    """
-    Run the **complete binder design pipeline** end-to-end by running:
-        1. `configure_command(args)` – generates the per-step YAML configurations.
-        2. `execute_command(args)` – launches each pipeline step based on those YAMLs.
+    """Run the binder-design pipeline end to end.
 
-    Typical CLI usage:
-        $ boltzgen run path/to/design.yaml --output out_dir --protocol protein-anything
+        $ tt-boltz gen run design.yaml --output out --device_ids 0,1,2,3
 
-    With several TT devices (``--device_ids 0,1,2,3``) the designs are split
-    evenly across the cards: one single-device run per card on its own shard,
-    then the shards are merged and filtered once so the final output directory
-    is identical in layout to a single-device run.
+    One device runs in-process. Several devices (``--device_ids 0,1,2,3``) split
+    the designs evenly across the cards — one single-device run per card on its
+    own shard — then merge and filter once, so the output directory is identical
+    in layout to a single-device run.
     """
-    # Default the output dir to ./<design-spec basename>/ (as documented), so a
-    # bare `tt-boltz gen run spec.yaml` works without an explicit --output.
+    from tt_boltz.boltzgen import progress as P
+
+    # Default --output to ./<spec basename>/ (documented), so a bare
+    # `tt-boltz gen run spec.yaml` works.
     if not args.output:
         args.output = Path(Path(args.design_spec[0]).stem or "boltzgen_output")
 
-    # A fresh run (no --reuse) into an existing output dir must not inherit a
-    # previous run's intermediate designs: the stages append rather than clean,
-    # so leftovers inflate per-device counts (e.g. a card showing 6/6 instead of
-    # 5). Clear the intermediate + shard dirs unless resuming. (filter cleans its
-    # own final_ranked_designs; config is regenerated.)
+    # A fresh run (no --reuse) into an existing dir must not inherit a previous
+    # run's designs: the stages append rather than clean, so leftovers would
+    # inflate counts. (filter cleans final_ranked_designs; config is regenerated.)
     if not getattr(args, "reuse", False) and args.output.exists():
-        for _sub in ("shards", "intermediate_designs",
-                     "intermediate_designs_inverse_folded"):
-            shutil.rmtree(args.output / _sub, ignore_errors=True)
-
-    from tt_boltz.boltzgen.progress import print_header, print_summary, suppress_output
+        for sub in ("shards", "intermediate_designs", "intermediate_designs_inverse_folded"):
+            shutil.rmtree(args.output / sub, ignore_errors=True)
 
     devices = _device_id_list(args.device_ids)
-    debug = getattr(args, "debug", False)
-    print_header(
-        specs=[str(s) for s in args.design_spec],
-        protocol=getattr(args, "protocol", "protein-anything"),
-        num_designs=args.num_designs,
-        batches=_planned_batches(args.num_designs, getattr(args, "diffusion_batch_size", None)),
-        budget=getattr(args, "budget", 30),
-        devices=devices,
-        output=str(args.output),
-    )
+    P.header(specs=[str(s) for s in args.design_spec],
+             protocol=getattr(args, "protocol", "protein-anything"),
+             num_designs=args.num_designs,
+             batches=_planned_batches(args.num_designs, getattr(args, "diffusion_batch_size", None)),
+             budget=getattr(args, "budget", 30), devices=devices, output=str(args.output))
 
-    start = time.time()
-    ok = True
+    t0, ok = time.time(), True
     try:
         if len(devices) > 1:
-            _run_multi_device(args, devices)
+            _run_distributed(args, devices)
         else:
-            # Quiet the configure preamble in normal mode (the header already
-            # said what matters); --debug lets it all through. Show a spinner so
-            # a first-run artifact download never looks hung.
-            if debug:
-                configure_command(args)
-            else:
-                from rich.console import Console
-                with Console(stderr=True).status(
-                    "[cyan]preparing pipeline…[/]", spinner="dots"
-                ), suppress_output(active=True, streams=("stdout",)):
-                    configure_command(args)
+            _configure(args)
             execute_command(args)
     except BaseException:
         ok = False
         raise
     finally:
-        print_summary(output=str(args.output), elapsed=time.time() - start, ok=ok)
+        P.summary(output=str(args.output), elapsed=time.time() - t0, ok=ok)
 
 
-def _run_multi_device(args: argparse.Namespace, devices: list[int]) -> None:
-    """Fan the design set out across ``devices``, then merge + filter once."""
-    from tt_boltz.boltzgen.progress import MultiDeviceDisplay, suppress_output
+def _configure(args: argparse.Namespace) -> None:
+    """Configure the pipeline, quietly with a spinner unless --debug."""
+    if getattr(args, "debug", False):
+        configure_command(args)
+        return
+    from rich.console import Console
+    with Console(stderr=True).status("[cyan]preparing pipeline…[/]", spinner="dots"), \
+            _quiet(True):
+        configure_command(args)
 
-    n = len(devices)
-    total = args.num_designs
+
+def _run_distributed(args: argparse.Namespace, devices: list[int]) -> None:
+    """Fan the designs out across ``devices``, render a per-device view, then
+    merge + filter once. Each worker is just a single-device ``run`` on a shard."""
+    from tt_boltz.boltzgen import progress as P
+
+    n, total = len(devices), args.num_designs
     debug = getattr(args, "debug", False)
     # Split designs as evenly as possible; the first cards take the remainder.
-    counts = {dev: total // n + (1 if i < total % n else 0)
-              for i, dev in enumerate(devices)}
+    counts = {d: total // n + (1 if i < total % n else 0) for i, d in enumerate(devices)}
 
-    output = args.output
-    shard_root = output / "shards"
-    base_argv = sys.argv[1:]  # the user's "run <spec> ..." argv
-
-    # CPU-bound stages (notably inverse folding's autoregressive decode) run on
-    # the host, not the TT device. Each worker's torch defaults to all cores, so
-    # N workers oversubscribe the CPU N× and thrash — which is why inverse
-    # folding got *slower* with more cards. Give each worker an equal slice.
+    # Inverse folding's decode runs on the host CPU; each worker's torch would
+    # grab every core, so N workers oversubscribe N× and thrash. Hand each an
+    # equal slice (respecting an explicit user setting).
     try:
         n_cpu = len(os.sched_getaffinity(0))
     except AttributeError:
         n_cpu = os.cpu_count() or n
-    per_worker_threads = str(max(1, n_cpu // n))
+    threads = str(max(1, n_cpu // n))
 
-    procs, files = [], {}
-    for dev in devices:
-        shard_dir = shard_root / f"device_{dev}"
-        shard_dir.mkdir(parents=True, exist_ok=True)
-        argv = _rewrite_run_argv(
-            base_argv,
-            strip={"--output", "--num_designs", "--device_ids"},
-            additions=["--output", str(shard_dir),
-                       "--num_designs", str(counts[dev]),
-                       "--device_ids", str(dev)],
-        )
-        # Pin the worker to its chip (read at import; explicit env stops the
-        # parent's multi-id value leaking in).
-        env = {**os.environ, "TT_VISIBLE_DEVICES": str(dev)}
-        # Cap host threads per worker so N workers share the CPU instead of each
-        # grabbing all of it (respect an explicit user setting if present).
-        for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
-                     "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-            env.setdefault(_var, per_worker_threads)
+    workers = []
+    for d in devices:
+        shard = args.output / "shards" / f"device_{d}"
+        shard.mkdir(parents=True, exist_ok=True)
+        argv = _rewrite_run_argv(sys.argv[1:], {"--output", "--num_designs", "--device_ids"},
+                                 ["--output", str(shard), "--num_designs", str(counts[d]),
+                                  "--device_ids", str(d)])
+        env = {**os.environ, "TT_VISIBLE_DEVICES": str(d)}
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            env.setdefault(var, threads)
+        cmd = [sys.executable, "-m", "tt_boltz.boltzgen.cli.boltzgen", *argv]
         if debug:
-            # --debug: stream every worker's raw output to the terminal,
-            # interleaved. Nothing is hidden or routed to a log.
-            print(f"\n=== device {dev}: {counts[dev]} designs (--debug, streaming) ===",
-                  flush=True)
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tt_boltz.boltzgen.cli.boltzgen", *argv],
-                env=env,
-            )
-            procs.append({"dev": dev, "dir": shard_dir, "proc": proc, "log": None})
+            # Stream every worker's raw output to the terminal (interleaved).
+            print(f"\n=== device {d}: {counts[d]} designs (--debug, streaming) ===", flush=True)
+            proc, log, pfile = subprocess.Popen(cmd, env=env), None, None
         else:
-            # Normal: workers emit structured progress to a file (parent renders
-            # the live table); their own chatter goes to the per-shard log.
-            prog = shard_dir / "progress.jsonl"
-            prog.write_text("")  # clear any stale events from a previous run
-            files[dev] = prog
-            env["BOLTZGEN_PROGRESS_FILE"] = str(prog)
-            log_file = open(shard_dir / "run.log", "w")
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tt_boltz.boltzgen.cli.boltzgen", *argv],
-                stdout=log_file, stderr=subprocess.STDOUT, env=env,
-            )
-            procs.append({"dev": dev, "dir": shard_dir, "proc": proc, "log": log_file})
+            pfile = shard / "progress.jsonl"
+            pfile.write_text("")
+            env["BOLTZGEN_PROGRESS_FILE"] = str(pfile)
+            log = open(shard / "run.log", "w")
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+        workers.append({"dev": d, "dir": shard, "proc": proc, "log": log, "file": pfile})
 
     if debug:
-        for p in procs:
-            p["proc"].wait()
+        for w in workers:
+            w["proc"].wait()
     else:
-        display = MultiDeviceDisplay(devices, files, counts)
-        display.start()
-        try:
-            while any(p["proc"].poll() is None for p in procs):
-                time.sleep(0.5)
-                display.update({p["dev"]: p["proc"].poll() for p in procs})
-            display.update({p["dev"]: p["proc"].poll() for p in procs})
-        finally:
-            display.stop()
-            for p in procs:
-                if p["log"]:
-                    p["log"].close()
+        devs = {w["dev"]: P.Device(f"device {w['dev']}") for w in workers}
+        view = P.View(list(devs.values()))
+        with view.show():
+            while any(w["proc"].poll() is None for w in workers):
+                time.sleep(0.4)
+                for w in workers:
+                    P.tail(devs[w["dev"]], w["file"])
+                view.refresh()
+            for w in workers:
+                P.tail(devs[w["dev"]], w["file"])
+                P.finish(devs[w["dev"]], ok=(w["proc"].returncode == 0))
+            view.refresh()
+        for w in workers:
+            w["log"].close()
 
-    failed = [p["dev"] for p in procs if p["proc"].returncode != 0]
+    failed = [w["dev"] for w in workers if w["proc"].returncode != 0]
     if failed:
         raise RuntimeError(
-            f"Design shard(s) on device(s) {failed} failed; see "
-            f"{shard_root}/device_<id>/run.log. Re-run with --reuse to resume."
-        )
+            f"Shard(s) on device(s) {failed} failed — see "
+            f"{args.output}/shards/device_<id>/run.log. Re-run with --reuse to resume.")
 
-    # Global reduce: combine all shards, then filter once over the union so the
-    # diversity-optimized final set is selected across every design.
-    with suppress_output(active=not debug):
+    # Global reduce: combine all shards, then filter once over the union.
+    with _quiet(not debug):
         merge_command(argparse.Namespace(
-            sources=[p["dir"] for p in procs], output=output, overwrite=False))
-
+            sources=[w["dir"] for w in workers], output=args.output, overwrite=False))
     if args.steps and "filtering" not in args.steps:
         return
     filter_args = copy.copy(args)
-    filter_args.steps = ["filtering"]
-    filter_args.reuse = True
-    with suppress_output(active=not debug):
+    filter_args.steps, filter_args.reuse = ["filtering"], True
+    with _quiet(not debug):
         configure_command(filter_args)
-    # Run the global filter without its own live display — the per-device view
-    # already covered the run; the final summary panel reports the result.
-    execute_command(filter_args, headless=True)
+    # Headless filter: the per-device view already covered the run; the summary
+    # panel reports the kept count.
+    execute_command(filter_args, headless=not debug)
 
 
 def download_command(args: argparse.Namespace) -> list[Path]:
@@ -1022,57 +1000,35 @@ def execute_command(args: argparse.Namespace, *, headless: bool = False) -> None
         return
 
     total_steps = len(resolved_steps)
-    stage_names = [name for name, _ in resolved_steps]
 
-    import contextlib
-
-    from tt_boltz.boltzgen.progress import (
-        DebugDisplay,
-        FileDisplay,
-        SilentDisplay,
-        SingleDeviceDisplay,
-        redirect_low_level_io,
-        set_display,
-    )
+    from tt_boltz.boltzgen import progress as P
 
     debug = getattr(args, "debug", False)
-    log = getattr(args, "log", False)
-    progress_file = os.environ.get("BOLTZGEN_PROGRESS_FILE")
-    _vd = (os.environ.get("TT_VISIBLE_DEVICES") or "").split(",")[0].strip()
-    device_label = f"device {_vd}" if _vd else "device"
+    worker_file = os.environ.get("BOLTZGEN_PROGRESS_FILE")
 
+    # Pick the reporter for this run, and route the model's fd-level chatter to a
+    # log so it can't scroll over a live display.
     with contextlib.ExitStack() as stack:
-        if headless and not debug:
-            # Run quietly with no live display (used for the multi-device global
-            # filter, which the parent already covered in its per-device view) —
-            # output still goes to the log, the summary panel reports the result.
-            stack.enter_context(redirect_low_level_io(config_dir / "run.log"))
-            display = SilentDisplay()
-        elif progress_file:
-            # Multi-device shard worker: emit structured events for the parent
-            # to render. The parent's Popen already routes our fd 1/2 to a log.
-            display = FileDisplay(progress_file)
-        elif debug:
-            # Debug: stream everything (ttnn + task output) straight through.
-            display = DebugDisplay(stages=stage_names) if log else SilentDisplay()
-        else:
-            # Normal: send the model's fd-level chatter (ttnn/tt-metal C++ logs)
-            # to a log file so it can't scroll over the live display, which keeps
-            # the real terminal via the yielded handle.
-            term = stack.enter_context(redirect_low_level_io(config_dir / "run.log"))
-            display = SingleDeviceDisplay(stages=stage_names,
-                                          device_label=device_label,
-                                          console_file=term)
+        if worker_file:                       # multi-device shard worker
+            reporter = P.FileReporter(worker_file)
+        elif debug:                           # raw passthrough (--debug[ --log])
+            reporter = P.DebugReporter() if getattr(args, "log", False) else P.Reporter()
+        elif headless:                        # quiet (multi-device global filter)
+            stack.enter_context(P.redirect_output(config_dir / "run.log"))
+            reporter = P.Reporter()
+        else:                                 # single-card live view
+            term = stack.enter_context(P.redirect_output(config_dir / "run.log"))
+            view = P.View([P.Device(_device_label())])
+            stack.enter_context(view.show(term))
+            reporter = P.LiveReporter(view)
 
-        set_display(display)
-        stack.enter_context(display)
+        stack.enter_context(reporter)
+        P.set_reporter(reporter)
         for index, (step_name, config_path) in enumerate(resolved_steps, start=1):
-            display.on_stage_start(step_name, index, total_steps)
-            start = time.time()
+            reporter.stage_start(step_name, index, total_steps)
             ok = True
             try:
-                config = _load_yaml(config_path)
-                config = _resolve_interpolations(config)
+                config = _resolve_interpolations(_load_yaml(config_path))
                 task = _instantiate(config)
                 if not isinstance(task, Task):
                     raise TypeError("Config must be an instance of Task.")
@@ -1081,7 +1037,7 @@ def execute_command(args: argparse.Namespace, *, headless: bool = False) -> None
                 ok = False
                 raise
             finally:
-                display.on_stage_done(step_name, time.time() - start, ok=ok)
+                reporter.stage_done(ok)
 
 
 #### Pipeline implementation ####
