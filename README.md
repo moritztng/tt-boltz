@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz runs Boltz-2 structure prediction and [BoltzGen](#boltzgen) binder design for inference on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
+TT-Boltz runs Boltz-2 structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
