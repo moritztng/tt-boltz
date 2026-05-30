@@ -586,23 +586,3 @@ class ProteinBinderDataModule:
             ]:
                 batch[key] = batch[key].to(device)
         return batch
-
-
-if __name__ == "__main__":
-    # debugging code
-    from omegaconf import OmegaConf
-    from hydra.utils import instantiate
-    import tqdm
-
-    cfg = OmegaConf.load("configs/predict/prot.yaml")
-    # cfg = OmegaConf.load("configs/predict/lig.yaml")
-    # datamodule = instantiate(cfg.data)
-
-    cfg.data.cfg.target_ids = "/data/scratch/faltings/data/bgen/hard_test_set_ids.txt"
-    datamodule = instantiate(cfg.data)
-    for i in tqdm.tqdm(range(len(datamodule.predict_set))):
-        try:
-            entry = datamodule.predict_set[i]
-        except Exception as e:
-            print(e)
-            continue

@@ -21,6 +21,7 @@ dependencies = [
     "omegaconf",  # only needed to unpickle DictConfig objects baked into upstream ckpts
     "biopython",
     "biotite",
+    "matplotlib",
     "scipy",
     "numba",
     "gemmi",
