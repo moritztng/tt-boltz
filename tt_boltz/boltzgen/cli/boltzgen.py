@@ -393,11 +393,10 @@ def add_device_arguments(p: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         metavar="IDS",
-        help="Tenstorrent device ID(s) to run on. A single ID (e.g. '2') runs on "
-        "that chip (made the only one ttnn sees, via TT_VISIBLE_DEVICES). A "
-        "comma-separated list (e.g. '0,1,2,3') splits the designs evenly across "
-        "those cards and merges the results — the output is identical in layout "
-        "to a single-device run. Default: device 0 / TT_VISIBLE_DEVICES if set.",
+        help="Tenstorrent device ID(s) to run on. Default: all available cards. "
+        "A single ID (e.g. '2') runs on that chip; a comma-separated list (e.g. "
+        "'0,1,2,3') splits the designs evenly across those cards. Multi-card runs "
+        "merge into one result identical in layout to a single-device run.",
     )
 
 
@@ -584,13 +583,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 #### Commands ####
-def _device_id_list(device_ids: str | None) -> list[int]:
-    """Parse ``--device_ids`` (e.g. '0,2,3') into a list of TT device IDs."""
-    if not device_ids:
-        return []
-    return [int(d) for d in (p.strip() for p in device_ids.split(",")) if d]
-
-
 def _rewrite_run_argv(argv: list[str], strip: set[str], additions: list[str]) -> list[str]:
     """Drop ``strip`` options (and their values) from a ``run`` argv, then append
     ``additions``. Positionals (design specs) come before options, so skipping
@@ -656,7 +648,11 @@ def run_command(args: argparse.Namespace) -> None:
         for sub in ("shards", "intermediate_designs", "intermediate_designs_inverse_folded"):
             shutil.rmtree(args.output / sub, ignore_errors=True)
 
-    devices = _device_id_list(args.device_ids)
+    # Default to every available card; --device_ids picks specific ones and
+    # --devices N picks the first N (same detection as `tt-boltz predict`).
+    from tt_boltz.runtime import detect_tenstorrent_devices
+    devices = detect_tenstorrent_devices(
+        args.device_ids, getattr(args, "devices", None) or 0, 10_000)
     P.header(specs=[str(s) for s in args.design_spec],
              protocol=getattr(args, "protocol", "protein-anything"),
              num_designs=args.num_designs,
