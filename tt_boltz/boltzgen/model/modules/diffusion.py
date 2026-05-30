@@ -5,27 +5,23 @@ from __future__ import annotations
 from math import sqrt
 from math import exp
 from scipy.stats import norm
-import math
 
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
-from torch import nn
 from torch.nn import Module
-from typing import Any, Dict, Optional, List
+from typing import Optional
 
 from tqdm import tqdm
 # The PyTorch ``DiffusionModule`` (score model) lived in this file; it's now
 # replaced by ``TTScoreModelAdapter`` (see :mod:`tt_boltz.boltzgen.adapter`).
 # ``AtomDiffusion`` below keeps the surrounding Euler-Maruyama sampler +
 # alignment logic in PyTorch.
-from tt_boltz.data import const
 from tt_boltz.boltzgen.model.geometry import weighted_rigid_align
 from tt_boltz.boltzgen.progress import progress as _emit_progress
 from tt_boltz.boltzgen.model.modules.utils import (
     center,
-    center_random_augmentation,
     compute_random_augmentation,
     default,
     log,
@@ -302,11 +298,7 @@ class AtomDiffusion(Module):
         inference_logging=False,
         **network_condition_kwargs,
     ):
-        if self.training and self.step_scale_random is not None:
-            step_scales = np.random.choice(self.step_scale_random) * torch.ones(
-                num_sampling_steps, device=self.device, dtype=torch.float32
-            )
-        elif self.step_scale_function == "beta":
+        if self.step_scale_function == "beta":
             step_scales = self.beta_step_scale_schedule(num_sampling_steps)
         else:
             step_scales = default(step_scale, self.step_scale) * torch.ones(

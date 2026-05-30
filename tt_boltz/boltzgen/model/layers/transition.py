@@ -56,7 +56,7 @@ class Transition(nn.Module):
         """
         x = self.norm(x)
 
-        if chunk_size is None or self.training:
+        if chunk_size is None:
             x = self.silu(self.fc1(x)) * self.fc2(x)
             x = self.fc3(x)
             return x

@@ -25,20 +25,6 @@ class GaussianSmearing(torch.nn.Module):
         return torch.exp(self.coeff * torch.pow(dist, 2))
 
 
-def softmax_dropout(
-    attn_weight: Tensor, softmax_dropout: float, dst_idx: Tensor = None
-):
-    for _ in range(10):
-        dropout_mask = torch.rand_like(attn_weight) < softmax_dropout
-        not_all_drop_mask = scatter_sum(~dropout_mask, index=dst_idx, dim=0)
-        if not_all_drop_mask.all():
-            attn_weight = attn_weight.masked_fill(dropout_mask, -float("inf"))
-            return attn_weight
-    raise RuntimeError(
-        "Softmax dropout failed to keep at least one edge for each node after 10 attempts."
-    )
-
-
 def build_constraint_logit_mask(
     num_nodes: int,
     aa_constraint_mask: Optional[Tensor],
@@ -176,11 +162,6 @@ class MLPAttnGNN(nn.Module):
         )
         attn_value = self.attn_value_mlp(torch.cat([s[src_idx], z], dim=1))
 
-        if self.training & (self.softmax_dropout > 0):
-            attn_weight = softmax_dropout(
-                attn_weight, softmax_dropout=self.softmax_dropout, dst_idx=dst_idx
-            )
-
         attn_weight = scatter_softmax(attn_weight, index=dst_idx, dim=0)
         attn_output = attn_weight.unsqueeze(-1) * attn_value.unsqueeze(1)
         attn_output = scatter_sum(attn_output, index=dst_idx, dim=0).flatten(
@@ -249,11 +230,6 @@ class MLPAttnGNNDecoder(nn.Module):
         attn_weight = self.attn_weight_mlp(torch.cat([s[dst_idx], z], dim=1))
         attn_value = self.attn_value_mlp(z)
 
-        if self.training & (self.softmax_dropout > 0):
-            attn_weight = softmax_dropout(
-                attn_weight, softmax_dropout=self.softmax_dropout, dst_idx=dst_idx
-            )
-
         attn_weight = scatter_softmax(attn_weight, index=dst_idx, dim=0)
         attn_output = attn_weight.unsqueeze(-1) * attn_value.unsqueeze(1)
         attn_output = scatter_sum(attn_output, index=dst_idx, dim=0).flatten(
@@ -269,11 +245,6 @@ class MLPAttnGNNDecoder(nn.Module):
         dst_idx = torch.zeros(z.shape[0], dtype=torch.long, device=z.device)
         attn_weight = self.attn_weight_mlp(torch.cat([s[dst_idx], z], dim=1))
         attn_value = self.attn_value_mlp(z)
-
-        if self.training & (self.softmax_dropout > 0):
-            attn_weight = softmax_dropout(
-                attn_weight, softmax_dropout=self.softmax_dropout, dst_idx=dst_idx
-            )
 
         attn_weight = scatter_softmax(attn_weight, index=dst_idx, dim=0)
         attn_output = attn_weight.unsqueeze(-1) * attn_value.unsqueeze(1)
@@ -405,9 +376,6 @@ class InverseFoldingEncoder(nn.Module):
         src_idx, dst_idx = edge_idx[0], edge_idx[1]
         token_to_bb4_atoms = feats["token_to_bb4_atoms"]
         r = feats["coords"]
-        if self.training and self.inverse_fold_noise > 0:
-            noise = torch.randn_like(r) * self.inverse_fold_noise
-            r = r + noise
         B, N = valid_mask.shape
         r_repr = torch.bmm(
             token_to_bb4_atoms.float().view(B, N * 4, -1), r.view(B, -1, 3)
