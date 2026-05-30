@@ -400,12 +400,7 @@ Behavior:
 tt-boltz gen run examples/binder.yaml --num_designs 10
 ```
 
-By default the designs are split across every available card and merged into
-one result. To restrict to specific cards:
-
-```bash
-tt-boltz gen run examples/binder.yaml --num_designs 100 --device_ids 0,2
-```
+This automatically uses every available card (splitting the designs across them and merging the results) and writes to `./binder/`. Add `--device_ids 0,2` to run on specific cards only.
 
 ### Input Format
 
@@ -455,7 +450,7 @@ tt-boltz gen run examples/binder.yaml --output existing/ --steps analysis filter
 | `--output` | `./<basename>/` | Output directory |
 | `--steps` | (all) | Run only specific stages |
 | `--config STEP key=val` | — | Override per-stage config (e.g. `--config design sampling_steps=200`) |
-| `--device_ids` | (all) | Comma-separated TT device IDs (e.g. `0,2`) |
+| `--device_ids` | all cards | Restrict to specific cards (e.g. `0,2`) |
 | `--cache` | `~/.boltz/boltzgen` | Cache for downloaded weights |
 | `--debug` | `False` | Disable live display; show raw stage output |
 | `--debug --log` | `False` | Add per-stage progress markers |
