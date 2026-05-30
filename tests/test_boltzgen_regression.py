@@ -160,6 +160,10 @@ def test_designed_structure_bond_geometry_matches_gpu(
         tt_boltz_bin, "gen", "run", str(spec_yaml),
         "--output", str(out_dir),
         "--num_designs", "1",
+        # Pin to one card: this asserts the single-device output layout
+        # (intermediate_designs/<stem>.cif), and on a multi-card box the default
+        # all-cards fan-out would split one design across workers.
+        "--devices", "1",
         "--config", "design", f"sampling_steps={sampling_steps}",
     ]
     subprocess.check_call(cmd)
