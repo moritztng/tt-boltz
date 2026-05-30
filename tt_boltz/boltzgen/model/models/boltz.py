@@ -29,6 +29,7 @@ from tt_boltz.tenstorrent import (
 )
 
 from tt_boltz.boltzgen.data.rmsd_computation import get_true_coordinates
+from tt_boltz.boltzgen.progress import progress as _emit_progress
 import tt_boltz.boltzgen.model.layers.initialize as init
 from tt_boltz.data import const
 from tt_boltz.data.mol import minimum_lddt_symmetry_dist
@@ -479,7 +480,6 @@ class Boltz(nn.Module):
 
             if not self.inverse_fold:
                 for i in range(recycling_steps + 1):
-                    from tt_boltz.boltzgen.progress import progress as _emit_progress
                     _emit_progress("trunk", i + 1, recycling_steps + 1)
                     with torch.set_grad_enabled(
                         (
