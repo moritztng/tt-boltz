@@ -113,7 +113,10 @@ def render(devices: list[Device], started: float, multi: bool) -> Group:
     for d in devices:
         ok = d.status == "ok"
         total = d.done / d.stages if d.stages else 0.0
-        stage_frac = d.pi / d.pn if d.pn else (d.ki / d.kn if d.kn else 0.0)
+        # Stage bar tracks the CURRENT protein's progress (its trunk/diffusion),
+        # so it fills per protein and restarts for the next one. Fall back to the
+        # proteins-done count for stages with no per-protein sub-steps.
+        stage_frac = d.ki / d.kn if d.kn else (d.pi / d.pn if d.pn else 0.0)
         icon, istyle = _ICON.get(d.status, ("·", "bright_black"))
         name = {"run": d.name, "ok": "done", "fail": "failed"}.get(d.status, "")
         detail = []
