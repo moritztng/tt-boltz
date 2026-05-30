@@ -107,8 +107,10 @@ def render(devices: list[Device], started: float, multi: bool) -> Group:
     head.append(f"   {_fmt(time.time() - started)}", style="dim")
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
-    for w in (2, 9, 12, 4, 1, 15, 8, 19):
-        tbl.add_column(width=w or None, no_wrap=True)
+    # Last column (stage detail) is flexible: when the terminal is narrow, Rich
+    # shrinks it rather than cropping the percentage into "10…".
+    for w in (2, 9, 12, 4, 1, 15, 8, None):
+        tbl.add_column(width=w, no_wrap=True)
 
     for d in devices:
         ok = d.status == "ok"
@@ -128,10 +130,11 @@ def render(devices: list[Device], started: float, multi: bool) -> Group:
             Text(icon, style=istyle),
             Text(d.label, style="bold" if d.status == "run" else ("" if ok else "dim")),
             _bar(total, 12, ok),
-            Text(f"{int(total * 100)}%", style="dim"),
+            Text(f"{int(total * 100)}%", style="dim", justify="right"),
             Text("│", style="bright_black"),
             Text(name, style=istyle if d.status != "run" else "bold"),
-            _bar(stage_frac, 8, ok) if d.status == "run" else Text(" " * 8),
+            _bar(stage_frac, 8, ok) if d.status == "run" and (d.kn or d.pn)
+            else Text(" " * 8),
             Text("  ".join(detail), style="cyan"),
         )
     return Group(Text(""), head, Text("  " + "─" * 74, style="bright_black"),
