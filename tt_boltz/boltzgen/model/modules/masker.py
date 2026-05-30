@@ -2,7 +2,6 @@ import torch
 from torch.nn import Module
 from torch.nn.functional import one_hot
 from tt_boltz.data import const
-import matplotlib.pyplot as plt
 
 
 class BoltzMasker(Module):
