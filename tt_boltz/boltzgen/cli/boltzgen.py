@@ -693,6 +693,10 @@ def _run_distributed(args: argparse.Namespace, devices: list[int]) -> None:
     debug = getattr(args, "debug", False)
     # Split designs as evenly as possible; the first cards take the remainder.
     counts = {d: total // n + (1 if i < total % n else 0) for i, d in enumerate(devices)}
+    # Drop cards that got no work (num_designs < card count) — an empty shard
+    # produces nothing for the merge to combine. Recompute n for the CPU split.
+    devices = [d for d in devices if counts[d] > 0]
+    n = len(devices)
 
     # Inverse folding's decode runs on the host CPU; each worker's torch would
     # grab every core, so N workers oversubscribe N× and thrash. Hand each an
