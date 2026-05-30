@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz is the Boltz-2 implementation for inference on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single run.
+TT-Boltz runs Boltz-2 structure prediction and [BoltzGen](#boltzgen) binder design for inference on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -394,7 +394,7 @@ Behavior:
 
 ## BoltzGen
 
-[BoltzGen](https://github.com/HannesStark/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`. Like Boltz-2, it runs on Tenstorrent Blackhole and Wormhole, on a single card or several (the designs are split across the cards and merged into one result).
+[BoltzGen](https://github.com/HannesStark/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`.
 
 ```bash
 tt-boltz gen run examples/binder.yaml --num_designs 10
