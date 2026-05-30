@@ -131,7 +131,8 @@ def render(devices: list[Device], started: float, multi: bool) -> Group:
             _bar(stage_frac, 8, ok) if d.status == "run" else Text(" " * 8),
             Text("  ".join(detail), style="cyan"),
         )
-    return Group(head, Text("  " + "─" * 74, style="bright_black"), Text(""), tbl)
+    return Group(Text(""), head, Text("  " + "─" * 74, style="bright_black"),
+                 Text(""), tbl)
 
 
 class View:
@@ -288,7 +289,9 @@ def _panel(title: str, rows: list[tuple[str, str]], color: str) -> None:
     grid.add_column(style="bold")
     for k, v in rows:
         grid.add_row(k, v)
-    Console(stderr=True).print(
+    console = Console(stderr=True)
+    console.print()  # breathing room above the box
+    console.print(
         Panel(grid, title=title, title_align="left", border_style=color,
               padding=(0, 1), expand=False))
 
