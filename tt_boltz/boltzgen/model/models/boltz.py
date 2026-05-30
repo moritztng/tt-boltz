@@ -15,7 +15,6 @@ constructed model runs on Tenstorrent — there's no CPU/GPU path here.
 
 import math
 from pathlib import Path
-import time
 from typing import Any, Dict, Optional, List
 
 import numpy as np
@@ -28,11 +27,9 @@ from tt_boltz.tenstorrent import (
     PairformerModule as TTPairformerModule,
 )
 
-from tt_boltz.boltzgen.data.rmsd_computation import get_true_coordinates
 from tt_boltz.boltzgen.progress import progress as _emit_progress
 import tt_boltz.boltzgen.model.layers.initialize as init
 from tt_boltz.data import const
-from tt_boltz.data.mol import minimum_lddt_symmetry_dist
 from tt_boltz.boltzgen.model.modules.confidence import ConfidenceModule
 from tt_boltz.boltzgen.model.modules.diffusion import AtomDiffusion
 from tt_boltz.boltzgen.model.modules.diffusion_conditioning import (
@@ -65,23 +62,18 @@ class Boltz(nn.Module):
         token_s: int,
         token_z: int,
         num_bins: int,
-        training_args: Dict[str, Any],
-        validation_args: Dict[str, Any],
         embedder_args: Dict[str, Any],
         msa_args: Dict[str, Any],
         pairformer_args: Dict[str, Any],
         score_model_args: Dict[str, Any],
         diffusion_process_args: Dict[str, Any],
-        diffusion_loss_args: Dict[str, Any],
         affinity_model_args: Dict[str, Any] = {},
         affinity_mw_correction: bool = True,
         affinity_ensemble: bool = False,
         affinity_model_args1: Dict[str, Any] = {},
         affinity_model_args2: Dict[str, Any] = {},
         confidence_model_args: Optional[Dict[str, Any]] = None,
-        validators: Any = None,
         masker_args: dict[str, Any] = {},
-        num_val_datasets: int = 1,
         atom_feature_dim: int = 128,
         template_args: Optional[Dict] = None,
         use_miniformer: bool = True,
@@ -89,13 +81,9 @@ class Boltz(nn.Module):
         affinity_prediction: bool = False,
         token_level_confidence: bool = True,
         alpha_pae: float = 0.0,
-        structure_prediction_training: bool = True,
-        validate_structure: bool = True,
         atoms_per_window_queries: int = 32,
         atoms_per_window_keys: int = 128,
         exclude_ions_from_lddt: bool = False,
-        ema: bool = False,
-        ema_decay: float = 0.999,
         ignore_ckpt_shape_mismatch: bool = False,
         min_dist: float = 2.0,
         max_dist: float = 22.0,
@@ -305,8 +293,6 @@ class Boltz(nn.Module):
         self.token_level_confidence = token_level_confidence
         self.alpha_pae = alpha_pae
 
-        self.structure_prediction_training = structure_prediction_training
-
         ### Affinity ###
         self.affinity_prediction = affinity_prediction
         self.affinity_ensemble = affinity_ensemble
@@ -442,9 +428,7 @@ class Boltz(nn.Module):
         dict_out = {}
         if self.inference_logging:
             print("\nRunning Trunk.\n")
-        with torch.set_grad_enabled(
-            (self.training and self.structure_prediction_training)
-        ):
+        with torch.no_grad():
             if self.inverse_fold:
                 if self.enable_if_input_embedder:
                     s_inputs = self.input_embedder(feats)
@@ -481,21 +465,7 @@ class Boltz(nn.Module):
             if not self.inverse_fold:
                 for i in range(recycling_steps + 1):
                     _emit_progress("trunk", i + 1, recycling_steps + 1)
-                    with torch.set_grad_enabled(
-                        (
-                            self.training
-                            and self.structure_prediction_training
-                            and (i == recycling_steps)
-                        )
-                    ):
-                        # Issue with unused parameters in autocast
-                        if (
-                            self.training
-                            and (i == recycling_steps)
-                            and torch.is_autocast_enabled()
-                        ):
-                            torch.clear_autocast_cache()
-
+                    with torch.no_grad():
                         # Apply recycling
                         s = s_init + self.s_recycle(self.s_norm(s))
                         z = z_init + self.z_recycle(self.z_norm(z))
@@ -573,91 +543,33 @@ class Boltz(nn.Module):
                     pbfactor = self.bfactor_module(s)
                     dict_out["pbfactor"] = pbfactor
 
-            if (
-                (not self.training)
-                or self.confidence_prediction
-                or self.affinity_prediction
-            ):
-                if self.inference_logging:
-                    print("\nRunning Structure Module.\n")
-                with torch.autocast("cuda", enabled=False):
-                    if not self.inverse_fold:
-                        struct_out = self.structure_module.sample(
-                            s_trunk=s.float(),
-                            s_inputs=s_inputs.float(),
-                            feats=feats,
-                            num_sampling_steps=num_sampling_steps,
-                            atom_mask=feats["atom_pad_mask"].float(),
-                            multiplicity=diffusion_samples,
-                            diffusion_conditioning=diffusion_conditioning,
-                            step_scale=step_scale,
-                            noise_scale=noise_scale,
-                            inference_logging=self.inference_logging,
-                        )
-                    else:
-                        struct_out = self.structure_module.sample(
-                            s=s,
-                            z=z,
-                            edge_idx=edge_idx,
-                            valid_mask=valid_mask,
-                            feats=feats,
-                        )
-
-                    dict_out.update(struct_out)
-
-                if self.training and self.structure_prediction_training:
-                    for idx in range(feats["token_index"].shape[0]):
-                        minimum_lddt_symmetry_dist(
-                            pred_distogram=pdistogram[idx],
-                            feats=feats,
-                            index_batch=idx,
-                        )
-
-            if self.training and (
-                self.confidence_prediction or self.affinity_prediction
-            ):
-                assert len(feats["coords"].shape) == 4
-                assert feats["coords"].shape[1] == 1, (
-                    "Only one conformation is supported for confidence"
-                )
-
-            # Compute structure module
-            if self.training and self.structure_prediction_training:
-                atom_coords = feats["coords"]
-                B, K, L = atom_coords.shape[0:3]
-                assert K in (
-                    multiplicity_diffusion_train,
-                    1,
-                )  # TODO make check somewhere else, expand to m % N == 0, m > N
-                atom_coords = atom_coords.reshape(B * K, L, 3)
-                atom_coords = atom_coords.repeat_interleave(
-                    multiplicity_diffusion_train // K, 0
-                )
-                feats["coords"] = atom_coords  # (multiplicity, L, 3)
-                assert len(feats["coords"].shape) == 3
-
-                with torch.autocast("cuda", enabled=False):
-                    if not self.inverse_fold:
-                        struct_out = self.structure_module(
-                            s_trunk=s.float(),
-                            s_inputs=s_inputs.float(),
-                            feats=feats,
-                            multiplicity=multiplicity_diffusion_train,
-                            diffusion_conditioning=diffusion_conditioning,
-                        )
-                    else:
-                        struct_out = self.structure_module(
-                            s=s,
-                            z=z,
-                            edge_idx=edge_idx,
-                            valid_mask=valid_mask,
-                            feats=feats,
-                        )
-                    dict_out.update(struct_out)
-
-            elif self.training:
-                feats["coords"] = feats["coords"].squeeze(1)
-                assert len(feats["coords"].shape) == 3
+            # Inference always samples (training-only structure-module forward,
+            # lddt symmetry and confidence/affinity coord asserts removed).
+            if self.inference_logging:
+                print("\nRunning Structure Module.\n")
+            with torch.autocast("cuda", enabled=False):
+                if not self.inverse_fold:
+                    struct_out = self.structure_module.sample(
+                        s_trunk=s.float(),
+                        s_inputs=s_inputs.float(),
+                        feats=feats,
+                        num_sampling_steps=num_sampling_steps,
+                        atom_mask=feats["atom_pad_mask"].float(),
+                        multiplicity=diffusion_samples,
+                        diffusion_conditioning=diffusion_conditioning,
+                        step_scale=step_scale,
+                        noise_scale=noise_scale,
+                        inference_logging=self.inference_logging,
+                    )
+                else:
+                    struct_out = self.structure_module.sample(
+                        s=s,
+                        z=z,
+                        edge_idx=edge_idx,
+                        valid_mask=valid_mask,
+                        feats=feats,
+                    )
+                dict_out.update(struct_out)
 
         if self.confidence_prediction:
             dict_out.update(
