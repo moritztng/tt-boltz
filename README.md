@@ -394,7 +394,7 @@ Behavior:
 
 ## BoltzGen
 
-[BoltzGen](https://github.com/HannesStark/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`.
+[BoltzGen](https://github.com/HannesStark/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`. Like Boltz-2, it runs on Tenstorrent Blackhole and Wormhole, on a single card or several (the designs are split across the cards and merged into one result).
 
 ```bash
 tt-boltz gen run examples/binder.yaml --num_designs 10
