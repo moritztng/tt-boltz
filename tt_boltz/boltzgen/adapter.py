@@ -14,6 +14,7 @@ design checkpoints still use.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import inspect
 import sys
 import types
@@ -66,21 +67,30 @@ def _legacy_pickle_compat():
 
 
 class _LegacyModuleFinder:
+    """``sys.meta_path`` finder fabricating placeholder modules on demand.
+
+    Implements the modern ``find_spec`` / loader protocol. The legacy
+    ``find_module`` / ``load_module`` protocol this used to rely on was removed
+    from the import system in Python 3.12, so under 3.12 the old finder was
+    silently never consulted and unpickling failed with
+    ``ModuleNotFoundError: No module named 'boltzgen.model.validation'``.
+    """
+
     PREFIXES = ("boltzgen.model.validation", "torchmetrics")
 
     def __init__(self, installed):
         self._installed = installed
 
-    def find_module(self, fullname, path=None):
+    def find_spec(self, fullname, path=None, target=None):
         for p in self.PREFIXES:
             if fullname == p or fullname.startswith(p + "."):
-                return self
+                # is_package=True gives the stub a ``__path__`` so submodules
+                # (e.g. ``torchmetrics.regression``) resolve through us too.
+                return importlib.util.spec_from_loader(fullname, self, is_package=True)
         return None
 
-    def load_module(self, fullname):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-        m = types.ModuleType(fullname)
+    def create_module(self, spec):
+        m = types.ModuleType(spec.name)
         m.__path__ = []
         # Raise AttributeError on dunder names so introspection tools that
         # probe ``__file__``/``__spec__``/etc. don't receive the stub class
@@ -90,9 +100,11 @@ class _LegacyModuleFinder:
                 raise AttributeError(name)
             return _stub
         m.__getattr__ = _module_getattr
-        sys.modules[fullname] = m
-        self._installed.append(fullname)
+        self._installed.append(spec.name)
         return m
+
+    def exec_module(self, module):
+        pass
 
 
 class TTScoreModelAdapter(TTDiffusionModule):
