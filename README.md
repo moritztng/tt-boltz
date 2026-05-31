@@ -451,6 +451,7 @@ tt-boltz gen run examples/binder.yaml --output existing/ --steps analysis filter
 | `--steps` | (all) | Run only specific stages |
 | `--config STEP key=val` | — | Override per-stage config (e.g. `--config design sampling_steps=200`) |
 | `--device_ids` | all cards | Restrict to specific cards (e.g. `0,2`) |
+| `--fast` | `False` | Use block-fp8 for some ops (slightly lower precision, faster) |
 | `--cache` | `~/.boltz/boltzgen` | Cache for downloaded weights |
 | `--debug` | `False` | Disable live display; show raw stage output |
 | `--debug --log` | `False` | Add per-stage progress markers |

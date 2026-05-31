@@ -398,6 +398,12 @@ def add_device_arguments(p: argparse.ArgumentParser) -> None:
         "'0,1,2,3') splits the designs evenly across those cards. Multi-card runs "
         "merge into one result identical in layout to a single-device run.",
     )
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use block-fp8 for some operations (slightly lower precision, faster). "
+        "Mirrors `tt-boltz predict --fast`.",
+    )
 
 
 def add_execute_core_arguments(p: argparse.ArgumentParser) -> None:
@@ -941,6 +947,13 @@ def execute_command(args: argparse.Namespace, *, headless: bool = False) -> None
     Usually this is executed by `boltzgen run ...` but it can be used like:
         $ boltzgen execute --output out_dir
     """
+    # Set block-fp8 fast mode before any ttnn module is built (the dtype/chunk
+    # choices read this global at construction). Covers the in-process single
+    # run, each multi-device worker (which re-parses --fast), and the parent's
+    # in-process filter pass. Mirrors tt-boltz predict's worker setup.
+    from tt_boltz.tenstorrent import set_fast_mode
+    set_fast_mode(getattr(args, "fast", False))
+
     config_dir = args.output
 
     if not config_dir.exists() or not config_dir.is_dir():
