@@ -713,6 +713,17 @@ def _run_distributed(args: argparse.Namespace, devices: list[int]) -> None:
         n_cpu = os.cpu_count() or n
     threads = str(max(1, n_cpu // n))
 
+    # P300 chips are a custom topology; like the `predict` path, each single-chip
+    # worker needs the 1x1 Blackhole mesh-graph descriptor or ttnn.open_device
+    # aborts with "Custom fabric mesh graph descriptor path must be specified".
+    from tt_boltz.main import _detect_p300_devices, _find_ttnn_mesh_graph_descriptor
+    p300_devices = set(_detect_p300_devices())
+    p300_mgd = (
+        _find_ttnn_mesh_graph_descriptor("p150_mesh_graph_descriptor.textproto")
+        if p300_devices and not os.environ.get("TT_MESH_GRAPH_DESC_PATH")
+        else None
+    )
+
     workers = []
     for d in devices:
         shard = args.output / "shards" / f"device_{d}"
@@ -721,6 +732,8 @@ def _run_distributed(args: argparse.Namespace, devices: list[int]) -> None:
                                  ["--output", str(shard), "--num_designs", str(counts[d]),
                                   "--device_ids", str(d)])
         env = {**os.environ, "TT_VISIBLE_DEVICES": str(d)}
+        if d in p300_devices and p300_mgd:
+            env.setdefault("TT_MESH_GRAPH_DESC_PATH", p300_mgd)
         for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             env.setdefault(var, threads)
         cmd = [sys.executable, "-m", "tt_boltz.boltzgen.cli.boltzgen", *argv]
