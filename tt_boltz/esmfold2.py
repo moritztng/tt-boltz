@@ -780,6 +780,54 @@ class InputsEmbedder(TorchWrapper):
 
 
 # ===========================================================================
+# LanguageModelShim (ESMC hidden states -> pair init)
+# ===========================================================================
+
+
+class LanguageModelShimModel(Module):
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.zl_ln_w = self.torch_to_tt("base_z_linear.0.weight"); self.zl_ln_b = self.torch_to_tt("base_z_linear.0.bias")
+        self.zl_w = self.torch_to_tt("base_z_linear.1.weight")
+        self.dp_w = self.torch_to_tt("base_z_mlp.0.downproject.weight"); self.dp_b = self.torch_to_tt("base_z_mlp.0.downproject.bias", transform=_ROW)
+        self.o0_w = self.torch_to_tt("base_z_mlp.0.output_mlp.0.weight"); self.o0_b = self.torch_to_tt("base_z_mlp.0.output_mlp.0.bias", transform=_ROW)
+        self.o2_w = self.torch_to_tt("base_z_mlp.0.output_mlp.2.weight"); self.o2_b = self.torch_to_tt("base_z_mlp.0.output_mlp.2.bias", transform=_ROW)
+        self.fln_w = self.torch_to_tt("base_z_mlp.1.weight"); self.fln_b = self.torch_to_tt("base_z_mlp.1.bias")
+
+    def __call__(self, hidden, combine_w):  # hidden [B,L,K,d_model]; combine_w torch [K]
+        ck = self.compute_kernel_config
+        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        ln = lambda t, w, b: ttnn.layer_norm(t, weight=w, bias=b, epsilon=1e-5, compute_kernel_config=ck)
+        B, L, K, dm = hidden.shape
+        # Per-layer projection in ttnn (reshape L,K together -> 3D, no sub-tile middle dim).
+        hs2 = ttnn.reshape(hidden, (B, L * K, dm))
+        lz = lin(ln(hs2, self.zl_ln_w, self.zl_ln_b), self.zl_w)  # [B, L*K, 256]
+        # Softmax-weighted layer combine on host (non-learned given combine_w).
+        lz_t = torch.Tensor(ttnn.to_torch(lz)).float().reshape(B, L, K, 256)
+        x_t = (combine_w.view(1, 1, K, 1) * lz_t).sum(2)  # [B,L,256]
+        x = lin(ttnn.from_torch(x_t, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16), self.dp_w, self.dp_b)
+        a = ttnn.repeat(ttnn.unsqueeze(x, 2), (1, 1, L, 1))  # [B,L,L,256]
+        b = ttnn.repeat(ttnn.unsqueeze(x, 1), (1, L, 1, 1))
+        feat = ttnn.concat([ttnn.multiply(a, b), ttnn.subtract(a, b)], dim=-1)  # [B,L,L,512]
+        ttnn.deallocate(a); ttnn.deallocate(b)
+        h = ttnn.gelu(lin(feat, self.o0_w, self.o0_b))
+        h = lin(h, self.o2_w, self.o2_b)
+        return ln(h, self.fln_w, self.fln_b)
+
+
+class LanguageModelShim(TorchWrapper):
+    """ESMC hidden states [B,L,n_layers+1,d_model] -> pair init z [B,L,L,256]."""
+
+    def _create_module(self, weights: WeightScope) -> LanguageModelShimModel:
+        self._combine = weights["base_z_combine"]  # [n_layers+1]
+        return LanguageModelShimModel(weights, self.compute_kernel_config)
+
+    def forward(self, hidden_states):
+        w = torch.softmax(self._combine, 0)  # [K]
+        return self._to_torch(self.module(self._from_torch(hidden_states), w))
+
+
+# ===========================================================================
 # MSA encoder (optional trunk; conditions pair on an MSA)
 # ===========================================================================
 
@@ -906,6 +954,111 @@ class MSAEncoder(TorchWrapper):
         ft = self._from_torch
         out = self.module(ft(x_pair), ft(x_inputs), ft(m_feat.float()), ft((1.0 / n_valid).float()))
         return self._to_torch(out)
+
+
+# ===========================================================================
+# Diffusion sampler (host orchestration over the ttnn DiffusionModule)
+# ===========================================================================
+
+
+def karras_schedule(steps, sigma_data=16.0, s_min=0.0004, s_max=160.0, p=7.0):
+    """Karras power-law noise schedule (mirrors DiffusionStructureHead)."""
+    inv_p = 1.0 / p
+    k = torch.arange(steps, dtype=torch.float32)
+    base = s_max ** inv_p + (k / (steps - 1)) * (s_min ** inv_p - s_max ** inv_p)
+    return F.pad(sigma_data * base.pow(p), (0, 1), value=0.0)
+
+
+def _random_rotations(n, gen):
+    q = torch.randn((n, 4), generator=gen)
+    scale = torch.sqrt((q * q).sum(1))
+    signs = torch.where(q[:, 0] < 0, -scale, scale)
+    q = q / signs[:, None]
+    r, i, j, k = torch.unbind(q, -1)
+    two_s = 2.0 / (q * q).sum(-1)
+    return torch.stack((
+        1 - two_s * (j * j + k * k), two_s * (i * j - k * r), two_s * (i * k + j * r),
+        two_s * (i * j + k * r), 1 - two_s * (i * i + k * k), two_s * (j * k - i * r),
+        two_s * (i * k - j * r), two_s * (j * k + i * r), 1 - two_s * (i * i + j * j),
+    ), -1).reshape(n, 3, 3)
+
+
+def _center_random_augmentation(x, atom_mask, gen, second=None):
+    mask = atom_mask.unsqueeze(-1)
+    mean = (x * mask).sum(1, keepdim=True) / mask.sum(1, keepdim=True).clamp(min=1)
+    x = x - mean
+    if second is not None:
+        second = second - mean
+    r = _random_rotations(x.shape[0], gen).to(x.dtype)
+    x = torch.einsum("bmd,bds->bms", x, r)
+    if second is not None:
+        second = torch.einsum("bmd,bds->bms", second, r)
+    t = torch.randn(x[:, 0:1, :].shape, generator=gen)
+    return x + t, (None if second is None else second + t)
+
+
+def _weighted_rigid_align(x, x_gt, w, mask):
+    w = (mask * w).unsqueeze(-1)
+    denom = w.sum(-2, keepdim=True).clamp(min=1e-8)
+    mu, mu_gt = (x * w).sum(-2, keepdim=True) / denom, (x_gt * w).sum(-2, keepdim=True) / denom
+    H = torch.einsum("bni,bnj->bij", w * (x_gt - mu_gt), (x - mu))
+    U, _, Vh = torch.linalg.svd(H.float())
+    det = torch.linalg.det(U @ Vh)
+    R = (U @ torch.diag_embed(torch.stack([torch.ones_like(det), torch.ones_like(det), det], -1)) @ Vh).to(H.dtype)
+    return torch.einsum("bni,bij->bnj", x - mu, R.transpose(-1, -2)) + mu_gt
+
+
+def sample_structure(denoise_fn, n_atoms, ref_mask, *, steps=14, sigma_data=16.0,
+                     s_min=0.0004, s_max=160.0, p=7.0, gamma_0=0.8, gamma_min=1.0,
+                     noise_scale=1.003, step_scale=1.5, max_inference_sigma=256.0, seed=0):
+    """Run reverse diffusion (Algorithm 18). denoise_fn(x_noisy[B,N,3], t_hat[B]) -> x_denoised."""
+    gen = torch.Generator().manual_seed(seed)
+    schedule = karras_schedule(steps, sigma_data, s_min, s_max, p)
+    if max_inference_sigma is not None:
+        schedule = schedule[schedule <= float(max_inference_sigma)]
+        schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
+    lam, eta = noise_scale, step_scale
+    B = ref_mask.shape[0]
+    x = schedule[0] * torch.randn(B, n_atoms, 3, generator=gen)
+    atom_mask = ref_mask.float()
+    gammas = torch.where(schedule > gamma_min, torch.full_like(schedule, gamma_0), torch.zeros_like(schedule))
+    x_prev = None
+    for s_tm, s_t, gamma in zip(schedule[:-1], schedule[1:], gammas[1:]):
+        x, x_prev = _center_random_augmentation(x, atom_mask, gen, x_prev)
+        s_tm_v = float(s_tm); t_hat = s_tm_v * (1.0 + float(gamma))
+        eps = lam * max(t_hat ** 2 - s_tm_v ** 2, 0.0) ** 0.5
+        x_noisy = x + eps * torch.randn(x.shape, generator=gen)
+        x_den = denoise_fn(x_noisy, torch.full((B,), t_hat))
+        x_noisy = _weighted_rigid_align(x_noisy.float(), x_den.float(), atom_mask, atom_mask)
+        x = x_noisy + eta * (float(s_t) - t_hat) * (x_noisy - x_den) / t_hat
+        x_prev = x_den
+    return x
+
+
+class StructureHead(TorchWrapper):
+    """ttnn DiffusionModule + diffusion sampler -> 3D coordinates."""
+
+    def __init__(self, sigma_data: float = SIGMA_DATA):
+        super().__init__()
+        self.sigma_data = sigma_data
+        self._dm = None
+
+    def _create_module(self, weights: WeightScope) -> DiffusionModuleModel:
+        self._fw = weights["diffusion_module.conditioning.fourier.w"]
+        self._fb = weights["diffusion_module.conditioning.fourier.b"]
+        return DiffusionModuleModel(weights.child("diffusion_module"), self.compute_kernel_config)
+
+    def sample(self, z_trunk, s_inputs, relpos, ref_pos, ref_charge, ref_mask, ref_element,
+               ref_atom_name_chars, ref_space_uid, tok_idx, steps=14, seed=0):
+        # Wrap the ttnn DiffusionModule forward as a denoise callable.
+        dm = DiffusionModule(sigma_data=self.sigma_data)
+        dm.module = self.module
+        dm._fw, dm._fb = self._fw, self._fb
+        denoise = lambda x_noisy, t_hat: dm(
+            x_noisy, t_hat, ref_pos, ref_charge, ref_mask, ref_element,
+            ref_atom_name_chars, ref_space_uid, tok_idx, s_inputs, z_trunk, relpos)
+        return sample_structure(denoise, tok_idx.shape[1], ref_mask, steps=steps,
+                                sigma_data=self.sigma_data, seed=seed)
 
 
 # ===========================================================================

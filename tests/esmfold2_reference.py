@@ -137,6 +137,14 @@ def make_diffusion_module(seed: int = 0):
     return m
 
 
+def make_lm_shim(seed: int = 0, d_model: int = 2560, num_layers: int = 80):
+    """Reference LanguageModelShim."""
+    import torch
+
+    torch.manual_seed(seed)
+    return common.LanguageModelShim(d_z=256, d_model=d_model, num_layers=num_layers).eval()
+
+
 def make_msa_encoder(seed: int = 0):
     """Self-contained reference MSAEncoder (matches modeling_esmfold2.MSAEncoder)."""
     import torch

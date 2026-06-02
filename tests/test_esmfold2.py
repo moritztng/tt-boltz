@@ -21,6 +21,7 @@ from esmfold2_reference import (  # noqa: E402
     make_distogram_head,
     make_folding_trunk,
     make_inputs_embedder,
+    make_lm_shim,
     make_msa_encoder,
     make_relpos,
     make_swa_atom_transformer,
@@ -53,6 +54,19 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("seq_len,d_model,n_layers", [(24, 512, 12)])
+def test_lm_shim(seq_len, d_model, n_layers):
+    ref = make_lm_shim(d_model=d_model, num_layers=n_layers)
+    hs = torch.randn(1, seq_len, n_layers + 1, d_model)
+    ref_out = ref(hs)
+
+    mod = tt_ef2.LanguageModelShim()
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(hs)
+    assert out.shape == ref_out.shape
+    assert pcc(out, ref_out) > 0.98
 
 
 @pytest.mark.parametrize("seq_len,depth", [(32, 8), (64, 16)])
@@ -154,6 +168,48 @@ def test_confidence_head(seq_len):
         assert o.shape == r.shape, (name, o.shape, r.shape)
         p = pcc(o, r)
         assert p > 0.98, f"{name} PCC {p:.5f} too low (L={seq_len})"
+
+
+def test_diffusion_sampler():
+    """Sampler orchestration + ttnn DiffusionModule over a (short) reverse-diffusion
+    trajectory. Compares ttnn-sampled coords to the torch reference module under
+    identical RNG; checks closeness after rigid alignment (per-step PCC ~0.999, so
+    the trajectory should track closely)."""
+    torch.manual_seed(0)
+    ref = make_diffusion_module()
+    L = 8
+    apt = torch.randint(1, 5, (L,))
+    tok_idx = torch.repeat_interleave(torch.arange(L), apt).unsqueeze(0)
+    N = tok_idx.shape[1]
+    feats = dict(
+        ref_pos=torch.randn(1, N, 3), ref_charge=torch.randn(1, N), ref_mask=torch.ones(1, N),
+        ref_element=torch.randn(1, N, 128), ref_atom_name_chars=torch.randn(1, N, 4, 64),
+        ref_space_uid=torch.randint(0, 8, (1, N)), tok_idx=tok_idx,
+        s_inputs=torch.randn(1, L, 451), z_trunk=torch.randn(1, L, L, 256), relpos=torch.randn(1, L, L, 256),
+    )
+    zL = torch.zeros(1, L, dtype=torch.long)
+
+    def ref_denoise(x_noisy, t_hat):
+        return ref(x_noisy, t_hat, feats["ref_pos"], feats["ref_charge"], feats["ref_mask"],
+                   feats["ref_element"], feats["ref_atom_name_chars"], feats["ref_space_uid"],
+                   tok_idx, feats["s_inputs"], None, feats["z_trunk"], feats["relpos"],
+                   zL, zL, zL, zL, zL)["x_denoised"]
+
+    mod = tt_ef2.DiffusionModule(sigma_data=16.0)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    def tt_denoise(x_noisy, t_hat):
+        return mod(x_noisy, t_hat, feats["ref_pos"], feats["ref_charge"], feats["ref_mask"],
+                   feats["ref_element"], feats["ref_atom_name_chars"], feats["ref_space_uid"],
+                   tok_idx, feats["s_inputs"], feats["z_trunk"], feats["relpos"])
+
+    ref_xyz = tt_ef2.sample_structure(ref_denoise, N, feats["ref_mask"], steps=4, seed=7)
+    tt_xyz = tt_ef2.sample_structure(tt_denoise, N, feats["ref_mask"], steps=4, seed=7)
+    assert tt_xyz.shape == (1, N, 3) and torch.isfinite(tt_xyz).all()
+    # rigid-align ttnn coords to reference and check RMSD is small
+    aligned = tt_ef2._weighted_rigid_align(tt_xyz.float(), ref_xyz.float(), feats["ref_mask"], feats["ref_mask"])
+    rmsd = ((aligned - ref_xyz).pow(2).sum(-1).mean()).sqrt().item()
+    scale = ref_xyz.float().std().item()
+    assert rmsd < 0.15 * scale, f"sampler RMSD {rmsd:.3f} vs scale {scale:.3f} too high"
 
 
 @pytest.mark.parametrize("n_tokens", [8, 16])
