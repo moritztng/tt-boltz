@@ -17,6 +17,8 @@ reuse tt-boltz's proven ttnn `TriangleMultiplication` kernel and the ESMC
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 import ttnn
@@ -323,3 +325,96 @@ class DiffusionTransformer(TorchWrapper):
     def forward(self, a, s, z):
         out = self.module(self._from_torch(a), self._from_torch(s), self._from_torch(z))
         return self._to_torch(out)
+
+
+# ===========================================================================
+# Diffusion conditioning (noise + s/z projections)
+# ===========================================================================
+
+
+class TransitionLayer(Module):
+    """SwiGLU transition with separate a/b projections: out_proj(silu(a(LN(x)))*b(LN(x)))."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.norm_w = self.torch_to_tt("norm.weight")
+        self.norm_b = self.torch_to_tt("norm.bias")
+        self.a_w = self.torch_to_tt("a_proj.weight")
+        self.b_w = self.torch_to_tt("b_proj.weight")
+        self.out_w = self.torch_to_tt("out_proj.weight")
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(
+            t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+        )
+        xn = ttnn.layer_norm(x, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck)
+        a = lin(xn, self.a_w)
+        b = lin(xn, self.b_w)
+        ttnn.deallocate(xn)
+        gated = ttnn.multiply(ttnn.silu(a), b)
+        ttnn.deallocate(a); ttnn.deallocate(b)
+        out = lin(gated, self.out_w)
+        ttnn.deallocate(gated)
+        return out
+
+
+class DiffusionConditioningModel(Module):
+    """Builds conditioning single s [B,L,c_s] and pair z [B,L,L,c_z] from inputs + noise."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.z_in_w = self.torch_to_tt("z_input_norm.weight")
+        self.z_in_b = self.torch_to_tt("z_input_norm.bias")
+        self.z_proj_w = self.torch_to_tt("z_proj.weight")
+        self.z_trans = [TransitionLayer(self.scope(f"z_transitions.{i}"), compute_kernel_config) for i in range(2)]
+        self.s_in_w = self.torch_to_tt("s_input_norm.weight")
+        self.s_in_b = self.torch_to_tt("s_input_norm.bias")
+        self.s_proj_w = self.torch_to_tt("s_proj.weight")
+        self.noise_n_w = self.torch_to_tt("noise_norm.weight")
+        self.noise_n_b = self.torch_to_tt("noise_norm.bias")
+        self.noise_proj_w = self.torch_to_tt("noise_proj.weight")
+        self.s_trans = [TransitionLayer(self.scope(f"s_transitions.{i}"), compute_kernel_config) for i in range(2)]
+
+    def __call__(self, s_inputs, z_trunk, relpos, n_raw):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(
+            t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+        )
+        z = ttnn.concat([z_trunk, relpos], dim=-1)
+        z = lin(ttnn.layer_norm(z, weight=self.z_in_w, bias=self.z_in_b, epsilon=1e-5, compute_kernel_config=ck), self.z_proj_w)
+        for t in self.z_trans:
+            z = ttnn.add(z, t(z))
+
+        s = lin(ttnn.layer_norm(s_inputs, weight=self.s_in_w, bias=self.s_in_b, epsilon=1e-5, compute_kernel_config=ck), self.s_proj_w)
+        n = lin(ttnn.layer_norm(n_raw, weight=self.noise_n_w, bias=self.noise_n_b, epsilon=1e-5, compute_kernel_config=ck), self.noise_proj_w)
+        s = ttnn.add(s, ttnn.unsqueeze(n, 1))  # broadcast noise over the L axis
+        for t in self.s_trans:
+            s = ttnn.add(s, t(s))
+        return s, z
+
+
+class DiffusionConditioning(TorchWrapper):
+    """Top-level conditioning (torch in/out). forward(t_hat, s_inputs, z_trunk, relpos) -> (s, z)."""
+
+    def __init__(self, sigma_data: float = 16.0):
+        super().__init__()
+        self.sigma_data = sigma_data
+
+    def _create_module(self, weights: WeightScope) -> DiffusionConditioningModel:
+        self._fw = weights["fourier.w"]  # [fourier_dim] buffers (host fourier embed)
+        self._fb = weights["fourier.b"]
+        return DiffusionConditioningModel(weights, self.compute_kernel_config)
+
+    def forward(self, t_hat, s_inputs, z_trunk, relpos):
+        bsz = z_trunk.shape[0]
+        t = torch.as_tensor(t_hat, dtype=torch.float32).reshape(-1)
+        if t.numel() == 1:
+            t = t.expand(bsz)
+        t_noise = 0.25 * torch.log((t / self.sigma_data).clamp(min=1e-20))
+        n_raw = torch.cos(2.0 * math.pi * (t_noise[:, None] * self._fw[None, :] + self._fb[None, :]))
+        s, z = self.module(
+            self._from_torch(s_inputs), self._from_torch(z_trunk),
+            self._from_torch(relpos), self._from_torch(n_raw.float()),
+        )
+        return self._to_torch(s), self._to_torch(z)

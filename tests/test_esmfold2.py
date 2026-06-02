@@ -14,6 +14,7 @@ import ttnn
 sys.path.insert(0, os.path.dirname(__file__))
 from esmfold2_reference import (  # noqa: E402
     DIFFUSION_TOKEN,
+    make_diffusion_conditioning,
     make_diffusion_transformer,
     make_folding_trunk,
 )
@@ -45,6 +46,24 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("seq_len", [37, 64])
+def test_diffusion_conditioning(seq_len):
+    ref = make_diffusion_conditioning()
+    s_inputs = torch.randn(1, seq_len, 451)
+    z_trunk = torch.randn(1, seq_len, seq_len, 256)
+    relpos = torch.randn(1, seq_len, seq_len, 256)
+    t_hat = torch.tensor([12.0])
+    s_ref, z_ref = ref(t_hat, s_inputs, None, z_trunk, relpos)
+
+    mod = tt_ef2.DiffusionConditioning(sigma_data=16.0)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    s_out, z_out = mod(t_hat, s_inputs, z_trunk, relpos)
+
+    assert s_out.shape == s_ref.shape and z_out.shape == z_ref.shape
+    ps, pz = pcc(s_out, s_ref), pcc(z_out, z_ref)
+    assert ps > 0.99 and pz > 0.99, f"s PCC {ps:.5f}, z PCC {pz:.5f}"
 
 
 @pytest.mark.parametrize("num_blocks,seq_len", [(1, 32), (4, 64), (12, 48)])
