@@ -114,6 +114,36 @@ def test_attention(seq_len):
     assert p > 0.99, f"PCC {p:.5f} too low"
 
 
+def test_esmc_real_weights():
+    """Validate against the trained ESMC-300M on a real protein (human ubiquitin).
+
+    Skips unless the HF checkpoint is already cached (avoids a ~1GB download).
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    _cfg, repo_id, wpath = tt_esmc.CONFIGS["esmc-300m"]
+    cached = try_to_load_from_cache(repo_id, wpath)
+    if not isinstance(cached, str):
+        pytest.skip("ESMC-300M weights not cached; run ESMC.from_pretrained() first")
+
+    sd = torch.load(cached, map_location="cpu", weights_only=False)
+    sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
+    ref = make_esmc_300m()
+    ref.load_state_dict(sd, strict=False)
+    mod = tt_esmc.ESMC(**ESMC_300M)
+    mod.load_state_dict(sd, strict=False)
+
+    seq = "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
+    tokens = tt_esmc.tokenize(seq)
+    ref_logits, _ = ref(tokens)
+    logits, _ = mod(tokens)
+
+    # On trained weights the model is confident, so top-1 should match torch exactly.
+    assert pcc(logits, ref_logits) > 0.999
+    agree = (logits.argmax(-1) == ref_logits.argmax(-1)).float().mean().item()
+    assert agree == 1.0, f"argmax agreement {agree:.3f} < 1.0"
+
+
 @pytest.mark.parametrize("seq_len", [16, 64])
 def test_esmc_end_to_end(seq_len):
     ref = make_esmc_300m()

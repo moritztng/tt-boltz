@@ -34,6 +34,30 @@ from tt_boltz.tenstorrent import (
 VOCAB_SIZE = 64
 ROPE_BASE = 10000.0
 
+# Sequence vocab (esm.utils.constants.esm3.SEQUENCE_VOCAB): token id = index here.
+SEQUENCE_VOCAB = [
+    "<cls>", "<pad>", "<eos>", "<unk>", "L", "A", "G", "V", "S", "E", "R", "T",
+    "I", "D", "P", "K", "Q", "N", "F", "Y", "M", "H", "W", "C", "X", "B", "U",
+    "Z", "O", ".", "-", "|", "<mask>",
+]
+BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, MASK_TOKEN = 0, 2, 3, 32
+_AA_TO_ID = {a: i for i, a in enumerate(SEQUENCE_VOCAB)}
+
+# name -> (config, hf repo id, weights path within repo)
+CONFIGS = {
+    "esmc-300m": (
+        dict(d_model=960, n_heads=15, n_layers=30),
+        "biohub/esmc-300m-2024-12",
+        "data/weights/esmc_300m_2024_12_v0.pth",
+    ),
+}
+
+
+def tokenize(sequence: str) -> "torch.Tensor":
+    """Protein string -> token ids [1, L+2] with <cls>/<eos> (matches esm)."""
+    ids = [BOS_TOKEN] + [_AA_TO_ID.get(c, UNK_TOKEN) for c in sequence.upper()] + [EOS_TOKEN]
+    return torch.tensor([ids], dtype=torch.long)
+
 
 def rope_tables(seq_len: int, head_dim: int, base: float = ROPE_BASE, device=None):
     """Precompute NeoX-style RoPE cos/sin tables, shaped [1, 1, L, head_dim].
@@ -290,6 +314,19 @@ class ESMC(TorchWrapper):
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
+
+    @classmethod
+    def from_pretrained(cls, name: str = "esmc-300m") -> "ESMC":
+        """Download + load trained weights from HuggingFace (e.g. 'esmc-300m')."""
+        from huggingface_hub import hf_hub_download
+
+        config, repo_id, weights_path = CONFIGS[name]
+        path = hf_hub_download(repo_id, weights_path)
+        sd = torch.load(path, map_location="cpu", weights_only=False)
+        sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
+        model = cls(**config)
+        model.load_state_dict(sd, strict=False)
+        return model
 
     def _create_module(self, weights: WeightScope) -> ESMCModel:
         return ESMCModel(self.n_heads, self.n_layers, weights, self.compute_kernel_config)
