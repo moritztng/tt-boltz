@@ -65,6 +65,25 @@ common = _load_common()
 FOLDING_TRUNK = dict(n_layers=48, d_pair=256, expansion_ratio=4)
 
 
+# Token DiffusionTransformer config (DiffusionModule: c_token=768, c_z=256,
+# token_num_heads=16, token_num_blocks=12, d_cond=c_token, transition_multiplier=2).
+DIFFUSION_TOKEN = dict(
+    d_model=768, d_pair=256, num_heads=16, num_blocks=12, d_cond=768,
+    transition_multiplier=2, use_conditioning=True,
+)
+
+
+def make_diffusion_transformer(num_blocks: int | None = None, seed: int = 0):
+    """Reference token DiffusionTransformer (random init)."""
+    import torch
+
+    torch.manual_seed(seed)
+    cfg = dict(DIFFUSION_TOKEN)
+    if num_blocks is not None:
+        cfg["num_blocks"] = num_blocks
+    return common.DiffusionTransformer(**cfg).eval()
+
+
 def make_folding_trunk(n_layers: int | None = None, seed: int = 0):
     """Reference FoldingTrunk (random init). chunk_size=None for bit-exact parity."""
     import torch
