@@ -84,6 +84,17 @@ def make_diffusion_transformer(num_blocks: int | None = None, seed: int = 0):
     return common.DiffusionTransformer(**cfg).eval()
 
 
+DIFFUSION_COND = dict(c_z=256, c_s=768, c_s_inputs=451, sigma_data=16.0, fourier_dim=256, transition_multiplier=2)
+
+
+def make_diffusion_conditioning(seed: int = 0):
+    """Reference DiffusionConditioning (random init)."""
+    import torch
+
+    torch.manual_seed(seed)
+    return common.DiffusionConditioning(**DIFFUSION_COND).eval()
+
+
 def make_folding_trunk(n_layers: int | None = None, seed: int = 0):
     """Reference FoldingTrunk (random init). chunk_size=None for bit-exact parity."""
     import torch
