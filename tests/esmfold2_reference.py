@@ -137,6 +137,45 @@ def make_diffusion_module(seed: int = 0):
     return m
 
 
+def make_relpos(seed: int = 0):
+    """Reference relative-position encoding."""
+    import torch
+
+    torch.manual_seed(seed)
+    return common.ResIdxAsymIdSymIdEntityIdEncoding(
+        n_relative_residx_bins=32, n_relative_chain_bins=2, d_pair=256
+    ).eval()
+
+
+def make_inputs_embedder(seed: int = 0):
+    """Reference inputs embedder (atom encoder, structure_prediction=False) + concat."""
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+
+    class InputsEmbedderRef(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.atom_attention_encoder = common.ESMFold2AtomEncoder(
+                d_atom=128, d_token=768, n_blocks=3, n_heads=4, swa_window_size=128,
+                expansion_ratio=2, structure_prediction=False,
+                spatial_rope_base_frequency=20.0, n_spatial_rope_pairs_per_axis=2,
+                n_uid_rope_pairs=10, uid_rope_base_frequency=10000.0,
+            )
+
+        def forward(self, aatype, profile, deletion_mean, ref_pos, atom_mask,
+                    ref_space_uid, ref_charge, ref_element, ref_atom_name_chars, atom_to_token):
+            a, _q, _c, _p, _i = self.atom_attention_encoder(
+                ref_pos=ref_pos, atom_attention_mask=atom_mask, ref_space_uid=ref_space_uid,
+                ref_charge=ref_charge, ref_element=ref_element,
+                ref_atom_name_chars=ref_atom_name_chars, atom_to_token=atom_to_token,
+            )
+            return torch.cat([a, aatype, profile, deletion_mean.unsqueeze(-1)], dim=-1)
+
+    return InputsEmbedderRef().eval()
+
+
 def make_distogram_head(seed: int = 0):
     """Reference model-level distogram head: Linear(d_pair, 64)."""
     import torch
