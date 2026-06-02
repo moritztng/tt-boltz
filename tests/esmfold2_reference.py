@@ -113,6 +113,30 @@ def make_swa_atom_transformer(n_blocks: int | None = None, seed: int = 0):
     return common.SWAAtomTransformer(**cfg).eval()
 
 
+DIFFUSION_MODULE = dict(
+    c_atom=128, c_token=768, c_z=256, c_s_inputs=451, sigma_data=16.0, fourier_dim=256,
+    atom_num_blocks=3, atom_num_heads=4, token_num_blocks=12, token_num_heads=16,
+    transition_multiplier=2, swa_window_size=128, spatial_rope_base_frequency=20.0,
+    n_spatial_rope_pairs_per_axis=2, n_uid_rope_pairs=10, uid_rope_base_frequency=10000.0,
+)
+
+# Params that are zero/constant-initialized in the reference; randomize them so
+# parity tests exercise the gated/modulated paths (loaded identically into ttnn).
+_ZERO_INIT_KEYS = ("out_gate", "output_gate", "s_to_token", "adaln_modulation")
+
+
+def make_diffusion_module(seed: int = 0):
+    """Reference DiffusionModule (random init; zero-init gates perturbed)."""
+    import torch
+
+    torch.manual_seed(seed)
+    m = common.DiffusionModule(**DIFFUSION_MODULE).eval()
+    for name, p in m.named_parameters():
+        if any(k in name for k in _ZERO_INIT_KEYS):
+            torch.nn.init.normal_(p, std=0.1)
+    return m
+
+
 def make_folding_trunk(n_layers: int | None = None, seed: int = 0):
     """Reference FoldingTrunk (random init). chunk_size=None for bit-exact parity."""
     import torch

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from esmfold2_reference import (  # noqa: E402
     DIFFUSION_TOKEN,
     make_diffusion_conditioning,
+    make_diffusion_module,
     make_diffusion_transformer,
     make_folding_trunk,
     make_swa_atom_transformer,
@@ -47,6 +48,43 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("n_tokens", [8, 16])
+def test_diffusion_module(n_tokens):
+    torch.manual_seed(0)
+    ref = make_diffusion_module()
+    L = n_tokens
+    apt = torch.randint(1, 8, (L,))  # atoms per token
+    tok_idx = torch.repeat_interleave(torch.arange(L), apt).unsqueeze(0)  # [1,N]
+    N = tok_idx.shape[1]
+
+    x_noisy = torch.randn(1, N, 3)
+    ref_pos = torch.randn(1, N, 3)
+    ref_charge = torch.randn(1, N)
+    ref_mask = torch.ones(1, N)
+    ref_element = torch.randn(1, N, 128)
+    ref_atom_name_chars = torch.randn(1, N, 4, 64)
+    ref_space_uid = torch.randint(0, 8, (1, N))
+    s_inputs = torch.randn(1, L, 451)
+    z_trunk = torch.randn(1, L, L, 256)
+    relpos = torch.randn(1, L, L, 256)
+    t_hat = torch.tensor([12.0])
+    zL = torch.zeros(1, L, dtype=torch.long)
+
+    ref_out = ref(
+        x_noisy, t_hat, ref_pos, ref_charge, ref_mask, ref_element, ref_atom_name_chars,
+        ref_space_uid, tok_idx, s_inputs, None, z_trunk, relpos, zL, zL, zL, zL, zL,
+    )["x_denoised"]
+
+    mod = tt_ef2.DiffusionModule(sigma_data=16.0)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(x_noisy, t_hat, ref_pos, ref_charge, ref_mask, ref_element,
+              ref_atom_name_chars, ref_space_uid, tok_idx, s_inputs, z_trunk, relpos)
+
+    assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
+    p = pcc(out, ref_out)
+    assert p > 0.98, f"PCC {p:.5f} too low (n_tokens={n_tokens}, N={N})"
 
 
 @pytest.mark.parametrize("n_atoms", [80, 200])

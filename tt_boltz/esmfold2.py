@@ -568,3 +568,134 @@ class SWAAtomTransformer(TorchWrapper):
             self._from_torch(mask.float()),
         )
         return self._to_torch(out)
+
+
+# ===========================================================================
+# Atom encoder / decoder wrappers + DiffusionModule
+# ===========================================================================
+
+ATOM_FEATURE_DIM = 389  # 3 + 1 + 1 + 128 + 4*64
+SIGMA_DATA = 16.0
+
+
+class AtomEncoder(Module):
+    """ref atom features (+ noisy coords) -> token-aggregated repr a, atom repr q, c."""
+
+    def __init__(self, n_heads, n_blocks, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.atom_linear_w = self.torch_to_tt("atom_linear.weight")
+        self.atom_norm_w = self.torch_to_tt("atom_norm.weight")
+        self.atom_norm_b = self.torch_to_tt("atom_norm.bias")
+        self.coords_w = self.torch_to_tt("coords_linear.weight")
+        self.a2t_w = self.torch_to_tt("atom_to_token_linear.weight")
+        self.transformer = SWAAtomTransformerModel(n_heads, n_blocks, self.scope("atom_transformer"), compute_kernel_config)
+
+    def __call__(self, atom_feats, r_input, cos, sin, band, scatter_m):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        c = ttnn.layer_norm(lin(atom_feats, self.atom_linear_w), weight=self.atom_norm_w, bias=self.atom_norm_b, epsilon=1e-5, compute_kernel_config=ck)
+        q = ttnn.add(c, lin(r_input, self.coords_w))
+        q = self.transformer(q, c, cos, sin, band)
+        q_to_a = ttnn.relu(lin(q, self.a2t_w))  # [B,N,d_token]
+        a = ttnn.matmul(scatter_m, q_to_a, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        ttnn.deallocate(q_to_a)
+        return a, q, c
+
+
+class AtomDecoder(Module):
+    """token repr a + atom skip (q,c) -> per-atom coordinate update r_update [B,N,3]."""
+
+    def __init__(self, n_heads, n_blocks, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.t2a_w = self.torch_to_tt("token_to_atom_linear.weight")
+        self.norm_w = self.torch_to_tt("norm.weight")
+        self.norm_b = self.torch_to_tt("norm.bias")
+        self.out_w = self.torch_to_tt("output_linear.weight")
+        self.transformer = SWAAtomTransformerModel(n_heads, n_blocks, self.scope("atom_transformer"), compute_kernel_config)
+
+    def __call__(self, a, q_skip, c_skip, cos, sin, band, gather_g):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        a_to_q = lin(a, self.t2a_w)  # [B,L,d_atom]
+        a_to_q = ttnn.matmul(gather_g, a_to_q, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,N,d_atom]
+        q = ttnn.add(q_skip, a_to_q)
+        q = self.transformer(q, c_skip, cos, sin, band)
+        q = ttnn.layer_norm(q, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck)
+        return lin(q, self.out_w)  # [B,N,3]
+
+
+class DiffusionModuleModel(Module):
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        ck = compute_kernel_config
+        self.conditioning = DiffusionConditioningModel(self.scope("conditioning"), ck)
+        self.atom_encoder = AtomEncoder(4, 3, self.scope("atom_encoder"), ck)
+        self.atom_decoder = AtomDecoder(4, 3, self.scope("atom_decoder"), ck)
+        self.token_transformer = DiffusionTransformerModel(16, 12, self.scope("token_transformer"), ck)
+        self.s_step_norm_w = self.torch_to_tt("s_step_norm.weight")
+        self.s_step_norm_b = self.torch_to_tt("s_step_norm.bias")
+        self.s_to_token_w = self.torch_to_tt("s_to_token.weight")
+        self.token_norm_w = self.torch_to_tt("token_norm.weight")
+        self.token_norm_b = self.torch_to_tt("token_norm.bias")
+
+    def __call__(self, s_inputs, z_trunk, relpos, n_raw, atom_feats, r_input,
+                 cos, sin, band, scatter_m, gather_g):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        s, z = self.conditioning(s_inputs, z_trunk, relpos, n_raw)
+        a, q_skip, c_skip = self.atom_encoder(atom_feats, r_input, cos, sin, band, scatter_m)
+        s_step = ttnn.layer_norm(s, weight=self.s_step_norm_w, bias=self.s_step_norm_b, epsilon=1e-5, compute_kernel_config=ck)
+        a = ttnn.add(a, lin(s_step, self.s_to_token_w))
+        a = self.token_transformer(a, s, z)
+        a = ttnn.layer_norm(a, weight=self.token_norm_w, bias=self.token_norm_b, epsilon=1e-5, compute_kernel_config=ck)
+        return self.atom_decoder(a, q_skip, c_skip, cos, sin, band, gather_g)
+
+
+class DiffusionModule(TorchWrapper):
+    """One diffusion denoising step. forward(x_noisy[B,N,3], t_hat, feats...) -> x_denoised[B,N,3]."""
+
+    def __init__(self, sigma_data: float = SIGMA_DATA):
+        super().__init__()
+        self.sigma_data = sigma_data
+
+    def _create_module(self, weights: WeightScope) -> DiffusionModuleModel:
+        self._fw = weights["conditioning.fourier.w"]
+        self._fb = weights["conditioning.fourier.b"]
+        return DiffusionModuleModel(weights, self.compute_kernel_config)
+
+    def forward(self, x_noisy, t_hat, ref_pos, ref_charge, ref_mask, ref_element,
+                ref_atom_name_chars, ref_space_uid, tok_idx, s_inputs, z_trunk, relpos):
+        sigma, B, N = self.sigma_data, x_noisy.shape[0], x_noisy.shape[1]
+        L = s_inputs.shape[1]
+        t = torch.as_tensor(t_hat, dtype=torch.float32).reshape(-1)
+        if t.numel() == 1:
+            t = t.expand(B)
+
+        # host: noise embedding, normalized coords, atom features, rope/band/scatter/gather
+        t_noise = 0.25 * torch.log((t / sigma).clamp(min=1e-20))
+        n_raw = torch.cos(2.0 * math.pi * (t_noise[:, None] * self._fw[None, :] + self._fb[None, :])).float()
+        denom = torch.sqrt(t * t + sigma * sigma)
+        r_noisy = x_noisy / denom[:, None, None]
+        r_input = torch.cat([r_noisy, torch.zeros_like(r_noisy)], dim=-1)  # [B,N,6]
+        atom_feats = torch.cat([
+            ref_pos, ref_charge.unsqueeze(-1), ref_mask.unsqueeze(-1).float(),
+            ref_element, ref_atom_name_chars.reshape(B, N, -1),
+        ], dim=-1)  # [B,N,389]
+        cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, 32, **ATOM_ROPE)
+        band = band_mask(N, 64)
+        oh = F.one_hot(tok_idx[0].long(), L).float() * ref_mask[0].float()[:, None]  # [N,L]
+        gather_g = oh.unsqueeze(0)  # [1,N,L]
+        scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)  # [1,L,N]
+
+        ft = self._from_torch
+        r_update = self.module(
+            ft(s_inputs), ft(z_trunk), ft(relpos), ft(n_raw), ft(atom_feats.float()),
+            ft(r_input.float()), ft(cos.float()), ft(sin.float()), ft(band.float()),
+            ft(scatter_m.float()), ft(gather_g.float()),
+        )
+        r_update = self._to_torch(r_update)
+
+        sigma2, t2 = sigma * sigma, (t * t)
+        out = (sigma2 / (sigma2 + t2))[:, None, None] * x_noisy
+        out = out + ((sigma * t) / torch.sqrt(sigma2 + t2))[:, None, None] * r_update
+        return out
