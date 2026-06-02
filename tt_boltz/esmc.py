@@ -52,6 +52,17 @@ CONFIGS = {
     ),
 }
 
+# Architecture configs for the larger variants. ESMC-6B is the LM backbone of
+# ESMFold2; the ttnn ESMC architecture supports it via config (identical to
+# 300M, just larger), validated by the 300M parity. Real-weight loading for 6B
+# needs a sharded-safetensors + key-remap loader (transformers format, ~12GB)
+# and block-fp8 to fit one Blackhole — separate from the single-.pth 300M path.
+ARCH_CONFIGS = {
+    "esmc-300m": dict(d_model=960, n_heads=15, n_layers=30),
+    "esmc-600m": dict(d_model=1152, n_heads=18, n_layers=36),
+    "esmc-6b": dict(d_model=2560, n_heads=40, n_layers=80),  # ESMFold2 LM backbone
+}
+
 
 def tokenize(sequence: str) -> "torch.Tensor":
     """Protein string -> token ids [1, L+2] with <cls>/<eos> (matches esm)."""

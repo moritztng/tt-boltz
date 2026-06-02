@@ -170,6 +170,53 @@ def test_confidence_head(seq_len):
         assert p > 0.98, f"{name} PCC {p:.5f} too low (L={seq_len})"
 
 
+def test_end_to_end_orchestration():
+    """Validate the full ESMFold2 forward WIRING (z-init, parcae recurrence, head
+    fan-out) on host with shape-correct mock components. Each real ttnn component
+    is separately device-parity-tested; this checks they compose correctly."""
+    L, N = 8, 20
+    sd = {
+        "parcae_log_a": torch.randn(256), "parcae_log_delta": torch.randn(256),
+        "parcae_b_cont": torch.randn(256, 256) * 0.02,
+        "parcae_input_norm.weight": torch.ones(256), "parcae_input_norm.bias": torch.zeros(256),
+        "parcae_readout.weight": torch.randn(256, 256) * 0.02,
+        "z_init_1.weight": torch.randn(256, 451) * 0.02, "z_init_2.weight": torch.randn(256, 451) * 0.02,
+        "token_bonds.weight": torch.randn(256, 1) * 0.02,
+    }
+    parcae = tt_ef2.ParcaeParams(sd)
+
+    class Coords:
+        def sample(self, z, x_inputs, relpos, *a, **k):
+            return torch.randn(1, N, 3)
+    comps = {
+        "inputs_embedder": lambda *a: torch.randn(1, L, 451),
+        "rel_pos": lambda *a: torch.randn(1, L, L, 256),
+        "folding_trunk": lambda z: z,
+        "parcae_coda": lambda z: z,
+        "lm_encoder": None, "language_model": None, "msa_encoder": None,
+        "distogram_head": lambda z: torch.randn(1, L, L, 64),
+        "structure_head": Coords(),
+        "confidence_head": lambda *a: (torch.randn(1, L, L, 64), torch.randn(1, L, L, 64),
+                                       torch.randn(1, N, 50), torch.randn(1, N, 2)),
+    }
+    inputs = dict(
+        aatype=torch.randn(1, L, 33), profile=torch.randn(1, L, 33), deletion_mean=torch.randn(1, L),
+        ref_pos=torch.randn(1, N, 3), atom_mask=torch.ones(1, N), ref_space_uid=torch.randint(0, 8, (1, N)),
+        ref_charge=torch.randn(1, N), ref_element=torch.randn(1, N, 128),
+        ref_atom_name_chars=torch.randn(1, N, 4, 64), atom_to_token=torch.repeat_interleave(
+            torch.arange(L), torch.tensor([3, 2, 3, 2, 3, 2, 3, 2]))[:N].unsqueeze(0),
+        residue_index=torch.arange(L).unsqueeze(0), asym_id=torch.zeros(1, L, dtype=torch.long),
+        sym_id=torch.zeros(1, L, dtype=torch.long), entity_id=torch.zeros(1, L, dtype=torch.long),
+        token_index=torch.arange(L).unsqueeze(0), token_bonds=torch.zeros(1, L, L),
+        intra_idx=torch.zeros(1, N, dtype=torch.long), distogram_atom_idx=torch.arange(L).unsqueeze(0),
+    )
+    out = tt_ef2.esmfold2_fold(comps, parcae, inputs, num_loops=2, sample_steps=2)
+    assert out["sample_atom_coords"].shape == (1, N, 3)
+    assert out["distogram_logits"].shape == (1, L, L, 64)
+    assert out["pae_logits"].shape == (1, L, L, 64) and out["plddt_logits"].shape == (1, N, 50)
+    assert all(torch.isfinite(v).all() for v in out.values())
+
+
 def test_diffusion_sampler():
     """Sampler orchestration + ttnn DiffusionModule over a (short) reverse-diffusion
     trajectory. Compares ttnn-sampled coords to the torch reference module under
