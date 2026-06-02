@@ -50,35 +50,6 @@ def _dtype():
     return ttnn.bfloat8_b if _FAST_MODE else ttnn.bfloat16
 
 
-def _matmul_fidelity():
-    """Math fidelity for matmuls. HiFi4 (4 passes) is the accurate default.
-
-    For block-fp8 (fast mode) the bf8_b mantissa is fully consumed in fewer
-    fidelity phases, so HiFi4 wastes ~2-4x of matmul math for no accuracy gain.
-    Tunable via TT_BOLTZ_FIDELITY={HiFi4,HiFi3,HiFi2,LoFi}.
-    """
-    name = os.environ.get("TT_BOLTZ_FIDELITY", "").strip()
-    if not name:
-        # HiFi4 is the validated default; the trunk is bandwidth-bound so lower
-        # fidelity buys ~6% there but risks accuracy. Tune via env if desired.
-        return ttnn.MathFidelity.HiFi4
-    return {
-        "HiFi4": ttnn.MathFidelity.HiFi4,
-        "HiFi3": ttnn.MathFidelity.HiFi3,
-        "HiFi2": ttnn.MathFidelity.HiFi2,
-        "LoFi": ttnn.MathFidelity.LoFi,
-    }[name]
-
-
-def _fp32_dest_acc():
-    env = os.environ.get("TT_BOLTZ_FP32_ACC", "").strip()
-    if env:
-        return env not in ("0", "false", "False")
-    # Always on by default: the Newton-Schulz Kabsch alignment requires fp32
-    # accumulation, and disabling it broke the diffusion resident-trace path.
-    return True
-
-
 def _adaln_memory_config(atom_level: bool, large_seq_len: bool) -> ttnn.MemoryConfig | None:
     if not atom_level:
         return None
@@ -2067,9 +2038,9 @@ class TorchWrapper(nn.Module):
             else ttnn.types.BlackholeComputeKernelConfig
         )
         self.compute_kernel_config = kernel_cls(
-            math_fidelity=_matmul_fidelity(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
-            fp32_dest_acc_en=_fp32_dest_acc(),
+            fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
 
