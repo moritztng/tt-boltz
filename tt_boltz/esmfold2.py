@@ -23,12 +23,16 @@ import ttnn
 
 from tt_boltz.esmc import SwiGLUFFN
 from tt_boltz.tenstorrent import (
+    CORE_GRID_MAIN,
     Module,
     TorchWrapper,
     TriangleMultiplication,
     Weights,
     WeightScope,
+    _sdpa_program_config_for_lengths,
 )
+
+_ROW = lambda x: x.reshape(1, -1)
 
 C_Z = 256  # pair channels
 PAD_MULTIPLE = 32  # pad seq to a tile multiple so the triangle contraction excludes padding
@@ -129,3 +133,193 @@ class FoldingTrunk(TorchWrapper):
             mask = self._from_torch(real)
         out = self.module(self._from_torch(z), mask)
         return self._to_torch(out)[:, :seq_len, :seq_len, :]
+
+
+# ===========================================================================
+# Diffusion structure head — token transformer (DiT with pair bias)
+# ===========================================================================
+
+
+class AdaLN(Module):
+    """Adaptive LayerNorm (adaLN-Zero): sigmoid(s_gate(LN_s(s)))*LN(a) + s_shift(LN_s(s))."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.s_scale = self.torch_to_tt("s_scale", transform=lambda x: x)
+        self.s_gate_w = self.torch_to_tt("s_gate.weight")
+        self.s_gate_b = self.torch_to_tt("s_gate.bias", transform=_ROW)
+        self.s_shift_w = self.torch_to_tt("s_shift.weight")
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        ck = self.compute_kernel_config
+        a_norm = ttnn.layer_norm(a, epsilon=1e-5, compute_kernel_config=ck)
+        s_norm = ttnn.layer_norm(s, weight=self.s_scale, epsilon=1e-5, compute_kernel_config=ck)
+        gate = ttnn.sigmoid(ttnn.linear(
+            s_norm, self.s_gate_w, bias=self.s_gate_b, compute_kernel_config=ck,
+            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
+        ))
+        shift = ttnn.linear(
+            s_norm, self.s_shift_w, compute_kernel_config=ck,
+            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
+        )
+        return ttnn.add(ttnn.multiply(gate, a_norm), shift)
+
+
+class AttentionPairBias(Module):
+    """Gated multi-head attention conditioned on s (adaLN) with per-head pair bias from z."""
+
+    def __init__(self, num_heads: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.num_heads = num_heads
+        self.adaln = AdaLN(self.scope("adaln"), compute_kernel_config)
+        self.q_w = self.torch_to_tt("q_proj.weight")
+        self.q_b = self.torch_to_tt("q_proj.bias", transform=_ROW)
+        self.kv_w = self.torch_to_tt("kv_proj.weight")
+        self.g_w = self.torch_to_tt("g_proj.weight")
+        self.out_gate_w = self.torch_to_tt("out_gate.weight")
+        self.out_gate_b = self.torch_to_tt("out_gate.bias", transform=_ROW)
+        self.pair_norm_w = self.torch_to_tt("pair_norm.weight")
+        self.pair_norm_b = self.torch_to_tt("pair_norm.bias")
+        self.pair_bias_w = self.torch_to_tt("pair_bias_proj.weight")
+
+        # head_dim may not be a tile multiple (e.g. 768/16=48 -> padded to 64 by
+        # the nlp head ops). Fold the head un-padding into two constant scatter
+        # matmuls: pad g (d_model->Dpad) and a padded out_proj (Dpad->d_model).
+        d_model = self.weights["out_proj.weight"].shape[0]
+        H, hd = num_heads, d_model // num_heads
+        self.head_dim = hd
+        hdp = -(-hd // 32) * 32  # round up to tile multiple
+        self.head_dim_pad = hdp
+        Dpad = H * hdp
+        Sg = torch.zeros(d_model, Dpad)  # g[.,768] @ Sg -> g[.,1024] (real slots only)
+        for h in range(H):
+            Sg[h * hd : (h + 1) * hd, h * hdp : h * hdp + hd] = torch.eye(hd)
+        owt = self.weights["out_proj.weight"].t()  # [in d_model, out d_model]
+        Op = torch.zeros(Dpad, d_model)  # padded out_proj input dim
+        for h in range(H):
+            Op[h * hdp : h * hdp + hd, :] = owt[h * hd : (h + 1) * hd, :]
+        to_tt = lambda x: ttnn.from_torch(
+            x, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16
+        )
+        self.scatter_g = to_tt(Sg)
+        self.out_w_padded = to_tt(Op)
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        ck = self.compute_kernel_config
+        d_model = a.shape[-1]
+        head_dim = d_model // self.num_heads
+
+        x = self.adaln(a, s)
+        lin = lambda t, w, b=None: ttnn.linear(
+            t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+        )
+        q = lin(x, self.q_w, self.q_b)
+        kv = lin(x, self.kv_w)
+        k, v = ttnn.chunk(kv, 2, dim=-1)
+        ttnn.deallocate(kv)
+        g = ttnn.sigmoid(lin(x, self.g_w))
+        ttnn.deallocate(x)
+
+        # Pack q,k,v and split into heads (tile-aware), then SDPA with pair bias.
+        qkv = ttnn.concat([q, k, v], dim=-1)
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
+        qkv = ttnn.unsqueeze(qkv, 1)
+        qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=self.num_heads, num_kv_heads=self.num_heads,
+            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(qkv)
+
+        z_norm = ttnn.layer_norm(
+            z, weight=self.pair_norm_w, bias=self.pair_norm_b, epsilon=1e-5, compute_kernel_config=ck
+        )
+        pair_bias = lin(z_norm, self.pair_bias_w)  # [B, L, L, H]
+        ttnn.deallocate(z_norm)
+        pair_bias = ttnn.permute(pair_bias, (0, 3, 1, 2))  # [B, H, L, L]
+
+        ctx = ttnn.transformer.scaled_dot_product_attention(
+            qh, kh, vh, attn_mask=pair_bias, is_causal=False, scale=head_dim**-0.5,
+            program_config=_sdpa_program_config_for_lengths(qh.shape[2], kh.shape[2]),
+        )
+        ttnn.deallocate(qh); ttnn.deallocate(kh); ttnn.deallocate(vh)
+        ttnn.deallocate(pair_bias)
+        ctx = ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ctx = ttnn.squeeze(ctx, 1)  # [B, L, H*head_dim_pad]  (pad value dims are 0)
+        # Gate + out_proj in the padded head layout, then project back to d_model.
+        g_pad = lin(g, self.scatter_g)  # [B, L, Dpad]
+        ttnn.deallocate(g)
+        ctx = ttnn.multiply(ctx, g_pad)
+        ttnn.deallocate(g_pad)
+        out = lin(ctx, self.out_w_padded)  # [B, L, d_model]
+        ttnn.deallocate(ctx)
+        out_gate = ttnn.sigmoid(lin(s, self.out_gate_w, self.out_gate_b))
+        return ttnn.multiply(out_gate, out)
+
+
+class ConditionedTransitionBlock(Module):
+    """adaLN-conditioned SwiGLU transition, gated by sigmoid(output_gate(s))."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.adaln = AdaLN(self.scope("adaln"), compute_kernel_config)
+        self.swish_w = self.torch_to_tt("lin_swish.weight")
+        self.out_w = self.torch_to_tt("lin_out.weight")
+        self.gate_w = self.torch_to_tt("output_gate.weight")
+        self.gate_b = self.torch_to_tt("output_gate.bias", transform=_ROW)
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
+        ck = self.compute_kernel_config
+        lin = lambda t, w, b=None: ttnn.linear(
+            t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+        )
+        x = self.adaln(a, s)
+        sw = lin(x, self.swish_w)
+        ttnn.deallocate(x)
+        a1, a2 = ttnn.chunk(sw, 2, dim=-1)
+        ttnn.deallocate(sw)
+        b = ttnn.multiply(ttnn.silu(a1), a2)
+        ttnn.deallocate(a1); ttnn.deallocate(a2)
+        out = lin(b, self.out_w)
+        ttnn.deallocate(b)
+        gate = ttnn.sigmoid(lin(s, self.gate_w, self.gate_b))
+        return ttnn.multiply(gate, out)
+
+
+class DiffusionTransformerModel(Module):
+    """Token DiT: x = x + attn(x,s,z); x = x + transition(x,s), repeated."""
+
+    def __init__(self, num_heads: int, num_blocks: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.attn = [
+            AttentionPairBias(num_heads, self.scope(f"attn_blocks.{i}"), compute_kernel_config)
+            for i in range(num_blocks)
+        ]
+        self.trans = [
+            ConditionedTransitionBlock(self.scope(f"transition_blocks.{i}"), compute_kernel_config)
+            for i in range(num_blocks)
+        ]
+
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+        x = a
+        for attn, trans in zip(self.attn, self.trans):
+            x = ttnn.add(x, attn(x, s, z))
+            x = ttnn.add(x, trans(x, s))
+        return x
+
+
+class DiffusionTransformer(TorchWrapper):
+    """Top-level token transformer (torch a[B,L,768], s[B,L,768], z[B,L,L,256] in/out)."""
+
+    def __init__(self, num_heads: int = 16, num_blocks: int = 12):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_blocks = num_blocks
+
+    def _create_module(self, weights: WeightScope) -> DiffusionTransformerModel:
+        return DiffusionTransformerModel(
+            self.num_heads, self.num_blocks, weights, self.compute_kernel_config
+        )
+
+    def forward(self, a, s, z):
+        out = self.module(self._from_torch(a), self._from_torch(s), self._from_torch(z))
+        return self._to_torch(out)

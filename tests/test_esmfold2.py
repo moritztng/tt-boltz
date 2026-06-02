@@ -12,7 +12,11 @@ import torch
 import ttnn
 
 sys.path.insert(0, os.path.dirname(__file__))
-from esmfold2_reference import make_folding_trunk  # noqa: E402
+from esmfold2_reference import (  # noqa: E402
+    DIFFUSION_TOKEN,
+    make_diffusion_transformer,
+    make_folding_trunk,
+)
 
 from tt_boltz import esmfold2 as tt_ef2  # noqa: E402
 from tt_boltz.tenstorrent import get_device  # noqa: E402
@@ -41,3 +45,24 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("num_blocks,seq_len", [(1, 32), (4, 64), (12, 48)])
+def test_diffusion_token_transformer(num_blocks, seq_len):
+    d_model = DIFFUSION_TOKEN["d_model"]
+    d_pair = DIFFUSION_TOKEN["d_pair"]
+    n_heads = DIFFUSION_TOKEN["num_heads"]
+
+    ref = make_diffusion_transformer(num_blocks=num_blocks)
+    a = torch.randn(1, seq_len, d_model)
+    s = torch.randn(1, seq_len, d_model)
+    z = torch.randn(1, seq_len, seq_len, d_pair)
+    ref_out, _ = ref(a, s, z, beta=0.0)
+
+    mod = tt_ef2.DiffusionTransformer(num_heads=n_heads, num_blocks=num_blocks)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(a, s, z)
+
+    assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
+    p = pcc(out, ref_out)
+    assert p > 0.98, f"PCC {p:.5f} too low (blocks={num_blocks}, L={seq_len})"
