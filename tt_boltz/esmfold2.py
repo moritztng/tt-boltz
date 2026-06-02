@@ -957,6 +957,80 @@ class MSAEncoder(TorchWrapper):
 
 
 # ===========================================================================
+# End-to-end orchestration (parcae trunk recurrence + heads + sampler)
+# ===========================================================================
+
+
+class ParcaeParams:
+    """Host-side parcae state-space params + small glue linears for the trunk."""
+
+    def __init__(self, sd: dict):
+        self.log_a = sd["parcae_log_a"]            # [256]
+        self.log_delta = sd["parcae_log_delta"]    # [256]
+        self.b_cont = sd["parcae_b_cont"]          # [256,256]
+        self.in_norm_w = sd["parcae_input_norm.weight"]; self.in_norm_b = sd["parcae_input_norm.bias"]
+        self.readout_w = sd["parcae_readout.weight"]
+        self.z1_w = sd["z_init_1.weight"]; self.z2_w = sd["z_init_2.weight"]
+        self.tb_w = sd["token_bonds.weight"]
+
+    def dynamics(self):
+        delta = F.softplus(self.log_delta)
+        a = torch.exp(-delta * torch.exp(self.log_a))      # [256]
+        b = delta[:, None] * self.b_cont                   # [256,256]
+        return a, b
+
+
+def esmfold2_fold(components, parcae: ParcaeParams, inputs, *, num_loops=3,
+                  sample_steps=14, seed=0):
+    """End-to-end ESMFold2 forward (single-sequence; LM/MSA optional).
+
+    `components` is a dict of the tested ttnn TorchWrappers: inputs_embedder,
+    rel_pos, folding_trunk (48-blk main), lm_encoder (4-blk) [opt], language_model
+    [opt], msa_encoder [opt], parcae_coda (2-blk), structure_head, distogram_head,
+    confidence_head. The parcae state-space recurrence and the small z-init /
+    token-bonds / readout linears run on host. Returns dict with coords + logits.
+    """
+    lin = lambda x, w: F.linear(x, w)
+    x_inputs = components["inputs_embedder"](
+        inputs["aatype"], inputs["profile"], inputs["deletion_mean"], inputs["ref_pos"],
+        inputs["atom_mask"], inputs["ref_space_uid"], inputs["ref_charge"],
+        inputs["ref_element"], inputs["ref_atom_name_chars"], inputs["atom_to_token"])  # [B,L,451]
+
+    relpos = components["rel_pos"](inputs["residue_index"], inputs["asym_id"], inputs["sym_id"],
+                                   inputs["entity_id"], inputs["token_index"])  # [B,L,L,256]
+    z_init = (lin(x_inputs, parcae.z1_w).unsqueeze(2) + lin(x_inputs, parcae.z2_w).unsqueeze(1)
+              + relpos + lin(inputs["token_bonds"].unsqueeze(-1), parcae.tb_w))
+
+    lm_z = components["language_model"](inputs["lm_hidden_states"]) if components.get("language_model") and inputs.get("lm_hidden_states") is not None else None
+
+    a, b = parcae.dynamics()
+    z = torch.zeros_like(z_init)
+    for _ in range(num_loops + 1):
+        z_inject = z_init
+        if components.get("lm_encoder") is not None and lm_z is not None:
+            z_inject = z_inject + components["lm_encoder"](lm_z)
+        if components.get("msa_encoder") is not None and inputs.get("msa_oh") is not None:
+            z_inject = z_inject + components["msa_encoder"](
+                z_inject, x_inputs, inputs["msa_oh"], inputs["has_deletion"],
+                inputs["deletion_value"], inputs["msa_mask"])
+        injected = F.layer_norm(z_inject, (256,), parcae.in_norm_w, parcae.in_norm_b, 1e-5)
+        z = a * z + lin(injected, b)
+        z = components["folding_trunk"](z)
+    z = lin(z, parcae.readout_w)
+    z = components["parcae_coda"](z)
+
+    distogram_logits = components["distogram_head"](z)
+    coords = components["structure_head"].sample(
+        z, x_inputs, relpos, inputs["ref_pos"], inputs["ref_charge"], inputs["atom_mask"],
+        inputs["ref_element"], inputs["ref_atom_name_chars"], inputs["ref_space_uid"],
+        inputs["atom_to_token"], steps=sample_steps, seed=seed)
+    rep = coords[:, inputs["distogram_atom_idx"][0]] if inputs.get("distogram_atom_idx") is not None else coords[:, :z.shape[1]]
+    conf = components["confidence_head"](x_inputs, z, rep, inputs["atom_to_token"], inputs["intra_idx"])
+    return {"sample_atom_coords": coords, "distogram_logits": distogram_logits,
+            "pae_logits": conf[0], "pde_logits": conf[1], "plddt_logits": conf[2], "resolved_logits": conf[3]}
+
+
+# ===========================================================================
 # Diffusion sampler (host orchestration over the ttnn DiffusionModule)
 # ===========================================================================
 
