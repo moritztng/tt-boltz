@@ -17,6 +17,7 @@ from esmfold2_reference import (  # noqa: E402
     make_diffusion_conditioning,
     make_diffusion_transformer,
     make_folding_trunk,
+    make_swa_atom_transformer,
 )
 
 from tt_boltz import esmfold2 as tt_ef2  # noqa: E402
@@ -46,6 +47,25 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("n_atoms", [80, 200])
+def test_swa_atom_transformer(n_atoms):
+    ref = make_swa_atom_transformer(n_blocks=3)
+    q = torch.randn(1, n_atoms, 128)
+    c = torch.randn(1, n_atoms, 128)
+    ref_pos = torch.randn(1, n_atoms, 3)
+    uid = torch.randint(0, 8, (1, n_atoms))
+    cos, sin = ref._build_3d_rope(ref_pos, uid)
+    ref_out = ref(q, c, (cos, sin))
+
+    mod = tt_ef2.SWAAtomTransformer(n_blocks=3, n_heads=4, swa_window_size=128, d_atom=128)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(q, c, ref_pos, uid)
+
+    assert out.shape == ref_out.shape
+    p = pcc(out, ref_out)
+    assert p > 0.98, f"PCC {p:.5f} too low (n_atoms={n_atoms})"
 
 
 @pytest.mark.parametrize("seq_len", [37, 64])

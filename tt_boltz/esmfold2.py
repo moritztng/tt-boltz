@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 import ttnn
 
-from tt_boltz.esmc import SwiGLUFFN
+from tt_boltz.esmc import SwiGLUFFN, apply_rotary
 from tt_boltz.tenstorrent import (
     CORE_GRID_MAIN,
     Module,
@@ -418,3 +418,153 @@ class DiffusionConditioning(TorchWrapper):
             self._from_torch(relpos), self._from_torch(n_raw.float()),
         )
         return self._to_torch(s), self._to_torch(z)
+
+
+# ===========================================================================
+# Atom encoder/decoder — SWA (sliding-window) attention with 3D RoPE
+# ===========================================================================
+
+
+def build_3d_rope_tables(ref_pos, ref_space_uid, head_dim, n_spatial_per_axis,
+                         n_uid_pairs, spatial_base_freq, uid_base_freq):
+    """Host-side 3D RoPE cos/sin, returned duplicated as [B, 1, N, head_dim]
+    (matches modeling_esmfold2_common.build_3d_rope + apply_rotary_emb_3d)."""
+    B, N = ref_pos.shape[:2]
+    half = head_dim // 2
+    spatial_inv = 1.0 / (spatial_base_freq ** (torch.arange(n_spatial_per_axis, dtype=torch.float32) / n_spatial_per_axis))
+    uid_inv = 1.0 / (uid_base_freq ** (torch.arange(n_uid_pairs, dtype=torch.float32) / n_uid_pairs))
+    spatial = torch.einsum("bna,k->bnak", ref_pos.float(), spatial_inv).reshape(B, N, 3 * n_spatial_per_axis)
+    uid = torch.einsum("bn,k->bnk", ref_space_uid.float(), uid_inv)
+    freqs = torch.cat([spatial, uid], dim=-1)
+    if freqs.shape[-1] < half:
+        freqs = torch.cat([freqs, torch.zeros(B, N, half - freqs.shape[-1])], dim=-1)
+    cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).view(B, 1, N, head_dim)
+    sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).view(B, 1, N, head_dim)
+    return cos, sin
+
+
+def band_mask(n: int, half_window: int):
+    """Sliding-window additive attention bias [1, 1, N, N] (0 inside band, -inf outside)."""
+    idx = torch.arange(n)
+    allowed = (idx[:, None] - idx[None, :]).abs() <= half_window
+    return torch.where(allowed, 0.0, float("-inf")).view(1, 1, n, n)
+
+
+def _rms_norm(x, ck, eps=1e-6):
+    return ttnn.rms_norm(x, epsilon=eps, compute_kernel_config=ck)
+
+
+class SWAAttention(Module):
+    """Sliding-window attention with 3D RoPE, qk RMSNorm, sigmoid gate."""
+
+    def __init__(self, n_heads: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.n_heads = n_heads
+        self.qkv_w = self.torch_to_tt("Wqkv.weight")
+        self.gate_w = self.torch_to_tt("gate_proj.weight")
+        self.out_w = self.torch_to_tt("out_proj.weight")
+
+    def __call__(self, x, cos, sin, attn_mask):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        head_dim = x.shape[-1] // self.n_heads
+        qkv = ttnn.unsqueeze(lin(x, self.qkv_w), 1)  # [B,1,N,3d]
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=self.n_heads, num_kv_heads=self.n_heads,
+            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(qkv)
+        q = apply_rotary(_rms_norm(q, ck), cos, sin)
+        k = apply_rotary(_rms_norm(k, ck), cos, sin)
+        ctx = ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=False, scale=head_dim**-0.5,
+            program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
+        )
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
+        ctx = ttnn.squeeze(ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG), 1)
+        gate = ttnn.sigmoid(lin(x, self.gate_w))
+        ctx = ttnn.multiply(ctx, gate)
+        ttnn.deallocate(gate)
+        out = lin(ctx, self.out_w)
+        ttnn.deallocate(ctx)
+        return out
+
+
+class SWAAtomBlock(Module):
+    """adaLN-Zero (RMSNorm * (1+scale) + shift) + SWA attn + SwiGLU FFN, gated residuals."""
+
+    def __init__(self, n_heads: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.adaln_w = self.torch_to_tt("adaln_modulation.1.weight")
+        self.attn = SWAAttention(n_heads, self.scope("attn"), compute_kernel_config)
+        self.ffn_up = self.torch_to_tt("ffn.w_up.weight")
+        self.ffn_down = self.torch_to_tt("ffn.w_down.weight")
+
+    def _modulate(self, x, scale, shift):
+        ck = self.compute_kernel_config
+        return ttnn.add(ttnn.multiply(_rms_norm(x, ck), ttnn.add(scale, 1.0)), shift)
+
+    def __call__(self, x, c_l, cos, sin, attn_mask):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        mod = lin(ttnn.silu(c_l), self.adaln_w)  # [B,N,6d]
+        sa, ca, ga, sf, cf, gf = ttnn.chunk(mod, 6, dim=-1)
+        ttnn.deallocate(mod)
+
+        attn_in = self._modulate(x, ca, sa)
+        attn_out = self.attn(attn_in, cos, sin, attn_mask)
+        x = ttnn.add(x, ttnn.multiply(ga, attn_out))
+        ttnn.deallocate(attn_out)
+
+        ffn_in = self._modulate(x, cf, sf)
+        h1, h2 = ttnn.chunk(lin(ffn_in, self.ffn_up), 2, dim=-1)
+        ttnn.deallocate(ffn_in)
+        ffn_out = lin(ttnn.multiply(ttnn.silu(h1), h2), self.ffn_down)
+        ttnn.deallocate(h1); ttnn.deallocate(h2)
+        x = ttnn.add(x, ttnn.multiply(gf, ffn_out))
+        ttnn.deallocate(ffn_out)
+        return x
+
+
+class SWAAtomTransformerModel(Module):
+    def __init__(self, n_heads: int, n_blocks: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.blocks = [
+            SWAAtomBlock(n_heads, self.scope(f"blocks.{i}"), compute_kernel_config)
+            for i in range(n_blocks)
+        ]
+
+    def __call__(self, q_l, c_l, cos, sin, attn_mask):
+        for block in self.blocks:
+            q_l = block(q_l, c_l, cos, sin, attn_mask)
+        return q_l
+
+
+# Atom 3D-RoPE config (DiffusionModule defaults).
+ATOM_ROPE = dict(n_spatial_per_axis=2, n_uid_pairs=10, spatial_base_freq=20.0, uid_base_freq=10000.0)
+
+
+class SWAAtomTransformer(TorchWrapper):
+    """Token-free SWA atom transformer (torch in/out).
+    forward(q_l[B,N,d], c_l[B,N,d], ref_pos[B,N,3], ref_space_uid[B,N]) -> [B,N,d]."""
+
+    def __init__(self, n_blocks: int = 3, n_heads: int = 4, swa_window_size: int = 128, d_atom: int = 128):
+        super().__init__()
+        self.n_blocks = n_blocks
+        self.n_heads = n_heads
+        self.half_window = swa_window_size // 2
+        self.head_dim = d_atom // n_heads
+
+    def _create_module(self, weights: WeightScope) -> SWAAtomTransformerModel:
+        return SWAAtomTransformerModel(self.n_heads, self.n_blocks, weights, self.compute_kernel_config)
+
+    def forward(self, q_l, c_l, ref_pos, ref_space_uid):
+        n = q_l.shape[1]
+        cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, self.head_dim, **ATOM_ROPE)
+        mask = band_mask(n, self.half_window)
+        out = self.module(
+            self._from_torch(q_l), self._from_torch(c_l),
+            self._from_torch(cos.float()), self._from_torch(sin.float()),
+            self._from_torch(mask.float()),
+        )
+        return self._to_torch(out)
