@@ -14,9 +14,11 @@ import ttnn
 sys.path.insert(0, os.path.dirname(__file__))
 from esmfold2_reference import (  # noqa: E402
     DIFFUSION_TOKEN,
+    make_confidence_core,
     make_diffusion_conditioning,
     make_diffusion_module,
     make_diffusion_transformer,
+    make_distogram_head,
     make_folding_trunk,
     make_swa_atom_transformer,
 )
@@ -48,6 +50,43 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("seq_len", [32, 64])
+def test_distogram_head(seq_len):
+    ref = make_distogram_head()
+    z = torch.randn(1, seq_len, seq_len, 256)
+    ref_out = ref(z + z.transpose(-2, -3))
+
+    mod = tt_ef2.DistogramHeadModel()
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(z)
+    assert out.shape == ref_out.shape
+    assert pcc(out, ref_out) > 0.999
+
+
+@pytest.mark.parametrize("seq_len", [32, 64])
+def test_confidence_head(seq_len):
+    ref = make_confidence_core()
+    L = seq_len
+    apt = torch.randint(1, 6, (L,))
+    tok_idx = torch.repeat_interleave(torch.arange(L), apt).unsqueeze(0)
+    intra = torch.cat([torch.arange(a) for a in apt]).unsqueeze(0)  # intra-token position
+    A = tok_idx.shape[1]
+    s_inputs = torch.randn(1, L, 451)
+    z = torch.randn(1, L, L, 256)
+    rep_coords = torch.randn(1, L, 3) * 10
+    ref_out = ref(s_inputs, z, rep_coords, tok_idx, intra)
+
+    mod = tt_ef2.ConfidenceHead(conf_trunk_layers=4)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(s_inputs, z, rep_coords, tok_idx, intra)
+
+    names = ["pae", "pde", "plddt", "resolved"]
+    for name, o, r in zip(names, out, ref_out):
+        assert o.shape == r.shape, (name, o.shape, r.shape)
+        p = pcc(o, r)
+        assert p > 0.98, f"{name} PCC {p:.5f} too low (L={seq_len})"
 
 
 @pytest.mark.parametrize("n_tokens", [8, 16])

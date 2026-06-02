@@ -699,3 +699,148 @@ class DiffusionModule(TorchWrapper):
         out = (sigma2 / (sigma2 + t2))[:, None, None] * x_noisy
         out = out + ((sigma * t) / torch.sqrt(sigma2 + t2))[:, None, None] * r_update
         return out
+
+
+# ===========================================================================
+# Distogram + Confidence heads
+# ===========================================================================
+
+
+class DistogramHead(Module):
+    """Linear on the symmetrized pair: distogram_head(z + z.transpose(L axes))."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.w = self.torch_to_tt("weight")
+        self.b = self.torch_to_tt("bias", transform=_ROW)
+
+    def __call__(self, z: ttnn.Tensor) -> ttnn.Tensor:
+        zs = ttnn.add(z, ttnn.permute(z, (0, 2, 1, 3)))
+        return ttnn.linear(zs, self.w, bias=self.b, compute_kernel_config=self.compute_kernel_config,
+                           dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+
+
+class DistogramHeadModel(TorchWrapper):
+    def _create_module(self, weights: WeightScope) -> DistogramHead:
+        return DistogramHead(weights, self.compute_kernel_config)
+
+    def forward(self, z):
+        return self._to_torch(self.module(self._from_torch(z)))
+
+
+class RowAttentionPooling(Module):
+    """Per-row scalar attention over columns, weighted sum of z, out_proj."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.attn_w = self.torch_to_tt("attn_proj.weight")
+        self.out_w = self.torch_to_tt("out_proj.weight")
+
+    def __call__(self, z: ttnn.Tensor) -> ttnn.Tensor:
+        ck = self.compute_kernel_config
+        scores = ttnn.linear(z, self.attn_w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,L,L,1]
+        scores = ttnn.softmax(scores, dim=-2)  # over columns m (the L axis at dim 2)
+        weights = ttnn.permute(scores, (0, 1, 3, 2))  # [B,L,1,L]
+        ttnn.deallocate(scores)
+        pooled = ttnn.matmul(weights, z, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,L,1,d]
+        ttnn.deallocate(weights)
+        pooled = ttnn.squeeze(pooled, 2)  # [B,L,d]
+        return ttnn.linear(pooled, self.out_w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+
+
+class ConfidenceHeadModel(Module):
+    """Learned core: build pair from s/z, refine with folding trunk, emit logits."""
+
+    def __init__(self, conf_trunk_layers: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        ck = compute_kernel_config
+        self.s_in_norm_w = self.torch_to_tt("s_inputs_norm.weight")
+        self.s_in_norm_b = self.torch_to_tt("s_inputs_norm.bias")
+        self.s_to_z_w = self.torch_to_tt("s_to_z.weight")
+        self.s_to_z_t_w = self.torch_to_tt("s_to_z_transpose.weight")
+        self.prod_in1_w = self.torch_to_tt("s_to_z_prod_in1.weight")
+        self.prod_in2_w = self.torch_to_tt("s_to_z_prod_in2.weight")
+        self.prod_out_w = self.torch_to_tt("s_to_z_prod_out.weight")
+        self.z_norm_w = self.torch_to_tt("z_norm.weight")
+        self.z_norm_b = self.torch_to_tt("z_norm.bias")
+        self.folding_trunk = FoldingTrunkModel(conf_trunk_layers, self.scope("folding_trunk"), ck)
+        self.row_pool = RowAttentionPooling(self.scope("row_attention_pooling"), ck)
+        self.pae_ln_w = self.torch_to_tt("pae_ln.weight"); self.pae_ln_b = self.torch_to_tt("pae_ln.bias")
+        self.pae_w = self.torch_to_tt("pae_head.weight")
+        self.pde_ln_w = self.torch_to_tt("pde_ln.weight"); self.pde_ln_b = self.torch_to_tt("pde_ln.bias")
+        self.pde_w = self.torch_to_tt("pde_head.weight")
+        self.plddt_ln_w = self.torch_to_tt("plddt_ln.weight"); self.plddt_ln_b = self.torch_to_tt("plddt_ln.bias")
+        self.resolved_ln_w = self.torch_to_tt("resolved_ln.weight"); self.resolved_ln_b = self.torch_to_tt("resolved_ln.bias")
+
+    def __call__(self, s_inputs, z, pair_dist_embed, gather_g, w_plddt, w_resolved):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        ln = lambda t, w, b: ttnn.layer_norm(t, weight=w, bias=b, epsilon=1e-5, compute_kernel_config=ck)
+        L = z.shape[1]
+
+        s_n = ln(s_inputs, self.s_in_norm_w, self.s_in_norm_b)
+        zb = ln(z, self.z_norm_w, self.z_norm_b)
+        zb = ttnn.add(zb, ttnn.unsqueeze(lin(s_n, self.s_to_z_w), 2))       # [B,L,1,256]
+        zb = ttnn.add(zb, ttnn.unsqueeze(lin(s_n, self.s_to_z_t_w), 1))     # [B,1,L,256]
+        # outer product: in1[:,:,None,:] * in2[:,None,:,:]  (expand both to [B,L,L,256])
+        a = ttnn.repeat(ttnn.unsqueeze(lin(s_n, self.prod_in1_w), 2), (1, 1, L, 1))
+        b = ttnn.repeat(ttnn.unsqueeze(lin(s_n, self.prod_in2_w), 1), (1, L, 1, 1))
+        zb = ttnn.add(zb, lin(ttnn.multiply(a, b), self.prod_out_w))
+        ttnn.deallocate(a); ttnn.deallocate(b)
+        pair = ttnn.add(zb, pair_dist_embed)
+        # folding_trunk deallocates its input; clone so we keep `pair` for the
+        # residual (reference: pair = pair + folding_trunk(pair)).
+        pair = ttnn.add(pair, self.folding_trunk(ttnn.clone(pair, memory_config=ttnn.DRAM_MEMORY_CONFIG)))
+
+        single = self.row_pool(pair)
+        pae_logits = lin(ln(pair, self.pae_ln_w, self.pae_ln_b), self.pae_w)
+        pde_logits = lin(ln(pair, self.pde_ln_w, self.pde_ln_b), self.pde_w)
+
+        # per-atom plddt/resolved: gather single->atoms, then per-atom weight matmul
+        s_at = ttnn.matmul(gather_g, single, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,A,768]
+        plddt_in = ttnn.unsqueeze(ln(s_at, self.plddt_ln_w, self.plddt_ln_b), 2)   # [B,A,1,768]
+        resolved_in = ttnn.unsqueeze(ln(s_at, self.resolved_ln_w, self.resolved_ln_b), 2)
+        plddt_logits = ttnn.squeeze(ttnn.matmul(plddt_in, w_plddt, compute_kernel_config=ck, dtype=ttnn.bfloat16), 2)
+        resolved_logits = ttnn.squeeze(ttnn.matmul(resolved_in, w_resolved, compute_kernel_config=ck, dtype=ttnn.bfloat16), 2)
+        return pae_logits, pde_logits, plddt_logits, resolved_logits
+
+
+class ConfidenceHead(TorchWrapper):
+    """Confidence head core (torch in/out). Returns pae/pde/plddt/resolved logits.
+
+    Host-side: distogram-bin embedding (learned table indexed by binned predicted
+    distances), per-atom weight gather (plddt/resolved weights by intra-token idx),
+    and the token->atom gather matrix.
+    """
+
+    def __init__(self, conf_trunk_layers: int = 4, min_dist: float = 3.25,
+                 max_dist: float = 50.75, distogram_bins: int = 39):
+        super().__init__()
+        self.conf_trunk_layers = conf_trunk_layers
+        self.boundaries = torch.linspace(min_dist, max_dist, distogram_bins - 1)
+
+    def _create_module(self, weights: WeightScope) -> ConfidenceHeadModel:
+        self._dist_embed = weights["dist_bin_pairwise_embed.weight"]  # [bins, 256]
+        self._plddt_weight = weights["plddt_weight"]                  # [23, 768, 50]
+        self._resolved_weight = weights["resolved_weight"]            # [23, 768, 2]
+        return ConfidenceHeadModel(self.conf_trunk_layers, weights, self.compute_kernel_config)
+
+    def forward(self, s_inputs, z, rep_coords, atom_to_token, intra_idx):
+        B, L = z.shape[0], z.shape[1]
+        # distogram bins from predicted representative-atom distances
+        d = torch.cdist(rep_coords, rep_coords, compute_mode="donot_use_mm_for_euclid_dist")
+        bins = (d.unsqueeze(-1) > self.boundaries).sum(-1).long()  # [B,L,L]
+        pair_dist_embed = self._dist_embed[bins]  # [B,L,L,256]
+
+        A = atom_to_token.shape[1]
+        oh = F.one_hot(atom_to_token[0].long(), L).float()  # [A,L]
+        gather_g = oh.unsqueeze(0)  # [1,A,L]
+        w_plddt = self._plddt_weight[intra_idx[0]].unsqueeze(0)        # [1,A,768,50]
+        w_resolved = self._resolved_weight[intra_idx[0]].unsqueeze(0)  # [1,A,768,2]
+
+        ft = self._from_torch
+        pae, pde, plddt, resolved = self.module(
+            ft(s_inputs), ft(z), ft(pair_dist_embed.float()), ft(gather_g),
+            ft(w_plddt.float()), ft(w_resolved.float()),
+        )
+        return tuple(self._to_torch(t) for t in (pae, pde, plddt, resolved))
