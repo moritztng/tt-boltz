@@ -95,6 +95,24 @@ def make_diffusion_conditioning(seed: int = 0):
     return common.DiffusionConditioning(**DIFFUSION_COND).eval()
 
 
+SWA_ATOM = dict(
+    d_atom=128, n_blocks=3, n_heads=4, swa_window_size=128, expansion_ratio=2,
+    spatial_rope_base_frequency=20.0, n_spatial_rope_pairs_per_axis=2,
+    n_uid_rope_pairs=10, uid_rope_base_frequency=10000.0,
+)
+
+
+def make_swa_atom_transformer(n_blocks: int | None = None, seed: int = 0):
+    """Reference SWAAtomTransformer (random init)."""
+    import torch
+
+    torch.manual_seed(seed)
+    cfg = dict(SWA_ATOM)
+    if n_blocks is not None:
+        cfg["n_blocks"] = n_blocks
+    return common.SWAAtomTransformer(**cfg).eval()
+
+
 def make_folding_trunk(n_layers: int | None = None, seed: int = 0):
     """Reference FoldingTrunk (random init). chunk_size=None for bit-exact parity."""
     import torch
