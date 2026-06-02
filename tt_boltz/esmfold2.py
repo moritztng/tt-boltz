@@ -780,6 +780,135 @@ class InputsEmbedder(TorchWrapper):
 
 
 # ===========================================================================
+# MSA encoder (optional trunk; conditions pair on an MSA)
+# ===========================================================================
+
+
+class OuterProductMean(Module):
+    """MSA -> pair update via outer-product mean (d_hidden=32, tile-aligned -> full ttnn)."""
+
+    def __init__(self, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.norm_w = self.torch_to_tt("norm.weight"); self.norm_b = self.torch_to_tt("norm.bias")
+        self.W = self.torch_to_tt("W.weight")
+        self.Wout = self.torch_to_tt("Wout.weight"); self.Wout_b = self.torch_to_tt("Wout.bias", transform=_ROW)
+
+    def __call__(self, m, recip_nvalid):  # m [B,L,M,128]; recip_nvalid [B,L,L,1]
+        ck = self.compute_kernel_config
+        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        B, L, M = m.shape[0], m.shape[1], m.shape[2]
+        x = lin(ttnn.layer_norm(m, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck), self.W)
+        a, b = ttnn.chunk(x, 2, dim=-1)  # [B,L,M,32]
+        a2 = ttnn.reshape(ttnn.permute(a, (0, 1, 3, 2)), (B, L * 32, M))   # [B,L*32,M]
+        b2 = ttnn.reshape(ttnn.permute(b, (0, 2, 1, 3)), (B, M, L * 32))   # [B,M,L*32]
+        prod = ttnn.matmul(a2, b2, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,L*32,L*32]
+        prod = ttnn.permute(ttnn.reshape(prod, (B, L, 32, L, 32)), (0, 1, 3, 2, 4))  # [B,L,L,32,32]
+        outer = ttnn.reshape(prod, (B, L, L, 1024))
+        out = lin(outer, self.Wout, self.Wout_b)  # [B,L,L,256]
+        return ttnn.multiply(out, recip_nvalid)
+
+
+class MSAPairWeightedAveraging(Module):
+    """Pair-biased MSA row update (head_width 16 sub-tile -> contraction on host)."""
+
+    def __init__(self, n_heads, head_width, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.n_heads, self.head_width = n_heads, head_width
+        self.ns_w = self.torch_to_tt("norm_single.weight"); self.ns_b = self.torch_to_tt("norm_single.bias")
+        self.cb_ln_w = self.torch_to_tt("compute_bias.0.weight"); self.cb_ln_b = self.torch_to_tt("compute_bias.0.bias")
+        self.cb_w = self.torch_to_tt("compute_bias.1.weight")
+        self.Wv = self.torch_to_tt("Wv.weight"); self.Wgate = self.torch_to_tt("Wgate.weight")
+        self.Wout = self.torch_to_tt("Wout.weight")
+
+    def __call__(self, m, pair):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        B, L, M = m.shape[0], m.shape[1], m.shape[2]
+        h, dh = self.n_heads, self.head_width
+        mn = ttnn.layer_norm(m, weight=self.ns_w, bias=self.ns_b, epsilon=1e-5, compute_kernel_config=ck)
+        bias = lin(ttnn.layer_norm(pair, weight=self.cb_ln_w, bias=self.cb_ln_b, epsilon=1e-5, compute_kernel_config=ck), self.cb_w)  # [B,L,L,8]
+        v = lin(mn, self.Wv)            # [B,L,M,128]
+        gate = ttnn.sigmoid(lin(mn, self.Wgate))
+        # non-learned 5D contraction on host (head_width 16 is sub-tile)
+        bias_t = torch.Tensor(ttnn.to_torch(bias)).float()
+        attn = torch.softmax(bias_t, dim=-2)  # over j
+        v_t = torch.Tensor(ttnn.to_torch(v)).float().reshape(B, L, M, h, dh)
+        gate_t = torch.Tensor(ttnn.to_torch(gate)).float().reshape(B, L, M, h, dh)
+        out = torch.einsum("bijh,bjmhd,bimhd->bimhd", attn, v_t, gate_t).reshape(B, L, M, h * dh)
+        out_tt = ttnn.from_torch(out, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        return lin(out_tt, self.Wout)
+
+
+class MSAEncoderBlock(Module):
+    def __init__(self, n_heads_msa, msa_head_width, is_final, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.is_final = is_final
+        self.opm = OuterProductMean(self.scope("outer_product_mean"), compute_kernel_config)
+        if not is_final:
+            self.mpwa = MSAPairWeightedAveraging(n_heads_msa, msa_head_width, self.scope("msa_pair_weighted_averaging"), compute_kernel_config)
+            self.msa_transition = SwiGLUFFN(_remap_transition_named(self.weights.as_dict(), "msa_transition"), compute_kernel_config)
+        self.tri_out = TriangleMultiplication(False, _remap_trimul(self.weights.as_dict(), "tri_mul_out._engine"), compute_kernel_config)
+        self.tri_in = TriangleMultiplication(True, _remap_trimul(self.weights.as_dict(), "tri_mul_in._engine"), compute_kernel_config)
+        self.pair_transition = SwiGLUFFN(_remap_transition_named(self.weights.as_dict(), "pair_transition"), compute_kernel_config)
+
+    def __call__(self, m, pair, recip_nvalid):
+        pair = ttnn.add(pair, self.opm(m, recip_nvalid))
+        if not self.is_final:
+            m = ttnn.add(m, self.mpwa(m, pair))
+            m = ttnn.add(m, self.msa_transition(m))
+        pair = ttnn.add(pair, self.tri_out(pair, None))
+        pair = ttnn.add(pair, self.tri_in(pair, None))
+        pair = ttnn.add(pair, self.pair_transition(pair))
+        return m, pair
+
+
+def _remap_transition_named(sd: dict, prefix: str) -> WeightScope:
+    return WeightScope({
+        "0.weight": sd[f"{prefix}.norm.weight"], "0.bias": sd[f"{prefix}.norm.bias"],
+        "1.weight": sd[f"{prefix}.ffn.w12.weight"], "3.weight": sd[f"{prefix}.ffn.w3.weight"],
+    })
+
+
+class MSAEncoderModel(Module):
+    def __init__(self, n_layers, n_heads_msa, msa_head_width, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.embed_w = self.torch_to_tt("embed.weight")
+        self.project_w = self.torch_to_tt("project_inputs.weight")
+        self.blocks = [
+            MSAEncoderBlock(n_heads_msa, msa_head_width, i == n_layers - 1, self.scope(f"blocks.{i}"), compute_kernel_config)
+            for i in range(n_layers)
+        ]
+
+    def __call__(self, x_pair, x_inputs, m_feat, recip_nvalid):
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        m = ttnn.add(lin(m_feat, self.embed_w), ttnn.unsqueeze(lin(x_inputs, self.project_w), 2))
+        pair = x_pair
+        for block in self.blocks:
+            m, pair = block(m, pair, recip_nvalid)
+        return pair
+
+
+class MSAEncoder(TorchWrapper):
+    """MSA encoder: refine pair using an MSA. forward(x_pair, x_inputs, msa_oh, has_deletion, deletion_value, msa_mask)."""
+
+    def __init__(self, n_layers: int = 4, n_heads_msa: int = 8, msa_head_width: int = 16):
+        super().__init__()
+        self.n_layers, self.n_heads_msa, self.msa_head_width = n_layers, n_heads_msa, msa_head_width
+
+    def _create_module(self, weights: WeightScope) -> MSAEncoderModel:
+        return MSAEncoderModel(self.n_layers, self.n_heads_msa, self.msa_head_width, weights, self.compute_kernel_config)
+
+    def forward(self, x_pair, x_inputs, msa_oh, has_deletion, deletion_value, msa_mask):
+        m_feat = torch.cat([msa_oh, has_deletion.unsqueeze(-1), deletion_value.unsqueeze(-1)], dim=-1)  # [B,L,M,35]
+        mask_f = msa_mask.float()
+        n_valid = (mask_f @ mask_f.transpose(-1, -2)).clamp(min=1.0).unsqueeze(-1)  # [B,L,L,1]
+        ft = self._from_torch
+        out = self.module(ft(x_pair), ft(x_inputs), ft(m_feat.float()), ft((1.0 / n_valid).float()))
+        return self._to_torch(out)
+
+
+# ===========================================================================
 # Distogram + Confidence heads
 # ===========================================================================
 

@@ -137,6 +137,64 @@ def make_diffusion_module(seed: int = 0):
     return m
 
 
+def make_msa_encoder(seed: int = 0):
+    """Self-contained reference MSAEncoder (matches modeling_esmfold2.MSAEncoder)."""
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+
+    class PairTransitionRef(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.norm = nn.LayerNorm(d)
+            self.ffn = common.SwiGLUMLP(d, expansion_ratio=4, bias=False)
+
+        def forward(self, x):
+            return self.ffn(self.norm(x))
+
+    class BlockRef(nn.Module):
+        def __init__(self, is_final):
+            super().__init__()
+            self.is_final = is_final
+            self.outer_product_mean = common.OuterProductMean(128, 32, 256)
+            if not is_final:
+                self.msa_pair_weighted_averaging = common.MSAPairWeightedAveraging(128, 256, 8, 16)
+                self.msa_transition = PairTransitionRef(128)
+            self.tri_mul_out = common.TriangleMultiplicativeUpdate(dim=256, _outgoing=True)
+            self.tri_mul_in = common.TriangleMultiplicativeUpdate(dim=256, _outgoing=False)
+            self.tri_mul_out.set_chunk_size(None); self.tri_mul_in.set_chunk_size(None)
+            self.pair_transition = PairTransitionRef(256)
+
+        def forward(self, m, pair, msa_mask, pair_mask):
+            pair = pair + self.outer_product_mean(m, msa_mask)
+            if not self.is_final:
+                m = m + self.msa_pair_weighted_averaging(m, pair, pair_mask)
+                m = m + self.msa_transition(m)
+            pair = pair + self.tri_mul_out(pair, mask=pair_mask)
+            pair = pair + self.tri_mul_in(pair, mask=pair_mask)
+            pair = pair + self.pair_transition(pair)
+            return m, pair
+
+    class MSAEncoderRef(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(35, 128, bias=False)
+            self.project_inputs = nn.Linear(451, 128, bias=False)
+            self.blocks = nn.ModuleList([BlockRef(i == 3) for i in range(4)])
+
+        def forward(self, x_pair, x_inputs, msa_oh, has_deletion, deletion_value, msa_mask):
+            m_feat = torch.cat([msa_oh, has_deletion.unsqueeze(-1), deletion_value.unsqueeze(-1)], dim=-1)
+            m = self.embed(m_feat) + self.project_inputs(x_inputs).unsqueeze(2)
+            tok_mask = msa_mask[:, :, 0].bool()
+            pair_mask = tok_mask.unsqueeze(2) & tok_mask.unsqueeze(1)
+            for block in self.blocks:
+                m, x_pair = block(m, x_pair, msa_mask, pair_mask)
+            return x_pair
+
+    return MSAEncoderRef().eval()
+
+
 def make_relpos(seed: int = 0):
     """Reference relative-position encoding."""
     import torch

@@ -21,6 +21,7 @@ from esmfold2_reference import (  # noqa: E402
     make_distogram_head,
     make_folding_trunk,
     make_inputs_embedder,
+    make_msa_encoder,
     make_relpos,
     make_swa_atom_transformer,
 )
@@ -52,6 +53,25 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("seq_len,depth", [(32, 8), (64, 16)])
+def test_msa_encoder(seq_len, depth):
+    ref = make_msa_encoder()
+    L, M = seq_len, depth
+    xp = torch.randn(1, L, L, 256)
+    xi = torch.randn(1, L, 451)
+    oh = torch.randn(1, L, M, 33)
+    hd = torch.randn(1, L, M)
+    dv = torch.randn(1, L, M)
+    mm = torch.ones(1, L, M)
+    ref_out = ref(xp, xi, oh, hd, dv, mm)
+
+    mod = tt_ef2.MSAEncoder()
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(xp, xi, oh, hd, dv, mm)
+    assert out.shape == ref_out.shape
+    assert pcc(out, ref_out) > 0.99
 
 
 @pytest.mark.parametrize("seq_len", [37, 64])
