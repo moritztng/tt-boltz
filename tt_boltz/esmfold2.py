@@ -581,20 +581,22 @@ SIGMA_DATA = 16.0
 class AtomEncoder(Module):
     """ref atom features (+ noisy coords) -> token-aggregated repr a, atom repr q, c."""
 
-    def __init__(self, n_heads, n_blocks, state_dict: Weights, compute_kernel_config):
+    def __init__(self, n_heads, n_blocks, state_dict: Weights, compute_kernel_config,
+                 structure_prediction: bool = True):
         super().__init__(state_dict, compute_kernel_config)
+        self.structure_prediction = structure_prediction
         self.atom_linear_w = self.torch_to_tt("atom_linear.weight")
         self.atom_norm_w = self.torch_to_tt("atom_norm.weight")
         self.atom_norm_b = self.torch_to_tt("atom_norm.bias")
-        self.coords_w = self.torch_to_tt("coords_linear.weight")
+        self.coords_w = self.torch_to_tt("coords_linear.weight") if structure_prediction else None
         self.a2t_w = self.torch_to_tt("atom_to_token_linear.weight")
         self.transformer = SWAAtomTransformerModel(n_heads, n_blocks, self.scope("atom_transformer"), compute_kernel_config)
 
-    def __call__(self, atom_feats, r_input, cos, sin, band, scatter_m):
+    def __call__(self, atom_feats, cos, sin, band, scatter_m, r_input=None):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
         c = ttnn.layer_norm(lin(atom_feats, self.atom_linear_w), weight=self.atom_norm_w, bias=self.atom_norm_b, epsilon=1e-5, compute_kernel_config=ck)
-        q = ttnn.add(c, lin(r_input, self.coords_w))
+        q = ttnn.add(c, lin(r_input, self.coords_w)) if self.structure_prediction else c
         q = self.transformer(q, c, cos, sin, band)
         q_to_a = ttnn.relu(lin(q, self.a2t_w))  # [B,N,d_token]
         a = ttnn.matmul(scatter_m, q_to_a, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
@@ -643,7 +645,7 @@ class DiffusionModuleModel(Module):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
         s, z = self.conditioning(s_inputs, z_trunk, relpos, n_raw)
-        a, q_skip, c_skip = self.atom_encoder(atom_feats, r_input, cos, sin, band, scatter_m)
+        a, q_skip, c_skip = self.atom_encoder(atom_feats, cos, sin, band, scatter_m, r_input=r_input)
         s_step = ttnn.layer_norm(s, weight=self.s_step_norm_w, bias=self.s_step_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = ttnn.add(a, lin(s_step, self.s_to_token_w))
         a = self.token_transformer(a, s, z)
@@ -699,6 +701,82 @@ class DiffusionModule(TorchWrapper):
         out = (sigma2 / (sigma2 + t2))[:, None, None] * x_noisy
         out = out + ((sigma * t) / torch.sqrt(sigma2 + t2))[:, None, None] * r_update
         return out
+
+
+# ===========================================================================
+# Inputs embedder + relative-position (pair init)
+# ===========================================================================
+
+
+def relpos_features(residue_index, asym_id, sym_id, entity_id, token_index,
+                    r_bins=32, c_bins=2):
+    """Host-build the relative-position one-hot features [B,L,L,n_feats]
+    (mirrors ResIdxAsymIdSymIdEntityIdEncoding.forward)."""
+    same_chain = asym_id.unsqueeze(2) == asym_id.unsqueeze(1)
+    same_res = residue_index.unsqueeze(2) == residue_index.unsqueeze(1)
+    same_entity = entity_id.unsqueeze(2) == entity_id.unsqueeze(1)
+
+    dij = torch.clip(residue_index.unsqueeze(2) - residue_index.unsqueeze(1) + r_bins, 0, 2 * r_bins)
+    dij = torch.where(same_chain, dij, torch.full_like(dij, 2 * r_bins + 1))
+    a_res = F.one_hot(dij, 2 * r_bins + 2)
+
+    dtok = torch.clip(token_index.unsqueeze(2) - token_index.unsqueeze(1) + r_bins, 0, 2 * r_bins)
+    dtok = torch.where(same_chain & same_res, dtok, torch.full_like(dtok, 2 * r_bins + 1))
+    a_tok = F.one_hot(dtok, 2 * r_bins + 2)
+
+    dch = torch.clip(sym_id.unsqueeze(2) - sym_id.unsqueeze(1) + c_bins, 0, 2 * c_bins)
+    dch = torch.where(same_chain, torch.full_like(dch, 2 * c_bins + 1), dch)
+    a_ch = F.one_hot(dch, 2 * c_bins + 2)
+
+    return torch.cat([a_res.float(), a_tok.float(), same_entity.float().unsqueeze(-1), a_ch.float()], dim=-1)
+
+
+class RelPosEncoding(TorchWrapper):
+    """Relative-position pair encoding: host one-hot features -> Linear(n_feats, d_pair)."""
+
+    def __init__(self, r_bins: int = 32, c_bins: int = 2):
+        super().__init__()
+        self.r_bins, self.c_bins = r_bins, c_bins
+
+    def _create_module(self, weights: WeightScope):
+        self._w = weights["embed.weight"]
+        return weights  # no ttnn submodule; we just hold the weight
+
+    def forward(self, residue_index, asym_id, sym_id, entity_id, token_index):
+        feats = relpos_features(residue_index, asym_id, sym_id, entity_id, token_index, self.r_bins, self.c_bins)
+        w = ttnn.from_torch(self._w.t(), layout=ttnn.TILE_LAYOUT, device=self.tt_device, dtype=ttnn.bfloat16)
+        out = ttnn.linear(self._from_torch(feats.float()), w, compute_kernel_config=self.compute_kernel_config,
+                          dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        return self._to_torch(out)
+
+
+class InputsEmbedder(TorchWrapper):
+    """Atom encoder (no coords) -> concat [a, aatype, profile, deletion_mean] = s_inputs [B,L,451]."""
+
+    def __init__(self, n_heads: int = 4, n_blocks: int = 3):
+        super().__init__()
+        self.n_heads, self.n_blocks = n_heads, n_blocks
+
+    def _create_module(self, weights: WeightScope) -> AtomEncoder:
+        return AtomEncoder(self.n_heads, self.n_blocks, weights.child("atom_attention_encoder"),
+                           self.compute_kernel_config, structure_prediction=False)
+
+    def forward(self, aatype, profile, deletion_mean, ref_pos, atom_mask, ref_space_uid,
+                ref_charge, ref_element, ref_atom_name_chars, atom_to_token):
+        B, N, L = ref_pos.shape[0], ref_pos.shape[1], aatype.shape[1]
+        atom_feats = torch.cat([
+            ref_pos, ref_charge.unsqueeze(-1), atom_mask.unsqueeze(-1).float(),
+            ref_element, ref_atom_name_chars.reshape(B, N, -1),
+        ], dim=-1)
+        cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, 32, **ATOM_ROPE)
+        band = band_mask(N, 64)
+        oh = F.one_hot(atom_to_token[0].long(), L).float() * atom_mask[0].float()[:, None]
+        scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)
+        ft = self._from_torch
+        a, _q, _c = self.module(ft(atom_feats.float()), ft(cos.float()), ft(sin.float()),
+                                ft(band.float()), ft(scatter_m.float()))
+        a = self._to_torch(a)  # [B,L,384]
+        return torch.cat([a, aatype, profile, deletion_mean.unsqueeze(-1)], dim=-1)
 
 
 # ===========================================================================

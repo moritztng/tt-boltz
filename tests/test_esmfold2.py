@@ -20,6 +20,8 @@ from esmfold2_reference import (  # noqa: E402
     make_diffusion_transformer,
     make_distogram_head,
     make_folding_trunk,
+    make_inputs_embedder,
+    make_relpos,
     make_swa_atom_transformer,
 )
 
@@ -50,6 +52,51 @@ def test_folding_trunk(n_layers, seq_len):
     assert out.shape == ref_out.shape, (out.shape, ref_out.shape)
     p = pcc(out, ref_out)
     assert p > 0.98, f"PCC {p:.5f} too low (n_layers={n_layers}, L={seq_len})"
+
+
+@pytest.mark.parametrize("seq_len", [37, 64])
+def test_relpos_encoding(seq_len):
+    ref = make_relpos()
+    L = seq_len
+    residue_index = torch.arange(L).unsqueeze(0)
+    asym_id = torch.zeros(1, L, dtype=torch.long)
+    sym_id = torch.zeros(1, L, dtype=torch.long)
+    entity_id = torch.zeros(1, L, dtype=torch.long)
+    token_index = torch.arange(L).unsqueeze(0)
+    ref_out = ref(residue_index, asym_id, sym_id, entity_id, token_index)
+
+    mod = tt_ef2.RelPosEncoding(r_bins=32, c_bins=2)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(residue_index, asym_id, sym_id, entity_id, token_index)
+    assert out.shape == ref_out.shape
+    assert pcc(out, ref_out) > 0.999
+
+
+@pytest.mark.parametrize("n_tokens", [16, 32])
+def test_inputs_embedder(n_tokens):
+    ref = make_inputs_embedder()
+    L = n_tokens
+    apt = torch.randint(1, 6, (L,))
+    tok_idx = torch.repeat_interleave(torch.arange(L), apt).unsqueeze(0)
+    N = tok_idx.shape[1]
+    aatype = torch.randn(1, L, 33)
+    profile = torch.randn(1, L, 33)
+    deletion_mean = torch.randn(1, L)
+    ref_pos = torch.randn(1, N, 3)
+    atom_mask = torch.ones(1, N)
+    uid = torch.randint(0, 8, (1, N))
+    ref_charge = torch.randn(1, N)
+    ref_element = torch.randn(1, N, 128)
+    ref_atom_name_chars = torch.randn(1, N, 4, 64)
+    args = (aatype, profile, deletion_mean, ref_pos, atom_mask, uid, ref_charge,
+            ref_element, ref_atom_name_chars, tok_idx)
+    ref_out = ref(*args)
+
+    mod = tt_ef2.InputsEmbedder(n_heads=4, n_blocks=3)
+    mod.load_state_dict(ref.state_dict(), strict=False)
+    out = mod(*args)
+    assert out.shape == ref_out.shape == (1, L, 451)
+    assert pcc(out, ref_out) > 0.98
 
 
 @pytest.mark.parametrize("seq_len", [32, 64])
