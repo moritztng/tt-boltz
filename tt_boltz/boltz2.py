@@ -4120,15 +4120,12 @@ class AtomDiffusion(Module):
         progress_fn=None,
         **network_condition_kwargs,
     ):
-        # Device-resident fast path (flagged by Boltz2.forward for the Tenstorrent
-        # simplest case): the whole reverse-diffusion loop runs on device and has
-        # no steering guidance, so disable steering when that path will be taken.
+        # Device-resident fast path: Boltz2.forward sets _tt_resident only when no
+        # steering is active for this input, so the resident loop (which has no
+        # guidance) is taken exactly when guidance would be a no-op. Steered runs
+        # fall through to the loop below with steering_args untouched.
         _resident = (getattr(self, "_tt_resident", False)
                      and multiplicity == 1 and self.alignment_reverse_diff)
-        if _resident and steering_args is not None:
-            steering_args = {**steering_args, "fk_steering": False,
-                             "physical_guidance_update": False,
-                             "contact_guidance_update": False}
         if steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
@@ -5572,19 +5569,27 @@ class Boltz2(nn.Module):
         # the input embedder, z-init, distogram, diffusion conditioning and
         # confidence on device, the big 64MB activations (z, rel_pos, conditioning)
         # chained device-to-device, and the reverse-diffusion sampler resident.
-        # That sampler has no steering guidance, so a user who opts into steering
-        # (--use_potentials) takes the torch path instead, as do CPU/GPU runs,
-        # templates and affinity.
+        # That sampler has no steering guidance, so the resident path is taken only
+        # when steering would be a no-op anyway: the physical/FK potentials
+        # (--use_potentials) and contact guidance with input-defined contacts both
+        # force the torch path so the guidance is applied. Contact guidance stays
+        # on by default (as upstream), but without contacts/templates it does
+        # nothing, so ordinary unconstrained prediction still takes the fast path.
+        # CPU/GPU, templates and affinity also use the torch path.
         template_mask = feats.get("template_mask")
         has_templates = (
             self.use_templates
             and template_mask is not None
             and bool(template_mask.any().item())
         )
-        _steered = self.steering_args is not None and (
-            self.steering_args["fk_steering"] or self.steering_args["physical_guidance_update"])
+        _contacts = feats.get("contact_pair_index")
+        _has_contacts = _contacts is not None and _contacts.shape[-1] > 0
+        _steering_active = self.steering_args is not None and (
+            self.steering_args["fk_steering"]
+            or self.steering_args["physical_guidance_update"]
+            or (self.steering_args["contact_guidance_update"] and _has_contacts))
         _resident = (self.use_tenstorrent and not has_templates
-                     and not self.affinity_prediction and not _steered)
+                     and not self.affinity_prediction and not _steering_active)
         self._chain_cache = {} if _resident else None
         self._chain_cond = _resident
         self.structure_module._tt_resident = _resident
