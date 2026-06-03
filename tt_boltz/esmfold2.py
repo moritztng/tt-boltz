@@ -36,6 +36,43 @@ from tt_boltz.tenstorrent import (
 
 _ROW = lambda x: x.reshape(1, -1)
 
+_DTYPE = ttnn.bfloat16  # activation dtype; set to ttnn.float32 for high-precision diffusion
+
+def set_dtype(dt):
+    global _DTYPE
+    _DTYPE = dt
+
+
+def _attn_fp32(q, k, v, attn_mask, scale, ck):
+    """Manual fp32 attention (matmul + softmax + matmul). Used for the token
+    AttentionPairBias, whose logits are NOT qk-normed and reach ~100+, making the
+    softmax argmax too peaked for bf16 SDPA precision. q/k/v [B,H,L,Dp]."""
+    f32 = ttnn.float32
+    qf = ttnn.typecast(q, f32); kf = ttnn.typecast(k, f32); vf = ttnn.typecast(v, f32)
+    kt = ttnn.permute(kf, (0, 1, 3, 2))  # [B,H,Dp,L]
+    logits = ttnn.multiply(ttnn.matmul(qf, kt, compute_kernel_config=ck, dtype=f32), scale)
+    if attn_mask is not None:
+        logits = ttnn.add(logits, ttnn.typecast(attn_mask, f32))
+    attn = ttnn.softmax(logits, dim=-1)  # over keys
+    ctx = ttnn.matmul(attn, vf, compute_kernel_config=ck, dtype=f32)  # [B,H,L,Dp]
+    return ttnn.typecast(ctx, _DTYPE)
+
+
+def _sdpa_bf16(q, k, v, attn_mask, scale):
+    """Scaled-dot-product attention; ttnn SDPA needs bf16, so cast i/o when _DTYPE is fp32."""
+    if _DTYPE == ttnn.bfloat16:
+        return ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=False, scale=scale,
+            program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]))
+    qb, kb, vb = (ttnn.typecast(t, ttnn.bfloat16) for t in (q, k, v))
+    mb = ttnn.typecast(attn_mask, ttnn.bfloat16) if attn_mask is not None else None
+    ctx = ttnn.transformer.scaled_dot_product_attention(
+        qb, kb, vb, attn_mask=mb, is_causal=False, scale=scale,
+        program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]))
+    ctx = ttnn.typecast(ctx, _DTYPE)
+    ttnn.deallocate(qb); ttnn.deallocate(kb); ttnn.deallocate(vb)
+    return ctx
+
 C_Z = 256  # pair channels
 PAD_MULTIPLE = 32  # pad seq to a tile multiple so the triangle contraction excludes padding
 
@@ -158,11 +195,11 @@ class AdaLN(Module):
         s_norm = ttnn.layer_norm(s, weight=self.s_scale, epsilon=1e-5, compute_kernel_config=ck)
         gate = ttnn.sigmoid(ttnn.linear(
             s_norm, self.s_gate_w, bias=self.s_gate_b, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
+            dtype=_DTYPE, core_grid=CORE_GRID_MAIN,
         ))
         shift = ttnn.linear(
             s_norm, self.s_shift_w, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
+            dtype=_DTYPE, core_grid=CORE_GRID_MAIN,
         )
         return ttnn.add(ttnn.multiply(gate, a_norm), shift)
 
@@ -201,7 +238,7 @@ class AttentionPairBias(Module):
         for h in range(H):
             Op[h * hdp : h * hdp + hd, :] = owt[h * hd : (h + 1) * hd, :]
         to_tt = lambda x: ttnn.from_torch(
-            x, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16
+            x, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=_DTYPE
         )
         self.scatter_g = to_tt(Sg)
         self.out_w_padded = to_tt(Op)
@@ -213,7 +250,7 @@ class AttentionPairBias(Module):
 
         x = self.adaln(a, s)
         lin = lambda t, w, b=None: ttnn.linear(
-            t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+            t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
         )
         q = lin(x, self.q_w, self.q_b)
         kv = lin(x, self.kv_w)
@@ -222,9 +259,17 @@ class AttentionPairBias(Module):
         g = ttnn.sigmoid(lin(x, self.g_w))
         ttnn.deallocate(x)
 
-        # Pack q,k,v and split into heads (tile-aware), then SDPA with pair bias.
-        qkv = ttnn.concat([q, k, v], dim=-1)
+        # Pack q,k,v into heads. nlp_create_qkv_heads splits at stride = head_dim
+        # rounded UP to a tile multiple (64 for head_dim 48), so a raw stride-48
+        # pack would be misread (heads bleed into neighbours). Pad each head
+        # 48->64 via scatter_g FIRST so nlp's stride-64 split lands on real
+        # boundaries; the padded dims are zero (no effect on q.k or on ctx).
+        qp = lin(q, self.scatter_g)  # [B, L, Dpad]  per-head 48 real + 16 zero
+        kp = lin(k, self.scatter_g)
+        vp = lin(v, self.scatter_g)
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
+        qkv = ttnn.concat([qp, kp, vp], dim=-1)  # [B, L, 3*Dpad]
+        ttnn.deallocate(qp); ttnn.deallocate(kp); ttnn.deallocate(vp)
         qkv = ttnn.unsqueeze(qkv, 1)
         qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.num_heads, num_kv_heads=self.num_heads,
@@ -239,10 +284,7 @@ class AttentionPairBias(Module):
         ttnn.deallocate(z_norm)
         pair_bias = ttnn.permute(pair_bias, (0, 3, 1, 2))  # [B, H, L, L]
 
-        ctx = ttnn.transformer.scaled_dot_product_attention(
-            qh, kh, vh, attn_mask=pair_bias, is_causal=False, scale=head_dim**-0.5,
-            program_config=_sdpa_program_config_for_lengths(qh.shape[2], kh.shape[2]),
-        )
+        ctx = _attn_fp32(qh, kh, vh, pair_bias, head_dim**-0.5, ck)
         ttnn.deallocate(qh); ttnn.deallocate(kh); ttnn.deallocate(vh)
         ttnn.deallocate(pair_bias)
         ctx = ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -272,7 +314,7 @@ class ConditionedTransitionBlock(Module):
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         lin = lambda t, w, b=None: ttnn.linear(
-            t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+            t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
         )
         x = self.adaln(a, s)
         sw = lin(x, self.swish_w)
@@ -346,7 +388,7 @@ class TransitionLayer(Module):
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(
-            t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+            t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
         )
         xn = ttnn.layer_norm(x, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = lin(xn, self.a_w)
@@ -379,7 +421,7 @@ class DiffusionConditioningModel(Module):
     def __call__(self, s_inputs, z_trunk, relpos, n_raw):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(
-            t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN
+            t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
         )
         z = ttnn.concat([z_trunk, relpos], dim=-1)
         z = lin(ttnn.layer_norm(z, weight=self.z_in_w, bias=self.z_in_b, epsilon=1e-5, compute_kernel_config=ck), self.z_proj_w)
@@ -443,10 +485,23 @@ def build_3d_rope_tables(ref_pos, ref_space_uid, head_dim, n_spatial_per_axis,
     return cos, sin
 
 
-def band_mask(n: int, half_window: int):
-    """Sliding-window additive attention bias [1, 1, N, N] (0 inside band, -inf outside)."""
-    idx = torch.arange(n)
-    allowed = (idx[:, None] - idx[None, :]).abs() <= half_window
+def band_mask(n_or_mask, half_window: int):
+    """Sliding-window additive attention bias [1,1,N,N], validity-aware.
+
+    Accepts either an int N (all atoms valid) or an atom mask [1,N]/[N] (1=valid).
+    Mirrors SWA3DRoPEAttention: window is over the *valid* atom ranking
+    (rank=cumsum(valid)-1), padded atoms are excluded, and the diagonal is always
+    allowed (so a fully-masked/invalid row doesn't produce NaN under softmax).
+    """
+    if isinstance(n_or_mask, int):
+        valid = torch.ones(n_or_mask, dtype=torch.bool)
+    else:
+        valid = (n_or_mask.reshape(-1) > 0.5)
+    n = valid.shape[0]
+    rank = torch.cumsum(valid.long(), 0) - 1
+    within = (rank[:, None] - rank[None, :]).abs() <= half_window
+    allowed = within & valid[:, None] & valid[None, :]
+    allowed = allowed | torch.eye(n, dtype=torch.bool)
     return torch.where(allowed, 0.0, float("-inf")).view(1, 1, n, n)
 
 
@@ -464,9 +519,9 @@ class SWAAttention(Module):
         self.gate_w = self.torch_to_tt("gate_proj.weight")
         self.out_w = self.torch_to_tt("out_proj.weight")
 
-    def __call__(self, x, cos, sin, attn_mask):
+    def __call__(self, x, cos, sin, attn_mask, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         head_dim = x.shape[-1] // self.n_heads
         qkv = ttnn.unsqueeze(lin(x, self.qkv_w), 1)  # [B,1,N,3d]
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -476,12 +531,13 @@ class SWAAttention(Module):
         ttnn.deallocate(qkv)
         q = apply_rotary(_rms_norm(q, ck), cos, sin)
         k = apply_rotary(_rms_norm(k, ck), cos, sin)
-        ctx = ttnn.transformer.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=False, scale=head_dim**-0.5,
-            program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
-        )
+        ctx = _sdpa_bf16(q, k, v, attn_mask, head_dim**-0.5)
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
         ctx = ttnn.squeeze(ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG), 1)
+        # Zero invalid (padding) atom outputs so they can't blow up / NaN-contaminate
+        # valid atoms via masked 0*inf in later blocks (matches reference out*valid).
+        if valid is not None:
+            ctx = ttnn.multiply(ctx, valid)
         gate = ttnn.sigmoid(lin(x, self.gate_w))
         ctx = ttnn.multiply(ctx, gate)
         ttnn.deallocate(gate)
@@ -504,15 +560,15 @@ class SWAAtomBlock(Module):
         ck = self.compute_kernel_config
         return ttnn.add(ttnn.multiply(_rms_norm(x, ck), ttnn.add(scale, 1.0)), shift)
 
-    def __call__(self, x, c_l, cos, sin, attn_mask):
+    def __call__(self, x, c_l, cos, sin, attn_mask, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         mod = lin(ttnn.silu(c_l), self.adaln_w)  # [B,N,6d]
         sa, ca, ga, sf, cf, gf = ttnn.chunk(mod, 6, dim=-1)
         ttnn.deallocate(mod)
 
         attn_in = self._modulate(x, ca, sa)
-        attn_out = self.attn(attn_in, cos, sin, attn_mask)
+        attn_out = self.attn(attn_in, cos, sin, attn_mask, valid)
         x = ttnn.add(x, ttnn.multiply(ga, attn_out))
         ttnn.deallocate(attn_out)
 
@@ -534,9 +590,9 @@ class SWAAtomTransformerModel(Module):
             for i in range(n_blocks)
         ]
 
-    def __call__(self, q_l, c_l, cos, sin, attn_mask):
+    def __call__(self, q_l, c_l, cos, sin, attn_mask, valid=None):
         for block in self.blocks:
-            q_l = block(q_l, c_l, cos, sin, attn_mask)
+            q_l = block(q_l, c_l, cos, sin, attn_mask, valid)
         return q_l
 
 
@@ -592,14 +648,14 @@ class AtomEncoder(Module):
         self.a2t_w = self.torch_to_tt("atom_to_token_linear.weight")
         self.transformer = SWAAtomTransformerModel(n_heads, n_blocks, self.scope("atom_transformer"), compute_kernel_config)
 
-    def __call__(self, atom_feats, cos, sin, band, scatter_m, r_input=None):
+    def __call__(self, atom_feats, cos, sin, band, scatter_m, r_input=None, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         c = ttnn.layer_norm(lin(atom_feats, self.atom_linear_w), weight=self.atom_norm_w, bias=self.atom_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         q = ttnn.add(c, lin(r_input, self.coords_w)) if self.structure_prediction else c
-        q = self.transformer(q, c, cos, sin, band)
+        q = self.transformer(q, c, cos, sin, band, valid)
         q_to_a = ttnn.relu(lin(q, self.a2t_w))  # [B,N,d_token]
-        a = ttnn.matmul(scatter_m, q_to_a, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        a = ttnn.matmul(scatter_m, q_to_a, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         ttnn.deallocate(q_to_a)
         return a, q, c
 
@@ -615,13 +671,13 @@ class AtomDecoder(Module):
         self.out_w = self.torch_to_tt("output_linear.weight")
         self.transformer = SWAAtomTransformerModel(n_heads, n_blocks, self.scope("atom_transformer"), compute_kernel_config)
 
-    def __call__(self, a, q_skip, c_skip, cos, sin, band, gather_g):
+    def __call__(self, a, q_skip, c_skip, cos, sin, band, gather_g, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         a_to_q = lin(a, self.t2a_w)  # [B,L,d_atom]
-        a_to_q = ttnn.matmul(gather_g, a_to_q, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,N,d_atom]
+        a_to_q = ttnn.matmul(gather_g, a_to_q, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,N,d_atom]
         q = ttnn.add(q_skip, a_to_q)
-        q = self.transformer(q, c_skip, cos, sin, band)
+        q = self.transformer(q, c_skip, cos, sin, band, valid)
         q = ttnn.layer_norm(q, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck)
         return lin(q, self.out_w)  # [B,N,3]
 
@@ -641,16 +697,16 @@ class DiffusionModuleModel(Module):
         self.token_norm_b = self.torch_to_tt("token_norm.bias")
 
     def __call__(self, s_inputs, z_trunk, relpos, n_raw, atom_feats, r_input,
-                 cos, sin, band, scatter_m, gather_g):
+                 cos, sin, band, scatter_m, gather_g, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         s, z = self.conditioning(s_inputs, z_trunk, relpos, n_raw)
-        a, q_skip, c_skip = self.atom_encoder(atom_feats, cos, sin, band, scatter_m, r_input=r_input)
+        a, q_skip, c_skip = self.atom_encoder(atom_feats, cos, sin, band, scatter_m, r_input=r_input, valid=valid)
         s_step = ttnn.layer_norm(s, weight=self.s_step_norm_w, bias=self.s_step_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = ttnn.add(a, lin(s_step, self.s_to_token_w))
         a = self.token_transformer(a, s, z)
         a = ttnn.layer_norm(a, weight=self.token_norm_w, bias=self.token_norm_b, epsilon=1e-5, compute_kernel_config=ck)
-        return self.atom_decoder(a, q_skip, c_skip, cos, sin, band, gather_g)
+        return self.atom_decoder(a, q_skip, c_skip, cos, sin, band, gather_g, valid=valid)
 
 
 class DiffusionModule(TorchWrapper):
@@ -684,7 +740,8 @@ class DiffusionModule(TorchWrapper):
             ref_element, ref_atom_name_chars.reshape(B, N, -1),
         ], dim=-1)  # [B,N,389]
         cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, 32, **ATOM_ROPE)
-        band = band_mask(N, 64)
+        band = band_mask(ref_mask, 64)
+        valid = ref_mask.reshape(1, N, 1).float()  # [1,N,1] zero out padding atoms
         oh = F.one_hot(tok_idx[0].long(), L).float() * ref_mask[0].float()[:, None]  # [N,L]
         gather_g = oh.unsqueeze(0)  # [1,N,L]
         scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)  # [1,L,N]
@@ -693,7 +750,7 @@ class DiffusionModule(TorchWrapper):
         r_update = self.module(
             ft(s_inputs), ft(z_trunk), ft(relpos), ft(n_raw), ft(atom_feats.float()),
             ft(r_input.float()), ft(cos.float()), ft(sin.float()), ft(band.float()),
-            ft(scatter_m.float()), ft(gather_g.float()),
+            ft(scatter_m.float()), ft(gather_g.float()), ft(valid),
         )
         r_update = self._to_torch(r_update)
 
@@ -744,9 +801,9 @@ class RelPosEncoding(TorchWrapper):
 
     def forward(self, residue_index, asym_id, sym_id, entity_id, token_index):
         feats = relpos_features(residue_index, asym_id, sym_id, entity_id, token_index, self.r_bins, self.c_bins)
-        w = ttnn.from_torch(self._w.t(), layout=ttnn.TILE_LAYOUT, device=self.tt_device, dtype=ttnn.bfloat16)
+        w = ttnn.from_torch(self._w.t(), layout=ttnn.TILE_LAYOUT, device=self.tt_device, dtype=_DTYPE)
         out = ttnn.linear(self._from_torch(feats.float()), w, compute_kernel_config=self.compute_kernel_config,
-                          dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+                          dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         return self._to_torch(out)
 
 
@@ -769,12 +826,13 @@ class InputsEmbedder(TorchWrapper):
             ref_element, ref_atom_name_chars.reshape(B, N, -1),
         ], dim=-1)
         cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, 32, **ATOM_ROPE)
-        band = band_mask(N, 64)
+        band = band_mask(atom_mask, 64)
+        valid = atom_mask.reshape(1, N, 1).float()
         oh = F.one_hot(atom_to_token[0].long(), L).float() * atom_mask[0].float()[:, None]
         scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)
         ft = self._from_torch
         a, _q, _c = self.module(ft(atom_feats.float()), ft(cos.float()), ft(sin.float()),
-                                ft(band.float()), ft(scatter_m.float()))
+                                ft(band.float()), ft(scatter_m.float()), valid=ft(valid))
         a = self._to_torch(a)  # [B,L,384]
         return torch.cat([a, aatype, profile, deletion_mean.unsqueeze(-1)], dim=-1)
 
@@ -796,7 +854,7 @@ class LanguageModelShimModel(Module):
 
     def __call__(self, hidden, combine_w):  # hidden [B,L,K,d_model]; combine_w torch [K]
         ck = self.compute_kernel_config
-        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         ln = lambda t, w, b: ttnn.layer_norm(t, weight=w, bias=b, epsilon=1e-5, compute_kernel_config=ck)
         B, L, K, dm = hidden.shape
         # Per-layer projection in ttnn (reshape L,K together -> 3D, no sub-tile middle dim).
@@ -805,7 +863,7 @@ class LanguageModelShimModel(Module):
         # Softmax-weighted layer combine on host (non-learned given combine_w).
         lz_t = torch.Tensor(ttnn.to_torch(lz)).float().reshape(B, L, K, 256)
         x_t = (combine_w.view(1, 1, K, 1) * lz_t).sum(2)  # [B,L,256]
-        x = lin(ttnn.from_torch(x_t, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16), self.dp_w, self.dp_b)
+        x = lin(ttnn.from_torch(x_t, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=_DTYPE), self.dp_w, self.dp_b)
         a = ttnn.repeat(ttnn.unsqueeze(x, 2), (1, 1, L, 1))  # [B,L,L,256]
         b = ttnn.repeat(ttnn.unsqueeze(x, 1), (1, L, 1, 1))
         feat = ttnn.concat([ttnn.multiply(a, b), ttnn.subtract(a, b)], dim=-1)  # [B,L,L,512]
@@ -843,13 +901,13 @@ class OuterProductMean(Module):
 
     def __call__(self, m, recip_nvalid):  # m [B,L,M,128]; recip_nvalid [B,L,L,1]
         ck = self.compute_kernel_config
-        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         B, L, M = m.shape[0], m.shape[1], m.shape[2]
         x = lin(ttnn.layer_norm(m, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck), self.W)
         a, b = ttnn.chunk(x, 2, dim=-1)  # [B,L,M,32]
         a2 = ttnn.reshape(ttnn.permute(a, (0, 1, 3, 2)), (B, L * 32, M))   # [B,L*32,M]
         b2 = ttnn.reshape(ttnn.permute(b, (0, 2, 1, 3)), (B, M, L * 32))   # [B,M,L*32]
-        prod = ttnn.matmul(a2, b2, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,L*32,L*32]
+        prod = ttnn.matmul(a2, b2, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,L*32,L*32]
         prod = ttnn.permute(ttnn.reshape(prod, (B, L, 32, L, 32)), (0, 1, 3, 2, 4))  # [B,L,L,32,32]
         outer = ttnn.reshape(prod, (B, L, L, 1024))
         out = lin(outer, self.Wout, self.Wout_b)  # [B,L,L,256]
@@ -870,7 +928,7 @@ class MSAPairWeightedAveraging(Module):
 
     def __call__(self, m, pair):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         B, L, M = m.shape[0], m.shape[1], m.shape[2]
         h, dh = self.n_heads, self.head_width
         mn = ttnn.layer_norm(m, weight=self.ns_w, bias=self.ns_b, epsilon=1e-5, compute_kernel_config=ck)
@@ -883,7 +941,7 @@ class MSAPairWeightedAveraging(Module):
         v_t = torch.Tensor(ttnn.to_torch(v)).float().reshape(B, L, M, h, dh)
         gate_t = torch.Tensor(ttnn.to_torch(gate)).float().reshape(B, L, M, h, dh)
         out = torch.einsum("bijh,bjmhd,bimhd->bimhd", attn, v_t, gate_t).reshape(B, L, M, h * dh)
-        out_tt = ttnn.from_torch(out, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        out_tt = ttnn.from_torch(out, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=_DTYPE)
         return lin(out_tt, self.Wout)
 
 
@@ -929,7 +987,7 @@ class MSAEncoderModel(Module):
 
     def __call__(self, x_pair, x_inputs, m_feat, recip_nvalid):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         m = ttnn.add(lin(m_feat, self.embed_w), ttnn.unsqueeze(lin(x_inputs, self.project_w), 2))
         pair = x_pair
         for block in self.blocks:
@@ -1005,14 +1063,23 @@ def esmfold2_fold(components, parcae: ParcaeParams, inputs, *, num_loops=3,
 
     a, b = parcae.dynamics()
     z = torch.zeros_like(z_init)
+    # Reference loop order (modeling_esmfold2 `_run_one_loop`): the MSA encoder
+    # sees z_init alone as its pair input; its result REPLACES z_init when
+    # `msa_encoder_overwrite` (default True), then the LM-encoder pair update is
+    # added on top. lm_dropout (0.25, per-loop) is stochastic at train time;
+    # its expectation is the identity, so deterministic inference applies lm_z
+    # as-is. The recurrent state z starts at ~0 (reference seeds it with tiny
+    # trunc-normal noise, negligible vs the injected pair magnitude).
+    msa_overwrite = inputs.get("msa_encoder_overwrite", True)
     for _ in range(num_loops + 1):
         z_inject = z_init
-        if components.get("lm_encoder") is not None and lm_z is not None:
-            z_inject = z_inject + components["lm_encoder"](lm_z)
         if components.get("msa_encoder") is not None and inputs.get("msa_oh") is not None:
-            z_inject = z_inject + components["msa_encoder"](
+            msa_pair = components["msa_encoder"](
                 z_inject, x_inputs, inputs["msa_oh"], inputs["has_deletion"],
                 inputs["deletion_value"], inputs["msa_mask"])
+            z_inject = msa_pair if msa_overwrite else (z_inject + msa_pair)
+        if components.get("lm_encoder") is not None and lm_z is not None:
+            z_inject = z_inject + components["lm_encoder"](lm_z)
         injected = F.layer_norm(z_inject, (256,), parcae.in_norm_w, parcae.in_norm_b, 1e-5)
         z = a * z + lin(injected, b)
         z = components["folding_trunk"](z)
@@ -1151,7 +1218,7 @@ class DistogramHead(Module):
     def __call__(self, z: ttnn.Tensor) -> ttnn.Tensor:
         zs = ttnn.add(z, ttnn.permute(z, (0, 2, 1, 3)))
         return ttnn.linear(zs, self.w, bias=self.b, compute_kernel_config=self.compute_kernel_config,
-                           dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+                           dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
 
 
 class DistogramHeadModel(TorchWrapper):
@@ -1172,14 +1239,14 @@ class RowAttentionPooling(Module):
 
     def __call__(self, z: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
-        scores = ttnn.linear(z, self.attn_w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,L,L,1]
+        scores = ttnn.linear(z, self.attn_w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,L,L,1]
         scores = ttnn.softmax(scores, dim=-2)  # over columns m (the L axis at dim 2)
         weights = ttnn.permute(scores, (0, 1, 3, 2))  # [B,L,1,L]
         ttnn.deallocate(scores)
-        pooled = ttnn.matmul(weights, z, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,L,1,d]
+        pooled = ttnn.matmul(weights, z, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,L,1,d]
         ttnn.deallocate(weights)
         pooled = ttnn.squeeze(pooled, 2)  # [B,L,d]
-        return ttnn.linear(pooled, self.out_w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        return ttnn.linear(pooled, self.out_w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
 
 
 class ConfidenceHeadModel(Module):
@@ -1208,7 +1275,7 @@ class ConfidenceHeadModel(Module):
 
     def __call__(self, s_inputs, z, pair_dist_embed, gather_g, w_plddt, w_resolved):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         ln = lambda t, w, b: ttnn.layer_norm(t, weight=w, bias=b, epsilon=1e-5, compute_kernel_config=ck)
         L = z.shape[1]
 
@@ -1231,11 +1298,11 @@ class ConfidenceHeadModel(Module):
         pde_logits = lin(ln(pair, self.pde_ln_w, self.pde_ln_b), self.pde_w)
 
         # per-atom plddt/resolved: gather single->atoms, then per-atom weight matmul
-        s_at = ttnn.matmul(gather_g, single, compute_kernel_config=ck, dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN)  # [B,A,768]
+        s_at = ttnn.matmul(gather_g, single, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,A,768]
         plddt_in = ttnn.unsqueeze(ln(s_at, self.plddt_ln_w, self.plddt_ln_b), 2)   # [B,A,1,768]
         resolved_in = ttnn.unsqueeze(ln(s_at, self.resolved_ln_w, self.resolved_ln_b), 2)
-        plddt_logits = ttnn.squeeze(ttnn.matmul(plddt_in, w_plddt, compute_kernel_config=ck, dtype=ttnn.bfloat16), 2)
-        resolved_logits = ttnn.squeeze(ttnn.matmul(resolved_in, w_resolved, compute_kernel_config=ck, dtype=ttnn.bfloat16), 2)
+        plddt_logits = ttnn.squeeze(ttnn.matmul(plddt_in, w_plddt, compute_kernel_config=ck, dtype=_DTYPE), 2)
+        resolved_logits = ttnn.squeeze(ttnn.matmul(resolved_in, w_resolved, compute_kernel_config=ck, dtype=_DTYPE), 2)
         return pae_logits, pde_logits, plddt_logits, resolved_logits
 
 
