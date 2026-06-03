@@ -65,6 +65,12 @@ class _ESMCAdapter:
         self._persistent = persistent
         self.lm = None  # loaded lazily on first fold
 
+    def preload(self):
+        """Load the ESMC-6B weights now (≈60 s) instead of lazily on the first
+        fold — lets the CLI attribute that time to the 'loading' stage."""
+        if self.lm is None:
+            self.lm = ESMCLanguageModel.from_pretrained(self._repo)
+
     def __call__(self, input_ids, sequence_id=None, output_hidden_states=True, **_):
         attn_mask = None
         if sequence_id is not None:
