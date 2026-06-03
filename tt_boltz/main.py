@@ -1202,7 +1202,7 @@ def _write_structure(complex_obj, outpath, output_format):
 
 
 def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_dir,
-                            output_format):
+                            output_format, quiet):
     """One ESMFold2 worker pinned to a TT device — folds targets pulled from a
     shared queue (dynamic load-balancing) until it receives the None sentinel,
     emitting progress events on ev_q for the live display.
@@ -1223,11 +1223,25 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
         except Exception:
             pass
 
-    emit("loading")
-    from tt_boltz import esmfold2 as E
-    from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
+    if quiet:
+        # Keep the worker's ttnn/C++ stderr off the parent's Rich live display
+        # (progress flows over ev_q, not stdout). Errors are reported via emit().
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
 
-    model = load_ttnn_esmfold2()
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    emit("loading")
+    try:
+        from tt_boltz import esmfold2 as E
+        from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
+        model = load_ttnn_esmfold2()
+        model._esmc.preload()  # do the ~60 s ESMC-6B load under the "loading" stage
+    except Exception as e:  # systemic load failure — report and exit (no hang)
+        emit("done", name="<load>", time=0, status="error", error=repr(e))
+        out_q.put(("<load>", {"error": f"model load failed: {e!r}"}))
+        return
     E.set_progress(make_progress_fn(ev_q, dev, dev, meta))  # trunk/diffusion steps
     struct_dir = Path(struct_dir)
     while (item := in_q.get()) is not None:
@@ -1269,6 +1283,8 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
     num_loops, sampling_steps, diffusion_samples carry over; MSA / ligand /
     affinity options don't apply to a single-sequence model.
     """
+    from queue import Empty as QueueEmpty
+
     if ignored:
         click.echo(f"Note: --model esmfold2 is single-sequence & protein-only; ignoring {', '.join(ignored)}")
     files = ([data] if data.is_file()
@@ -1305,7 +1321,7 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
         in_q.put(None)  # one sentinel per worker
     procs = [ctx.Process(target=_esmfold2_device_worker,
                          args=(assigns[d], in_q, out_q, ev_q, fold_kwargs, str(struct_dir),
-                               output_format))
+                               output_format, not debug))
              for d in devices]
     for p in procs:
         p.start()
@@ -1315,15 +1331,22 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
     display.start()
     results, failed = {}, 0
     try:
-        for _ in range(len(todo)):
-            name, entry = out_q.get()
+        collected = 0
+        while collected < len(todo):
+            try:
+                name, entry = out_q.get(timeout=5)
+            except QueueEmpty:
+                if not any(p.is_alive() for p in procs):
+                    break  # workers exited (e.g. load failure) — don't hang
+                continue
+            collected += 1
             if isinstance(entry, dict) and "error" in entry:
                 failed += 1
             else:
                 results[name] = entry
     finally:
         for p in procs:
-            p.join()
+            p.join(timeout=10)
         display.stop()
 
     (out / "results.json").write_text(json.dumps(results, indent=2))
