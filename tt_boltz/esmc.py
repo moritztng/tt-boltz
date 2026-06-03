@@ -141,7 +141,8 @@ class Attention(Module):
         self.k_ln_weight = self.torch_to_tt("k_ln.weight")
         self.out_weight = self.torch_to_tt("out_proj.weight")
 
-    def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor,
+                 attn_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         d_model = x.shape[-1]
         head_dim = d_model // self.n_heads
@@ -174,7 +175,7 @@ class Attention(Module):
         k = apply_rotary(k, cos, sin)
 
         o = ttnn.transformer.scaled_dot_product_attention(
-            q, k, v, is_causal=False, scale=head_dim**-0.5,
+            q, k, v, attn_mask=attn_mask, is_causal=False, scale=head_dim**-0.5,
             program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
         )
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
@@ -234,8 +235,9 @@ class Block(Module):
         self.ffn = SwiGLUFFN(self.scope("ffn"), compute_kernel_config)
         self.inv_scale = 1.0 / (n_layers / 36) ** 0.5
 
-    def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor) -> ttnn.Tensor:
-        r1 = self.attn(x, cos, sin)
+    def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor,
+                 attn_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
+        r1 = self.attn(x, cos, sin, attn_mask)
         x = ttnn.add(x, ttnn.multiply(r1, self.inv_scale))
         ttnn.deallocate(r1)
         r3 = self.ffn(x)
@@ -427,7 +429,7 @@ class ESMCHiddenStatesModel(Module):
         ]
         self.norm_weight = self.torch_to_tt("transformer.norm.weight")
 
-    def __call__(self, tokens: ttnn.Tensor):
+    def __call__(self, tokens: ttnn.Tensor, attn_mask: ttnn.Tensor | None = None):
         seq_len = tokens.shape[-1]
         head_dim = self.norm_weight.shape[-1] // self.n_heads
         cos, sin = rope_tables(seq_len, head_dim, device=self.device)
@@ -435,7 +437,7 @@ class ESMCHiddenStatesModel(Module):
         x = self.embed(tokens)
         hidden = [self._to_host(x)]  # hs[0] = embedding output
         for i, block in enumerate(self.blocks):
-            x = block(x, cos, sin)
+            x = block(x, cos, sin, attn_mask)
             if i < self.n_layers - 1:
                 hidden.append(self._to_host(x))  # hs[i+1] = block i output
         norm_x = ttnn.layer_norm(
@@ -478,10 +480,51 @@ class ESMCLanguageModel(TorchWrapper):
     def _create_module(self, weights: WeightScope) -> ESMCHiddenStatesModel:
         return ESMCHiddenStatesModel(self.n_heads, self.n_layers, weights, self.compute_kernel_config)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         tokens_tt = ttnn.from_torch(
             input_ids.to(torch.int32), device=self.tt_device,
             layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
         )
-        hidden = self.module(tokens_tt)  # list of [B, L, d_model]
+        mask_tt = None
+        if attn_mask is not None:
+            # [B,L,L] additive mask -> [B,1,L,L] bf16 for SDPA
+            mask_tt = ttnn.from_torch(
+                attn_mask.unsqueeze(1).to(torch.bfloat16), device=self.tt_device,
+                layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            )
+        hidden = self.module(tokens_tt, mask_tt)  # list of [B, L, d_model]
         return torch.stack(hidden, dim=0)  # [n_layers+1, B, L, d_model]
+
+    def release(self):
+        """Free all ttnn device weights (≈12.8 GB for the 6B). Call after the
+        single LM forward so the folding trunk reclaims DRAM on long sequences.
+        Hidden states are already on host, so only weights are released."""
+        if self.module is not None:
+            _free_ttnn_tensors(self.module)
+            self.module = None
+
+
+def _free_ttnn_tensors(obj, seen=None):
+    """Recursively ttnn.deallocate every device tensor reachable from `obj`."""
+    seen = set() if seen is None else seen
+    if id(obj) in seen:
+        return
+    seen.add(id(obj))
+    if isinstance(obj, ttnn.Tensor):
+        try:
+            ttnn.deallocate(obj)
+        except Exception:
+            pass
+        return
+    if isinstance(obj, (list, tuple, set)):
+        for x in obj:
+            _free_ttnn_tensors(x, seen)
+        return
+    if isinstance(obj, dict):
+        for x in obj.values():
+            _free_ttnn_tensors(x, seen)
+        return
+    d = getattr(obj, "__dict__", None)
+    if d:
+        for x in list(d.values()):
+            _free_ttnn_tensors(x, seen)

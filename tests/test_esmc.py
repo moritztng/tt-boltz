@@ -114,6 +114,72 @@ def test_attention(seq_len):
     assert p > 0.99, f"PCC {p:.5f} too low"
 
 
+def test_attention_mask_isolates_segments():
+    """The additive attn_mask (used for ESMC-6B chain-aware / padded attention)
+    must block cross-segment attention: perturbing one segment's tokens leaves
+    the other segment's attention output unchanged."""
+    n_heads, head_dim = ESMC_300M["n_heads"], D_MODEL // ESMC_300M["n_heads"]
+    ref = make_esmc_300m()
+    state = WeightScope.wrap(ref.state_dict()).child("transformer.blocks.0.attn").as_dict()
+    dev = get_device()
+    mod = tt_esmc.Attention(n_heads, state, _kernel_config())
+
+    seq_len, cut = 32, 16
+    cos, sin = tt_esmc.rope_tables(seq_len, head_dim, device=dev)
+    # block-diagonal mask: [0:cut] and [cut:] cannot attend to each other
+    seg = torch.cat([torch.zeros(cut), torch.ones(seq_len - cut)]).long()
+    allow = seg[:, None] == seg[None, :]
+    m = torch.where(allow, 0.0, float("-inf"))[None, None]  # [1,1,L,L]
+    m_tt = ttnn.from_torch(m.to(torch.bfloat16), device=dev, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+
+    def run(x):
+        x_tt = ttnn.from_torch(x, device=dev, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        return torch.Tensor(ttnn.to_torch(mod(x_tt, cos, sin, m_tt))).float()
+
+    x1 = torch.randn(1, seq_len, D_MODEL)
+    x2 = x1.clone()
+    x2[:, cut:] = torch.randn(1, seq_len - cut, D_MODEL)  # perturb second segment only
+    o1, o2 = run(x1), run(x2)
+    drift = (o1[:, :cut] - o2[:, :cut]).abs().max().item()
+    assert drift < 1e-2, f"segment 0 leaked across mask (max drift {drift})"
+
+
+def test_te_key_remap():
+    """TransformerEngine 6B weight names map to the esm-repo nn.Sequential
+    index names the ttnn blocks expect; _extra_state and the LM head drop out."""
+    src = {
+        "esmc.embed.weight": 0,
+        "esmc.transformer.blocks.0.attn.layernorm_qkv.layer_norm_weight": 0,
+        "esmc.transformer.blocks.0.attn.layernorm_qkv.layer_norm_bias": 0,
+        "esmc.transformer.blocks.0.attn.layernorm_qkv.weight": 0,
+        "esmc.transformer.blocks.0.attn.layernorm_qkv._extra_state": 0,
+        "esmc.transformer.blocks.0.attn.q_ln.weight": 0,
+        "esmc.transformer.blocks.0.attn.out_proj.weight": 0,
+        "esmc.transformer.blocks.0.ffn.layer_norm_weight": 0,
+        "esmc.transformer.blocks.0.ffn.fc1_weight": 0,
+        "esmc.transformer.blocks.0.ffn.fc2_weight": 0,
+        "esmc.transformer.norm.weight": 0,
+        "lm_head.0.weight": 0,
+    }
+    remapped = set()
+    for k in src:
+        if k.endswith("_extra_state") or k.startswith("lm_head") or not k.startswith("esmc."):
+            continue
+        nk = k[len("esmc."):]
+        for s, d in tt_esmc._TE_KEY_REMAP:
+            nk = nk.replace(s, d)
+        remapped.add(nk)
+    assert "embed.weight" in remapped
+    assert "transformer.blocks.0.attn.layernorm_qkv.0.weight" in remapped  # layer_norm_weight
+    assert "transformer.blocks.0.attn.layernorm_qkv.0.bias" in remapped
+    assert "transformer.blocks.0.attn.layernorm_qkv.1.weight" in remapped  # qkv proj
+    assert "transformer.blocks.0.ffn.0.weight" in remapped  # ffn norm
+    assert "transformer.blocks.0.ffn.1.weight" in remapped  # fc1
+    assert "transformer.blocks.0.ffn.3.weight" in remapped  # fc2
+    assert "transformer.norm.weight" in remapped
+    assert not any("_extra_state" in k or "lm_head" in k for k in remapped)
+
+
 def test_esmc_real_weights():
     """Validate against the trained ESMC-300M on a real protein (human ubiquitin).
 
