@@ -1329,6 +1329,7 @@ class DiffusionTransformerLayer(Module):
         super().__init__(state_dict, compute_kernel_config)
         self.atom_level = atom_level
         self.s_o = None
+        self._s_o_src = None
         self.adaln = AdaLN(
             atom_level, self.scope("adaln"), compute_kernel_config
         )
@@ -1363,7 +1364,15 @@ class DiffusionTransformerLayer(Module):
             b = self.attn_pair_bias(b, z)
         else:
             b = self.attn_pair_bias(b, z, keys_indexing)
-        if self.s_o is None:
+        # s_o = sigmoid(linear(s)) is constant while s is (the atom conditioning
+        # is reused across the 200 diffusion steps), so cache it — but only while
+        # the same s object is fed. A new protein passes a fresh s, which rebuilds
+        # it; this keeps the cache correct across proteins of any size without an
+        # external reset (s for the atom encoder/decoder is _c_reshaped; for the
+        # input-embedder atom transformer it is a fresh per-protein tensor).
+        if self.atom_level and self.s_o is not None and self._s_o_src is s:
+            s_o = self.s_o
+        else:
             s_o = ttnn.linear(
                 s,
                 self.output_projection_weight,
@@ -1374,8 +1383,7 @@ class DiffusionTransformerLayer(Module):
             )
             if self.atom_level:
                 self.s_o = s_o
-        else:
-            s_o = self.s_o
+                self._s_o_src = s
         b = ttnn.multiply(s_o, b)
         a = ttnn.add(a, b)
         a_t = self.transition(a, s, large_seq_len=large_seq_len)
@@ -1746,6 +1754,7 @@ class Diffusion(Module):
         super().__init__(state_dict, compute_kernel_config)
         self._s_conditioned = None
         self._c_reshaped = None
+        self._cond_src = None
         self.conditioner_norm_weight = self.torch_to_tt(
             "single_conditioner.norm_single.weight"
         )
@@ -1848,7 +1857,11 @@ class Diffusion(Module):
     ) -> ttnn.Tensor:
         B, N, D = q.shape
         NW = N // ATOM_WINDOW
-        if self._s_conditioned is None:
+        # The conditioning (s_conditioned/c_reshaped) is constant across the 200
+        # diffusion steps but changes per protein. Rebuild it whenever a new c
+        # arrives (the wrapper passes a fresh c object per protein); reuse it
+        # while the same c is fed step after step.
+        if self._s_conditioned is None or self._cond_src is not c:
             s = ttnn.concat([s_trunk, s_inputs], dim=-1)
             s = ttnn.layer_norm(
                 s,
@@ -1866,6 +1879,7 @@ class Diffusion(Module):
             )
             ttnn.deallocate(s)
             self._c_reshaped = ttnn.reshape(c, (B, NW, ATOM_WINDOW, -1))
+            self._cond_src = c
         r_to_q = ttnn.linear(
             r,
             self.r_to_q_weight,
@@ -2051,12 +2065,6 @@ class TorchWrapper(nn.Module):
         except Exception:
             # Best effort cleanup: stale/already-freed buffers should not break reset.
             pass
-
-    def _clear_cached_attrs(self, obj, attr_names):
-        for attr in attr_names:
-            value = getattr(obj, attr, None)
-            self._deallocate_tensor_like(value)
-            setattr(obj, attr, None)
 
     def _clear_runtime_cache(self):
         for value in self._runtime_cache.values():
@@ -2443,11 +2451,6 @@ class DiffusionModule(TorchWrapper):
             self._cache_get("atom_to_token_normed"),
             large_seq_len=self._cache_get("large_seq_len"),
         )
-
-        if self.module is not None:
-            self._clear_cached_attrs(self.module, ("_s_conditioned", "_c_reshaped"))
-            for layer in self.module.encoder.layers + self.module.decoder.layers:
-                self._clear_cached_attrs(layer, ("s_o",))
 
 
 class MSAModule(TorchWrapper):
