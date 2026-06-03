@@ -3997,28 +3997,6 @@ class AtomDiffusion(Module):
         )
         return denoised_coords
 
-    def _release_res_trace(self):
-        """Release the persisted device-resident diffusion trace + its buffers.
-
-        Called between proteins: the captured reverse-diffusion trace reads the
-        score model's static conditioning (which is rebuilt per protein), so the
-        trace must be re-captured for each protein to stay correct. The program
-        cache (compiled kernels) is preserved separately, so re-capture is cheap.
-        """
-        rc = getattr(self, "_res_trace_cache", None)
-        if rc is None:
-            return
-        try:
-            import tt_boltz.tenstorrent as _tt
-            dev = _tt.get_device()
-            _tt.ttnn.release_trace(dev, rc["trace_id"])
-            _tt.ttnn.deallocate(rc["coords_dev"])
-            for b in rc.get("bufs", {}).values():
-                _tt.ttnn.deallocate(b)
-        except Exception:
-            pass
-        self._res_trace_cache = None
-
     def sample_schedule(self, num_sampling_steps=None):
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         inv_rho = 1 / self.rho
@@ -4040,15 +4018,14 @@ class AtomDiffusion(Module):
 
     def _resident_sample(
         self, atom_coords, atom_mask, sigmas_and_gammas, step_scale,
-        network_condition_kwargs, progress_fn, n_steps, traced=None,
+        network_condition_kwargs, progress_fn, n_steps,
     ):
         """Device-resident reverse-diffusion loop (simplest case).
 
         The atom coords stay on the TT device for the whole loop; per step the
         augmentation, noise, preconditioning, score-model forward, on-device
         Kabsch alignment and EDM update all run on device. Per-step RNG and
-        schedule scalars are precomputed on host and fed in. With traced=True the
-        step body is captured once and replayed (no per-step host interaction).
+        schedule scalars are precomputed on host and fed in.
         """
         import tt_boltz.tenstorrent as tt
         ttnn = tt.ttnn
@@ -4057,8 +4034,6 @@ class AtomDiffusion(Module):
         f32, bf16 = ttnn.float32, ttnn.bfloat16
         TILE = ttnn.TILE_LAYOUT
         sd, ns = self.sigma_data, self.noise_scale
-        if traced is None:
-            traced = bool(os.environ.get("TT_BOLTZ_DIFFUSION_RESIDENT_TRACE"))
 
         N = atom_mask.shape[1]
         shape = (*atom_mask.shape, 3)
@@ -4129,62 +4104,12 @@ class AtomDiffusion(Module):
         _dtypes = {"R": f32, "tr": f32, "eps": f32, "times": bf16,
                    "c_in": f32, "c_skip": f32, "c_out": f32, "coef": f32}
 
-        if not traced:
-            for i, st in enumerate(steps):
-                if progress_fn and i % 10 == 0:
-                    progress_fn("diffusion", step=i, total=n_steps)
-                hi = host_inputs(st)
-                coords = step_body(coords, {k: to(v, _dtypes[k]) for k, v in hi.items()})
-            out = torch.Tensor(ttnn.to_torch(coords)).to(torch.float32)[:, :N, :]
-            return out
-
-        # ---- traced: persistent input buffers + coords; capture step once, replay ----
-        coords_dev = ttnn.allocate_tensor_on_device(coords.spec, dev)
-        ttnn.copy(coords, coords_dev)
-        h0 = host_inputs(steps[0])
-        bufs = {}
-        for k, v in h0.items():
-            host = ttnn.from_torch(v, layout=TILE, dtype=_dtypes[k])
-            bufs[k] = ttnn.allocate_tensor_on_device(host.spec, dev)
-
-        def load(st):
-            for k, v in host_inputs(st).items():
-                ttnn.copy_host_to_device_tensor(
-                    ttnn.from_torch(v, layout=TILE, dtype=_dtypes[k]), bufs[k])
-
-        if progress_fn:
-            progress_fn("diffusion", step=0, total=n_steps)
-        load(steps[0])                                   # warm-up = step 0
-        ttnn.copy(step_body(coords_dev, bufs), coords_dev)
-        ttnn.synchronize_device(dev)
-
-        load(steps[1] if n_steps > 1 else steps[0])
-        trace_id = ttnn.begin_trace_capture(dev)
-        ttnn.copy(step_body(coords_dev, bufs), coords_dev)
-        ttnn.end_trace_capture(dev, trace_id)
-
-        _timing = os.environ.get("TT_BOLTZ_TIME_DIFFUSION")
-        if _timing:
-            import time as _time
-            ttnn.synchronize_device(dev)
-            _t0 = _time.perf_counter()
-        for i in range(1, n_steps):                      # replay steps 1..T-1
+        for i, st in enumerate(steps):
             if progress_fn and i % 10 == 0:
                 progress_fn("diffusion", step=i, total=n_steps)
-            load(steps[i])
-            ttnn.execute_trace(dev, trace_id)
-        ttnn.synchronize_device(dev)
-        if _timing:
-            dt = _time.perf_counter() - _t0
-            print(f"[diffusion-resident-traced] replay {n_steps - 1} steps: {dt:.3f}s "
-                  f"({dt / max(n_steps - 1, 1) * 1000:.1f} ms/step)", flush=True)
-        # Persist the trace + buffers so a same-shape next protein replays it
-        # (instead of releasing). Released on shape change / reset_static_cache.
-        self._res_trace_cache = {"sig": (N, n_steps), "coords_dev": coords_dev,
-                                 "bufs": bufs, "trace_id": trace_id}
-
-        out = torch.Tensor(ttnn.to_torch(coords_dev)).to(torch.float32)[:, :N, :]
-        return out
+            hi = host_inputs(st)
+            coords = step_body(coords, {k: to(v, _dtypes[k]) for k, v in hi.items()})
+        return torch.Tensor(ttnn.to_torch(coords)).to(torch.float32)[:, :N, :]
 
     def sample(
         self,
@@ -4270,12 +4195,6 @@ class AtomDiffusion(Module):
                 network_condition_kwargs, progress_fn, _n_steps,
             )
             return dict(sample_atom_coords=coords, diff_token_repr=None)
-        _t_diff = None
-        if os.environ.get("TT_BOLTZ_TIME_DIFFUSION"):
-            import time as _time
-            import tt_boltz.tenstorrent as _tt
-            _tt.ttnn.synchronize_device(_tt.get_device())
-            _t_diff = _time.perf_counter()
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
             if progress_fn and step_idx % 10 == 0:
                 progress_fn("diffusion", step=step_idx, total=_n_steps)
@@ -4478,18 +4397,6 @@ class AtomDiffusion(Module):
             )
 
             atom_coords = atom_coords_next
-
-        if _t_diff is not None:
-            import tt_boltz.tenstorrent as _tt
-            _tt.ttnn.synchronize_device(_tt.get_device())
-            print(f"[diffusion] loop: {_time.perf_counter() - _t_diff:.3f}s "
-                  f"({_n_steps} steps, {(_time.perf_counter() - _t_diff) / _n_steps * 1000:.1f} ms/step)",
-                  flush=True)
-
-        # Release the captured score-model trace (if any) before downstream device
-        # work (confidence) allocates buffers; safe no-op when not tracing.
-        if getattr(self.score_model, "release_trace", None):
-            self.score_model.release_trace()
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 
@@ -5405,11 +5312,6 @@ class Boltz2(nn.Module):
 
         W, H = 32, 128
         B, Natom, _ = feats["ref_pos"].shape
-        if os.environ.get("TT_BOLTZ_DEBUG_SHAPES"):
-            print(f"[ie] B={B} Natom={Natom} Ntok={feats['res_type'].shape[1]} "
-                  f"name_chars={tuple(feats['ref_atom_name_chars'].shape)} "
-                  f"atom_to_token={tuple(feats['atom_to_token'].shape)} "
-                  f"method={tuple(feats['method_feature'].shape)}", flush=True)
         assert Natom % W == 0, f"atom count {Natom} not a multiple of {W}"
         K = Natom // W
         Ntok = feats["res_type"].shape[1]
@@ -5717,11 +5619,9 @@ class Boltz2(nn.Module):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
-        # Per protein: reset all device caches and re-capture the diffusion trace
-        # fresh (correct by construction — no cross-protein trace reuse). The
-        # program cache (compiled kernels) is enabled once and kept warm, so a
-        # same-shape protein needs no recompile and the per-protein re-capture is
-        # cheap (~0.4s).
+        # Per protein: reset all device static caches so each protein's
+        # conditioning is rebuilt fresh. The program cache (compiled kernels) is
+        # enabled once and kept warm, so a same-shape protein needs no recompile.
         if self.use_tenstorrent:
             if not getattr(self, "_pc_enabled", False):
                 try:
@@ -5732,20 +5632,10 @@ class Boltz2(nn.Module):
             for m in self.modules():
                 if hasattr(m, 'reset_static_cache'):
                     m.reset_static_cache()
-            _sm = getattr(self, "structure_module", None)
-            if _sm is not None and getattr(_sm, "_release_res_trace", None):
-                _sm._release_res_trace()
 
         _pfn = self.progress_fn
         if _pfn:
             _pfn("trunk", step=0, total=recycling_steps + 1)
-
-        # One-shot feats dump for offline unit-testing of ported modules.
-        _dump = os.environ.get("TT_BOLTZ_DUMP_FEATS")
-        if _dump:
-            torch.save({k: (v.detach().cpu() if torch.is_tensor(v) else v)
-                        for k, v in feats.items()}, _dump)
-            print(f"[boltz2] dumped feats -> {_dump}", flush=True)
 
         if self.trace:
             print("[boltz2] forward: input_embedder")
@@ -5805,30 +5695,14 @@ class Boltz2(nn.Module):
             and not os.environ.get("TT_BOLTZ_NO_RESIDENT_TRUNK")
         )
         if use_resident_trunk:
-            if self.trace or os.environ.get("TT_BOLTZ_TRACE_TRUNK"):
-                print("[boltz2] resident trunk loop (ttnn)", flush=True)
-            _t_trunk = None
-            if os.environ.get("TT_BOLTZ_TIME_TRUNK"):
-                import time as _time
-                tenstorrent.ttnn.synchronize_device(tenstorrent.get_device())
-                _t_trunk = _time.perf_counter()
             _trunk = self._tt_trunk_module()
             _trunk._keep_device_z = _chain
             s, z = _trunk(s_inputs, s_init, z_init, feats, recycling_steps)
             if _chain and getattr(_trunk, "_dev_z", None) is not None:
                 self._chain_cache[id(z)] = _trunk._dev_z
-            if _t_trunk is not None:
-                tenstorrent.ttnn.synchronize_device(tenstorrent.get_device())
-                print(f"[boltz2] resident trunk: {_time.perf_counter() - _t_trunk:.3f}s "
-                      f"({recycling_steps + 1} iters)", flush=True)
             if _pfn:
                 _pfn("trunk", step=recycling_steps, total=recycling_steps + 1)
         elif self.run_trunk_and_structure:
-            _t_wrap = None
-            if os.environ.get("TT_BOLTZ_TIME_TRUNK"):
-                import time as _time
-                tenstorrent.ttnn.synchronize_device(tenstorrent.get_device())
-                _t_wrap = _time.perf_counter()
             for i in range(recycling_steps + 1):
                 if _pfn:
                     _pfn("trunk", step=i, total=recycling_steps + 1)
@@ -5875,11 +5749,6 @@ class Boltz2(nn.Module):
                     pair_mask=pair_mask,
                     use_kernels=self.use_kernels,
                 )
-            if _t_wrap is not None:
-                tenstorrent.ttnn.synchronize_device(tenstorrent.get_device())
-                print(f"[boltz2] wrapper trunk: {_time.perf_counter() - _t_wrap:.3f}s "
-                      f"({recycling_steps + 1} iters)", flush=True)
-
 
         if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_DISTOGRAM"):
             import tt_boltz.tenstorrent as _tt

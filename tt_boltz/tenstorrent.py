@@ -181,13 +181,6 @@ def get_device():
             {"dispatch_core_config": ttnn.DispatchCoreConfig(ttnn.DispatchCoreType.ETH)}
             if ttnn.get_arch_name() == "wormhole_b0" else {}
         )
-        # Reserve a trace region when a tracing path is enabled so a captured op
-        # sequence can be replayed (trunk loop or diffusion score-model forward).
-        if (os.environ.get("TT_BOLTZ_TRUNK_TRACE") or os.environ.get("TT_BOLTZ_DIFFUSION_TRACE")
-                or os.environ.get("TT_BOLTZ_DIFFUSION_RESIDENT_TRACE")):
-            kwargs["trace_region_size"] = int(
-                os.environ.get("TT_BOLTZ_TRACE_REGION_SIZE", str(256 * 1024 * 1024))
-            )
         _device = ttnn.open_device(device_id=device_id, **kwargs)
         _configure_active_compute_grid(_device)
         _device.enable_program_cache()
@@ -2422,11 +2415,7 @@ class DiffusionModule(TorchWrapper):
         if atom_pad_cached:
             r = torch.nn.functional.pad(r, (0, 0, 0, atom_pad_cached))
 
-        _call = self.forward_device
-        if os.environ.get("TT_BOLTZ_DIFFUSION_TRACE"):
-            result_tt = self._traced_call(r, times, _call)
-        else:
-            result_tt = _call(self._from_torch(r), self._from_torch(times))
+        result_tt = self.forward_device(self._from_torch(r), self._from_torch(times))
 
         result = self._to_torch(result_tt)
         result = result[:, :N, :]
@@ -2455,77 +2444,6 @@ class DiffusionModule(TorchWrapper):
             large_seq_len=self._cache_get("large_seq_len"),
         )
 
-    def _traced_call(self, r, times, call):
-        """Capture the score-model forward once, then replay it each step.
-
-        Only ``r`` (atom coords) and ``times`` change between diffusion steps;
-        everything else is the cached static conditioning. So the inner forward
-        is captured on the first step and replayed for the rest, feeding new
-        r/times into persistent input buffers (zero per-step op-dispatch).
-        Returns a device tensor (the persistent output buffer on replays).
-        """
-        dev = self.tt_device
-        trace = self._cache_get("_diff_trace")
-        if trace is None:
-            r_dev = self._persistent_from(r)
-            times_dev = self._persistent_from(times)
-            # Warm-up: compiles all kernels AND lazily fills the module's static
-            # conditioning cache (_s_conditioned, ...) so the capture records only
-            # the per-step ops. This call also produces this step's real result.
-            warm = call(r_dev, times_dev)
-            ttnn.synchronize_device(dev)
-            ttnn.deallocate(warm)
-            trace_id = ttnn.begin_trace_capture(dev)
-            result_dev = call(r_dev, times_dev)
-            ttnn.end_trace_capture(dev, trace_id)
-            self._cache_set("_diff_trace", {
-                "id": trace_id, "r": r_dev, "times": times_dev, "result": result_dev,
-            })
-            # The warm-up already advanced device state identically to a replay
-            # would; return its (re-run) result via one replay so step 1 and the
-            # rest share one path.
-            ttnn.execute_trace(dev, trace_id)
-            return result_dev
-
-        ttnn.copy_host_to_device_tensor(self._host_like(r, trace["r"]), trace["r"])
-        ttnn.copy_host_to_device_tensor(self._host_like(times, trace["times"]), trace["times"])
-        ttnn.execute_trace(dev, trace["id"])
-        return trace["result"]
-
-    def _persistent_from(self, x):
-        """Allocate a persistent device buffer holding x (a trace input)."""
-        host = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
-        dev_t = ttnn.allocate_tensor_on_device(host.spec, self.tt_device)
-        ttnn.copy_host_to_device_tensor(host, dev_t)
-        return dev_t
-
-    @staticmethod
-    def _host_like(x, template):
-        """A host tensor matching template's spec, holding x's data."""
-        return ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
-
-    def release_trace(self):
-        """Release any captured diffusion trace + its persistent buffers.
-
-        Called after the sampling loop so device allocations made afterwards
-        (e.g. the confidence module) don't coexist with an active trace.
-        """
-        trace = self._cache_get("_diff_trace")
-        if trace is None:
-            return
-        try:
-            ttnn.release_trace(self.tt_device, trace["id"])
-        except Exception:
-            pass
-        for key in ("r", "times", "result"):
-            self._deallocate_tensor_like(trace.get(key))
-        self._runtime_cache.pop("_diff_trace", None)
-
-    def reset_static_cache(self):
-        # Release any captured diffusion trace before the generic cache clear
-        # (the trace dict isn't a plain tensor container).
-        self.release_trace()
-        super().reset_static_cache()
         if self.module is not None:
             self._clear_cached_attrs(self.module, ("_s_conditioned", "_c_reshaped"))
             for layer in self.module.encoder.layers + self.module.decoder.layers:
@@ -2790,18 +2708,12 @@ class TrunkModule(TorchWrapper):
             self._cache_set(k, v)
         return static
 
-    def _iteration(self, s, z, st, dealloc_inputs=True):
-        """Run one recycling iteration fully on device; returns (s, z).
-
-        ``dealloc_inputs`` frees the input s/z (eager loop, where they are the
-        previous iteration's tensors). The traced path keeps its persistent
-        input buffers alive and copies the result back into them instead.
-        """
+    def _iteration(self, s, z, st):
+        """Run one recycling iteration fully on device; returns (s, z)."""
         # s = s_init + s_recycle(s_norm(s)); z = z_init + z_recycle(z_norm(z))
         s_rec, z_rec = self.recycle(s, z, st["s_init_tt"], st["z_init_tt"])
-        if dealloc_inputs:
-            ttnn.deallocate(s)
-            ttnn.deallocate(z)
+        ttnn.deallocate(s)
+        ttnn.deallocate(z)
 
         # z = z + msa(z). The inner MSA mutates its z argument in place, so clone
         # z_rec first to preserve it for the residual add (matches the wrapper,
@@ -2828,10 +2740,7 @@ class TrunkModule(TorchWrapper):
         st = self._build_static(s_inputs, s_init, z_init, feats)
         seq_len = st["seq_len"]
 
-        if os.environ.get("TT_BOLTZ_TRUNK_TRACE"):
-            s, z = self._run_traced(st, recycling_steps)
-        else:
-            s, z = self._run_eager(st, s_init.dtype, z_init.dtype, recycling_steps)
+        s, z = self._run_eager(st, s_init.dtype, z_init.dtype, recycling_steps)
 
         # Device-resident chaining: stash an unpadded device clone of z (the 64MB
         # [1,N,N,128] pair tensor) so distogram/diffusion_conditioning reuse it
@@ -2914,78 +2823,9 @@ class TrunkModule(TorchWrapper):
     def _run_eager(self, st, s_dtype, z_dtype, recycling_steps):
         s = self._from_torch(torch.zeros(list(st["s_init_tt"].shape), dtype=s_dtype))
         z = self._from_torch(torch.zeros(list(st["z_init_tt"].shape), dtype=z_dtype))
-        _time = None
-        if os.environ.get("TT_BOLTZ_TIME_TRUNK_ITERS"):
-            import time as _time
-        for i in range(recycling_steps + 1):
-            t0 = None
-            if _time is not None:
-                ttnn.synchronize_device(self.tt_device)
-                t0 = _time.perf_counter()
+        for _ in range(recycling_steps + 1):
             s, z = self._iteration(s, z, st)
-            if _time is not None:
-                ttnn.synchronize_device(self.tt_device)
-                print(f"[trunk-eager] iter {i}: {_time.perf_counter() - t0:.3f}s", flush=True)
         return s, z
-
-    def _persistent_zeros(self, template):
-        """A persistent device buffer (trace input) initialised to zeros."""
-        host = ttnn.from_torch(
-            torch.zeros(list(template.shape)), layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16
-        )
-        dev_t = ttnn.allocate_tensor_on_device(host.spec, self.tt_device)
-        ttnn.copy_host_to_device_tensor(host, dev_t)
-        return dev_t
-
-    def _run_traced(self, st, recycling_steps):
-        """Capture one recycling-iteration body and replay it for the rest.
-
-        s/z live in persistent device buffers; each iteration's result is copied
-        back into them in place, so the captured trace chains across replays with
-        zero host interaction (see the recycling loop semantics in boltz2.py).
-        """
-        dev = self.tt_device
-        _time = None
-        if os.environ.get("TT_BOLTZ_TIME_TRUNK"):
-            import time as _time
-        s_dev = self._persistent_zeros(st["s_init_tt"])
-        z_dev = self._persistent_zeros(st["z_init_tt"])
-
-        def body():
-            s_out, z_out = self._iteration(s_dev, z_dev, st, dealloc_inputs=False)
-            ttnn.copy(s_out, s_dev)
-            ttnn.copy(z_out, z_dev)
-            ttnn.deallocate(s_out)
-            ttnn.deallocate(z_out)
-
-        def _mark():
-            if _time is not None:
-                ttnn.synchronize_device(dev)
-                return _time.perf_counter()
-            return None
-
-        # Warm-up iteration (compiles all kernels; required before capture). This
-        # is iteration 1 of recycling_steps+1.
-        t0 = _mark()
-        body()
-        t1 = _mark()
-
-        if recycling_steps >= 1:
-            trace_id = ttnn.begin_trace_capture(dev)
-            body()
-            ttnn.end_trace_capture(dev, trace_id)
-            t2 = _mark()
-            for _ in range(recycling_steps):  # iterations 2 .. recycling_steps+1
-                ttnn.execute_trace(dev, trace_id)
-            t3 = _mark()
-            ttnn.release_trace(dev, trace_id)
-            if _time is not None:
-                print(f"[trunk-trace] warmup={t1-t0:.3f}s capture={t2-t1:.3f}s "
-                      f"replay({recycling_steps})={t3-t2:.3f}s "
-                      f"=> {(t3-t2)/recycling_steps:.3f}s/replay vs {t1-t0:.3f}s/eager-iter",
-                      flush=True)
-
-        return s_dev, z_dev
 
 
 # ---------------------------------------------------------------------------
@@ -3392,8 +3232,6 @@ class AtomAttentionEncoder(Module):
 
         a = ttnn.reshape(c, (B, K, W, atom_s))
         a = self.transformer(a, a, bias, keys_indexing)            # [B,K,W,atom_s]
-        if os.environ.get("TT_BOLTZ_DEBUG_SHAPES"):
-            print(f"[aae] transformer out shape {tuple(a.shape)} -> reshape ({B},{N},{atom_s})", flush=True)
         a = ttnn.reshape(a, (B, N, atom_s))
 
         qa = ttnn.linear(a, self.a2t_w, activation="relu", compute_kernel_config=kc, core_grid=CORE_GRID_MAIN)
