@@ -349,3 +349,139 @@ class ESMC(TorchWrapper):
         )
         logits, emb = self.module(tokens_tt)
         return self._to_torch(logits), self._to_torch(emb)
+
+
+# ===========================================================================
+# ESMC-6B language-model backbone for ESMFold2
+# ===========================================================================
+#
+# The 6B checkpoint ships in HuggingFace transformers / TransformerEngine
+# layout (sharded safetensors, fused LayerNormLinear / LayerNormMLP modules),
+# so its weight keys differ from the esm-repo names the ttnn blocks expect.
+# This remap renames TE keys to the esm-repo `nn.Sequential`-index names, after
+# which the existing `Block` / `Embedding` modules load unchanged.
+
+_TE_KEY_REMAP = (
+    ("attn.layernorm_qkv.layer_norm_weight", "attn.layernorm_qkv.0.weight"),
+    ("attn.layernorm_qkv.layer_norm_bias", "attn.layernorm_qkv.0.bias"),
+    ("attn.layernorm_qkv.weight", "attn.layernorm_qkv.1.weight"),
+    ("ffn.layer_norm_weight", "ffn.0.weight"),
+    ("ffn.layer_norm_bias", "ffn.0.bias"),
+    ("ffn.fc1_weight", "ffn.1.weight"),
+    ("ffn.fc2_weight", "ffn.3.weight"),
+)
+
+
+def load_esmc6b_state_dict(snapshot_dir: str) -> dict:
+    """Read the sharded 6B safetensors and remap TE keys to esm-repo names.
+
+    Keeps only weights the ttnn stack consumes (embed, transformer blocks,
+    final norm); drops `_extra_state`, the LM head and any classifier heads.
+    """
+    import glob
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    idx_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
+    weight_map = json.load(open(idx_path))["weight_map"]
+    by_shard: dict[str, list[str]] = {}
+    for k, shard in weight_map.items():
+        by_shard.setdefault(shard, []).append(k)
+
+    sd: dict[str, torch.Tensor] = {}
+    for shard, keys in by_shard.items():
+        with safe_open(os.path.join(snapshot_dir, shard), "pt") as f:
+            for k in keys:
+                if k.endswith("_extra_state") or k.startswith("lm_head"):
+                    continue
+                if not k.startswith("esmc."):
+                    continue
+                nk = k[len("esmc."):]  # drop the "esmc." prefix
+                for src, dst in _TE_KEY_REMAP:
+                    nk = nk.replace(src, dst)
+                sd[nk] = f.get_tensor(k).float()
+    _ = glob  # (kept for symmetry with other loaders)
+    return sd
+
+
+class ESMCHiddenStatesModel(Module):
+    """ESMC stack returning all `n_layers + 1` hidden states (ESMFold2 LM input).
+
+    Matches `EsmcTransformerStack` collection semantics:
+    `hs[0]` = embedding output, `hs[i]` = input to block `i` (= output of block
+    `i-1`) for `1 <= i < n_layers`, and `hs[n_layers]` = final-LayerNorm output.
+    Single-sequence / single-chain only (full attention, no padding) — which is
+    how `compute_lm_hidden_states` feeds one wrapped chain at a time.
+    """
+
+    def __init__(self, n_heads: int, n_layers: int, state_dict: Weights, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.embed = Embedding(self.scope("embed"), compute_kernel_config)
+        self.blocks = [
+            Block(n_heads, n_layers, self.scope(f"transformer.blocks.{i}"), compute_kernel_config)
+            for i in range(n_layers)
+        ]
+        self.norm_weight = self.torch_to_tt("transformer.norm.weight")
+
+    def __call__(self, tokens: ttnn.Tensor):
+        seq_len = tokens.shape[-1]
+        head_dim = self.norm_weight.shape[-1] // self.n_heads
+        cos, sin = rope_tables(seq_len, head_dim, device=self.device)
+
+        x = self.embed(tokens)
+        hidden = [self._to_host(x)]  # hs[0] = embedding output
+        for i, block in enumerate(self.blocks):
+            x = block(x, cos, sin)
+            if i < self.n_layers - 1:
+                hidden.append(self._to_host(x))  # hs[i+1] = block i output
+        norm_x = ttnn.layer_norm(
+            x, weight=self.norm_weight, epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        ttnn.deallocate(x)
+        hidden.append(self._to_host(norm_x))  # hs[n_layers] = post-norm output
+        return hidden
+
+    @staticmethod
+    def _to_host(t: ttnn.Tensor) -> torch.Tensor:
+        return torch.Tensor(ttnn.to_torch(t)).float()
+
+
+class ESMCLanguageModel(TorchWrapper):
+    """ESMC-6B backbone (torch in / torch out) producing ESMFold2 LM hidden states.
+
+    `forward(input_ids[B,L])` -> hidden states `[n_layers+1, B, L, d_model]`,
+    matching `transformers` ESMC `output_hidden_states=True` (the stacked input
+    consumed by ESMFold2's `LanguageModelShim`).
+    """
+
+    def __init__(self, name: str = "esmc-6b"):
+        super().__init__()
+        cfg = ARCH_CONFIGS[name]
+        self.d_model = cfg["d_model"]
+        self.n_heads = cfg["n_heads"]
+        self.n_layers = cfg["n_layers"]
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str = "biohub/ESMC-6B", name: str = "esmc-6b") -> "ESMCLanguageModel":
+        from huggingface_hub import snapshot_download
+
+        snap = snapshot_download(repo_id)
+        model = cls(name=name)
+        model.load_state_dict(load_esmc6b_state_dict(snap), strict=False)
+        return model
+
+    def _create_module(self, weights: WeightScope) -> ESMCHiddenStatesModel:
+        return ESMCHiddenStatesModel(self.n_heads, self.n_layers, weights, self.compute_kernel_config)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        tokens_tt = ttnn.from_torch(
+            input_ids.to(torch.int32), device=self.tt_device,
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        )
+        hidden = self.module(tokens_tt)  # list of [B, L, d_model]
+        return torch.stack(hidden, dim=0)  # [n_layers+1, B, L, d_model]
