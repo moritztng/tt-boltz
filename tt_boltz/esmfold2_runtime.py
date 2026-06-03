@@ -62,8 +62,9 @@ class _ESMCAdapter:
         hs = self.lm(input_ids, attn_mask=attn_mask)            # [n_layers+1,B,L,D]
         if not self._persistent:
             # Memory-conservative mode: free the ~12.8 GB of 6B device weights
-            # after the single LM forward (reloaded lazily next fold). Use this
-            # only if a very long sequence would otherwise OOM.
+            # after the single LM forward (reloaded lazily next fold). Not needed
+            # in practice — persistent mode fits the full L<=1024 range — but
+            # available as extra headroom for unusually large inputs.
             self.lm.release()
             self.lm = None
         return types.SimpleNamespace(hidden_states=hs)
@@ -175,8 +176,11 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
     resident across folds — so predicting many proteins in one process keeps all
     weights loaded (tt-boltz style: pay the ~60 s ESMC load once on the first
     fold, then reuse). The trunk / encoders / structure-head weights are always
-    resident. Set ``persistent_lm=False`` to release+reload the 6B per fold for
-    the rare case where a single very long sequence would otherwise OOM.
+    resident. This fits the full supported range: a single Blackhole holds the
+    resident 6B (~12.8 GB) plus the L=1024 trunk/diffusion activations with room
+    to spare (validated: L=1024 folds in persistent mode without OOM).
+    ``persistent_lm=False`` releases+reloads the 6B per fold as extra headroom
+    for unusually large inputs, at the cost of an ESMC reload each fold.
     """
     sd = {k: v.float() for k, v in model.state_dict().items()}
     comps = _components(sd)
