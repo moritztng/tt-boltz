@@ -418,22 +418,31 @@ class DiffusionConditioningModel(Module):
         self.noise_proj_w = self.torch_to_tt("noise_proj.weight")
         self.s_trans = [TransitionLayer(self.scope(f"s_transitions.{i}"), compute_kernel_config) for i in range(2)]
 
-    def __call__(self, s_inputs, z_trunk, relpos, n_raw):
+    def cond_pair(self, z_trunk, relpos):
+        """Pair conditioning z = f(z_trunk, relpos). Step-INVARIANT (no t / no
+        coords) — computed once and cached across the diffusion trajectory."""
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(
-            t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
-        )
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         z = ttnn.concat([z_trunk, relpos], dim=-1)
         z = lin(ttnn.layer_norm(z, weight=self.z_in_w, bias=self.z_in_b, epsilon=1e-5, compute_kernel_config=ck), self.z_proj_w)
         for t in self.z_trans:
             z = ttnn.add(z, t(z))
+        return z
 
+    def cond_single(self, s_inputs, n_raw):
+        """Single conditioning s = f(s_inputs, fourier(t)). t-DEPENDENT (cheap,
+        [B,L,c]) — recomputed each step."""
+        ck = self.compute_kernel_config
+        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         s = lin(ttnn.layer_norm(s_inputs, weight=self.s_in_w, bias=self.s_in_b, epsilon=1e-5, compute_kernel_config=ck), self.s_proj_w)
         n = lin(ttnn.layer_norm(n_raw, weight=self.noise_n_w, bias=self.noise_n_b, epsilon=1e-5, compute_kernel_config=ck), self.noise_proj_w)
         s = ttnn.add(s, ttnn.unsqueeze(n, 1))  # broadcast noise over the L axis
         for t in self.s_trans:
             s = ttnn.add(s, t(s))
-        return s, z
+        return s
+
+    def __call__(self, s_inputs, z_trunk, relpos, n_raw):
+        return self.cond_single(s_inputs, n_raw), self.cond_pair(z_trunk, relpos)
 
 
 class DiffusionConditioning(TorchWrapper):
@@ -696,17 +705,52 @@ class DiffusionModuleModel(Module):
         self.token_norm_w = self.torch_to_tt("token_norm.weight")
         self.token_norm_b = self.torch_to_tt("token_norm.bias")
 
-    def __call__(self, s_inputs, z_trunk, relpos, n_raw, atom_feats, r_input,
-                 cos, sin, band, scatter_m, gather_g, valid=None):
+    def _denoise(self, s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g, valid):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
-        s, z = self.conditioning(s_inputs, z_trunk, relpos, n_raw)
         a, q_skip, c_skip = self.atom_encoder(atom_feats, cos, sin, band, scatter_m, r_input=r_input, valid=valid)
         s_step = ttnn.layer_norm(s, weight=self.s_step_norm_w, bias=self.s_step_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = ttnn.add(a, lin(s_step, self.s_to_token_w))
         a = self.token_transformer(a, s, z)
         a = ttnn.layer_norm(a, weight=self.token_norm_w, bias=self.token_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         return self.atom_decoder(a, q_skip, c_skip, cos, sin, band, gather_g, valid=valid)
+
+    def __call__(self, s_inputs, z_trunk, relpos, n_raw, atom_feats, r_input,
+                 cos, sin, band, scatter_m, gather_g, valid=None):
+        s, z = self.conditioning(s_inputs, z_trunk, relpos, n_raw)
+        out = self._denoise(s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g, valid)
+        ttnn.deallocate(z); ttnn.deallocate(s)
+        return out
+
+    # --- Cached sampling path: prepare step-invariant device tensors once, then
+    # run each diffusion step transferring only the (tiny) noisy coords. Avoids
+    # re-transferring z_trunk/relpos (~L²·256) and re-computing the pair
+    # conditioning at every one of the ~20 sampling steps. ---
+    def prepare(self, s_inputs, z_trunk, relpos, atom_feats, cos, sin, band,
+                scatter_m, gather_g, valid=None):
+        self._ctx = dict(
+            s_inputs=s_inputs, atom_feats=atom_feats, cos=cos, sin=sin, band=band,
+            scatter_m=scatter_m, gather_g=gather_g, valid=valid,
+            z=self.conditioning.cond_pair(z_trunk, relpos),  # cached pair conditioning
+        )
+        ttnn.deallocate(z_trunk); ttnn.deallocate(relpos)
+
+    def step(self, n_raw, r_input):
+        c = self._ctx
+        s = self.conditioning.cond_single(c["s_inputs"], n_raw)
+        out = self._denoise(s, c["z"], c["atom_feats"], r_input, c["cos"], c["sin"],
+                            c["band"], c["scatter_m"], c["gather_g"], c["valid"])
+        ttnn.deallocate(s)
+        return out
+
+    def release_cache(self):
+        for k, v in getattr(self, "_ctx", {}).items():
+            if isinstance(v, ttnn.Tensor):
+                try:
+                    ttnn.deallocate(v)
+                except Exception:
+                    pass
+        self._ctx = {}
 
 
 class DiffusionModule(TorchWrapper):
@@ -1191,15 +1235,47 @@ class StructureHead(TorchWrapper):
 
     def sample(self, z_trunk, s_inputs, relpos, ref_pos, ref_charge, ref_mask, ref_element,
                ref_atom_name_chars, ref_space_uid, tok_idx, steps=14, seed=0):
-        # Wrap the ttnn DiffusionModule forward as a denoise callable.
-        dm = DiffusionModule(sigma_data=self.sigma_data)
-        dm.module = self.module
-        dm._fw, dm._fb = self._fw, self._fb
-        denoise = lambda x_noisy, t_hat: dm(
-            x_noisy, t_hat, ref_pos, ref_charge, ref_mask, ref_element,
-            ref_atom_name_chars, ref_space_uid, tok_idx, s_inputs, z_trunk, relpos)
-        return sample_structure(denoise, tok_idx.shape[1], ref_mask, steps=steps,
-                                sigma_data=self.sigma_data, seed=seed)
+        # Build the step-invariant tensors ONCE and keep them resident on the
+        # device for the whole trajectory: the pair conditioning, atom features,
+        # 3D-RoPE / band / scatter / gather tables. Only the (tiny) noisy coords
+        # cross PCIe each step — z_trunk/relpos (~L²·256) and the pair
+        # conditioning are not re-transferred / re-computed per step.
+        dmm, sigma = self.module, self.sigma_data
+        B, N, L = ref_pos.shape[0], ref_pos.shape[1], s_inputs.shape[1]
+        ft = self._from_torch
+        atom_feats = torch.cat([
+            ref_pos, ref_charge.unsqueeze(-1), ref_mask.unsqueeze(-1).float(),
+            ref_element, ref_atom_name_chars.reshape(B, N, -1),
+        ], dim=-1)
+        cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, 32, **ATOM_ROPE)
+        band = band_mask(ref_mask, 64)
+        valid = ref_mask.reshape(1, N, 1).float()
+        oh = F.one_hot(tok_idx[0].long(), L).float() * ref_mask[0].float()[:, None]
+        gather_g = oh.unsqueeze(0)
+        scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)
+        dmm.prepare(ft(s_inputs), ft(z_trunk), ft(relpos), ft(atom_feats.float()),
+                    ft(cos.float()), ft(sin.float()), ft(band.float()),
+                    ft(scatter_m.float()), ft(gather_g.float()), ft(valid))
+
+        def denoise(x_noisy, t_hat):
+            t = torch.as_tensor(t_hat, dtype=torch.float32).reshape(-1)
+            if t.numel() == 1:
+                t = t.expand(x_noisy.shape[0])
+            t_noise = 0.25 * torch.log((t / sigma).clamp(min=1e-20))
+            n_raw = torch.cos(2.0 * math.pi * (t_noise[:, None] * self._fw[None, :] + self._fb[None, :])).float()
+            denom = torch.sqrt(t * t + sigma * sigma)
+            r_noisy = x_noisy / denom[:, None, None]
+            r_input = torch.cat([r_noisy, torch.zeros_like(r_noisy)], dim=-1)  # [B,N,6]
+            r_update = self._to_torch(dmm.step(ft(n_raw), ft(r_input.float())))
+            sigma2, t2 = sigma * sigma, t * t
+            out = (sigma2 / (sigma2 + t2))[:, None, None] * x_noisy
+            return out + ((sigma * t) / torch.sqrt(sigma2 + t2))[:, None, None] * r_update
+
+        try:
+            return sample_structure(denoise, N, ref_mask, steps=steps,
+                                    sigma_data=sigma, seed=seed)
+        finally:
+            dmm.release_cache()
 
 
 # ===========================================================================
