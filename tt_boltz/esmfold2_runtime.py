@@ -174,6 +174,70 @@ def _components(sd):
     return built
 
 
+def _install_resident_trunk_loop(model):
+    """Replace the reference `_run_one_loop` with an on-device, resident-z version.
+
+    Two wins over the per-module reference loop:
+      * Deterministic inference (the per-loop lm_dropout's expectation is the
+        identity) makes the LM-encoder, MSA-encoder and injection projection
+        LOOP-INVARIANT — they are computed once instead of every iteration.
+      * The pair state z stays resident on the TT device across all trunk
+        iterations: the parcae recurrence (a*z + inject) and the folding trunk
+        both run on-device, so the ~L²·256 pair tensor is never round-tripped
+        (host<->device, with tile-layout conversion) per loop.
+    """
+    import types
+
+    import ttnn
+
+    from tt_boltz import esmfold2 as E
+
+    ftw = model.folding_trunk.m  # _TrunkAdapter.m -> E.FoldingTrunk TorchWrapper
+    overwrite = bool(getattr(model.config, "msa_encoder_overwrite", True))
+
+    def _run_one_loop(self, z, z_init, lm_z, _msa_kwargs, pair_mask, a, b_mat, total_steps):
+        # --- loop-invariant injection, computed ONCE ---
+        z_inject = z_init
+        if self.msa_encoder is not None and _msa_kwargs is not None:
+            # reference passes x_pair (the current pair state) separately from _msa_kwargs
+            msa_pair = self.msa_encoder(x_pair=z_inject, **_msa_kwargs).to(z_init.dtype)
+            z_inject = msa_pair if overwrite else (z_inject + msa_pair)
+        if lm_z is not None and self.lm_encoder is not None:
+            refined = self.lm_encoder(lm_z.to(z_init.dtype), pair_attention_mask=pair_mask)
+            z_inject = z_inject + refined.to(z_init.dtype)
+        injected = self.parcae_input_norm(z_inject)
+        inject_proj = F.linear(injected.to(z.dtype), b_mat)  # [1,L,L,256] (host)
+
+        # --- resident-z recurrence on device ---
+        Lp = z.shape[1]
+        pad = (-Lp) % E.PAD_MULTIPLE
+        padz = lambda t: F.pad(t, (0, 0, 0, pad, 0, pad)) if pad else t
+        mask = None
+        if pad:
+            real = torch.zeros(1, Lp + pad, Lp + pad)
+            real[:, :Lp, :Lp] = 1.0
+            mask = ftw._from_torch(real)
+        zt = ftw._from_torch(padz(z).float())
+        ipt = ftw._from_torch(padz(inject_proj).float())
+        at = ftw._from_torch(a.reshape(1, 1, 1, -1).float())  # parcae a, broadcasts over L,L
+        for _ in range(total_steps):
+            az = ttnn.multiply(zt, at)
+            ttnn.deallocate(zt)
+            znew = ttnn.add(az, ipt)
+            ttnn.deallocate(az)
+            zt = ftw.module(znew, mask)  # folding trunk consumes znew, returns new z
+        z_out = ftw._to_torch(zt)[:, :Lp, :Lp, :].to(z.dtype)
+        for t in (zt, ipt, at, mask):
+            if t is not None:
+                try:
+                    ttnn.deallocate(t)
+                except Exception:
+                    pass
+        return z_out
+
+    model._run_one_loop = types.MethodType(_run_one_loop, model)
+
+
 def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool = True):
     """Replace every neural submodule of `model` with its ttnn implementation.
 
@@ -220,6 +284,11 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
     # persistent_lm it then stays resident for all subsequent folds.
     model._esmc = _ESMCAdapter(esmc_repo, persistent=persistent_lm)
     model._esmc_fp8 = False
+
+    # Keep the pair state resident on-device across the trunk loop (hoist the
+    # loop-invariant LM/MSA/injection work and run the parcae recurrence on
+    # device), avoiding per-loop host<->device round-trips of the L²·256 pair.
+    _install_resident_trunk_loop(model)
     return model
 
 
