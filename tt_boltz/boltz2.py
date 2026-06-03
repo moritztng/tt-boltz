@@ -5568,19 +5568,23 @@ class Boltz2(nn.Module):
 
         if self.trace:
             print("[boltz2] forward: input_embedder")
-        # On Tenstorrent the simplest case (no templates, no affinity) runs the
-        # whole forward device-resident: the input embedder, z-init, distogram,
-        # diffusion conditioning and confidence on device, the big 64MB
-        # activations (z, rel_pos, conditioning) chained device-to-device, and the
-        # reverse-diffusion sampler resident (which has no steering guidance).
-        # Everything else (CPU/GPU, templates, affinity) takes the torch path.
+        # On Tenstorrent the simplest case runs the whole forward device-resident:
+        # the input embedder, z-init, distogram, diffusion conditioning and
+        # confidence on device, the big 64MB activations (z, rel_pos, conditioning)
+        # chained device-to-device, and the reverse-diffusion sampler resident.
+        # That sampler has no steering guidance, so a user who opts into steering
+        # (--use_potentials) takes the torch path instead, as do CPU/GPU runs,
+        # templates and affinity.
         template_mask = feats.get("template_mask")
         has_templates = (
             self.use_templates
             and template_mask is not None
             and bool(template_mask.any().item())
         )
-        _resident = self.use_tenstorrent and not has_templates and not self.affinity_prediction
+        _steered = self.steering_args is not None and (
+            self.steering_args["fk_steering"] or self.steering_args["physical_guidance_update"])
+        _resident = (self.use_tenstorrent and not has_templates
+                     and not self.affinity_prediction and not _steered)
         self._chain_cache = {} if _resident else None
         self._chain_cond = _resident
         self.structure_module._tt_resident = _resident
