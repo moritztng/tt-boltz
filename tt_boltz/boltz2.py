@@ -5292,8 +5292,6 @@ class Boltz2(nn.Module):
             self._tt_ie = ie
 
         g = self._atom_geom(feats)
-        B, Natom, K, W, H = g["dims"]
-        assert Natom % W == 0, f"atom count {Natom} not a multiple of {W}"
         idx = g["idx"]
         att = feats["atom_to_token"].float()
         att_mean_T = (att / (att.sum(1, keepdim=True) + 1e-6)).transpose(1, 2)
@@ -5326,6 +5324,7 @@ class Boltz2(nn.Module):
         same-uid mask v, the per-atom feature vector, and the window indexing
         (idx + the single_to_keys closure tk). All host torch tensors."""
         B, Natom, _ = feats["ref_pos"].shape
+        assert Natom % W == 0, f"atom count {Natom} not a multiple of {W}"
         K = Natom // W
         Ntok = feats["res_type"].shape[1]
         rp = feats["ref_pos"].float()
@@ -5348,16 +5347,16 @@ class Boltz2(nn.Module):
     def _atom_host_prep(self, feats, dev, to, W=32, H=128):
         """ttnn host-feature dict for the diffusion-conditioning atom encoder."""
         g = self._atom_geom(feats, W, H)
-        B, Natom, K, W, H = g["dims"]
-        idx, tk = g["idx"], g["tk"]
+        _, _, K, _, _ = g["dims"]
+        tk = g["tk"]
         att = feats["atom_to_token"].float()
         att_k = tk(att).reshape(K, H, g["Ntok"])
         host = {
             "atom_feats": to(g["atom_feats"]), "d": to(g["d"]),
             "d_norm": to(g["d_norm"]), "v": to(g["v"]),
-            "idx_T": to(idx.t().contiguous()), "att": to(att), "att_q": to(att), "att_k": to(att_k),
+            "idx_T": to(g["idx"].t().contiguous()), "att": to(att), "att_q": to(att), "att_k": to(att_k),
         }
-        return host, g["dims"], g["Ntok"], idx, tk
+        return host, g["dims"], tk
 
     def _rel_pos_bins(self, feats, r_max=32, s_max=2):
         """Integer relative-position bins (cached per forward) feeding the
@@ -5532,13 +5531,13 @@ class Boltz2(nn.Module):
         def to(x):
             return _ttnn.from_torch(x.float(), layout=_ttnn.TILE_LAYOUT,
                                     dtype=_ttnn.bfloat16, device=dev)
-        host, dims, Ntok, idx, tk = self._atom_host_prep(feats, dev, to)
+        host, dims, tk = self._atom_host_prep(feats, dev, to)
         # z_trunk/rel_pos are the big 64MB tensors — reuse device clones if the
         # trunk/z_init stashed them this forward (chaining); s_trunk is small.
         _zt = self._chain_get(z_trunk); _rpt = self._chain_get(rel_pos)
         q, c, aeb, adb, ttb = dc(to(s_trunk), _zt if _zt is not None else to(z_trunk),
                                  _rpt if _rpt is not None else to(rel_pos), host, dims)
-        B, Natom, K, W, H = dims
+        B, _, K, W, H = dims
         if getattr(self, "_chain_cond", False):
             # Phase 1 device-resident chaining of the conditioning: hand q/c/biases
             # to the score model on device (no download here, no re-upload there).

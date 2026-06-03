@@ -3039,7 +3039,7 @@ class AtomEncoder(Module):
 
     def __call__(self, atom_feats, d, d_norm, v, idx_T, dims,
                  s_trunk=None, z=None, att=None, att_q=None, att_k=None):
-        B, N, K, W, H = dims
+        B, _, K, W, H = dims
         kc = self.compute_kernel_config
         atom_s = self.feat_w.shape[-1]
         c = self._lin(atom_feats, self.feat_w, bias=self.feat_b)        # [1,N,atom_s]
@@ -3188,7 +3188,7 @@ class InputEmbedder(Module):
 
     def __call__(self, h, dims):
         # h: dict of host-built device tensors (see verify script for keys)
-        q, c, p = self.atom_encoder(h["atom_feats"], h["d"], h["d_norm"], h["v"], h["idx_T"], dims)
+        _, c, p = self.atom_encoder(h["atom_feats"], h["d"], h["d_norm"], h["v"], h["idx_T"], dims)
         atom_enc_bias = self.proj_z(p)
         a = self.aae(c, atom_enc_bias, h["atom_mask"], h["keys_idx"], h["att_mean_T"], dims)
 
