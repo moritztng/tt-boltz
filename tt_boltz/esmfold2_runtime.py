@@ -108,6 +108,14 @@ class _TrunkAdapter(_Adapter):
         # mask is all-ones and the trunk's own tile-padding mask suffices.
         return self.m(z.float())
 
+    # No-ops so a reference module that owns this trunk (e.g. the confidence
+    # head) can still call set_kernel_backend / set_chunk_size on it.
+    def set_kernel_backend(self, backend):
+        pass
+
+    def set_chunk_size(self, chunk_size):
+        pass
+
 
 class _MSAAdapter(_Adapter):
     def forward(self, *, x_pair, x_inputs, msa_oh, has_deletion, deletion_value,
@@ -195,11 +203,18 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
         model.msa_encoder = comps["msa_encoder"]
     model.distogram_head = comps["distogram_head"]
     model.structure_head = comps["structure_head"]
-    # The confidence head is left on the reference (CPU) path: it is a small
-    # auxiliary head (pLDDT / pAE / pTM) that does not affect the predicted
-    # structure, and it carries extensive logit->value post-processing the
-    # output builder depends on. All structure-determining compute (ESMC-6B,
-    # folding trunk, encoders, diffusion structure head) runs on the TT device.
+    # Confidence head: its dominant cost is an internal 4-block pair trunk
+    # (triangle-multiplicative updates, O(L^3)) — move that onto the device too.
+    # `FoldingTrunk` returns the fully residual-updated pair, matching the
+    # reference, so the head's `pair.add_(folding_trunk(pair))` is unchanged. The
+    # reference head keeps the cheap O(L^2) glue (s->z products, pae/pde heads,
+    # row pooling) and the logit->value post-processing (pLDDT / pAE / pTM) the
+    # output builder needs. pLDDT/pAE/pTM do not affect the predicted structure.
+    sub = lambda p: {k[len(p):]: v for k, v in sd.items() if k.startswith(p)}
+    n_conf_blocks = len(model.confidence_head.folding_trunk.blocks)
+    conf_trunk = E.FoldingTrunk(n_conf_blocks)
+    conf_trunk.load_state_dict(sub("confidence_head.folding_trunk."), strict=False)
+    model.confidence_head.folding_trunk = _TrunkAdapter(conf_trunk)
 
     # ttnn ESMC-6B language model. Loaded lazily on the first fold; with
     # persistent_lm it then stays resident for all subsequent folds.
