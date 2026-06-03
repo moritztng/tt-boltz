@@ -44,9 +44,10 @@ class _ESMCAdapter:
     attention for multi-chain / padded batches.
     """
 
-    def __init__(self, repo: str):
+    def __init__(self, repo: str, persistent: bool = True):
         self._repo = repo
-        self.lm = None  # loaded lazily per fold, released afterward
+        self._persistent = persistent
+        self.lm = None  # loaded lazily on first fold
 
     def __call__(self, input_ids, sequence_id=None, output_hidden_states=True, **_):
         attn_mask = None
@@ -59,12 +60,12 @@ class _ESMCAdapter:
         if self.lm is None:
             self.lm = ESMCLanguageModel.from_pretrained(self._repo)
         hs = self.lm(input_ids, attn_mask=attn_mask)            # [n_layers+1,B,L,D]
-        # The LM runs once per fold; free its ~12.8 GB of device weights so the
-        # folding trunk + diffusion head have DRAM headroom on long sequences
-        # (validated to L=1024). It is reloaded lazily on the next fold, so the
-        # patched model stays reusable across multiple predictions.
-        self.lm.release()
-        self.lm = None
+        if not self._persistent:
+            # Memory-conservative mode: free the ~12.8 GB of 6B device weights
+            # after the single LM forward (reloaded lazily next fold). Use this
+            # only if a very long sequence would otherwise OOM.
+            self.lm.release()
+            self.lm = None
         return types.SimpleNamespace(hidden_states=hs)
 
 
@@ -164,11 +165,18 @@ def _components(sd):
     return built
 
 
-def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B"):
+def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool = True):
     """Replace every neural submodule of `model` with its ttnn implementation.
 
     After this, a normal `model.forward(...)` / input-builder fold runs the whole
     network on the TT device. Returns `model` for chaining.
+
+    With ``persistent_lm=True`` (default) the ESMC-6B device weights stay
+    resident across folds — so predicting many proteins in one process keeps all
+    weights loaded (tt-boltz style: pay the ~60 s ESMC load once on the first
+    fold, then reuse). The trunk / encoders / structure-head weights are always
+    resident. Set ``persistent_lm=False`` to release+reload the 6B per fold for
+    the rare case where a single very long sequence would otherwise OOM.
     """
     sd = {k: v.float() for k, v in model.state_dict().items()}
     comps = _components(sd)
@@ -189,8 +197,45 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B"):
     # output builder depends on. All structure-determining compute (ESMC-6B,
     # folding trunk, encoders, diffusion structure head) runs on the TT device.
 
-    # ttnn ESMC-6B language model (lazily loaded per fold from its own sharded
-    # safetensors, then released so long sequences keep DRAM for the trunk).
-    model._esmc = _ESMCAdapter(esmc_repo)
+    # ttnn ESMC-6B language model. Loaded lazily on the first fold; with
+    # persistent_lm it then stays resident for all subsequent folds.
+    model._esmc = _ESMCAdapter(esmc_repo, persistent=persistent_lm)
     model._esmc_fp8 = False
     return model
+
+
+def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
+                       esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool = True):
+    """Load + patch an ESMFold2 model for on-device inference, weights resident.
+
+    Returns a patched model ready to fold many proteins without reloading. The
+    24 GB CPU ESMC checkpoint is skipped (ttnn ESMC-6B is used instead).
+    """
+    from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+
+    model = ESMFold2Model.from_pretrained(esmfold2_repo, load_esmc=False).eval()
+    return patch_esmfold2(model, esmc_repo=esmc_repo, persistent_lm=persistent_lm)
+
+
+def fold_sequences(model, sequences, *, num_loops=3, num_sampling_steps=20,
+                   num_diffusion_samples=1, seed=0):
+    """Fold an iterable of sequences with an already-patched, weight-resident model.
+
+    `sequences` is an iterable of ``(id, sequence)`` pairs (or bare sequence
+    strings). Yields ``(id, result, seconds)`` per protein. All weights stay
+    loaded across the batch — only the first protein pays the ESMC load.
+    """
+    import time
+
+    from esm.models.esmfold2 import (
+        ESMFold2InputBuilder, ProteinInput, StructurePredictionInput)
+
+    builder = ESMFold2InputBuilder()
+    for i, item in enumerate(sequences):
+        pid, seq = item if isinstance(item, (tuple, list)) else (f"seq{i}", item)
+        spi = StructurePredictionInput(sequences=[ProteinInput(id="A", sequence=seq)])
+        t0 = time.time()
+        res = builder.fold(model, spi, num_loops=num_loops,
+                           num_sampling_steps=num_sampling_steps,
+                           num_diffusion_samples=num_diffusion_samples, seed=seed)
+        yield pid, res, time.time() - t0
