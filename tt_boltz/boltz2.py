@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import gc
 import math
-import os
 from abc import ABC, abstractmethod
 from functools import partial
 from math import exp, pi, sqrt
@@ -4121,9 +4120,12 @@ class AtomDiffusion(Module):
         progress_fn=None,
         **network_condition_kwargs,
     ):
-        # The device-resident sampler runs the whole reverse-diffusion loop on
-        # device; it has no steering guidance, so TT_BOLTZ_RESIDENT disables it.
-        if steering_args is not None and os.environ.get("TT_BOLTZ_RESIDENT"):
+        # Device-resident fast path (flagged by Boltz2.forward for the Tenstorrent
+        # simplest case): the whole reverse-diffusion loop runs on device and has
+        # no steering guidance, so disable steering when that path will be taken.
+        _resident = (getattr(self, "_tt_resident", False)
+                     and multiplicity == 1 and self.alignment_reverse_diff)
+        if _resident and steering_args is not None:
             steering_args = {**steering_args, "fk_steering": False,
                              "physical_guidance_update": False,
                              "contact_guidance_update": False}
@@ -4176,20 +4178,9 @@ class AtomDiffusion(Module):
         _n_steps = len(sigmas_and_gammas)
 
         # Simplest-case device-resident sampler: the whole reverse-diffusion loop
-        # runs on the TT device (no per-step host round-trips). No steering, single
-        # sample, with reverse alignment (the default predict path).
-        _no_steering = not (
-            steering_args["fk_steering"]
-            or steering_args["physical_guidance_update"]
-            or steering_args["contact_guidance_update"]
-        )
-        if (
-            self.use_tenstorrent
-            and os.environ.get("TT_BOLTZ_RESIDENT")
-            and multiplicity == 1
-            and self.alignment_reverse_diff
-            and _no_steering
-        ):
+        # runs on the TT device (no per-step host round-trips). Steering was
+        # disabled above for this path.
+        if _resident:
             coords = self._resident_sample(
                 atom_coords, atom_mask, sigmas_and_gammas, step_scale,
                 network_condition_kwargs, progress_fn, _n_steps,
@@ -5577,15 +5568,22 @@ class Boltz2(nn.Module):
 
         if self.trace:
             print("[boltz2] forward: input_embedder")
-        # TT_BOLTZ_RESIDENT enables the whole device-resident fast path: the
-        # input embedder, z-init, distogram, diffusion conditioning and confidence
-        # run on device, and the big 64MB activations (z from the trunk, rel_pos
-        # from z-init, the conditioning) are chained device-to-device instead of
-        # round-tripping through host. The stashed activations are freed before
-        # the diffusion sample (nothing device-resident may outlive it).
-        _resident = bool(self.use_tenstorrent and os.environ.get("TT_BOLTZ_RESIDENT"))
+        # On Tenstorrent the simplest case (no templates, no affinity) runs the
+        # whole forward device-resident: the input embedder, z-init, distogram,
+        # diffusion conditioning and confidence on device, the big 64MB
+        # activations (z, rel_pos, conditioning) chained device-to-device, and the
+        # reverse-diffusion sampler resident (which has no steering guidance).
+        # Everything else (CPU/GPU, templates, affinity) takes the torch path.
+        template_mask = feats.get("template_mask")
+        has_templates = (
+            self.use_templates
+            and template_mask is not None
+            and bool(template_mask.any().item())
+        )
+        _resident = self.use_tenstorrent and not has_templates and not self.affinity_prediction
         self._chain_cache = {} if _resident else None
         self._chain_cond = _resident
+        self.structure_module._tt_resident = _resident
         if _resident:
             s_inputs = self._tt_input_embedder_s_inputs(feats)
         else:
@@ -5613,12 +5611,6 @@ class Boltz2(nn.Module):
         # Compute pairwise mask
         mask = feats["token_pad_mask"].float()
         pair_mask = mask[:, :, None] * mask[:, None, :]
-        template_mask = feats.get("template_mask")
-        has_templates = (
-            self.use_templates
-            and template_mask is not None
-            and bool(template_mask.any().item())
-        )
         # Perform rounds of the pairwise stack
         s = torch.zeros_like(s_init)
         z = torch.zeros_like(z_init)
