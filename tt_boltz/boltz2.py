@@ -4087,47 +4087,6 @@ class AtomDiffusion(Module):
                 "t_hat": t_hat,
             })
 
-        _rdtypes = {"R": f32, "tr": f32, "eps": f32, "times": bf16,
-                    "c_in": f32, "c_skip": f32, "c_out": f32, "coef": f32}
-
-        def _host_in(st):
-            return {"R": st["R"], "tr": st["tr"], "eps": st["eps"],
-                    "times": torch.full((1,), st["times"]),
-                    "c_in": torch.full((1, 1, 1), st["c_in"]), "c_skip": torch.full((1, 1, 1), st["c_skip"]),
-                    "c_out": torch.full((1, 1, 1), st["c_out"]), "coef": torch.full((1, 1, 1), st["coef"])}
-
-        # ---- cross-protein PURE REPLAY: same-shape next protein reuses the trace
-        # (no prime, no capture, no recompile) — replay the captured step n times.
-        _rc = getattr(self, "_res_trace_cache", None)
-        _sig = (N, n_steps)
-        if traced and getattr(self, "_replay_diffusion", False) and _rc is not None and _rc["sig"] == _sig:
-            cd, rbufs, tid = _rc["coords_dev"], _rc["bufs"], _rc["trace_id"]
-            ttnn.copy(ttnn.from_torch(atom_coords.float(), layout=TILE, dtype=f32, device=dev), cd)
-            # Refresh the score model's static conditioning IN PLACE for THIS
-            # protein (the trace reads those buffers), so the replay is correct
-            # for a genuinely different same-shape protein — not just a re-run of
-            # the protein that was captured.
-            self.preconditioned_network_forward(
-                atom_coords, steps[0]["t_hat"],
-                network_condition_kwargs=dict(multiplicity=1, **network_condition_kwargs),
-                refresh=True,
-            )
-            _tr0 = None
-            if os.environ.get("TT_BOLTZ_TIME_DIFFUSION"):
-                import time as _time
-                ttnn.synchronize_device(dev); _tr0 = _time.perf_counter()
-            for i in range(n_steps):
-                for k, v in _host_in(steps[i]).items():
-                    ttnn.copy_host_to_device_tensor(
-                        ttnn.from_torch(v, layout=TILE, dtype=_rdtypes[k]), rbufs[k])
-                ttnn.execute_trace(dev, tid)
-            ttnn.synchronize_device(dev)
-            if _tr0 is not None:
-                dt = _time.perf_counter() - _tr0
-                print(f"[diffusion-PURE-REPLAY] {n_steps} steps: {dt:.3f}s "
-                      f"({dt / n_steps * 1000:.1f} ms/step)", flush=True)
-            return torch.Tensor(ttnn.to_torch(cd)).to(torch.float32)[:, :N, :]
-
         # Prime the score-model static cache (+ warm kernels) via one host call.
         self.preconditioned_network_forward(
             atom_coords, steps[0]["t_hat"],
@@ -5497,8 +5456,6 @@ class Boltz2(nn.Module):
             "cyclic": to(cyclic), "mol_type": ids(feats["mol_type"]),
         }
         out = ie(h, (B, Natom, K, W, H))
-        if getattr(self, "_tt_return_ttnn", False):
-            return out
         return torch.Tensor(_ttnn.to_torch(out)).to(torch.float32)
 
     def _atom_host_prep(self, feats, dev, to, W=32, H=128):
@@ -5646,8 +5603,6 @@ class Boltz2(nn.Module):
         cc = feats["contact_conditioning"].float(); thr = feats["contact_threshold"].float()
         thr_norm = ((thr - 4.0) / 16.0).unsqueeze(-1)
         z = _ttnn.add(z, ze["cc"](to(cc[:, :, :, 2:]), to(thr_norm), to(cc[:, :, :, 0:1]), to(cc[:, :, :, 1:2])))
-        if getattr(self, "_tt_return_ttnn", False):
-            return s_init, z, rpe
         g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
         s_init_t, z_t, rpe_t = g(s_init), g(z), g(rpe)
         # Device-resident chaining: stash a stable device clone of rel_pos (a 64MB
@@ -5657,50 +5612,6 @@ class Boltz2(nn.Module):
         if getattr(self, "_chain_cache", None) is not None:
             self._chain_cache[id(rpe_t)] = _ttnn.clone(rpe)
         return s_init_t, z_t, rpe_t
-
-    def _tt_resident_pretrunk(self, feats, recycling_steps):
-        """Device-resident input_embedder -> z_init -> trunk with NO to_torch
-        between stages (everything stays as ttnn tensors on device). Returns torch
-        (s, z, s_inputs, relative_position_encoding) for the downstream stages."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
-        self._tt_return_ttnn = True
-        try:
-            s_inputs_tt = self._tt_input_embedder_s_inputs(feats)          # ttnn
-            s_init_tt, z_init_tt, rpe_tt = self._tt_z_init_ttnn(s_inputs_tt, feats)
-            trunk = self._tt_trunk_module()
-            s_tt, z_tt = trunk.forward_device(s_inputs_tt, s_init_tt, z_init_tt, feats, recycling_steps)
-            g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
-            return g(s_tt), g(z_tt), g(s_inputs_tt), g(rpe_tt)
-        finally:
-            self._tt_return_ttnn = False
-
-    def _tt_z_init_ttnn(self, s_inputs_tt, feats):
-        """z_init device chain taking a ttnn s_inputs (built modules reused)."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
-        dev = _tt.get_device()
-        ze = getattr(self, "_tt_zinit", None)
-        if ze is None:
-            kc = self.msa_module.compute_kernel_config
-            root = _tt.WeightScope.wrap(self.state_dict())
-            ze = {"lin": _tt.PreTrunkLinears(root, kc), "rel": _tt.RelPosLinear(root.child("rel_pos"), kc),
-                  "tb": _tt.TypeBondEmbedding(root.child("token_bonds_type"), kc),
-                  "cc": _tt.ContactConditioning(root.child("contact_conditioning"), kc)}
-            self._tt_zinit = ze
-        def to(x):
-            return _ttnn.from_torch(x.float(), layout=_ttnn.TILE_LAYOUT, dtype=_ttnn.bfloat16, device=dev)
-        def ids(x):
-            return _ttnn.from_torch(x.to(torch.uint32), layout=_ttnn.ROW_MAJOR_LAYOUT, dtype=_ttnn.uint32, device=dev)
-        s_init, z = ze["lin"](s_inputs_tt, to(feats["token_bonds"].float()))
-        _drb, _dtb, _seb, _dcb = self._rel_pos_bins(feats)
-        rpe = ze["rel"](ids(_drb), ids(_dtb), ids(_seb), ids(_dcb))
-        z = _ttnn.add(z, rpe)
-        z = _ttnn.add(z, ze["tb"](ids(feats["type_bonds"])))
-        cc = feats["contact_conditioning"].float(); thr = feats["contact_threshold"].float()
-        z = _ttnn.add(z, ze["cc"](to(cc[:, :, :, 2:]), to(((thr - 4.0) / 16.0).unsqueeze(-1)),
-                                  to(cc[:, :, :, 0:1]), to(cc[:, :, :, 1:2])))
-        return s_init, z, rpe
 
     def _tt_confidence(self, s_inputs, s, z, x_pred, feats, multiplicity, pred_distogram_logits):
         """Confidence via ttnn ConfidenceModule.reps (conditioning + pairformer on
@@ -5893,47 +5804,21 @@ class Boltz2(nn.Module):
         if self.trace:
             print("[boltz2] forward: input_embedder")
         _mark("start")
-        _resident_pre = bool(self.use_tenstorrent and os.environ.get("TT_BOLTZ_RESIDENT_PRETRUNK"))
-        if _resident_pre and os.environ.get("TT_BOLTZ_REPLAY_SAME_SHAPE"):
-            # KNOWN INCOMPATIBILITY: the device-resident pre-trunk keeps the whole
-            # embedder->z_init->trunk resident on device; those allocations
-            # alias/corrupt the persisted diffusion trace's device buffers (the
-            # trace is captured on the first protein and replayed on same-shape
-            # ones), silently producing wrong structures — verified: structured
-            # prot replay 10 A vs 1.5 A on the standard TT_ZINIT path. Disable it
-            # for the whole replay-enabled run so the trace is captured cleanly.
-            if not getattr(self, "_warned_respre_replay", False):
-                print("[boltz2] WARNING: TT_BOLTZ_RESIDENT_PRETRUNK is incompatible "
-                      "with TT_BOLTZ_REPLAY_SAME_SHAPE (corrupts the diffusion "
-                      "trace); ignoring RESIDENT_PRETRUNK.", flush=True)
-                self._warned_respre_replay = True
-            _resident_pre = False
-        # Device-resident chaining (TT_ZINIT path, trace-compatible): keep the big
-        # 64MB activations (z from the trunk, rel_pos from z_init) on device and let
-        # distogram/diffusion_conditioning clone them device-to-device instead of
-        # re-uploading from host. Freed before the diffusion sample (holding device
-        # tensors across the diffusion trace replay corrupts it — unlike
-        # RESIDENT_PRETRUNK, which is why chaining lives on the TT_ZINIT path).
-        _chain = bool(self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_CHAIN")
-                      and not _resident_pre)
+        # Device-resident chaining: keep the big 64MB activations (z from the trunk,
+        # rel_pos from z_init) on device so distogram/diffusion_conditioning clone
+        # them device-to-device instead of re-uploading from host; with CHAIN_COND
+        # the conditioning is handed to the score model on device too. Freed before
+        # the diffusion sample.
+        _chain = bool(self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_CHAIN"))
         self._chain_cache = {} if _chain else None
-        # Phase 1 of the monolithic-trace build: hand the diffusion conditioning
-        # (q/c/biases) to the score model ON DEVICE (no download/re-upload).
         self._chain_cond = bool(_chain and os.environ.get("TT_BOLTZ_CHAIN_COND"))
-        if _resident_pre:
-            # input_embedder -> z_init -> trunk, fully device-resident (no to_torch
-            # between stages). s/z are the trunk outputs; s_init/z_init are internal.
-            s, z, s_inputs, relative_position_encoding = self._tt_resident_pretrunk(feats, recycling_steps)
-            s_init = z_init = None
-        elif self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_INPUT_EMBEDDER"):
+        if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_INPUT_EMBEDDER"):
             s_inputs = self._tt_input_embedder_s_inputs(feats)
         else:
             s_inputs = self.input_embedder(feats)
         _mark("input_embedder")
 
-        if _resident_pre:
-            pass
-        elif self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_ZINIT"):
+        if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_ZINIT"):
             s_init, z_init, relative_position_encoding = self._tt_z_init(s_inputs, feats)
         else:
             # Initialize the sequence embeddings
@@ -5962,17 +5847,13 @@ class Boltz2(nn.Module):
             and template_mask is not None
             and bool(template_mask.any().item())
         )
-        if _resident_pre:
-            # s, z already produced device-resident by _tt_resident_pretrunk.
-            use_resident_trunk = False
-        else:
-            # Perform rounds of the pairwise stack
-            s = torch.zeros_like(s_init)
-            z = torch.zeros_like(z_init)
-        # Simplest-case fast path: run the whole recycling loop resident on the
-        # Tenstorrent device (no per-iteration host round-trips). Only for the
-        # no-template, uncompiled TT path; everything else uses the loop below.
-        use_resident_trunk = (not _resident_pre) and (
+        # Perform rounds of the pairwise stack
+        s = torch.zeros_like(s_init)
+        z = torch.zeros_like(z_init)
+        # Run the whole recycling loop resident on the Tenstorrent device (no
+        # per-iteration host round-trips). Only for the no-template, uncompiled TT
+        # path; everything else uses the loop below.
+        use_resident_trunk = (
             self.run_trunk_and_structure
             and self.use_tenstorrent
             and not has_templates
@@ -5999,7 +5880,7 @@ class Boltz2(nn.Module):
                       f"({recycling_steps + 1} iters)", flush=True)
             if _pfn:
                 _pfn("trunk", step=recycling_steps, total=recycling_steps + 1)
-        elif self.run_trunk_and_structure and not _resident_pre:
+        elif self.run_trunk_and_structure:
             _t_wrap = None
             if os.environ.get("TT_BOLTZ_TIME_TRUNK"):
                 import time as _time
