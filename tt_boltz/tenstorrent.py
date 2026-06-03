@@ -265,6 +265,10 @@ class Module:
             dtype=dtype,
         )
 
+    def _lin(self, x, w, **kw):
+        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config,
+                           core_grid=CORE_GRID_MAIN, **kw)
+
 
 class TriangleMultiplication(Module):
     def __init__(
@@ -2867,9 +2871,6 @@ class PreTrunkLinears(Module):
         self.z2_w = self.torch_to_tt("z_init_2.weight")
         self.token_bonds_w = self.torch_to_tt("token_bonds.weight")
 
-    def _lin(self, x, w):
-        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN)
-
     def __call__(self, s_inputs: ttnn.Tensor, token_bond_feat: ttnn.Tensor):
         s_init = self._lin(s_inputs, self.s_init_w)                 # [1,N,384]
         z1 = self._lin(s_inputs, self.z1_w)                         # [1,N,128]
@@ -2999,9 +3000,6 @@ class AtomPairEmbed(Module):
         self.w_dist = self.torch_to_tt("embed_atompair_ref_dist.weight")
         self.w_mask = self.torch_to_tt("embed_atompair_mask.weight")
 
-    def _lin(self, x, w):
-        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN)
-
     def __call__(self, d, d_norm, v):
         p = ttnn.multiply(self._lin(d, self.w_pos), v)
         p = ttnn.add(p, ttnn.multiply(self._lin(d_norm, self.w_dist), v))
@@ -3038,10 +3036,6 @@ class AtomEncoder(Module):
             self.structure_prediction = True
         except Exception:
             self.structure_prediction = False
-
-    def _lin(self, x, w, **kw):
-        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config,
-                           core_grid=CORE_GRID_MAIN, **kw)
 
     def __call__(self, atom_feats, d, d_norm, v, idx_T, dims,
                  s_trunk=None, z=None, att=None, att_q=None, att_k=None):
@@ -3189,10 +3183,6 @@ class InputEmbedder(Module):
         self.modified_table = emb_table("modified_conditioning_init.weight")
         self.mol_type_table = emb_table("mol_type_conditioning_init.weight")
 
-    def _lin(self, x, w, **kw):
-        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config,
-                           core_grid=CORE_GRID_MAIN, **kw)
-
     def _emb(self, ids, table):
         return ttnn.embedding(ids, table, layout=ttnn.TILE_LAYOUT)
 
@@ -3329,9 +3319,6 @@ class ConfidenceModule(Module):
         # The pairformer_stack weights live in a ttnn wrapper (no torch params in
         # the state dict), so reuse the already-loaded inner Pairformer when given.
         self.pairformer = pairformer or Pairformer(8, 32, 4, 24, 16, True, self.scope("pairformer_stack"), kc)
-
-    def _lin(self, x, w, **kw):
-        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN, **kw)
 
     def _ln(self, x, nb):
         return ttnn.layer_norm(x, weight=nb[0], bias=nb[1], epsilon=1e-5, compute_kernel_config=self.compute_kernel_config)
