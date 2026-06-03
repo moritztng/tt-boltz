@@ -213,7 +213,8 @@ def _install_resident_trunk_loop(model):
         zt = ftw._from_torch(padz(z).float())
         ipt = ftw._from_torch(padz(inject_proj).float())
         at = ftw._from_torch(a.reshape(1, 1, 1, -1).float())  # parcae a, broadcasts over L,L
-        for _ in range(total_steps):
+        for _step in range(total_steps):
+            E.report_progress("trunk", _step, total_steps)
             az = ttnn.multiply(zt, at)
             ttnn.deallocate(zt)
             znew = ttnn.add(az, ipt)

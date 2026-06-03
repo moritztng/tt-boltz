@@ -43,6 +43,22 @@ def set_dtype(dt):
     _DTYPE = dt
 
 
+# Optional progress callback for the CLI display: report_progress(stage, step, total).
+# A no-op unless a worker installs one via set_progress(); never affects compute.
+_PROGRESS = None
+
+def set_progress(fn):
+    global _PROGRESS
+    _PROGRESS = fn
+
+def report_progress(stage, step=0, total=0):
+    if _PROGRESS is not None:
+        try:
+            _PROGRESS(stage, step, total)
+        except Exception:
+            pass
+
+
 def _attn_fp32(q, k, v, attn_mask, scale, ck):
     """Manual fp32 attention (matmul + softmax + matmul). Used for the token
     AttentionPairBias, whose logits are NOT qk-normed and reach ~100+, making the
@@ -1125,7 +1141,9 @@ def sample_structure(denoise_fn, n_atoms, ref_mask, *, steps=14, sigma_data=16.0
     atom_mask = ref_mask.float()
     gammas = torch.where(schedule > gamma_min, torch.full_like(schedule, gamma_0), torch.zeros_like(schedule))
     x_prev = None
-    for s_tm, s_t, gamma in zip(schedule[:-1], schedule[1:], gammas[1:]):
+    n_steps = len(schedule) - 1
+    for i, (s_tm, s_t, gamma) in enumerate(zip(schedule[:-1], schedule[1:], gammas[1:])):
+        report_progress("diffusion", i, n_steps)
         x, x_prev = _center_random_augmentation(x, atom_mask, gen, x_prev)
         s_tm_v = float(s_tm); t_hat = s_tm_v * (1.0 + float(gamma))
         eps = lam * max(t_hat ** 2 - s_tm_v ** 2, 0.0) ** 0.5

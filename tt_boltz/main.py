@@ -100,7 +100,7 @@ from tt_boltz.distributed import (
     worker_payload,
 )
 from tt_boltz.energy import DEFAULT_ENERGY_SAMPLE_HZ, PowerProfiler
-from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay
+from tt_boltz.progress import DebugDisplay, NullDisplay, ProgressDisplay, make_progress_fn
 from tt_boltz.runtime import (
     build_local_workers,
     detect_tenstorrent_devices,
@@ -1201,10 +1201,11 @@ def _write_structure(complex_obj, outpath, output_format):
     pf.write(str(outpath))
 
 
-def _esmfold2_device_worker(assignment, in_q, out_q, fold_kwargs, struct_dir,
-                            output_format, override):
+def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_dir,
+                            output_format):
     """One ESMFold2 worker pinned to a TT device — folds targets pulled from a
-    shared queue (dynamic load-balancing) until it receives the None sentinel.
+    shared queue (dynamic load-balancing) until it receives the None sentinel,
+    emitting progress events on ev_q for the live display.
 
     Mirrors the Boltz worker: TT_VISIBLE_DEVICES is set BEFORE ttnn is imported,
     so the assigned physical chip is logical device 0. Weights stay resident on
@@ -1213,43 +1214,60 @@ def _esmfold2_device_worker(assignment, in_q, out_q, fold_kwargs, struct_dir,
     os.environ["TT_VISIBLE_DEVICES"] = str(assignment["visible_devices"])
     if assignment.get("mesh_graph_descriptor") and not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
         os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(assignment["mesh_graph_descriptor"])
+    dev = int(assignment["visible_devices"])
+    meta = {"accelerator": "tenstorrent"}
+
+    def emit(event, **kw):
+        try:
+            ev_q.put({"dev": dev, "worker": str(dev), "event": event, **meta, **kw})
+        except Exception:
+            pass
+
+    emit("loading")
+    from tt_boltz import esmfold2 as E
     from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
 
-    dev = int(assignment["visible_devices"])
     model = load_ttnn_esmfold2()
+    E.set_progress(make_progress_fn(ev_q, dev, dev, meta))  # trunk/diffusion steps
     struct_dir = Path(struct_dir)
     while (item := in_q.get()) is not None:
         path = Path(item)
         name = path.stem
-        outpath = struct_dir / f"{name}.{output_format}"
-        if outpath.exists() and not override:
-            out_q.put((name, "skip")); continue
         try:
             chains = _read_protein_chains(path)
             if not chains:
+                emit("done", name=name, time=0, status="error", error="no protein sequences")
                 out_q.put((name, {"error": "no protein sequences"})); continue
+            emit("start", name=name)
+            emit("stage", stage="prep")
             t0 = time.time()
             res = fold_complex(model, chains, **fold_kwargs)
-            _write_structure(res.complex, outpath, output_format)
+            emit("stage", stage="saving")
+            _write_structure(res.complex, struct_dir / f"{name}.{output_format}", output_format)
+            dt = round(time.time() - t0, 1)
             entry = {"plddt": round(float(res.plddt.mean()), 4),
                      "n_residues": sum(len(s) for _, s in chains), "n_chains": len(chains),
-                     "device": dev, "time_s": round(time.time() - t0, 1)}
+                     "device": dev, "time_s": dt}
             if getattr(res, "ptm", None) is not None:
                 entry["ptm"] = round(float(res.ptm), 4)
+            emit("done", name=name, time=dt, status="ok")
             out_q.put((name, entry))
         except Exception as e:  # keep the worker alive for the remaining targets
+            emit("done", name=name, time=0, status="error", error=repr(e))
             out_q.put((name, {"error": repr(e)}))
 
 
 def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_steps,
-                      diffusion_samples, seed, override, ignored, num_devices, device_ids):
+                      diffusion_samples, seed, override, ignored, num_devices, device_ids,
+                      debug, log):
     """On-device ttnn ESMFold2 over the same inputs / output layout as predict.
 
     Targets fan out across TT devices exactly like the Boltz path: one pinned
     worker process per device (device set via detect_tenstorrent_devices /
-    --num_devices / --device_ids), each pulling targets from a shared queue.
-    recycling_steps -> num_loops, sampling_steps, diffusion_samples carry over;
-    MSA / ligand / affinity options don't apply to a single-sequence model.
+    --num_devices / --device_ids), each pulling targets from a shared queue, and
+    progress is rendered with the same Rich/debug displays. recycling_steps ->
+    num_loops, sampling_steps, diffusion_samples carry over; MSA / ligand /
+    affinity options don't apply to a single-sequence model.
     """
     if ignored:
         click.echo(f"Note: --model esmfold2 is single-sequence & protein-only; ignoring {', '.join(ignored)}")
@@ -1263,45 +1281,56 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
     struct_dir = out / "structures"
     struct_dir.mkdir(parents=True, exist_ok=True)
 
-    devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=len(files))
+    todo = [f for f in files
+            if override or not (struct_dir / f"{f.stem}.{output_format}").exists()]
+    for f in files:
+        if f not in todo:
+            click.echo(f"{f.stem}: exists, skipping (use --override)")
+    if not todo:
+        click.echo("All predictions complete")
+        return
+
+    devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=len(todo))
     assigns = _build_worker_device_assignments(devices)
-    click.echo(f"ESMFold2 on TT device(s) {devices}; {len(files)} target(s) "
+    click.echo(f"ESMFold2 on TT device(s) {devices}; {len(todo)} target(s) "
                f"(weights resident per device)")
 
     fold_kwargs = dict(num_loops=recycling_steps, num_sampling_steps=sampling_steps,
                        num_diffusion_samples=diffusion_samples, seed=seed or 0)
     ctx = mp.get_context("spawn")
-    in_q, out_q = ctx.Queue(), ctx.Queue()
-    for f in files:
+    in_q, out_q, ev_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
+    for f in todo:
         in_q.put(str(f))
     for _ in devices:
         in_q.put(None)  # one sentinel per worker
     procs = [ctx.Process(target=_esmfold2_device_worker,
-                         args=(assigns[d], in_q, out_q, fold_kwargs, str(struct_dir),
-                               output_format, override))
+                         args=(assigns[d], in_q, out_q, ev_q, fold_kwargs, str(struct_dir),
+                               output_format))
              for d in devices]
     for p in procs:
         p.start()
 
-    results = {}
+    display = (ProgressDisplay(ev_q, total=len(todo), n_workers=len(devices)) if not debug
+               else DebugDisplay(ev_q) if log else NullDisplay(ev_q))
+    display.start()
+    results, failed = {}, 0
     try:
-        for _ in range(len(files)):
+        for _ in range(len(todo)):
             name, entry = out_q.get()
-            if entry == "skip":
-                click.echo(f"{name}: exists, skipping (use --override)")
-            elif isinstance(entry, dict) and "error" in entry:
-                click.echo(f"{name}: ERROR {entry['error']}")
+            if isinstance(entry, dict) and "error" in entry:
+                failed += 1
             else:
                 results[name] = entry
-                ptm_s = f" pTM={entry['ptm']:.3f}" if "ptm" in entry else ""
-                click.echo(f"{name}: L={entry['n_residues']} chains={entry['n_chains']} "
-                           f"pLDDT={entry['plddt']:.3f}{ptm_s} [dev {entry['device']}] {entry['time_s']}s")
     finally:
         for p in procs:
             p.join()
+        display.stop()
 
     (out / "results.json").write_text(json.dumps(results, indent=2))
-    click.echo(f"Done. Results in {out}")
+    msg = f"Done. {len(results)}/{len(todo)} folded"
+    if failed:
+        msg += f", {failed} failed"
+    click.echo(f"{msg}. Results in {out}")
 
 
 @cli.command()
@@ -1398,7 +1427,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         _predict_esmfold2(
             Path(data).expanduser(), Path(out_dir).expanduser(), output_format,
             recycling_steps, sampling_steps, diffusion_samples, seed, override, ignored,
-            num_devices, device_ids)
+            num_devices, device_ids, debug, log)
         return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
