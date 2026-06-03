@@ -1141,6 +1141,122 @@ def msa(db, path, install_tools):
     click.echo(f"  tt-boltz predict input.yaml --msa_db_path {db_dir}")
 
 
+# ---------------------------------------------------------------------------
+# ESMFold2 (--model esmfold2): single-sequence, protein-only, on-device ttnn.
+# ---------------------------------------------------------------------------
+def _read_protein_chains(path):
+    """Extract [(chain_id, sequence)] protein entries from a FASTA or Boltz YAML.
+
+    FASTA headers may be plain (``>name``) or Boltz-style (``>ID|TYPE|MSA``);
+    non-protein typed records are skipped, and comma-separated ids expand to
+    repeated chains. Each input file is one (possibly multi-chain) complex.
+    """
+    suffix = path.suffix.lower()
+    chains: list[tuple[str, str]] = []
+    if suffix in (".fa", ".fas", ".fasta"):
+        cid, buf = None, []
+        def flush():
+            if cid and buf:
+                for c in cid.split(","):
+                    chains.append((c.strip() or chr(65 + len(chains)), "".join(buf)))
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(">"):
+                flush()
+                parts = line[1:].split("|")
+                if len(parts) > 1 and parts[1].strip().lower() not in ("protein", ""):
+                    cid, buf = None, []  # skip non-protein chain
+                else:
+                    cid, buf = parts[0].strip(), []
+            elif line and cid is not None:
+                buf.append(line)
+        flush()
+    elif suffix in (".yml", ".yaml"):
+        import yaml
+        doc = yaml.safe_load(path.read_text()) or {}
+        for entry in doc.get("sequences", []):
+            prot = entry.get("protein") if isinstance(entry, dict) else None
+            if prot and prot.get("sequence"):
+                for c in str(prot.get("id", "A")).split(","):
+                    chains.append((c.strip(), prot["sequence"]))
+    else:
+        raise click.ClickException(f"Unsupported input for esmfold2: {path.name}")
+    return chains
+
+
+def _write_structure(complex_obj, outpath, output_format):
+    if output_format == "pdb" and hasattr(complex_obj, "to_pdb"):
+        outpath.write_text(complex_obj.to_pdb())
+        return
+    cif_text = complex_obj.to_mmcif()
+    if output_format == "cif":
+        outpath.write_text(cif_text)
+        return
+    import io
+    import biotite.structure.io.pdb as _pdb
+    import biotite.structure.io.pdbx as _pdbx
+    arr = _pdbx.get_structure(_pdbx.CIFFile.read(io.StringIO(cif_text)), model=1)
+    pf = _pdb.PDBFile()
+    pf.set_structure(arr)
+    pf.write(str(outpath))
+
+
+def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_steps,
+                      diffusion_samples, seed, override, ignored):
+    """On-device ttnn ESMFold2 over the same input files / output layout as predict.
+
+    recycling_steps -> num_loops, sampling_steps -> num_sampling_steps,
+    diffusion_samples -> num_diffusion_samples. MSA / ligand / affinity options
+    do not apply to a single-sequence model and are ignored.
+    """
+    from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
+
+    if ignored:
+        click.echo(f"Note: --model esmfold2 is single-sequence & protein-only; ignoring {', '.join(ignored)}")
+    files = ([data] if data.is_file()
+             else sorted(p for ext in ("*.fasta", "*.fa", "*.fas", "*.yaml", "*.yml")
+                         for p in data.glob(ext)))
+    if not files:
+        click.echo("No .fasta/.yaml input files found")
+        return
+    out = out_dir / f"boltz_results_{data.stem}"
+    struct_dir = out / "structures"
+    struct_dir.mkdir(parents=True, exist_ok=True)
+
+    model = None
+    results = {}
+    for f in files:
+        name = f.stem
+        outpath = struct_dir / f"{name}.{output_format}"
+        if outpath.exists() and not override:
+            click.echo(f"{name}: exists, skipping (use --override)")
+            continue
+        chains = _read_protein_chains(f)
+        if not chains:
+            click.echo(f"{name}: no protein sequences found, skipping")
+            continue
+        if model is None:
+            click.echo("Loading ttnn ESMFold2 (weights stay resident across targets) ...")
+            model = load_ttnn_esmfold2()
+        t0 = time.time()
+        res = fold_complex(model, chains, num_loops=recycling_steps,
+                           num_sampling_steps=sampling_steps,
+                           num_diffusion_samples=diffusion_samples, seed=seed or 0)
+        _write_structure(res.complex, outpath, output_format)
+        n_res = sum(len(s) for _, s in chains)
+        plddt = float(res.plddt.mean())
+        entry = {"plddt": round(plddt, 4), "n_residues": n_res, "n_chains": len(chains),
+                 "time_s": round(time.time() - t0, 1)}
+        if getattr(res, "ptm", None) is not None:
+            entry["ptm"] = round(float(res.ptm), 4)
+        results[name] = entry
+        ptm_s = f" pTM={entry['ptm']:.3f}" if "ptm" in entry else ""
+        click.echo(f"{name}: L={n_res} chains={len(chains)} pLDDT={plddt:.3f}{ptm_s} "
+                   f"{entry['time_s']}s -> {outpath}")
+    (out / "results.json").write_text(json.dumps(results, indent=2))
+    click.echo(f"Done. Results in {out}")
+
+
 @cli.command()
 @click.argument("data", type=click.Path(exists=True))
 @click.option("--out_dir", default="./")
@@ -1186,6 +1302,9 @@ def msa(db, path, install_tools):
 @click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for power reporting")
 @click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
+@click.option("--model", type=click.Choice(["boltz2", "esmfold2"]), default="boltz2", show_default=True,
+              help="Structure model. boltz2: MSA + Pairformer. esmfold2: single-sequence ESMC-6B + diffusion, "
+                   "run on-device via the ttnn pipeline (MSA / ligand / affinity options do not apply).")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1194,12 +1313,15 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, debug, log,
-            report_energy, energy_sample_hz, energy_metric, listen):
-    """Run Boltz-2 structure prediction.
+            report_energy, energy_sample_hz, energy_metric, listen, model):
+    """Run structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
-    A scheduler runs in-process and dispatches jobs to local workers; pass
-    --listen to also accept workers from other machines.
+
+    The default Boltz-2 path runs an in-process scheduler that dispatches jobs
+    to local workers (pass --listen to accept remote workers). With
+    --model esmfold2 it instead runs the on-device ttnn ESMFold2 pipeline
+    (single-sequence, protein-only) and writes the same output layout.
 
     \b
     Output:
@@ -1220,6 +1342,16 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+
+    if model == "esmfold2":
+        ignored = [n for n, on in [
+            ("--use_msa_server", use_msa_server), ("--msa_db_path", bool(msa_db_path)),
+            ("--use_potentials", use_potentials), ("--write_embeddings", write_embeddings),
+            ("--checkpoint", bool(checkpoint))] if on]
+        _predict_esmfold2(
+            Path(data).expanduser(), Path(out_dir).expanduser(), output_format,
+            recycling_steps, sampling_steps, diffusion_samples, seed, override, ignored)
+        return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
     os.environ.setdefault("CUEQ_DISABLE_AOT_TUNING", "1")

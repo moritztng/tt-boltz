@@ -23,6 +23,8 @@ loaded from its own sharded safetensors instead.
 
 from __future__ import annotations
 
+import os
+import sys
 import types
 
 import torch
@@ -30,6 +32,20 @@ import torch.nn.functional as F
 
 from tt_boltz import esmfold2 as E
 from tt_boltz.esmc import ESMCLanguageModel
+
+
+def _ensure_reference_on_path():
+    """Put the Biohub `esm` + `transformers` (ESMFold2 fork) on sys.path.
+
+    They supply the host-side featurization and mmCIF assembly (not the neural
+    compute, which is ttnn). Locations default to the standard sibling clones
+    and can be overridden with the ESM_PATH / BIOHUB_TRANSFORMERS_PATH env vars.
+    """
+    for env, default in [("BIOHUB_TRANSFORMERS_PATH", "/home/ttuser/biohub-transformers/src"),
+                         ("ESM_PATH", "/home/ttuser/esm")]:
+        path = os.environ.get(env, default)
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
 
 NUM_RES_TYPES = 33
 
@@ -276,6 +292,7 @@ def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
     Returns a patched model ready to fold many proteins without reloading. The
     24 GB CPU ESMC checkpoint is skipped (ttnn ESMC-6B is used instead).
     """
+    _ensure_reference_on_path()
     from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
 
     model = ESMFold2Model.from_pretrained(esmfold2_repo, load_esmc=False).eval()
@@ -292,15 +309,29 @@ def fold_sequences(model, sequences, *, num_loops=3, num_sampling_steps=20,
     """
     import time
 
-    from esm.models.esmfold2 import (
-        ESMFold2InputBuilder, ProteinInput, StructurePredictionInput)
-
-    builder = ESMFold2InputBuilder()
     for i, item in enumerate(sequences):
         pid, seq = item if isinstance(item, (tuple, list)) else (f"seq{i}", item)
-        spi = StructurePredictionInput(sequences=[ProteinInput(id="A", sequence=seq)])
         t0 = time.time()
-        res = builder.fold(model, spi, num_loops=num_loops,
+        res = fold_complex(model, [("A", seq)], num_loops=num_loops,
                            num_sampling_steps=num_sampling_steps,
                            num_diffusion_samples=num_diffusion_samples, seed=seed)
         yield pid, res, time.time() - t0
+
+
+def fold_complex(model, chains, *, num_loops=3, num_sampling_steps=20,
+                 num_diffusion_samples=1, seed=0):
+    """Fold one (possibly multi-chain) protein complex on an already-patched model.
+
+    `chains` is a list of ``(chain_id, sequence)``. Returns the reference fold
+    result (with `.complex`, `.plddt`, `.ptm`).
+    """
+    _ensure_reference_on_path()
+    from esm.models.esmfold2 import (
+        ESMFold2InputBuilder, ProteinInput, StructurePredictionInput)
+
+    spi = StructurePredictionInput(
+        sequences=[ProteinInput(id=cid, sequence=seq) for cid, seq in chains])
+    res = ESMFold2InputBuilder().fold(
+        model, spi, num_loops=num_loops, num_sampling_steps=num_sampling_steps,
+        num_diffusion_samples=num_diffusion_samples, seed=seed)
+    return res[0] if isinstance(res, list) else res
