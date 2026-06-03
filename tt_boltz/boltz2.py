@@ -4121,9 +4121,9 @@ class AtomDiffusion(Module):
         progress_fn=None,
         **network_condition_kwargs,
     ):
-        # Test hook: force the simplest (no-steering) case so the device-resident
-        # sampler can be exercised + compared against the same no-steering CPU path.
-        if steering_args is not None and os.environ.get("TT_BOLTZ_NO_STEERING"):
+        # The device-resident sampler runs the whole reverse-diffusion loop on
+        # device; it has no steering guidance, so TT_BOLTZ_RESIDENT disables it.
+        if steering_args is not None and os.environ.get("TT_BOLTZ_RESIDENT"):
             steering_args = {**steering_args, "fk_steering": False,
                              "physical_guidance_update": False,
                              "contact_guidance_update": False}
@@ -4185,7 +4185,7 @@ class AtomDiffusion(Module):
         )
         if (
             self.use_tenstorrent
-            and os.environ.get("TT_BOLTZ_DIFFUSION_RESIDENT")
+            and os.environ.get("TT_BOLTZ_RESIDENT")
             and multiplicity == 1
             and self.alignment_reverse_diff
             and _no_steering
@@ -4363,31 +4363,12 @@ class AtomDiffusion(Module):
 
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
-                    if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_ALIGN"):
-                        # On-device Kabsch (matmul-only Newton-Schulz polar
-                        # decomposition); host-orchestrated round-trip for now.
-                        import tt_boltz.tenstorrent as _tt
-                        _ttnn = _tt.ttnn
-                        dev = _tt.get_device()
-                        _kc = self.score_model.compute_kernel_config
-                        def _to(x):
-                            return _ttnn.from_torch(x, layout=_ttnn.TILE_LAYOUT,
-                                                    dtype=_ttnn.float32, device=dev)
-                        aligned_tt = _tt.weighted_rigid_align_tt(
-                            _to(atom_coords_noisy.float()),
-                            _to(atom_coords_denoised.float()),
-                            _to(atom_mask.float().unsqueeze(-1)),
-                            _kc,
-                        )
-                        atom_coords_noisy = torch.Tensor(
-                            _ttnn.to_torch(aligned_tt)).to(torch.float32)
-                    else:
-                        atom_coords_noisy = weighted_rigid_align(
-                            atom_coords_noisy.float(),
-                            atom_coords_denoised.float(),
-                            atom_mask.float(),
-                            atom_mask.float(),
-                        )
+                    atom_coords_noisy = weighted_rigid_align(
+                        atom_coords_noisy.float(),
+                        atom_coords_denoised.float(),
+                        atom_mask.float(),
+                        atom_mask.float(),
+                    )
 
                 atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
 
@@ -5310,25 +5291,10 @@ class Boltz2(nn.Module):
                 _tt.WeightScope.wrap(self.input_embedder.state_dict()), kc, 3, 4, 128)
             self._tt_ie = ie
 
-        W, H = 32, 128
-        B, Natom, _ = feats["ref_pos"].shape
+        g = self._atom_geom(feats)
+        B, Natom, K, W, H = g["dims"]
         assert Natom % W == 0, f"atom count {Natom} not a multiple of {W}"
-        K = Natom // W
-        Ntok = feats["res_type"].shape[1]
-        rp = feats["ref_pos"].float()
-        am = feats["atom_pad_mask"].bool()
-        uid = feats["ref_space_uid"]
-        idx = get_indexing_matrix(K, W, H, rp.device)
-        tk = partial(single_to_keys, indexing_matrix=idx, W=W, H=H)
-        aq = rp.view(B, K, W, 1, 3); ak = tk(rp).view(B, K, 1, H, 3)
-        d = ak - aq; dn = 1.0 / (1.0 + torch.sum(d * d, -1, keepdim=True))
-        mq = am.view(B, K, W, 1); mk = tk(am.unsqueeze(-1).float()).view(B, K, 1, H).bool()
-        uq = uid.view(B, K, W, 1); uk = tk(uid.unsqueeze(-1).float()).view(B, K, 1, H).long()
-        v = ((mq & mk & (uq == uk)).float().unsqueeze(-1))
-        M = B * K * W * H
-        atom_feats = torch.cat([rp, feats["ref_charge"].unsqueeze(-1).float(),
-                                feats["ref_element"].float(),
-                                feats["ref_atom_name_chars"].reshape(B, Natom, 256).float()], -1)
+        idx = g["idx"]
         att = feats["atom_to_token"].float()
         att_mean_T = (att / (att.sum(1, keepdim=True) + 1e-6)).transpose(1, 2)
         profile_del = torch.cat([feats["profile"].float(),
@@ -5343,21 +5309,22 @@ class Boltz2(nn.Module):
             return _ttnn.from_torch(x.to(torch.uint32), layout=_ttnn.ROW_MAJOR_LAYOUT,
                                     dtype=_ttnn.uint32, device=dev)
         h = {
-            "atom_feats": to(atom_feats), "d": to(d.reshape(M, 3)),
-            "d_norm": to(dn.reshape(M, 1)), "v": to(v.reshape(M, 1)),
+            "atom_feats": to(g["atom_feats"]), "d": to(g["d"]),
+            "d_norm": to(g["d_norm"]), "v": to(g["v"]),
             "idx_T": to(idx.t().contiguous()), "keys_idx": to(idx, _ttnn.bfloat4_b),
             "atom_mask": to(feats["atom_pad_mask"].float()), "att_mean_T": to(att_mean_T),
             "res_type": to(feats["res_type"].float()), "profile_del": to(profile_del),
             "method": ids(feats["method_feature"]), "modified": ids(feats["modified"]),
             "cyclic": to(cyclic), "mol_type": ids(feats["mol_type"]),
         }
-        out = ie(h, (B, Natom, K, W, H))
+        out = ie(h, g["dims"])
         return torch.Tensor(_ttnn.to_torch(out)).to(torch.float32)
 
-    def _atom_host_prep(self, feats, dev, to, W=32, H=128):
-        """Shared host-feature prep for the atom encoders (input + conditioning)."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
+    def _atom_geom(self, feats, W=32, H=128):
+        """Windowed per-atom geometry shared by the input-embedder and diffusion-
+        conditioning atom encoders: the pair distances d/d_norm, the same-window
+        same-uid mask v, the per-atom feature vector, and the window indexing
+        (idx + the single_to_keys closure tk). All host torch tensors."""
         B, Natom, _ = feats["ref_pos"].shape
         K = Natom // W
         Ntok = feats["res_type"].shape[1]
@@ -5375,26 +5342,22 @@ class Boltz2(nn.Module):
         atom_feats = torch.cat([rp, feats["ref_charge"].unsqueeze(-1).float(),
                                 feats["ref_element"].float(),
                                 feats["ref_atom_name_chars"].reshape(B, Natom, 256).float()], -1)
+        return {"atom_feats": atom_feats, "d": d.reshape(M, 3), "d_norm": dn.reshape(M, 1),
+                "v": v.reshape(M, 1), "idx": idx, "tk": tk, "dims": (B, Natom, K, W, H), "Ntok": Ntok}
+
+    def _atom_host_prep(self, feats, dev, to, W=32, H=128):
+        """ttnn host-feature dict for the diffusion-conditioning atom encoder."""
+        g = self._atom_geom(feats, W, H)
+        B, Natom, K, W, H = g["dims"]
+        idx, tk = g["idx"], g["tk"]
         att = feats["atom_to_token"].float()
-        att_k = tk(att).reshape(K, H, Ntok)
+        att_k = tk(att).reshape(K, H, g["Ntok"])
         host = {
-            "atom_feats": to(atom_feats), "d": to(d.reshape(M, 3)),
-            "d_norm": to(dn.reshape(M, 1)), "v": to(v.reshape(M, 1)),
+            "atom_feats": to(g["atom_feats"]), "d": to(g["d"]),
+            "d_norm": to(g["d_norm"]), "v": to(g["v"]),
             "idx_T": to(idx.t().contiguous()), "att": to(att), "att_q": to(att), "att_k": to(att_k),
         }
-        return host, (B, Natom, K, W, H), Ntok, idx, tk
-
-    def _rel_pos_features(self, feats, r_max=32, s_max=2):
-        """Host build of RelativePositionEncoder's one-hot features (pre-linear),
-        cached per forward — it is needed by both the z_init and confidence stages
-        and the [1,N,N,~140] one-hot build is non-trivial host work.
-        Mirrors boltz2.RelativePositionEncoder.forward (fix_sym_check/cyclic off)."""
-        _c = getattr(self, "_rpf_cache", None)
-        if _c is not None and _c[0] is feats:
-            return _c[1]
-        out = self._rel_pos_features_build(feats, r_max, s_max)
-        self._rpf_cache = (feats, out)
-        return out
+        return host, g["dims"], g["Ntok"], idx, tk
 
     def _rel_pos_bins(self, feats, r_max=32, s_max=2):
         """Integer relative-position bins (cached per forward) feeding the
@@ -5418,26 +5381,6 @@ class Boltz2(nn.Module):
         out = (d_res, d_tok, same_ent, d_chain)
         self._relbins_cache = (feats, out)
         return out
-
-    @staticmethod
-    def _rel_pos_features_build(feats, r_max=32, s_max=2):
-        from torch.nn.functional import one_hot
-        asym = feats["asym_id"]; res = feats["residue_index"]; ent = feats["entity_id"]
-        tok = feats["token_index"]; sym = feats["sym_id"]
-        same_chain = asym[:, :, None] == asym[:, None, :]
-        same_res = res[:, :, None] == res[:, None, :]
-        same_ent = ent[:, :, None] == ent[:, None, :]
-        d_res = (res[:, :, None] - res[:, None, :]).clamp(-r_max, r_max) + r_max
-        d_res = torch.where(same_chain, d_res, torch.full_like(d_res, 2 * r_max + 1))
-        a_rel_pos = one_hot(d_res, 2 * r_max + 2)
-        d_tok = (tok[:, :, None] - tok[:, None, :] + r_max).clamp(0, 2 * r_max)
-        d_tok = torch.where(same_chain & same_res, d_tok, torch.full_like(d_tok, 2 * r_max + 1))
-        a_rel_tok = one_hot(d_tok, 2 * r_max + 2)
-        d_chain = (sym[:, :, None] - sym[:, None, :] + s_max).clamp(0, 2 * s_max)
-        d_chain = torch.where(same_chain, torch.full_like(d_chain, 2 * s_max + 1), d_chain)
-        a_rel_chain = one_hot(d_chain, 2 * s_max + 2)
-        return torch.cat([a_rel_pos.float(), a_rel_tok.float(),
-                          same_ent.unsqueeze(-1).float(), a_rel_chain.float()], -1)
 
     def _chain_get(self, x):
         """Device-resident chaining (TT_ZINIT path): if x's device version was
@@ -5639,20 +5582,21 @@ class Boltz2(nn.Module):
 
         if self.trace:
             print("[boltz2] forward: input_embedder")
-        # Device-resident chaining: keep the big 64MB activations (z from the trunk,
-        # rel_pos from z_init) on device so distogram/diffusion_conditioning clone
-        # them device-to-device instead of re-uploading from host; with CHAIN_COND
-        # the conditioning is handed to the score model on device too. Freed before
-        # the diffusion sample.
-        _chain = bool(self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_CHAIN"))
-        self._chain_cache = {} if _chain else None
-        self._chain_cond = bool(_chain and os.environ.get("TT_BOLTZ_CHAIN_COND"))
-        if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_INPUT_EMBEDDER"):
+        # TT_BOLTZ_RESIDENT enables the whole device-resident fast path: the
+        # input embedder, z-init, distogram, diffusion conditioning and confidence
+        # run on device, and the big 64MB activations (z from the trunk, rel_pos
+        # from z-init, the conditioning) are chained device-to-device instead of
+        # round-tripping through host. The stashed activations are freed before
+        # the diffusion sample (nothing device-resident may outlive it).
+        _resident = bool(self.use_tenstorrent and os.environ.get("TT_BOLTZ_RESIDENT"))
+        self._chain_cache = {} if _resident else None
+        self._chain_cond = _resident
+        if _resident:
             s_inputs = self._tt_input_embedder_s_inputs(feats)
         else:
             s_inputs = self.input_embedder(feats)
 
-        if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_ZINIT"):
+        if _resident:
             s_init, z_init, relative_position_encoding = self._tt_z_init(s_inputs, feats)
         else:
             # Initialize the sequence embeddings
@@ -5692,13 +5636,12 @@ class Boltz2(nn.Module):
             and not has_templates
             and not self.is_msa_compiled
             and not self.is_pairformer_compiled
-            and not os.environ.get("TT_BOLTZ_NO_RESIDENT_TRUNK")
         )
         if use_resident_trunk:
             _trunk = self._tt_trunk_module()
-            _trunk._keep_device_z = _chain
+            _trunk._keep_device_z = _resident
             s, z = _trunk(s_inputs, s_init, z_init, feats, recycling_steps)
-            if _chain and getattr(_trunk, "_dev_z", None) is not None:
+            if _resident and getattr(_trunk, "_dev_z", None) is not None:
                 self._chain_cache[id(z)] = _trunk._dev_z
             if _pfn:
                 _pfn("trunk", step=recycling_steps, total=recycling_steps + 1)
@@ -5750,7 +5693,7 @@ class Boltz2(nn.Module):
                     use_kernels=self.use_kernels,
                 )
 
-        if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_DISTOGRAM"):
+        if _resident:
             import tt_boltz.tenstorrent as _tt
             _dm = getattr(self, "_tt_distogram", None)
             if _dm is None:
@@ -5776,7 +5719,7 @@ class Boltz2(nn.Module):
                 _pfn("diffusion", step=0, total=num_sampling_steps or self.structure_module.num_sampling_steps)
             if self.trace:
                 print("[boltz2] diffusion_conditioning")
-            if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_DIFFUSION_COND"):
+            if _resident:
                 q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
                     self._tt_diffusion_conditioning(s, z, relative_position_encoding, feats)
                 )
@@ -5833,8 +5776,7 @@ class Boltz2(nn.Module):
                 else feats["coords"].repeat_interleave(diffusion_samples, 0)
             )
             _pdl = dict_out["pdistogram"][:, :, :, 0].detach()
-            if (self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_CONFIDENCE")
-                    and diffusion_samples == 1):
+            if _resident and diffusion_samples == 1:
                 dict_out.update(self._tt_confidence(
                     s_inputs.detach(), s.detach(), z.detach(), _x_pred, feats,
                     diffusion_samples, _pdl))

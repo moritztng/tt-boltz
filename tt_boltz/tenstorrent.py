@@ -2761,68 +2761,6 @@ class TrunkModule(TorchWrapper):
         ttnn.deallocate(z)
         return s_out, z_out
 
-    def _build_static_device(self, s_inputs_tt, s_init_tt, z_init_tt, feats):
-        """Like _build_static but s_inputs/s_init/z_init arrive as ttnn tensors
-        (device-resident chaining, no to_torch). Masks/m are built host-side; the
-        ttnn inputs are zero-padded to PAIRFORMER_PAD_MULTIPLE on device."""
-        seq_len = z_init_tt.shape[1]
-        seq_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
-        padded_seq = seq_len + seq_pad
-        pad = torch.nn.functional.pad
-        m = torch.cat([
-            torch.nn.functional.one_hot(feats["msa"], num_classes=33),
-            feats["has_deletion"].unsqueeze(-1), feats["deletion_value"].unsqueeze(-1),
-            feats["msa_paired"].unsqueeze(-1)], dim=-1)
-        n_msa = m.shape[1]; msa_pad = (-n_msa) % MSA_PAD_MULTIPLE
-        m_p = pad(m, (0, 0, 0, seq_pad, 0, msa_pad)) if (seq_pad or msa_pad) else m
-        token_mask = feats["token_pad_mask"].float()
-        pair_mask = token_mask[:, :, None] * token_mask[:, None, :]
-        mask_1d_pf = token_mask
-        if seq_pad:
-            mask_1d_pf = pad(mask_1d_pf, (0, seq_pad)); pair_mask = pad(pair_mask, (0, seq_pad, 0, seq_pad))
-        if seq_pad:
-            mask_1d_msa = token_mask.new_ones(1, padded_seq); mask_1d_msa[:, seq_len:] = 0.0
-            msa_mask_tt = self._from_torch(mask_1d_msa.unsqueeze(-1) * mask_1d_msa.unsqueeze(1))
-            msa_attn_tt = self._from_torch((1 - mask_1d_msa).unsqueeze(1).unsqueeze(1) * -1e9)
-        else:
-            msa_mask_tt = msa_attn_tt = None
-        if msa_pad:
-            msa_row = token_mask.new_zeros(n_msa + msa_pad, 1, 1); msa_row[:n_msa] = 1.0
-            msa_rowmask_tt = self._from_torch(msa_row); n_msa_arg = n_msa
-        else:
-            msa_rowmask_tt = None; n_msa_arg = None
-
-        def pad_dev2(x):  # pad [1,N,D] seq dim -> [1,padded,D]
-            return x if not seq_pad else ttnn.concat(
-                [x, self._from_torch(torch.zeros(1, seq_pad, x.shape[-1]))], dim=1)
-
-        def pad_dev_z(x):  # pad [1,N,N,D] both seq dims -> [1,padded,padded,D]
-            if not seq_pad:
-                return x
-            x = ttnn.concat([x, self._from_torch(torch.zeros(1, seq_pad, seq_len, x.shape[-1]))], dim=1)
-            return ttnn.concat([x, self._from_torch(torch.zeros(1, padded_seq, seq_pad, x.shape[-1]))], dim=2)
-
-        return {
-            "seq_len": seq_len,
-            "s_init_tt": pad_dev2(s_init_tt), "z_init_tt": pad_dev_z(z_init_tt),
-            "emb_tt": pad_dev2(s_inputs_tt), "m_tt": self._from_torch(m_p),
-            "pf_mask_tt": self._from_torch(pair_mask),
-            "pf_attn_tt": self._from_torch((1 - mask_1d_pf).unsqueeze(1).unsqueeze(1) * -1e9),
-            "msa_mask_tt": msa_mask_tt, "msa_attn_tt": msa_attn_tt,
-            "msa_rowmask_tt": msa_rowmask_tt, "n_msa_arg": n_msa_arg,
-        }
-
-    def forward_device(self, s_inputs_tt, s_init_tt, z_init_tt, feats, recycling_steps):
-        """Device-resident trunk: ttnn in -> ttnn out (no host round-trip)."""
-        st = self._build_static_device(s_inputs_tt, s_init_tt, z_init_tt, feats)
-        seq_len = st["seq_len"]
-        s = ttnn.zeros_like(st["s_init_tt"]); z = ttnn.zeros_like(st["z_init_tt"])
-        for _ in range(recycling_steps + 1):
-            s, z = self._iteration(s, z, st)
-        s = ttnn.slice(s, [0, 0, 0], [1, seq_len, s.shape[-1]])
-        z = ttnn.slice(z, [0, 0, 0, 0], [1, seq_len, seq_len, z.shape[-1]])
-        return s, z
-
     def _run_eager(self, st, s_dtype, z_dtype, recycling_steps):
         s = self._from_torch(torch.zeros(list(st["s_init_tt"].shape), dtype=s_dtype))
         z = self._from_torch(torch.zeros(list(st["z_init_tt"].shape), dtype=z_dtype))
@@ -3046,22 +2984,6 @@ class ContactConditioning(Module):
         out = ttnn.add(out, ttnn.multiply(cc0, self.enc_unspecified))
         out = ttnn.add(out, ttnn.multiply(cc1, self.enc_unselected))
         return out
-
-
-class AtomFeatureEmbed(Module):
-    """AtomEncoder.embed_atom_features: Linear(atom_feature_dim -> atom_s) over the
-    host-built per-atom feature vector (ref_pos|ref_charge|ref_element|name_chars...).
-    Produces q == c (the per-atom single rep). Pair features p come separately.
-    """
-
-    def __init__(self, state_dict: Weights, compute_kernel_config: ttnn.DeviceComputeKernelConfig):
-        super().__init__(state_dict, compute_kernel_config)
-        self.w = self.torch_to_tt("embed_atom_features.weight")
-        self.b = self.torch_to_tt("embed_atom_features.bias", transform=lambda x: x)
-
-    def __call__(self, atom_feats: ttnn.Tensor) -> ttnn.Tensor:
-        return ttnn.linear(atom_feats, self.w, bias=self.b,
-                           compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN)
 
 
 class AtomPairEmbed(Module):
@@ -3377,10 +3299,10 @@ class ConfidenceModule(Module):
     """ttnn ConfidenceModule (boltz2, use_separate_heads, all input branches on).
 
     Reuses RelPosLinear/TypeBondEmbedding/ContactConditioning + the ttnn Pairformer
-    (padded like TrunkModule). Produces the 4 logit tensors (plddt/resolved from s,
-    pae/pde from z); the ptm/iptm aggregation is host output-processing. Integer
-    features (rel_pos one-hots, contact slices, cdist distogram bins, chain masks,
-    token masks) are host-built and fed in.
+    (padded like TrunkModule). ``reps`` runs the conditioning + pairformer on device
+    to produce s_t/z_t; the torch confidence_heads then computes logits + ptm/iptm
+    aggregation (host output-processing). Integer features (rel_pos one-hots, contact
+    slices, cdist distogram bins) are host-built and fed in.
     """
 
     def __init__(self, state_dict, compute_kernel_config, pairformer=None):
@@ -3407,13 +3329,6 @@ class ConfidenceModule(Module):
         # The pairformer_stack weights live in a ttnn wrapper (no torch params in
         # the state dict), so reuse the already-loaded inner Pairformer when given.
         self.pairformer = pairformer or Pairformer(8, 32, 4, 24, 16, True, self.scope("pairformer_stack"), kc)
-        h = lambda name: self.torch_to_tt("confidence_heads." + name)
-        self.to_pae_intra = h("to_pae_intra_logits.weight")
-        self.to_pae_inter = h("to_pae_inter_logits.weight")
-        self.to_pde_intra = h("to_pde_intra_logits.weight")
-        self.to_pde_inter = h("to_pde_inter_logits.weight")
-        self.to_plddt = h("to_plddt_logits.weight")
-        self.to_resolved = h("to_resolved_logits.weight")
 
     def _lin(self, x, w, **kw):
         return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN, **kw)
@@ -3454,11 +3369,3 @@ class ConfidenceModule(Module):
 
     def _dist_embed(self, dist_ids, N):
         return _pairgrid_embedding(dist_ids, self.dist_table)
-
-    def logits(self, s_t, z_t, same_chain, diff_chain):
-        pae = ttnn.add(ttnn.multiply(self._lin(z_t, self.to_pae_intra), same_chain),
-                       ttnn.multiply(self._lin(z_t, self.to_pae_inter), diff_chain))
-        zt_sym = ttnn.add(z_t, ttnn.permute(z_t, (0, 2, 1, 3)))
-        pde = ttnn.add(ttnn.multiply(self._lin(zt_sym, self.to_pde_intra), same_chain),
-                       ttnn.multiply(self._lin(zt_sym, self.to_pde_inter), diff_chain))
-        return self._lin(s_t, self.to_plddt), self._lin(s_t, self.to_resolved), pae, pde
