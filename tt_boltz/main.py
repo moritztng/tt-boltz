@@ -1201,16 +1201,56 @@ def _write_structure(complex_obj, outpath, output_format):
     pf.write(str(outpath))
 
 
-def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_steps,
-                      diffusion_samples, seed, override, ignored):
-    """On-device ttnn ESMFold2 over the same input files / output layout as predict.
+def _esmfold2_device_worker(assignment, in_q, out_q, fold_kwargs, struct_dir,
+                            output_format, override):
+    """One ESMFold2 worker pinned to a TT device — folds targets pulled from a
+    shared queue (dynamic load-balancing) until it receives the None sentinel.
 
-    recycling_steps -> num_loops, sampling_steps -> num_sampling_steps,
-    diffusion_samples -> num_diffusion_samples. MSA / ligand / affinity options
-    do not apply to a single-sequence model and are ignored.
+    Mirrors the Boltz worker: TT_VISIBLE_DEVICES is set BEFORE ttnn is imported,
+    so the assigned physical chip is logical device 0. Weights stay resident on
+    that device across every target this worker handles.
     """
+    os.environ["TT_VISIBLE_DEVICES"] = str(assignment["visible_devices"])
+    if assignment.get("mesh_graph_descriptor") and not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(assignment["mesh_graph_descriptor"])
     from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
 
+    dev = int(assignment["visible_devices"])
+    model = load_ttnn_esmfold2()
+    struct_dir = Path(struct_dir)
+    while (item := in_q.get()) is not None:
+        path = Path(item)
+        name = path.stem
+        outpath = struct_dir / f"{name}.{output_format}"
+        if outpath.exists() and not override:
+            out_q.put((name, "skip")); continue
+        try:
+            chains = _read_protein_chains(path)
+            if not chains:
+                out_q.put((name, {"error": "no protein sequences"})); continue
+            t0 = time.time()
+            res = fold_complex(model, chains, **fold_kwargs)
+            _write_structure(res.complex, outpath, output_format)
+            entry = {"plddt": round(float(res.plddt.mean()), 4),
+                     "n_residues": sum(len(s) for _, s in chains), "n_chains": len(chains),
+                     "device": dev, "time_s": round(time.time() - t0, 1)}
+            if getattr(res, "ptm", None) is not None:
+                entry["ptm"] = round(float(res.ptm), 4)
+            out_q.put((name, entry))
+        except Exception as e:  # keep the worker alive for the remaining targets
+            out_q.put((name, {"error": repr(e)}))
+
+
+def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_steps,
+                      diffusion_samples, seed, override, ignored, num_devices, device_ids):
+    """On-device ttnn ESMFold2 over the same inputs / output layout as predict.
+
+    Targets fan out across TT devices exactly like the Boltz path: one pinned
+    worker process per device (device set via detect_tenstorrent_devices /
+    --num_devices / --device_ids), each pulling targets from a shared queue.
+    recycling_steps -> num_loops, sampling_steps, diffusion_samples carry over;
+    MSA / ligand / affinity options don't apply to a single-sequence model.
+    """
     if ignored:
         click.echo(f"Note: --model esmfold2 is single-sequence & protein-only; ignoring {', '.join(ignored)}")
     files = ([data] if data.is_file()
@@ -1223,36 +1263,43 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
     struct_dir = out / "structures"
     struct_dir.mkdir(parents=True, exist_ok=True)
 
-    model = None
-    results = {}
+    devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=len(files))
+    assigns = _build_worker_device_assignments(devices)
+    click.echo(f"ESMFold2 on TT device(s) {devices}; {len(files)} target(s) "
+               f"(weights resident per device)")
+
+    fold_kwargs = dict(num_loops=recycling_steps, num_sampling_steps=sampling_steps,
+                       num_diffusion_samples=diffusion_samples, seed=seed or 0)
+    ctx = mp.get_context("spawn")
+    in_q, out_q = ctx.Queue(), ctx.Queue()
     for f in files:
-        name = f.stem
-        outpath = struct_dir / f"{name}.{output_format}"
-        if outpath.exists() and not override:
-            click.echo(f"{name}: exists, skipping (use --override)")
-            continue
-        chains = _read_protein_chains(f)
-        if not chains:
-            click.echo(f"{name}: no protein sequences found, skipping")
-            continue
-        if model is None:
-            click.echo("Loading ttnn ESMFold2 (weights stay resident across targets) ...")
-            model = load_ttnn_esmfold2()
-        t0 = time.time()
-        res = fold_complex(model, chains, num_loops=recycling_steps,
-                           num_sampling_steps=sampling_steps,
-                           num_diffusion_samples=diffusion_samples, seed=seed or 0)
-        _write_structure(res.complex, outpath, output_format)
-        n_res = sum(len(s) for _, s in chains)
-        plddt = float(res.plddt.mean())
-        entry = {"plddt": round(plddt, 4), "n_residues": n_res, "n_chains": len(chains),
-                 "time_s": round(time.time() - t0, 1)}
-        if getattr(res, "ptm", None) is not None:
-            entry["ptm"] = round(float(res.ptm), 4)
-        results[name] = entry
-        ptm_s = f" pTM={entry['ptm']:.3f}" if "ptm" in entry else ""
-        click.echo(f"{name}: L={n_res} chains={len(chains)} pLDDT={plddt:.3f}{ptm_s} "
-                   f"{entry['time_s']}s -> {outpath}")
+        in_q.put(str(f))
+    for _ in devices:
+        in_q.put(None)  # one sentinel per worker
+    procs = [ctx.Process(target=_esmfold2_device_worker,
+                         args=(assigns[d], in_q, out_q, fold_kwargs, str(struct_dir),
+                               output_format, override))
+             for d in devices]
+    for p in procs:
+        p.start()
+
+    results = {}
+    try:
+        for _ in range(len(files)):
+            name, entry = out_q.get()
+            if entry == "skip":
+                click.echo(f"{name}: exists, skipping (use --override)")
+            elif isinstance(entry, dict) and "error" in entry:
+                click.echo(f"{name}: ERROR {entry['error']}")
+            else:
+                results[name] = entry
+                ptm_s = f" pTM={entry['ptm']:.3f}" if "ptm" in entry else ""
+                click.echo(f"{name}: L={entry['n_residues']} chains={entry['n_chains']} "
+                           f"pLDDT={entry['plddt']:.3f}{ptm_s} [dev {entry['device']}] {entry['time_s']}s")
+    finally:
+        for p in procs:
+            p.join()
+
     (out / "results.json").write_text(json.dumps(results, indent=2))
     click.echo(f"Done. Results in {out}")
 
@@ -1350,7 +1397,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             ("--checkpoint", bool(checkpoint))] if on]
         _predict_esmfold2(
             Path(data).expanduser(), Path(out_dir).expanduser(), output_format,
-            recycling_steps, sampling_steps, diffusion_samples, seed, override, ignored)
+            recycling_steps, sampling_steps, diffusion_samples, seed, override, ignored,
+            num_devices, device_ids)
         return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
