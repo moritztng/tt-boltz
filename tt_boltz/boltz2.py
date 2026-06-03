@@ -5272,10 +5272,6 @@ class Boltz2(nn.Module):
             self._tt_trunk = trunk
         return trunk
 
-    # Raw, host-side feats that fully define the protein for the trunk. We key
-    # the trunk memoization on these (NOT the ttnn-derived s_inputs/s_init/z_init,
-    # which carry run-to-run bf8 reduction-order noise of ~0.1-0.5%). Identical
-    # raw feats => same protein => the cached trunk output is valid to reuse.
     def _tt_input_embedder_s_inputs(self, feats):
         """Compute s_inputs via the device-resident ttnn InputEmbedder (assembly
         step 1). Builds the host feature contract from feats, runs on device,
@@ -5382,10 +5378,9 @@ class Boltz2(nn.Module):
         return out
 
     def _chain_get(self, x):
-        """Device-resident chaining (TT_ZINIT path): if x's device version was
-        stashed this forward, return a device-to-device CLONE (no host upload);
-        else None so the caller uploads from host. Cleared before the diffusion
-        sample so nothing is held across the persisted diffusion trace replay."""
+        """Device-resident chaining: if x's device version was stashed this
+        forward, return a device-to-device CLONE (no host upload); else None so
+        the caller uploads from host. Freed before the diffusion sample."""
         import tt_boltz.tenstorrent as _tt
         cache = getattr(self, "_chain_cache", None)
         if cache:
@@ -5395,8 +5390,8 @@ class Boltz2(nn.Module):
         return None
 
     def _chain_free(self):
-        """Free the stashed device activations (called BEFORE the diffusion sample
-        — holding device tensors across the diffusion trace replay corrupts it)."""
+        """Free the stashed device activations, before the diffusion sample (a
+        device-resident sampler must not coexist with leftover chained tensors)."""
         import tt_boltz.tenstorrent as _tt
         cache = getattr(self, "_chain_cache", None)
         if not cache:
@@ -5517,7 +5512,8 @@ class Boltz2(nn.Module):
 
     def _tt_diffusion_conditioning(self, s_trunk, z_trunk, rel_pos, feats):
         """Compute the diffusion conditioning (q, c, biases, to_keys) via the ttnn
-        DiffusionConditioning (assembly step 2). Returns torch tensors + to_keys."""
+        DiffusionConditioning. Returns torch tensors (or device tensors handed to
+        the score model directly when chaining the conditioning) + to_keys."""
         import tt_boltz.tenstorrent as _tt
         _ttnn = _tt.ttnn
         dev = _tt.get_device()
@@ -5539,8 +5535,8 @@ class Boltz2(nn.Module):
                                  _rpt if _rpt is not None else to(rel_pos), host, dims)
         B, _, K, W, H = dims
         if getattr(self, "_chain_cond", False):
-            # Phase 1 device-resident chaining of the conditioning: hand q/c/biases
-            # to the score model on device (no download here, no re-upload there).
+            # Device-resident chaining of the conditioning: hand q/c/biases to the
+            # score model on device (no download here, no re-upload there).
             # The score model's static build (DiffusionModule.forward) detects ttnn
             # inputs and pads them on device. atom biases reshaped to [B,K,W,H,-1].
             out = (q, c, tk,
@@ -5739,8 +5735,8 @@ class Boltz2(nn.Module):
                 "atom_dec_bias": atom_dec_bias,
                 "token_trans_bias": token_trans_bias,
             }
-            # Free the stashed device activations BEFORE the diffusion sample —
-            # nothing device-resident may be held across the diffusion trace replay.
+            # Free the stashed device activations before the device-resident
+            # diffusion sample claims the device.
             self._chain_free()
 
             if self.trace:

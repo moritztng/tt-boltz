@@ -2438,7 +2438,8 @@ class DiffusionModule(TorchWrapper):
 
         Assumes the static cache has been built (via a prior forward()/prepare).
         ``r_tt`` is the padded atom coords [B, N_padded, 3]; returns the atom
-        coords update [B, N_padded, 3]. No host transfers — usable inside a trace.
+        coords update [B, N_padded, 3]. No host transfers (ttnn in -> ttnn out),
+        so the device-resident sampler can call it step after step.
         """
         return self.module(
             r_tt,
@@ -2643,7 +2644,7 @@ class TrunkModule(TorchWrapper):
         """Build + upload (once per protein) all loop-invariant device tensors.
 
         Returns a dict cached in ``self._runtime_cache`` and reused across the
-        recycling iterations (and, later, across traced replays).
+        recycling iterations.
         """
         seq_len = z_init.shape[1]
         seq_pad = (-seq_len) % PAIRFORMER_PAD_MULTIPLE
@@ -2923,7 +2924,7 @@ EMBED_ROW_CHUNK = 32768  # cap embedding rows per op so the L1 circular buffer f
 def _pairgrid_embedding(ids_nn: ttnn.Tensor, table: ttnn.Tensor) -> ttnn.Tensor:
     """Embed a [1, N, N] integer pair grid -> [1, N, N, d]. Embed as [N, N]
     (batch=N, seq=N) and chunk the batch so the L1 circular buffer fits at large
-    N; avoids the [1, N*N] mega-reshape that overflows. Fixed chunks -> trace-safe."""
+    N; avoids the [1, N*N] mega-reshape that overflows."""
     _, n, m = ids_nn.shape
     x = ttnn.reshape(ids_nn, (n, m))                  # [N, N], cheap (drop leading 1)
     rows = max(1, EMBED_ROW_CHUNK // m)               # batch rows per embed
