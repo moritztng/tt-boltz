@@ -1276,8 +1276,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "use_paired_feature": True}
     conf_kwargs = dict(
         predict_args={"recycling_steps": recycling_steps, "sampling_steps": sampling_steps,
-                      "diffusion_samples": diffusion_samples, "max_parallel_samples": max_parallel_samples,
-                      "seed": seed},
+                      "diffusion_samples": diffusion_samples, "max_parallel_samples": max_parallel_samples},
         diffusion_process_args=_diffusion, pairformer_args=_pairformer, msa_args=_msa,
         steering_args={"fk_steering": use_potentials, "physical_guidance_update": use_potentials,
                        "contact_guidance_update": True, "num_particles": 3, "fk_lambda": 4.0,

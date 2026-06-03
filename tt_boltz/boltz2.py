@@ -5622,16 +5622,6 @@ class Boltz2(nn.Module):
                 pairformer=self.confidence_module.pairformer_stack.module)
             self._tt_cm = cm
 
-        import time as _time
-        _prof = bool(os.environ.get("TT_BOLTZ_STAGE_TIME"))
-        def _ck(lbl, t0):
-            if _prof:
-                _ttnn.synchronize_device(dev)
-                print(f"[conf]   {lbl}: {_time.perf_counter() - t0:.3f}s", flush=True)
-                return _time.perf_counter()
-            return t0
-        _t = _time.perf_counter()
-
         B, Ntok = s.shape[0], s.shape[1]
         P = (-Ntok) % 64 + Ntok  # padded seq for the pairformer
         def to(x):
@@ -5644,7 +5634,6 @@ class Boltz2(nn.Module):
         xr = torch.bmm(ttra, x_pred.float()); d = torch.cdist(xr, xr)
         bnd = torch.linspace(2, 22, 63, device=d.device)
         dist = (d.unsqueeze(-1) > bnd).sum(-1).long()                # [B,Ntok,Ntok]
-        _t = _ck("host dist/cdist bins", _t)
 
         # pairformer masks (padded), pad closures
         mask1d = feats["token_pad_mask"].float()
@@ -5674,16 +5663,12 @@ class Boltz2(nn.Module):
             "dist_ids": ids(dist), "pf_mask": pf_mask, "pf_attn": pf_attn,
             "pad_s": pad_s, "pad_z": pad_z,
         }
-        _t = _ck("host prep+uploads", _t)
         s_t, z_t = cm.reps(to(s_inputs), to(s), to(z), host, (B, Ntok))
-        _t = _ck("device reps (pairformer)", _t)
         g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
         s_t, z_t = g(s_t), g(z_t)
-        _t = _ck("download s/z", _t)
         out = self.confidence_module.confidence_heads(
             s=s_t, z=z_t, x_pred=x_pred, d=d, feats=feats,
             multiplicity=multiplicity, pred_distogram_logits=pred_distogram_logits)
-        _t = _ck("confidence_heads (torch)", _t)
         return out
 
     def _tt_diffusion_conditioning(self, s_trunk, z_trunk, rel_pos, feats):
@@ -5699,27 +5684,15 @@ class Boltz2(nn.Module):
                 _tt.WeightScope.wrap(self.diffusion_conditioning.state_dict()), kc)
             self._tt_dc = dc
 
-        import time as _time
-        _prof = bool(os.environ.get("TT_BOLTZ_STAGE_TIME"))
-        def _ck(lbl, t0):
-            if _prof:
-                _ttnn.synchronize_device(dev)
-                print(f"[dcond]  {lbl}: {_time.perf_counter() - t0:.3f}s", flush=True)
-                return _time.perf_counter()
-            return t0
-        _t = _time.perf_counter()
-
         def to(x):
             return _ttnn.from_torch(x.float(), layout=_ttnn.TILE_LAYOUT,
                                     dtype=_ttnn.bfloat16, device=dev)
         host, dims, Ntok, idx, tk = self._atom_host_prep(feats, dev, to)
-        _t = _ck("atom_host_prep", _t)
         # z_trunk/rel_pos are the big 64MB tensors — reuse device clones if the
         # trunk/z_init stashed them this forward (chaining); s_trunk is small.
         _zt = self._chain_get(z_trunk); _rpt = self._chain_get(rel_pos)
         q, c, aeb, adb, ttb = dc(to(s_trunk), _zt if _zt is not None else to(z_trunk),
                                  _rpt if _rpt is not None else to(rel_pos), host, dims)
-        _t = _ck("device DiffusionConditioning", _t)
         B, Natom, K, W, H = dims
         if getattr(self, "_chain_cond", False):
             # Phase 1 device-resident chaining of the conditioning: hand q/c/biases
@@ -5729,12 +5702,10 @@ class Boltz2(nn.Module):
             out = (q, c, tk,
                    _ttnn.reshape(aeb, (B, K, W, H, -1)),
                    _ttnn.reshape(adb, (B, K, W, H, -1)), ttb)
-            _t = _ck("conditioning (device, no download)", _t)
             return out
         g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
         out = (g(q), g(c), tk,
                g(aeb).reshape(B, K, W, H, -1), g(adb).reshape(B, K, W, H, -1), g(ttb))
-        _t = _ck("download", _t)
         return out
 
     def forward(
@@ -5776,26 +5747,8 @@ class Boltz2(nn.Module):
                         for k, v in feats.items()}, _dump)
             print(f"[boltz2] dumped feats -> {_dump}", flush=True)
 
-        # Optional per-stage wall-clock profiling to estimate the ceiling of a
-        # whole-model trace (TT_BOLTZ_STAGE_TIME). Syncs the device at each mark.
-        _stage_t = {"on": bool(os.environ.get("TT_BOLTZ_STAGE_TIME")), "last": None}
-        if _stage_t["on"]:
-            import time as _stime
-            import tt_boltz.tenstorrent as _stt
-
-            def _mark(name):
-                _stt.ttnn.synchronize_device(_stt.get_device())
-                now = _stime.perf_counter()
-                if _stage_t["last"] is not None:
-                    print(f"[stage] {name}: {now - _stage_t['last']:.3f}s", flush=True)
-                _stage_t["last"] = now
-        else:
-            def _mark(name):
-                pass
-
         if self.trace:
             print("[boltz2] forward: input_embedder")
-        _mark("start")
         # Device-resident chaining: keep the big 64MB activations (z from the trunk,
         # rel_pos from z_init) on device so distogram/diffusion_conditioning clone
         # them device-to-device instead of re-uploading from host; with CHAIN_COND
@@ -5808,7 +5761,6 @@ class Boltz2(nn.Module):
             s_inputs = self._tt_input_embedder_s_inputs(feats)
         else:
             s_inputs = self.input_embedder(feats)
-        _mark("input_embedder")
 
         if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_ZINIT"):
             s_init, z_init, relative_position_encoding = self._tt_z_init(s_inputs, feats)
@@ -5828,7 +5780,6 @@ class Boltz2(nn.Module):
                 z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
             z_init = z_init + self.contact_conditioning(feats)
 
-        _mark("z_init")
 
         # Compute pairwise mask
         mask = feats["token_pad_mask"].float()
@@ -5929,7 +5880,6 @@ class Boltz2(nn.Module):
                 print(f"[boltz2] wrapper trunk: {_time.perf_counter() - _t_wrap:.3f}s "
                       f"({recycling_steps + 1} iters)", flush=True)
 
-        _mark("trunk")
 
         if self.use_tenstorrent and os.environ.get("TT_BOLTZ_TT_DISTOGRAM"):
             import tt_boltz.tenstorrent as _tt
@@ -5951,7 +5901,6 @@ class Boltz2(nn.Module):
             "s": s,
             "z": z,
         }
-        _mark("distogram")
 
         if self.run_trunk_and_structure and not self.skip_run_structure:
             if _pfn:
@@ -5982,7 +5931,6 @@ class Boltz2(nn.Module):
             # Free the stashed device activations BEFORE the diffusion sample —
             # nothing device-resident may be held across the diffusion trace replay.
             self._chain_free()
-            _mark("diffusion_conditioning")
 
             if self.trace:
                 print("[boltz2] structure_module.sample")
@@ -6000,7 +5948,6 @@ class Boltz2(nn.Module):
                     progress_fn=_pfn,
                 )
                 dict_out.update(struct_out)
-            _mark("diffusion_sample")
 
             if self.predict_bfactor:
                 pbfactor = self.bfactor_module(s)
@@ -6036,7 +5983,6 @@ class Boltz2(nn.Module):
                         use_kernels=self.use_kernels,
                     )
                 )
-            _mark("confidence")
 
         if self.affinity_prediction:
             if self.trace:
@@ -6233,16 +6179,6 @@ class Boltz2(nn.Module):
             The prediction dictionary.
         """
         try:
-            # Per-protein deterministic reseed: the CLI sets the global seed once,
-            # so without this a protein's result depends on how many proteins ran
-            # before it (RNG drift) — i.e. batch order changes the output. Reseed
-            # from the configured seed at the start of every prediction so each
-            # protein is reproducible regardless of position in the batch (and a
-            # same-shape replay produces the same structure as a fresh run).
-            _seed = self.predict_args.get("seed")
-            if _seed is not None:
-                import random as _random, numpy as _np
-                _random.seed(_seed); _np.random.seed(_seed); torch.manual_seed(_seed)
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
