@@ -75,41 +75,26 @@ def _to_t(x):
 
 
 class _Adapter(torch.nn.Module):
-    """Base: holds a ttnn TorchWrapper and forwards via a mapping function."""
+    """Bridge a reference submodule call to a ttnn TorchWrapper's positional forward.
 
-    def __init__(self, ttnn_mod):
+    `argnames` lists the reference kwarg names in the order the wrapper expects;
+    floating tensors are cast to fp32. With no `argnames`, the reference's first
+    positional arg is forwarded (single-input modules like the trunk / shim /
+    distogram head, which ignore any extra kwargs such as `pair_attention_mask`).
+    """
+
+    def __init__(self, mod, *argnames):
         super().__init__()
-        self.m = ttnn_mod
+        self.m = mod
+        self.argnames = argnames
 
+    def forward(self, *args, **kw):
+        if self.argnames:
+            return self.m(*[_to_t(kw[n]) for n in self.argnames])
+        return self.m(_to_t(args[0]))
 
-class _InputsEmbedderAdapter(_Adapter):
-    def forward(self, *, aatype, profile, deletion_mean, ref_pos, atom_attention_mask,
-                ref_space_uid, ref_charge, ref_element, ref_atom_name_chars, atom_to_token):
-        return self.m(aatype.float(), profile.float(), deletion_mean.float(), ref_pos.float(),
-                      atom_attention_mask.float(), ref_space_uid, ref_charge.float(),
-                      ref_element.float(), ref_atom_name_chars.float(), atom_to_token)
-
-
-class _RelPosAdapter(_Adapter):
-    def forward(self, *, residue_index, asym_id, sym_id, entity_id, token_index):
-        return self.m(residue_index, asym_id, sym_id, entity_id, token_index)
-
-
-class _ShimAdapter(_Adapter):
-    def forward(self, hidden_states, *, lm_dropout: float = 0.0):
-        # lm_dropout is stochastic train-time regularisation; expectation is the
-        # identity, so deterministic inference applies hidden states as-is.
-        return self.m(hidden_states.float())
-
-
-class _TrunkAdapter(_Adapter):
-    def forward(self, z, pair_attention_mask=None):
-        # Single (possibly multi-chain) complex => all tokens valid => the pair
-        # mask is all-ones and the trunk's own tile-padding mask suffices.
-        return self.m(z.float())
-
-    # No-ops so a reference module that owns this trunk (e.g. the confidence
-    # head) can still call set_kernel_backend / set_chunk_size on it.
+    # No-ops so a reference module that owns this wrapper (e.g. the confidence
+    # head owning a folding trunk) can still call these on it.
     def set_kernel_backend(self, backend):
         pass
 
@@ -117,60 +102,52 @@ class _TrunkAdapter(_Adapter):
         pass
 
 
-class _MSAAdapter(_Adapter):
-    def forward(self, *, x_pair, x_inputs, msa_oh, has_deletion, deletion_value,
-                msa_attention_mask):
-        return self.m(x_pair.float(), x_inputs.float(), msa_oh.float(), has_deletion.float(),
-                      deletion_value.float(), msa_attention_mask.float())
-
-
-class _DistogramAdapter(_Adapter):
-    def forward(self, z):
-        return self.m(z.float())
-
-
 class _StructureHeadAdapter(_Adapter):
-    """Diffusion sampler adapter. Replicates the reference multi-sample batching
-    by running the ttnn sampler once per diffusion sample with distinct seeds."""
-
-    def forward(self, *a, **k):  # never called; the head is used via .sample
-        raise NotImplementedError
+    """Diffusion sampler adapter — runs the ttnn sampler once per diffusion
+    sample (distinct seeds) to mirror the reference's multi-sample batching."""
 
     def sample(self, *, z_trunk, s_inputs, relative_position_encoding, ref_pos, ref_charge,
                ref_mask, ref_element, ref_atom_name_chars, ref_space_uid, tok_idx,
                num_diffusion_samples: int = 1, num_sampling_steps=None, seed: int = 0,
-               s_trunk=None, **_ignored):
+               **_ignored):
         steps = 20 if num_sampling_steps is None else int(num_sampling_steps)
-        samples = []
-        for i in range(max(1, num_diffusion_samples)):
-            coords = self.m.sample(
-                z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
-                ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
-                ref_atom_name_chars.float(), ref_space_uid, tok_idx, steps=steps, seed=seed + i)
-            samples.append(coords)
-        sample_atom_coords = torch.cat(samples, dim=0)  # [B*ns, N, 3]
-        return {"sample_atom_coords": sample_atom_coords}
+        samples = [
+            self.m.sample(z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
+                          ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
+                          ref_atom_name_chars.float(), ref_space_uid, tok_idx, steps=steps, seed=seed + i)
+            for i in range(max(1, num_diffusion_samples))
+        ]
+        return {"sample_atom_coords": torch.cat(samples, dim=0)}  # [B*ns, N, 3]
 
 
-# Map: reference attribute -> (ttnn factory, state-dict prefix). FoldingTrunk
-# variants differ only in block count (folding_trunk 48 / lm_encoder 4 / coda 2).
+# reference attribute -> (ttnn wrapper, state-dict prefix, reference kwarg order).
+# An empty kwarg tuple means "forward the first positional arg" (trunk/shim/
+# distogram). FoldingTrunk variants differ only in block count (48 / 4 / 2).
+_SPEC = {
+    "inputs_embedder": (lambda: E.InputsEmbedder(), "inputs_embedder.",
+        ("aatype", "profile", "deletion_mean", "ref_pos", "atom_attention_mask",
+         "ref_space_uid", "ref_charge", "ref_element", "ref_atom_name_chars", "atom_to_token")),
+    "rel_pos": (lambda: E.RelPosEncoding(), "rel_pos.",
+        ("residue_index", "asym_id", "sym_id", "entity_id", "token_index")),
+    "msa_encoder": (lambda: E.MSAEncoder(), "msa_encoder.",
+        ("x_pair", "x_inputs", "msa_oh", "has_deletion", "deletion_value", "msa_attention_mask")),
+    "language_model": (lambda: E.LanguageModelShim(), "language_model.", ()),
+    "lm_encoder": (lambda: E.FoldingTrunk(4), "lm_encoder.", ()),
+    "folding_trunk": (lambda: E.FoldingTrunk(48), "folding_trunk.", ()),
+    "parcae_coda": (lambda: E.FoldingTrunk(2), "parcae_coda.", ()),
+    "distogram_head": (lambda: E.DistogramHeadModel(), "distogram_head.", ()),
+    "structure_head": (lambda: E.StructureHead(sigma_data=16.0), "structure_head.", None),
+}
+
+
 def _components(sd):
     sub = lambda p: {k[len(p):]: v for k, v in sd.items() if k.startswith(p)}
-    spec = {
-        "inputs_embedder": (E.InputsEmbedder(), "inputs_embedder.", _InputsEmbedderAdapter),
-        "rel_pos": (E.RelPosEncoding(), "rel_pos.", _RelPosAdapter),
-        "language_model": (E.LanguageModelShim(), "language_model.", _ShimAdapter),
-        "lm_encoder": (E.FoldingTrunk(4), "lm_encoder.", _TrunkAdapter),
-        "folding_trunk": (E.FoldingTrunk(48), "folding_trunk.", _TrunkAdapter),
-        "parcae_coda": (E.FoldingTrunk(2), "parcae_coda.", _TrunkAdapter),
-        "msa_encoder": (E.MSAEncoder(), "msa_encoder.", _MSAAdapter),
-        "distogram_head": (E.DistogramHeadModel(), "distogram_head.", _DistogramAdapter),
-        "structure_head": (E.StructureHead(sigma_data=16.0), "structure_head.", _StructureHeadAdapter),
-    }
     built = {}
-    for name, (mod, prefix, adapter) in spec.items():
+    for name, (factory, prefix, argnames) in _SPEC.items():
+        mod = factory()
         mod.load_state_dict(sub(prefix), strict=False)
-        built[name] = adapter(mod)
+        cls = _StructureHeadAdapter if argnames is None else _Adapter
+        built[name] = cls(mod, *(argnames or ()))
     return built
 
 
@@ -192,7 +169,7 @@ def _install_resident_trunk_loop(model):
 
     from tt_boltz import esmfold2 as E
 
-    ftw = model.folding_trunk.m  # _TrunkAdapter.m -> E.FoldingTrunk TorchWrapper
+    ftw = model.folding_trunk.m  # _Adapter.m -> E.FoldingTrunk TorchWrapper
     overwrite = bool(getattr(model.config, "msa_encoder_overwrite", True))
 
     def _run_one_loop(self, z, z_init, lm_z, _msa_kwargs, pair_mask, a, b_mat, total_steps):
@@ -278,7 +255,7 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
     n_conf_blocks = len(model.confidence_head.folding_trunk.blocks)
     conf_trunk = E.FoldingTrunk(n_conf_blocks)
     conf_trunk.load_state_dict(sub("confidence_head.folding_trunk."), strict=False)
-    model.confidence_head.folding_trunk = _TrunkAdapter(conf_trunk)
+    model.confidence_head.folding_trunk = _Adapter(conf_trunk)
 
     # ttnn ESMC-6B language model. Loaded lazily on the first fold; with
     # persistent_lm it then stays resident for all subsequent folds.

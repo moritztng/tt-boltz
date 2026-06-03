@@ -1059,89 +1059,6 @@ class MSAEncoder(TorchWrapper):
 
 
 # ===========================================================================
-# End-to-end orchestration (parcae trunk recurrence + heads + sampler)
-# ===========================================================================
-
-
-class ParcaeParams:
-    """Host-side parcae state-space params + small glue linears for the trunk."""
-
-    def __init__(self, sd: dict):
-        self.log_a = sd["parcae_log_a"]            # [256]
-        self.log_delta = sd["parcae_log_delta"]    # [256]
-        self.b_cont = sd["parcae_b_cont"]          # [256,256]
-        self.in_norm_w = sd["parcae_input_norm.weight"]; self.in_norm_b = sd["parcae_input_norm.bias"]
-        self.readout_w = sd["parcae_readout.weight"]
-        self.z1_w = sd["z_init_1.weight"]; self.z2_w = sd["z_init_2.weight"]
-        self.tb_w = sd["token_bonds.weight"]
-
-    def dynamics(self):
-        delta = F.softplus(self.log_delta)
-        a = torch.exp(-delta * torch.exp(self.log_a))      # [256]
-        b = delta[:, None] * self.b_cont                   # [256,256]
-        return a, b
-
-
-def esmfold2_fold(components, parcae: ParcaeParams, inputs, *, num_loops=3,
-                  sample_steps=14, seed=0):
-    """End-to-end ESMFold2 forward (single-sequence; LM/MSA optional).
-
-    `components` is a dict of the tested ttnn TorchWrappers: inputs_embedder,
-    rel_pos, folding_trunk (48-blk main), lm_encoder (4-blk) [opt], language_model
-    [opt], msa_encoder [opt], parcae_coda (2-blk), structure_head, distogram_head,
-    confidence_head. The parcae state-space recurrence and the small z-init /
-    token-bonds / readout linears run on host. Returns dict with coords + logits.
-    """
-    lin = lambda x, w: F.linear(x, w)
-    x_inputs = components["inputs_embedder"](
-        inputs["aatype"], inputs["profile"], inputs["deletion_mean"], inputs["ref_pos"],
-        inputs["atom_mask"], inputs["ref_space_uid"], inputs["ref_charge"],
-        inputs["ref_element"], inputs["ref_atom_name_chars"], inputs["atom_to_token"])  # [B,L,451]
-
-    relpos = components["rel_pos"](inputs["residue_index"], inputs["asym_id"], inputs["sym_id"],
-                                   inputs["entity_id"], inputs["token_index"])  # [B,L,L,256]
-    z_init = (lin(x_inputs, parcae.z1_w).unsqueeze(2) + lin(x_inputs, parcae.z2_w).unsqueeze(1)
-              + relpos + lin(inputs["token_bonds"].unsqueeze(-1), parcae.tb_w))
-
-    lm_z = components["language_model"](inputs["lm_hidden_states"]) if components.get("language_model") and inputs.get("lm_hidden_states") is not None else None
-
-    a, b = parcae.dynamics()
-    z = torch.zeros_like(z_init)
-    # Reference loop order (modeling_esmfold2 `_run_one_loop`): the MSA encoder
-    # sees z_init alone as its pair input; its result REPLACES z_init when
-    # `msa_encoder_overwrite` (default True), then the LM-encoder pair update is
-    # added on top. lm_dropout (0.25, per-loop) is stochastic at train time;
-    # its expectation is the identity, so deterministic inference applies lm_z
-    # as-is. The recurrent state z starts at ~0 (reference seeds it with tiny
-    # trunc-normal noise, negligible vs the injected pair magnitude).
-    msa_overwrite = inputs.get("msa_encoder_overwrite", True)
-    for _ in range(num_loops + 1):
-        z_inject = z_init
-        if components.get("msa_encoder") is not None and inputs.get("msa_oh") is not None:
-            msa_pair = components["msa_encoder"](
-                z_inject, x_inputs, inputs["msa_oh"], inputs["has_deletion"],
-                inputs["deletion_value"], inputs["msa_mask"])
-            z_inject = msa_pair if msa_overwrite else (z_inject + msa_pair)
-        if components.get("lm_encoder") is not None and lm_z is not None:
-            z_inject = z_inject + components["lm_encoder"](lm_z)
-        injected = F.layer_norm(z_inject, (256,), parcae.in_norm_w, parcae.in_norm_b, 1e-5)
-        z = a * z + lin(injected, b)
-        z = components["folding_trunk"](z)
-    z = lin(z, parcae.readout_w)
-    z = components["parcae_coda"](z)
-
-    distogram_logits = components["distogram_head"](z)
-    coords = components["structure_head"].sample(
-        z, x_inputs, relpos, inputs["ref_pos"], inputs["ref_charge"], inputs["atom_mask"],
-        inputs["ref_element"], inputs["ref_atom_name_chars"], inputs["ref_space_uid"],
-        inputs["atom_to_token"], steps=sample_steps, seed=seed)
-    rep = coords[:, inputs["distogram_atom_idx"][0]] if inputs.get("distogram_atom_idx") is not None else coords[:, :z.shape[1]]
-    conf = components["confidence_head"](x_inputs, z, rep, inputs["atom_to_token"], inputs["intra_idx"])
-    return {"sample_atom_coords": coords, "distogram_logits": distogram_logits,
-            "pae_logits": conf[0], "pde_logits": conf[1], "plddt_logits": conf[2], "resolved_logits": conf[3]}
-
-
-# ===========================================================================
 # Diffusion sampler (host orchestration over the ttnn DiffusionModule)
 # ===========================================================================
 
@@ -1226,7 +1143,6 @@ class StructureHead(TorchWrapper):
     def __init__(self, sigma_data: float = SIGMA_DATA):
         super().__init__()
         self.sigma_data = sigma_data
-        self._dm = None
 
     def _create_module(self, weights: WeightScope) -> DiffusionModuleModel:
         self._fw = weights["diffusion_module.conditioning.fourier.w"]
@@ -1279,7 +1195,7 @@ class StructureHead(TorchWrapper):
 
 
 # ===========================================================================
-# Distogram + Confidence heads
+# Distogram head
 # ===========================================================================
 
 
@@ -1304,120 +1220,3 @@ class DistogramHeadModel(TorchWrapper):
     def forward(self, z):
         return self._to_torch(self.module(self._from_torch(z)))
 
-
-class RowAttentionPooling(Module):
-    """Per-row scalar attention over columns, weighted sum of z, out_proj."""
-
-    def __init__(self, state_dict: Weights, compute_kernel_config):
-        super().__init__(state_dict, compute_kernel_config)
-        self.attn_w = self.torch_to_tt("attn_proj.weight")
-        self.out_w = self.torch_to_tt("out_proj.weight")
-
-    def __call__(self, z: ttnn.Tensor) -> ttnn.Tensor:
-        ck = self.compute_kernel_config
-        scores = ttnn.linear(z, self.attn_w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,L,L,1]
-        scores = ttnn.softmax(scores, dim=-2)  # over columns m (the L axis at dim 2)
-        weights = ttnn.permute(scores, (0, 1, 3, 2))  # [B,L,1,L]
-        ttnn.deallocate(scores)
-        pooled = ttnn.matmul(weights, z, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,L,1,d]
-        ttnn.deallocate(weights)
-        pooled = ttnn.squeeze(pooled, 2)  # [B,L,d]
-        return ttnn.linear(pooled, self.out_w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
-
-
-class ConfidenceHeadModel(Module):
-    """Learned core: build pair from s/z, refine with folding trunk, emit logits."""
-
-    def __init__(self, conf_trunk_layers: int, state_dict: Weights, compute_kernel_config):
-        super().__init__(state_dict, compute_kernel_config)
-        ck = compute_kernel_config
-        self.s_in_norm_w = self.torch_to_tt("s_inputs_norm.weight")
-        self.s_in_norm_b = self.torch_to_tt("s_inputs_norm.bias")
-        self.s_to_z_w = self.torch_to_tt("s_to_z.weight")
-        self.s_to_z_t_w = self.torch_to_tt("s_to_z_transpose.weight")
-        self.prod_in1_w = self.torch_to_tt("s_to_z_prod_in1.weight")
-        self.prod_in2_w = self.torch_to_tt("s_to_z_prod_in2.weight")
-        self.prod_out_w = self.torch_to_tt("s_to_z_prod_out.weight")
-        self.z_norm_w = self.torch_to_tt("z_norm.weight")
-        self.z_norm_b = self.torch_to_tt("z_norm.bias")
-        self.folding_trunk = FoldingTrunkModel(conf_trunk_layers, self.scope("folding_trunk"), ck)
-        self.row_pool = RowAttentionPooling(self.scope("row_attention_pooling"), ck)
-        self.pae_ln_w = self.torch_to_tt("pae_ln.weight"); self.pae_ln_b = self.torch_to_tt("pae_ln.bias")
-        self.pae_w = self.torch_to_tt("pae_head.weight")
-        self.pde_ln_w = self.torch_to_tt("pde_ln.weight"); self.pde_ln_b = self.torch_to_tt("pde_ln.bias")
-        self.pde_w = self.torch_to_tt("pde_head.weight")
-        self.plddt_ln_w = self.torch_to_tt("plddt_ln.weight"); self.plddt_ln_b = self.torch_to_tt("plddt_ln.bias")
-        self.resolved_ln_w = self.torch_to_tt("resolved_ln.weight"); self.resolved_ln_b = self.torch_to_tt("resolved_ln.bias")
-
-    def __call__(self, s_inputs, z, pair_dist_embed, gather_g, w_plddt, w_resolved):
-        ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
-        ln = lambda t, w, b: ttnn.layer_norm(t, weight=w, bias=b, epsilon=1e-5, compute_kernel_config=ck)
-        L = z.shape[1]
-
-        s_n = ln(s_inputs, self.s_in_norm_w, self.s_in_norm_b)
-        zb = ln(z, self.z_norm_w, self.z_norm_b)
-        zb = ttnn.add(zb, ttnn.unsqueeze(lin(s_n, self.s_to_z_w), 2))       # [B,L,1,256]
-        zb = ttnn.add(zb, ttnn.unsqueeze(lin(s_n, self.s_to_z_t_w), 1))     # [B,1,L,256]
-        # outer product: in1[:,:,None,:] * in2[:,None,:,:]  (expand both to [B,L,L,256])
-        a = ttnn.repeat(ttnn.unsqueeze(lin(s_n, self.prod_in1_w), 2), (1, 1, L, 1))
-        b = ttnn.repeat(ttnn.unsqueeze(lin(s_n, self.prod_in2_w), 1), (1, L, 1, 1))
-        zb = ttnn.add(zb, lin(ttnn.multiply(a, b), self.prod_out_w))
-        ttnn.deallocate(a); ttnn.deallocate(b)
-        pair = ttnn.add(zb, pair_dist_embed)
-        # folding_trunk deallocates its input; clone so we keep `pair` for the
-        # residual (reference: pair = pair + folding_trunk(pair)).
-        pair = ttnn.add(pair, self.folding_trunk(ttnn.clone(pair, memory_config=ttnn.DRAM_MEMORY_CONFIG)))
-
-        single = self.row_pool(pair)
-        pae_logits = lin(ln(pair, self.pae_ln_w, self.pae_ln_b), self.pae_w)
-        pde_logits = lin(ln(pair, self.pde_ln_w, self.pde_ln_b), self.pde_w)
-
-        # per-atom plddt/resolved: gather single->atoms, then per-atom weight matmul
-        s_at = ttnn.matmul(gather_g, single, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,A,768]
-        plddt_in = ttnn.unsqueeze(ln(s_at, self.plddt_ln_w, self.plddt_ln_b), 2)   # [B,A,1,768]
-        resolved_in = ttnn.unsqueeze(ln(s_at, self.resolved_ln_w, self.resolved_ln_b), 2)
-        plddt_logits = ttnn.squeeze(ttnn.matmul(plddt_in, w_plddt, compute_kernel_config=ck, dtype=_DTYPE), 2)
-        resolved_logits = ttnn.squeeze(ttnn.matmul(resolved_in, w_resolved, compute_kernel_config=ck, dtype=_DTYPE), 2)
-        return pae_logits, pde_logits, plddt_logits, resolved_logits
-
-
-class ConfidenceHead(TorchWrapper):
-    """Confidence head core (torch in/out). Returns pae/pde/plddt/resolved logits.
-
-    Host-side: distogram-bin embedding (learned table indexed by binned predicted
-    distances), per-atom weight gather (plddt/resolved weights by intra-token idx),
-    and the token->atom gather matrix.
-    """
-
-    def __init__(self, conf_trunk_layers: int = 4, min_dist: float = 3.25,
-                 max_dist: float = 50.75, distogram_bins: int = 39):
-        super().__init__()
-        self.conf_trunk_layers = conf_trunk_layers
-        self.boundaries = torch.linspace(min_dist, max_dist, distogram_bins - 1)
-
-    def _create_module(self, weights: WeightScope) -> ConfidenceHeadModel:
-        self._dist_embed = weights["dist_bin_pairwise_embed.weight"]  # [bins, 256]
-        self._plddt_weight = weights["plddt_weight"]                  # [23, 768, 50]
-        self._resolved_weight = weights["resolved_weight"]            # [23, 768, 2]
-        return ConfidenceHeadModel(self.conf_trunk_layers, weights, self.compute_kernel_config)
-
-    def forward(self, s_inputs, z, rep_coords, atom_to_token, intra_idx):
-        B, L = z.shape[0], z.shape[1]
-        # distogram bins from predicted representative-atom distances
-        d = torch.cdist(rep_coords, rep_coords, compute_mode="donot_use_mm_for_euclid_dist")
-        bins = (d.unsqueeze(-1) > self.boundaries).sum(-1).long()  # [B,L,L]
-        pair_dist_embed = self._dist_embed[bins]  # [B,L,L,256]
-
-        A = atom_to_token.shape[1]
-        oh = F.one_hot(atom_to_token[0].long(), L).float()  # [A,L]
-        gather_g = oh.unsqueeze(0)  # [1,A,L]
-        w_plddt = self._plddt_weight[intra_idx[0]].unsqueeze(0)        # [1,A,768,50]
-        w_resolved = self._resolved_weight[intra_idx[0]].unsqueeze(0)  # [1,A,768,2]
-
-        ft = self._from_torch
-        pae, pde, plddt, resolved = self.module(
-            ft(s_inputs), ft(z), ft(pair_dist_embed.float()), ft(gather_g),
-            ft(w_plddt.float()), ft(w_resolved.float()),
-        )
-        return tuple(self._to_torch(t) for t in (pae, pde, plddt, resolved))

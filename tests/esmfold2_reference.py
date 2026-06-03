@@ -251,64 +251,6 @@ def make_distogram_head(seed: int = 0):
     return nn.Linear(256, 64).eval()
 
 
-def make_confidence_core(seed: int = 0):
-    """Self-contained reference for the ConfidenceHead learned core (4 logits).
-
-    Composes the same submodules the real ConfidenceHead uses and replicates the
-    logit-producing forward (pae/pde/plddt/resolved). Matches the ttnn port; real
-    checkpoint weights load by the same key names.
-    """
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    torch.manual_seed(seed)
-
-    class ConfidenceCore(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.s_inputs_norm = nn.LayerNorm(451)
-            self.z_norm = nn.LayerNorm(256)
-            self.s_to_z = nn.Linear(451, 256, bias=False)
-            self.s_to_z_transpose = nn.Linear(451, 256, bias=False)
-            self.s_to_z_prod_in1 = nn.Linear(451, 256, bias=False)
-            self.s_to_z_prod_in2 = nn.Linear(451, 256, bias=False)
-            self.s_to_z_prod_out = nn.Linear(256, 256, bias=False)
-            self.dist_bin_pairwise_embed = nn.Embedding(39, 256)
-            self.folding_trunk = common.FoldingTrunk(n_layers=4, d_pair=256, expansion_ratio=4)
-            self.folding_trunk.set_chunk_size(None)
-            self.row_attention_pooling = common.RowAttentionPooling(d_pair=256, d_single=768)
-            self.pae_ln = nn.LayerNorm(256); self.pae_head = nn.Linear(256, 64, bias=False)
-            self.pde_ln = nn.LayerNorm(256); self.pde_head = nn.Linear(256, 64, bias=False)
-            self.plddt_ln = nn.LayerNorm(768)
-            self.plddt_weight = nn.Parameter(torch.randn(23, 768, 50) * 0.1)
-            self.resolved_ln = nn.LayerNorm(768)
-            self.resolved_weight = nn.Parameter(torch.randn(23, 768, 2) * 0.1)
-            self.register_buffer("boundaries", torch.linspace(3.25, 50.75, 38))
-
-        def forward(self, s_inputs, z, rep_coords, atom_to_token, intra_idx):
-            B, L = z.shape[0], z.shape[1]
-            s_n = self.s_inputs_norm(s_inputs)
-            zb = self.z_norm(z)
-            zb = zb + self.s_to_z(s_n).unsqueeze(2) + self.s_to_z_transpose(s_n).unsqueeze(1)
-            zb = zb + self.s_to_z_prod_out(
-                self.s_to_z_prod_in1(s_n)[:, :, None, :] * self.s_to_z_prod_in2(s_n)[:, None, :, :]
-            )
-            d = torch.cdist(rep_coords, rep_coords, compute_mode="donot_use_mm_for_euclid_dist")
-            bins = (d.unsqueeze(-1) > self.boundaries).sum(-1).long()
-            pair = zb + self.dist_bin_pairwise_embed(bins)
-            pair = pair + self.folding_trunk(pair)
-            single = self.row_attention_pooling(pair, torch.ones(B, L))
-            pae = self.pae_head(self.pae_ln(pair))
-            pde = self.pde_head(self.pde_ln(pair))
-            s_at = common.gather_token_to_atom(single, atom_to_token)
-            plddt = torch.einsum("bac,bacd->bad", self.plddt_ln(s_at), self.plddt_weight[intra_idx])
-            resolved = torch.einsum("bac,bacd->bad", self.resolved_ln(s_at), self.resolved_weight[intra_idx])
-            return pae, pde, plddt, resolved
-
-    return ConfidenceCore().eval()
-
-
 def make_folding_trunk(n_layers: int | None = None, seed: int = 0):
     """Reference FoldingTrunk (random init). chunk_size=None for bit-exact parity."""
     import torch
