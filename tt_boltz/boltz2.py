@@ -3947,7 +3947,6 @@ class AtomDiffusion(Module):
         noised_atom_coords,  #: Float['b m 3'],
         sigma,  #: Float['b'] | Float[' '] | float,
         network_condition_kwargs: dict,
-        refresh: bool = False,
     ):
         batch, device = noised_atom_coords.shape[0], noised_atom_coords.device
 
@@ -3983,7 +3982,6 @@ class AtomDiffusion(Module):
                 atom_to_token=network_condition_kwargs["feats"][
                     "atom_to_token"
                 ],
-                refresh=refresh,
             )
             if self.use_tenstorrent
             else self.score_model(
@@ -3992,10 +3990,6 @@ class AtomDiffusion(Module):
                 **network_condition_kwargs,
             )
         )
-        # refresh-only call: the score model rebuilt its static conditioning in
-        # place (for a same-shape replay) and returned no update — nothing to do.
-        if refresh:
-            return None
 
         denoised_coords = (
             self.c_skip(padded_sigma) * noised_atom_coords
@@ -5768,10 +5762,8 @@ class Boltz2(nn.Module):
                 if hasattr(m, 'reset_static_cache'):
                     m.reset_static_cache()
             _sm = getattr(self, "structure_module", None)
-            if _sm is not None:
-                _sm._replay_diffusion = False
-                if getattr(_sm, "_release_res_trace", None):
-                    _sm._release_res_trace()
+            if _sm is not None and getattr(_sm, "_release_res_trace", None):
+                _sm._release_res_trace()
 
         _pfn = self.progress_fn
         if _pfn:

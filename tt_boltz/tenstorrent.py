@@ -1836,27 +1836,6 @@ class Diffusion(Module):
             "atom_attention_decoder.atom_feat_to_atom_pos_update.1.weight"
         )
 
-    def refresh_conditioning(self, s_trunk, s_inputs, c):
-        """Recompute the cached static conditioning (_s_conditioned, _c_reshaped)
-        for a new protein, copied IN PLACE into the existing buffers so a captured
-        trace that reads them stays valid. Mirrors the lazy build in __call__."""
-        s = ttnn.concat([s_trunk, s_inputs], dim=-1)
-        s = ttnn.layer_norm(
-            s, weight=self.conditioner_norm_weight, bias=self.conditioner_norm_bias,
-            epsilon=1e-5, compute_kernel_config=self.compute_kernel_config,
-        )
-        new_sc = ttnn.linear(
-            s, self.conditioner_embed_weight, bias=self.conditioner_embed_bias,
-            compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN,
-        )
-        ttnn.deallocate(s)
-        ttnn.copy(new_sc, self._s_conditioned)
-        ttnn.deallocate(new_sc)
-        B, N, _ = c.shape
-        NW = N // ATOM_WINDOW
-        new_cr = ttnn.reshape(c, (B, NW, ATOM_WINDOW, -1))
-        ttnn.copy(new_cr, self._c_reshaped)
-        # new_cr may alias c's storage (reshape view); do not deallocate it.
 
     def __call__(
         self,
@@ -2058,26 +2037,6 @@ class TorchWrapper(nn.Module):
     def _cache_set(self, key: str, value):
         self._runtime_cache[key] = value
         return value
-
-    def _set_or_refresh(self, key: str, value, free_temp: bool = True):
-        """First build: cache ``value``. Refresh: copy ``value`` into the existing
-        cached buffer IN PLACE (preserving its device address so a captured trace
-        that reads this buffer stays valid), then free the temporary.
-
-        Returns the persistent cached tensor to use for the rest of the build.
-        ``free_temp=False`` keeps ``value`` alive (use when it is reused later in
-        the build, e.g. an intermediate that also feeds another op)."""
-        existing = self._runtime_cache.get(key)
-        if existing is None or not isinstance(value, ttnn.Tensor) or not isinstance(existing, ttnn.Tensor):
-            self._runtime_cache[key] = value
-            return value
-        ttnn.copy(value, existing)
-        if free_temp and value is not existing:
-            try:
-                ttnn.deallocate(value)
-            except Exception:
-                pass
-        return existing
 
     def _cache_get(self, key: str, default=None):
         return self._runtime_cache.get(key, default)
@@ -2313,7 +2272,6 @@ class DiffusionModule(TorchWrapper):
         keys_indexing: torch.Tensor,
         mask: torch.Tensor,
         atom_to_token: torch.Tensor,
-        refresh: bool = False,
     ) -> torch.Tensor:
         B, N, _ = q.shape
         NW = N // ATOM_WINDOW
@@ -2344,13 +2302,9 @@ class DiffusionModule(TorchWrapper):
             self._clear_runtime_cache()
             self._first_forward_pass = True
 
-        # Compute all static data once (everything except r and times is constant across diffusion steps)
-        # refresh=True re-runs the static build for a NEW protein while keeping the
-        # existing buffers (and any captured trace that reads them) at their fixed
-        # addresses: _set_or_refresh copies into them in place. This is what makes
-        # a same-shape cross-protein diffusion trace both correct (B's conditioning)
-        # and fast (no re-capture).
-        if self._first_forward_pass or refresh:
+        # Compute all static data once (everything except r and times is constant
+        # across diffusion steps).
+        if self._first_forward_pass:
             # Device-resident conditioning chaining: q/c/biases/s_inputs/s_trunk may
             # arrive as ttnn tensors (already on device, no host upload). In that
             # case pad on device (concat with zeros, matching pad_dev2) and skip
@@ -2365,27 +2319,27 @@ class DiffusionModule(TorchWrapper):
                 return ttnn.concat([x, self._from_torch(torch.zeros(shp))], dim=dim)
 
             if _dt(s_inputs):
-                self._set_or_refresh("s_inputs", _padcat(s_inputs, token_pad, 1))
-                self._set_or_refresh("s_trunk", _padcat(s_trunk, token_pad, 1))
+                self._cache_set("s_inputs", _padcat(s_inputs, token_pad, 1))
+                self._cache_set("s_trunk", _padcat(s_trunk, token_pad, 1))
             else:
                 if token_pad:
                     s_inputs = torch.nn.functional.pad(s_inputs, (0, 0, 0, token_pad))
                     s_trunk = torch.nn.functional.pad(s_trunk, (0, 0, 0, token_pad))
-                self._set_or_refresh("s_inputs", self._from_torch(s_inputs))
-                self._set_or_refresh("s_trunk", self._from_torch(s_trunk))
+                self._cache_set("s_inputs", self._from_torch(s_inputs))
+                self._cache_set("s_trunk", self._from_torch(s_trunk))
 
             if _dt(q):
                 # multiplicity==1 assumed for device chaining (no repeat_interleave)
-                self._set_or_refresh("q", _padcat(q, atom_pad, 1))
-                self._set_or_refresh("c", _padcat(c, atom_pad, 1))
+                self._cache_set("q", _padcat(q, atom_pad, 1))
+                self._cache_set("c", _padcat(c, atom_pad, 1))
             else:
                 q_pt = q if r.shape[0] == q.shape[0] else torch.repeat_interleave(q, r.shape[0], dim=0)
                 c_pt = c if r.shape[0] == c.shape[0] else torch.repeat_interleave(c, r.shape[0], dim=0)
                 if atom_pad:
                     q_pt = torch.nn.functional.pad(q_pt, (0, 0, 0, atom_pad))
                     c_pt = torch.nn.functional.pad(c_pt, (0, 0, 0, atom_pad))
-                self._set_or_refresh("q", self._from_torch(q_pt))
-                self._set_or_refresh("c", self._from_torch(c_pt))
+                self._cache_set("q", self._from_torch(q_pt))
+                self._cache_set("c", self._from_torch(c_pt))
 
             # keys_indexing is a pure function of the windowing shape (K, W, H), so
             # it is identical across all same-shape proteins — reuse the cached one
@@ -2427,8 +2381,8 @@ class DiffusionModule(TorchWrapper):
                 bias = ttnn.add_(bias, mask)
                 return ttnn.multiply_(bias, ATOM_WINDOW ** 0.5)
 
-            self._set_or_refresh("bias_encoder", prepare_atom_bias(bias_encoder))
-            self._set_or_refresh("bias_decoder", prepare_atom_bias(bias_decoder))
+            self._cache_set("bias_encoder", prepare_atom_bias(bias_encoder))
+            self._cache_set("bias_decoder", prepare_atom_bias(bias_decoder))
 
             if _dt(bias_token):
                 bias = _padcat(_padcat(bias_token, token_pad, 1), token_pad, 2)
@@ -2445,33 +2399,24 @@ class DiffusionModule(TorchWrapper):
                 seq_mask = torch.zeros(1, 1, 1, padded_seq)
                 seq_mask[..., seq_len:] = -1e9
                 bias_token_tt = ttnn.add_(bias_token_tt, self._from_torch(seq_mask))
-            self._set_or_refresh("bias_token", bias_token_tt)
+            self._cache_set("bias_token", bias_token_tt)
 
             if atom_pad or token_pad:
                 atom_to_token = torch.nn.functional.pad(atom_to_token, (0, token_pad, 0, atom_pad))
-            atom_to_token_tt = self._set_or_refresh("atom_to_token", self._from_torch(atom_to_token))
+            atom_to_token_tt = self._cache_set("atom_to_token", self._from_torch(atom_to_token))
             atom_to_token_normed_tt = ttnn.multiply(
                 atom_to_token_tt,
                 ttnn.reciprocal(
                     ttnn.sum(atom_to_token_tt, dim=1, keepdim=True) + 1e-6
                 ),
             )
-            self._set_or_refresh("atom_to_token_normed", atom_to_token_normed_tt)
+            self._cache_set("atom_to_token_normed", atom_to_token_normed_tt)
 
             self._cache_set("atom_pad", atom_pad)
             self._cache_set("large_seq_len", seq_len > SEQ_LEN_MORE_CHUNKING)
             self._cache_set("N_padded", N_padded)
             self._cache_set("N_real", N)
             self._first_forward_pass = False
-
-            # Refresh the inner module's derived conditioning (_s_conditioned from
-            # s_trunk+s_inputs, _c_reshaped from c) IN PLACE too — the captured
-            # trace reads those buffers directly.
-            if refresh and getattr(self.module, "_s_conditioned", None) is not None:
-                self.module.refresh_conditioning(
-                    self._cache_get("s_trunk"), self._cache_get("s_inputs"),
-                    self._cache_get("c"))
-                return None  # refresh-only call: caller replays the trace separately
 
         atom_pad_cached = self._cache_get("atom_pad", 0)
         if atom_pad_cached:
