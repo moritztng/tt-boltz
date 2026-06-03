@@ -5841,42 +5841,25 @@ class Boltz2(nn.Module):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
-        # Cross-protein replay: if this protein has the same shape signature as the
-        # previous one and replay is enabled, keep ALL device state (program cache,
-        # module caches, the captured diffusion trace) so it can just be replayed.
-        _sig = None
-        _replay = False
+        # Per protein: reset all device caches and re-capture the diffusion trace
+        # fresh (correct by construction — no cross-protein trace reuse). The
+        # program cache (compiled kernels) is enabled once and kept warm, so a
+        # same-shape protein needs no recompile and the per-protein re-capture is
+        # cheap (~0.4s).
         if self.use_tenstorrent:
-            _sig = (feats["res_type"].shape[1], feats["ref_pos"].shape[1], feats["msa"].shape[1])
-            _replay = bool(os.environ.get("TT_BOLTZ_REPLAY_SAME_SHAPE")) and getattr(self, "_last_sig", None) == _sig
-            self._last_sig = _sig
-        if hasattr(self, "structure_module"):
-            self.structure_module._replay_diffusion = _replay
-
-        if self.use_tenstorrent and not _replay:
-            try:
-                dev = tenstorrent.get_device()
-                dev.disable_and_clear_program_cache()
-                dev.enable_program_cache()
-            except Exception:
-                pass
-
-        # Reset cached static data so masks/biases/conditioning are recomputed for
-        # THIS protein. On a same-shape replay we KEEP the diffusion score model's
-        # buffers and its captured reverse-diffusion trace, and instead refresh the
-        # protein-dependent conditioning IN PLACE at sample time (see
-        # _resident_sample) — correct for the new protein AND fast (no re-capture).
-        # On a shape change everything is rebuilt and the resident trace released.
-        if self.use_tenstorrent:
-            _score = getattr(getattr(self, "structure_module", None), "score_model", None)
+            if not getattr(self, "_pc_enabled", False):
+                try:
+                    tenstorrent.get_device().enable_program_cache()
+                except Exception:
+                    pass
+                self._pc_enabled = True
             for m in self.modules():
                 if hasattr(m, 'reset_static_cache'):
-                    if _replay and m is _score:
-                        continue
                     m.reset_static_cache()
-            if not _replay:
-                _sm = getattr(self, "structure_module", None)
-                if _sm is not None and getattr(_sm, "_release_res_trace", None):
+            _sm = getattr(self, "structure_module", None)
+            if _sm is not None:
+                _sm._replay_diffusion = False
+                if getattr(_sm, "_release_res_trace", None):
                     _sm._release_res_trace()
 
         _pfn = self.progress_fn
