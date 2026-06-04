@@ -36,22 +36,12 @@ from tt_boltz.tenstorrent import (
 
 _ROW = lambda x: x.reshape(1, -1)
 
-_DTYPE = ttnn.bfloat16  # activation dtype; set to ttnn.float32 for high-precision diffusion
-
-def set_dtype(dt):
-    global _DTYPE
-    _DTYPE = dt
-
+_DTYPE = ttnn.bfloat16  # activation dtype for the diffusion / encoders
 
 # Cache step-invariant diffusion quantities (pair_bias from z, atom conditioning
 # c, the atom adaLN modulation) across the ~20 sampling steps, keyed by source-
-# tensor identity. Bit-identical to recomputing; on by default. Kill-switch for
-# A/B measurement / debugging.
+# tensor identity. Bit-identical to recomputing.
 _STEP_CACHE = True
-
-def set_step_cache(on):
-    global _STEP_CACHE
-    _STEP_CACHE = bool(on)
 
 
 # Optional progress callback for the CLI display: report_progress(stage, step, total).
@@ -225,14 +215,8 @@ class AdaLN(Module):
         ck = self.compute_kernel_config
         a_norm = ttnn.layer_norm(a, epsilon=1e-5, compute_kernel_config=ck)
         s_norm = ttnn.layer_norm(s, weight=self.s_scale, epsilon=1e-5, compute_kernel_config=ck)
-        gate = ttnn.sigmoid(ttnn.linear(
-            s_norm, self.s_gate_w, bias=self.s_gate_b, compute_kernel_config=ck,
-            dtype=_DTYPE, core_grid=CORE_GRID_MAIN,
-        ))
-        shift = ttnn.linear(
-            s_norm, self.s_shift_w, compute_kernel_config=ck,
-            dtype=_DTYPE, core_grid=CORE_GRID_MAIN,
-        )
+        gate = ttnn.sigmoid(self._lin(s_norm, self.s_gate_w, bias=self.s_gate_b))
+        shift = self._lin(s_norm, self.s_shift_w)
         return ttnn.add(ttnn.multiply(gate, a_norm), shift)
 
 
@@ -283,9 +267,7 @@ class AttentionPairBias(Module):
         head_dim = d_model // self.num_heads
 
         x = self.adaln(a, s)
-        lin = lambda t, w, b=None: ttnn.linear(
-            t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
-        )
+        lin = self._lin
         q = lin(x, self.q_w, self.q_b)
         kv = lin(x, self.kv_w)
         k, v = ttnn.chunk(kv, 2, dim=-1)
@@ -304,12 +286,7 @@ class AttentionPairBias(Module):
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
         qkv = ttnn.concat([qp, kp, vp], dim=-1)  # [B, L, 3*Dpad]
         ttnn.deallocate(qp); ttnn.deallocate(kp); ttnn.deallocate(vp)
-        qkv = ttnn.unsqueeze(qkv, 1)
-        qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=self.num_heads, num_kv_heads=self.num_heads,
-            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        ttnn.deallocate(qkv)
+        qh, kh, vh = self._split_heads(qkv, self.num_heads)
 
         # pair_bias = pair_bias_proj(layer_norm(z)) is a pure function of the
         # pair conditioning z, which is constant across the diffusion sampling
@@ -335,8 +312,7 @@ class AttentionPairBias(Module):
 
         ctx = _attn_fp32(qh, kh, vh, pair_bias, head_dim**-0.5, ck)
         ttnn.deallocate(qh); ttnn.deallocate(kh); ttnn.deallocate(vh)
-        ctx = ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ctx = ttnn.squeeze(ctx, 1)  # [B, L, H*head_dim_pad]  (pad value dims are 0)
+        ctx = self._merge_heads(ctx)  # [B, L, H*head_dim_pad]  (pad value dims are 0)
         # Gate + out_proj in the padded head layout, then project back to d_model.
         g_pad = lin(g, self.scatter_g)  # [B, L, Dpad]
         ttnn.deallocate(g)
@@ -361,9 +337,7 @@ class ConditionedTransitionBlock(Module):
 
     def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
-        lin = lambda t, w, b=None: ttnn.linear(
-            t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
-        )
+        lin = self._lin
         x = self.adaln(a, s)
         sw = lin(x, self.swish_w)
         ttnn.deallocate(x)
@@ -435,9 +409,7 @@ class TransitionLayer(Module):
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(
-            t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN
-        )
+        lin = self._lin
         xn = ttnn.layer_norm(x, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = lin(xn, self.a_w)
         b = lin(xn, self.b_w)
@@ -470,7 +442,7 @@ class DiffusionConditioningModel(Module):
         """Pair conditioning z = f(z_trunk, relpos). Step-INVARIANT (no t / no
         coords) — computed once and cached across the diffusion trajectory."""
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         z = ttnn.concat([z_trunk, relpos], dim=-1)
         z = lin(ttnn.layer_norm(z, weight=self.z_in_w, bias=self.z_in_b, epsilon=1e-5, compute_kernel_config=ck), self.z_proj_w)
         for t in self.z_trans:
@@ -481,7 +453,7 @@ class DiffusionConditioningModel(Module):
         """Single conditioning s = f(s_inputs, fourier(t)). t-DEPENDENT (cheap,
         [B,L,c]) — recomputed each step."""
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         s = lin(ttnn.layer_norm(s_inputs, weight=self.s_in_w, bias=self.s_in_b, epsilon=1e-5, compute_kernel_config=ck), self.s_proj_w)
         n = lin(ttnn.layer_norm(n_raw, weight=self.noise_n_w, bias=self.noise_n_b, epsilon=1e-5, compute_kernel_config=ck), self.noise_proj_w)
         s = ttnn.add(s, ttnn.unsqueeze(n, 1))  # broadcast noise over the L axis
@@ -578,19 +550,14 @@ class SWAAttention(Module):
 
     def __call__(self, x, cos, sin, attn_mask, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         head_dim = x.shape[-1] // self.n_heads
-        qkv = ttnn.unsqueeze(lin(x, self.qkv_w), 1)  # [B,1,N,3d]
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=self.n_heads, num_kv_heads=self.n_heads,
-            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        ttnn.deallocate(qkv)
+        q, k, v = self._split_heads(lin(x, self.qkv_w), self.n_heads)
         q = apply_rotary(_rms_norm(q, ck), cos, sin)
         k = apply_rotary(_rms_norm(k, ck), cos, sin)
         ctx = _sdpa_bf16(q, k, v, attn_mask, head_dim**-0.5)
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
-        ctx = ttnn.squeeze(ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG), 1)
+        ctx = self._merge_heads(ctx)
         # Zero invalid (padding) atom outputs so they can't blow up / NaN-contaminate
         # valid atoms via masked 0*inf in later blocks (matches reference out*valid).
         if valid is not None:
@@ -621,7 +588,7 @@ class SWAAtomBlock(Module):
 
     def __call__(self, x, c_l, cos, sin, attn_mask, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         # The adaLN modulation is a pure function of the conditioning c_l, which
         # is step-invariant during diffusion sampling (the encoder feeds the same
         # cached c each step), so cache the 6 chunks keyed by c_l identity.
@@ -702,7 +669,6 @@ class SWAAtomTransformer(TorchWrapper):
 # Atom encoder / decoder wrappers + DiffusionModule
 # ===========================================================================
 
-ATOM_FEATURE_DIM = 389  # 3 + 1 + 1 + 128 + 4*64
 SIGMA_DATA = 16.0
 
 
@@ -724,7 +690,7 @@ class AtomEncoder(Module):
 
     def __call__(self, atom_feats, cos, sin, band, scatter_m, r_input=None, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         # c = layer_norm(atom_linear(atom_feats)) depends only on the (step-
         # invariant) reference atom features, so cache it across sampling steps
         # keyed by the atom_feats identity. This also keeps the SAME c object
@@ -759,7 +725,7 @@ class AtomDecoder(Module):
 
     def __call__(self, a, q_skip, c_skip, cos, sin, band, gather_g, valid=None):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         a_to_q = lin(a, self.t2a_w)  # [B,L,d_atom]
         a_to_q = ttnn.matmul(gather_g, a_to_q, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,N,d_atom]
         q = ttnn.add(q_skip, a_to_q)
@@ -784,7 +750,7 @@ class DiffusionModuleModel(Module):
 
     def _denoise(self, s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g, valid):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         a, q_skip, c_skip = self.atom_encoder(atom_feats, cos, sin, band, scatter_m, r_input=r_input, valid=valid)
         s_step = ttnn.layer_norm(s, weight=self.s_step_norm_w, bias=self.s_step_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = ttnn.add(a, lin(s_step, self.s_to_token_w))
@@ -975,7 +941,7 @@ class LanguageModelShimModel(Module):
 
     def __call__(self, hidden, combine_w):  # hidden [B,L,K,d_model]; combine_w torch [K]
         ck = self.compute_kernel_config
-        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         ln = lambda t, w, b: ttnn.layer_norm(t, weight=w, bias=b, epsilon=1e-5, compute_kernel_config=ck)
         B, L, K, dm = hidden.shape
         # Per-layer projection in ttnn (reshape L,K together -> 3D, no sub-tile middle dim).
@@ -1022,7 +988,7 @@ class OuterProductMean(Module):
 
     def __call__(self, m, recip_nvalid):  # m [B,L,M,128]; recip_nvalid [B,L,L,1]
         ck = self.compute_kernel_config
-        lin = lambda t, w, b=None: ttnn.linear(t, w, bias=b, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         B, L, M = m.shape[0], m.shape[1], m.shape[2]
         x = lin(ttnn.layer_norm(m, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck), self.W)
         a, b = ttnn.chunk(x, 2, dim=-1)  # [B,L,M,32]
@@ -1049,7 +1015,7 @@ class MSAPairWeightedAveraging(Module):
 
     def __call__(self, m, pair):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         B, L, M = m.shape[0], m.shape[1], m.shape[2]
         h, dh = self.n_heads, self.head_width
         mn = ttnn.layer_norm(m, weight=self.ns_w, bias=self.ns_b, epsilon=1e-5, compute_kernel_config=ck)
@@ -1108,7 +1074,7 @@ class MSAEncoderModel(Module):
 
     def __call__(self, x_pair, x_inputs, m_feat, recip_nvalid):
         ck = self.compute_kernel_config
-        lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        lin = self._lin
         m = ttnn.add(lin(m_feat, self.embed_w), ttnn.unsqueeze(lin(x_inputs, self.project_w), 2))
         pair = x_pair
         for block in self.blocks:
@@ -1288,8 +1254,7 @@ class DistogramHead(Module):
 
     def __call__(self, z: ttnn.Tensor) -> ttnn.Tensor:
         zs = ttnn.add(z, ttnn.permute(z, (0, 2, 1, 3)))
-        return ttnn.linear(zs, self.w, bias=self.b, compute_kernel_config=self.compute_kernel_config,
-                           dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
+        return self._lin(zs, self.w, bias=self.b)
 
 
 class DistogramHeadModel(TorchWrapper):
