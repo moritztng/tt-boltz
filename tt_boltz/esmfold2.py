@@ -90,12 +90,14 @@ def _sdpa_bf16(q, k, v, attn_mask, scale):
     return ctx
 
 C_Z = 256  # pair channels
-PAD_MULTIPLE = 32  # token-dim tile bucket for the folding trunk (pads + masks + slices).
-#                    Stays at 32 (not 64): the trimul's matmul contraction size depends on
-#                    the padded length, and in bf16 that is NOT exact across sizes — a 64
-#                    bucket measurably shifts RMSD-vs-truth (~0.065 Å on ubiquitin). Unlike
-#                    the ESMC LM (whose padded attention is masked exactly → bit-identical
-#                    hidden states), the trunk can't be re-bucketed without an accuracy hit.
+BUCKET = 64  # bucket all varying-length dims (token L, atom N, ESMC LM length) to multiples
+#              of 64 so kernels are shared across nearby lengths instead of recompiling per
+#              length (matches tt-boltz PAIRFORMER_PAD_MULTIPLE). Padding is masked out. The
+#              ESMC LM is bit-exact (masked flash chunks are no-ops); the trunk trimul and
+#              diffusion are sample-equivalent (the chaotic diffusion turns the tiny bf16
+#              padded-size numerics into a different-but-equally-good sample — RMSD-vs-truth
+#              unchanged within the diffusion's inherent seed-to-seed variation).
+PAD_MULTIPLE = BUCKET  # folding-trunk token-dim bucket (pads + masks + slices)
 
 
 def _remap_trimul(sd: dict, prefix: str) -> WeightScope:
@@ -264,7 +266,8 @@ class AttentionPairBias(Module):
         self.scatter_g = to_tt(Sg)
         self.out_w_padded = to_tt(Op)
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor,
+                 tok_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         d_model = a.shape[-1]
         head_dim = d_model // self.num_heads
@@ -304,6 +307,10 @@ class AttentionPairBias(Module):
         pair_bias = lin(z_norm, self.pair_bias_w)  # [B, L, L, H]
         ttnn.deallocate(z_norm)
         pair_bias = ttnn.permute(pair_bias, (0, 3, 1, 2))  # [B, H, L, L]
+        if tok_mask is not None:
+            # additive -inf for padded token keys ([1,1,1,Lb]); fp32 attention
+            # below makes exp(-inf)=0 exact, so real tokens ignore padding.
+            pair_bias = ttnn.add(pair_bias, tok_mask)
 
         ctx = _attn_fp32(qh, kh, vh, pair_bias, head_dim**-0.5, ck)
         ttnn.deallocate(qh); ttnn.deallocate(kh); ttnn.deallocate(vh)
@@ -364,10 +371,11 @@ class DiffusionTransformerModel(Module):
             for i in range(num_blocks)
         ]
 
-    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, a: ttnn.Tensor, s: ttnn.Tensor, z: ttnn.Tensor,
+                 tok_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
         x = a
         for attn, trans in zip(self.attn, self.trans):
-            x = ttnn.add(x, attn(x, s, z))
+            x = ttnn.add(x, attn(x, s, z, tok_mask))
             x = ttnn.add(x, trans(x, s))
         return x
 
@@ -726,20 +734,21 @@ class DiffusionModuleModel(Module):
         self.token_norm_w = self.torch_to_tt("token_norm.weight")
         self.token_norm_b = self.torch_to_tt("token_norm.bias")
 
-    def _denoise(self, s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g, valid):
+    def _denoise(self, s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g,
+                 valid, tok_mask=None):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
         a, q_skip, c_skip = self.atom_encoder(atom_feats, cos, sin, band, scatter_m, r_input=r_input, valid=valid)
         s_step = ttnn.layer_norm(s, weight=self.s_step_norm_w, bias=self.s_step_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         a = ttnn.add(a, lin(s_step, self.s_to_token_w))
-        a = self.token_transformer(a, s, z)
+        a = self.token_transformer(a, s, z, tok_mask)
         a = ttnn.layer_norm(a, weight=self.token_norm_w, bias=self.token_norm_b, epsilon=1e-5, compute_kernel_config=ck)
         return self.atom_decoder(a, q_skip, c_skip, cos, sin, band, gather_g, valid=valid)
 
     def __call__(self, s_inputs, z_trunk, relpos, n_raw, atom_feats, r_input,
-                 cos, sin, band, scatter_m, gather_g, valid=None):
+                 cos, sin, band, scatter_m, gather_g, valid=None, tok_mask=None):
         s, z = self.conditioning(s_inputs, z_trunk, relpos, n_raw)
-        out = self._denoise(s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g, valid)
+        out = self._denoise(s, z, atom_feats, r_input, cos, sin, band, scatter_m, gather_g, valid, tok_mask)
         ttnn.deallocate(z); ttnn.deallocate(s)
         return out
 
@@ -748,10 +757,10 @@ class DiffusionModuleModel(Module):
     # re-transferring z_trunk/relpos (~L²·256) and re-computing the pair
     # conditioning at every one of the ~20 sampling steps. ---
     def prepare(self, s_inputs, z_trunk, relpos, atom_feats, cos, sin, band,
-                scatter_m, gather_g, valid=None):
+                scatter_m, gather_g, valid=None, tok_mask=None):
         self._ctx = dict(
             s_inputs=s_inputs, atom_feats=atom_feats, cos=cos, sin=sin, band=band,
-            scatter_m=scatter_m, gather_g=gather_g, valid=valid,
+            scatter_m=scatter_m, gather_g=gather_g, valid=valid, tok_mask=tok_mask,
             z=self.conditioning.cond_pair(z_trunk, relpos),  # cached pair conditioning
         )
         ttnn.deallocate(z_trunk); ttnn.deallocate(relpos)
@@ -760,7 +769,7 @@ class DiffusionModuleModel(Module):
         c = self._ctx
         s = self.conditioning.cond_single(c["s_inputs"], n_raw)
         out = self._denoise(s, c["z"], c["atom_feats"], r_input, c["cos"], c["sin"],
-                            c["band"], c["scatter_m"], c["gather_g"], c["valid"])
+                            c["band"], c["scatter_m"], c["gather_g"], c["valid"], c["tok_mask"])
         ttnn.deallocate(s)
         return out
 
@@ -1181,31 +1190,48 @@ class StructureHead(TorchWrapper):
         # conditioning are not re-transferred / re-computed per step.
         dmm, sigma = self.module, self.sigma_data
         B, N, L = ref_pos.shape[0], ref_pos.shape[1], s_inputs.shape[1]
+        # Bucket the atom dim N and token dim L to multiples of 64 so the
+        # diffusion (atom SWA + token DiT, all SDPA-based) reuses kernels across
+        # nearby lengths. Padded atoms are excluded by the validity-aware band
+        # mask + valid-multiply; padded tokens by an additive -inf token mask in
+        # the (fp32) DiT — both exact. The reverse-diffusion RNG runs over the
+        # real N (coords padded only for the on-device step), so sampling is
+        # unchanged; coords are sliced back to N.
+        Nb = ((N + BUCKET - 1) // BUCKET) * BUCKET
+        Lb = ((L + BUCKET - 1) // BUCKET) * BUCKET
         ft = self._from_torch
-        atom_feats = torch.cat([
-            ref_pos, ref_charge.unsqueeze(-1), ref_mask.unsqueeze(-1).float(),
-            ref_element, ref_atom_name_chars.reshape(B, N, -1),
-        ], dim=-1)
-        cos, sin = build_3d_rope_tables(ref_pos, ref_space_uid, 32, **ATOM_ROPE)
-        band = band_mask(ref_mask, 64)
-        valid = ref_mask.reshape(1, N, 1).float()
-        oh = F.one_hot(tok_idx[0].long(), L).float() * ref_mask[0].float()[:, None]
-        gather_g = oh.unsqueeze(0)
-        scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)
-        dmm.prepare(ft(s_inputs), ft(z_trunk), ft(relpos), ft(atom_feats.float()),
-                    ft(cos.float()), ft(sin.float()), ft(band.float()),
-                    ft(scatter_m.float()), ft(gather_g.float()), ft(valid))
+        pad1 = lambda t, m: F.pad(t, [0, 0] * (t.dim() - 2) + [0, m - t.shape[1]])  # pad dim 1 -> m
+        pad2 = lambda t, m: F.pad(t, [0, 0] * (t.dim() - 3) + [0, m - t.shape[2], 0, m - t.shape[1]])
 
-        def denoise(x_noisy, t_hat):
+        ref_mask_b = pad1(ref_mask, Nb)
+        atom_feats = torch.cat([
+            pad1(ref_pos, Nb), pad1(ref_charge, Nb).unsqueeze(-1), ref_mask_b.unsqueeze(-1).float(),
+            pad1(ref_element, Nb), pad1(ref_atom_name_chars, Nb).reshape(B, Nb, -1),
+        ], dim=-1)
+        cos, sin = build_3d_rope_tables(pad1(ref_pos, Nb), pad1(ref_space_uid, Nb), 32, **ATOM_ROPE)
+        band = band_mask(ref_mask_b, 64)
+        valid = ref_mask_b.reshape(1, Nb, 1).float()
+        oh = F.one_hot(pad1(tok_idx, Nb)[0].long(), Lb).float() * ref_mask_b[0].float()[:, None]  # [Nb,Lb]
+        gather_g = oh.unsqueeze(0)
+        scatter_m = (oh / oh.sum(0).clamp(min=1)).t().unsqueeze(0)  # [1,Lb,Nb]
+        tok_mask = None
+        if Lb != L:
+            tm = torch.zeros(1, 1, 1, Lb); tm[..., L:] = float("-inf")  # mask padded token keys
+            tok_mask = ft(tm)
+        dmm.prepare(ft(pad1(s_inputs, Lb)), ft(pad2(z_trunk, Lb)), ft(pad2(relpos, Lb)),
+                    ft(atom_feats.float()), ft(cos.float()), ft(sin.float()), ft(band.float()),
+                    ft(scatter_m.float()), ft(gather_g.float()), ft(valid), tok_mask)
+
+        def denoise(x_noisy, t_hat):  # x_noisy is [B,N,3] (real atoms)
             t = torch.as_tensor(t_hat, dtype=torch.float32).reshape(-1)
             if t.numel() == 1:
                 t = t.expand(x_noisy.shape[0])
             t_noise = 0.25 * torch.log((t / sigma).clamp(min=1e-20))
             n_raw = torch.cos(2.0 * math.pi * (t_noise[:, None] * self._fw[None, :] + self._fb[None, :])).float()
             denom = torch.sqrt(t * t + sigma * sigma)
-            r_noisy = x_noisy / denom[:, None, None]
-            r_input = torch.cat([r_noisy, torch.zeros_like(r_noisy)], dim=-1)  # [B,N,6]
-            r_update = self._to_torch(dmm.step(ft(n_raw), ft(r_input.float())))
+            r_noisy = pad1(x_noisy / denom[:, None, None], Nb)  # [B,Nb,3]
+            r_input = torch.cat([r_noisy, torch.zeros_like(r_noisy)], dim=-1)  # [B,Nb,6]
+            r_update = self._to_torch(dmm.step(ft(n_raw), ft(r_input.float())))[:, :N, :]  # slice -> [B,N,3]
             sigma2, t2 = sigma * sigma, t * t
             out = (sigma2 / (sigma2 + t2))[:, None, None] * x_noisy
             return out + ((sigma * t) / torch.sqrt(sigma2 + t2))[:, None, None] * r_update
