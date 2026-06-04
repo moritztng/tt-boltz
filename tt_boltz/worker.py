@@ -58,10 +58,15 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
     only fall back to the local cache when that path is not writable on
     this host (the no-shared-FS multi-machine case).
     """
-    from tt_boltz.main import download_all
-
     cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
     cache.mkdir(parents=True, exist_ok=True)
+    # ESMFold2 loads its weights from HF on the first fold and needs no Boltz-2
+    # checkpoints / molecule library — only a writable MSA dir.
+    if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
+        cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
+        return
+    from tt_boltz.main import download_all
+
     download_all(cache)
     cfg["conf_ckpt"] = str(cache / "boltz2_conf.ckpt")
     cfg["aff_ckpt"] = str(cache / "boltz2_aff.ckpt")
@@ -116,16 +121,31 @@ class _WorkerState:
                 pass
 
     def load(self, run_id: str, cfg: dict[str, Any]) -> None:
+        if self.accelerator == "tenstorrent":
+            from tt_boltz.tenstorrent import set_fast_mode
+
+            set_fast_mode(cfg.get("fast", False))
+
+        # ESMFold2 family: load + patch the ttnn model (no tokenizer/featurizer;
+        # chains are read straight from the input in predict_one). Symmetric to
+        # the Boltz-2 load below — same _WorkerState, same scheduler/worker loop.
+        if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
+            from tt_boltz.esmfold2_runtime import load_ttnn_esmfold2
+
+            repo = "biohub/ESMFold2-Fast" if cfg["model"] == "esmfold2-fast" else "biohub/ESMFold2"
+            self.model = load_ttnn_esmfold2(esmfold2_repo=repo, fast=cfg.get("fast", False))
+            self.model._esmc.preload()
+            self.prepare = None
+            self.run_id = run_id
+            self.config_hash = _hash_run_config(cfg)
+            return
+
         from tt_boltz.boltz2 import Boltz2
         from tt_boltz.data.featurizer import Boltz2Featurizer
         from tt_boltz.data.mol import load_canonicals
         from tt_boltz.data.tokenize import Boltz2Tokenizer
         from tt_boltz.main import prepare_features
 
-        if self.accelerator == "tenstorrent":
-            from tt_boltz.tenstorrent import set_fast_mode
-
-            set_fast_mode(cfg.get("fast", False))
         tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
         ccd = load_canonicals(Path(cfg["mol_dir"]))
         self.prepare = partial(
@@ -154,6 +174,9 @@ class _WorkerState:
         self.config_hash = _hash_run_config(cfg)
 
     def predict_one(self, path: Path, cfg: dict[str, Any]):
+        if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
+            return self._predict_esmfold2_one(path, cfg)
+
         from tt_boltz.main import to_batch, write_result
 
         feats, input_struct = self.prepare(path, method=cfg.get("method"))
@@ -171,6 +194,35 @@ class _WorkerState:
             cfg["write_embeddings"],
         )
         return metrics, best, feats
+
+    def _predict_esmfold2_one(self, path: Path, cfg: dict[str, Any]):
+        import types
+
+        from tt_boltz.esmfold2_runtime import fold_complex, resolve_msa
+        from tt_boltz.main import _read_protein_chains, _write_structure
+
+        chains = _read_protein_chains(path)
+        if not chains:
+            raise RuntimeError("no protein sequences")
+        msa_dir = cfg.get("msa_dir")
+        chains = [(cid, seq, resolve_msa(spec, seq, msa_dir)) for cid, seq, spec in chains]
+        res = fold_complex(
+            self.model, chains,
+            num_loops=cfg["recycling_steps"], num_sampling_steps=cfg["sampling_steps"],
+            num_diffusion_samples=cfg["diffusion_samples"], seed=cfg.get("seed") or 0,
+        )
+        out = Path(cfg["struct_dir"]) / f"{path.stem}.{cfg['output_format']}"
+        _write_structure(res.complex, out, cfg["output_format"])
+        metrics = {
+            "plddt": round(float(res.plddt.mean()), 4),
+            "n_residues": sum(len(c[1]) for c in chains), "n_chains": len(chains),
+            "msa": any(c[2] is not None for c in chains),
+        }
+        if getattr(res, "ptm", None) is not None:
+            metrics["ptm"] = round(float(res.ptm), 4)
+        # _execute_job inspects feats["record"].affinity; ESMFold2 has no affinity.
+        feats = {"record": types.SimpleNamespace(affinity=False)}
+        return metrics, None, feats
 
     def predict_affinity(self, path: Path, pred_structure, cfg: dict[str, Any]) -> dict[str, float]:
         from tt_boltz.boltz2 import Boltz2
@@ -205,7 +257,7 @@ def _hash_run_config(cfg: dict[str, Any]) -> str:
     import hashlib
     import json
 
-    keep = {k: cfg.get(k) for k in ("conf_kwargs", "aff_kwargs", "fast", "method")}
+    keep = {k: cfg.get(k) for k in ("model", "conf_kwargs", "aff_kwargs", "fast", "method")}
     blob = json.dumps(keep, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
@@ -273,10 +325,16 @@ def run_worker_loop(
                     state.load(run_id, cfg)
                     from tt_boltz.progress import make_progress_fn
 
-                    state.model.progress_fn = make_progress_fn(
+                    pfn = make_progress_fn(
                         HttpProgressQueue(client, run_id, worker_id),
                         worker_info["device_id"], worker_id, meta,
                     )
+                    if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
+                        from tt_boltz import esmfold2 as _E
+
+                        _E.set_progress(pfn)  # trunk/diffusion per-step bars
+                    else:
+                        state.model.progress_fn = pfn
                 except Exception as exc:
                     traceback.print_exc()
                     _complete_failure(client, run_id, worker_id, meta, jobs, str(exc)[:200])
