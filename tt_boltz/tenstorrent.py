@@ -93,50 +93,16 @@ def _sdpa_program_config_for_lengths(q_len: int, k_len: int) -> ttnn.SDPAProgram
     )
 
 
-# Trimul matmul tiling knobs (in0_block_w, out_subblock_h, out_subblock_w).
-# Default (1,1,1) = the original Boltz-2-tuned behaviour. The folding model can
-# raise these via set_trimul_tuning() for better tensor-core reuse; values are
-# clamped per-shape (must divide the K / per-core dims, subblock area <= 4 with
-# fp32_dest_acc) so a too-large request can never produce an invalid config.
-# Boltz-2 never calls the setter, so its kernels are unchanged.
-_TRIMUL_TUNE = (1, 1, 1)
-
-
-def _largest_divisor(n: int, cap: int) -> int:
-    cap = max(1, min(cap, n))
-    for d in range(cap, 0, -1):
-        if n % d == 0:
-            return d
-    return 1
-
-
-def set_trimul_tuning(in0_block_w: int = 1, out_subblock_h: int = 1, out_subblock_w: int = 1) -> None:
-    """Set the trimul matmul tiling knobs (clamped per-shape at use). Clears the
-    program-config cache so the new values take effect on the next build."""
-    global _TRIMUL_TUNE
-    _TRIMUL_TUNE = (int(in0_block_w), int(out_subblock_h), int(out_subblock_w))
-    _triangle_mul_program_config.cache_clear()
-
-
 @lru_cache(maxsize=None)
 def _triangle_mul_program_config(seq_len_tiles: int) -> ttnn.MatmulMultiCoreReuseMultiCastProgramConfig:
     gx, gy = COMPUTE_GRID_MAIN
     per_core_M = -(-seq_len_tiles // gy)
     per_core_N = -(-seq_len_tiles // gx)
-    in0_req, subh_req, subw_req = _TRIMUL_TUNE
-    in0_block_w = _largest_divisor(seq_len_tiles, in0_req)
-    sub_h = _largest_divisor(per_core_M, subh_req)
-    sub_w = _largest_divisor(per_core_N, subw_req)
-    while sub_h * sub_w > 4:  # fp32_dest_acc dest-register limit
-        if sub_w >= sub_h:
-            sub_w = _largest_divisor(per_core_N, sub_w - 1)
-        else:
-            sub_h = _largest_divisor(per_core_M, sub_h - 1)
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
         compute_with_storage_grid_size=(gx, gy),
-        in0_block_w=in0_block_w,
-        out_subblock_h=sub_h,
-        out_subblock_w=sub_w,
+        in0_block_w=1,
+        out_subblock_h=1,
+        out_subblock_w=1,
         out_block_h=per_core_M,
         out_block_w=per_core_N,
         per_core_M=per_core_M,

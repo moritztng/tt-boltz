@@ -326,10 +326,6 @@ def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
     """
     from tt_boltz import tenstorrent
     tenstorrent.set_fast_mode(fast)
-    # Trimul matmul tiling tuned for the folding trunk (clamped per-shape; safe
-    # at any L). ESMFold2 runs in its own process, so this does not touch Boltz-2.
-    # Modest at L=512 (~1% — the trunk is op-dispatch-bound, not matmul-bound).
-    tenstorrent.set_trimul_tuning(in0_block_w=4, out_subblock_h=2, out_subblock_w=2)
     _ensure_reference_on_path()
     from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
 
