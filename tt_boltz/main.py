@@ -1202,7 +1202,7 @@ def _write_structure(complex_obj, outpath, output_format):
 
 
 def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_dir,
-                            output_format, quiet):
+                            output_format, quiet, fast=False):
     """One ESMFold2 worker pinned to a TT device — folds targets pulled from a
     shared queue (dynamic load-balancing) until it receives the None sentinel,
     emitting progress events on ev_q for the live display.
@@ -1236,7 +1236,7 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
     try:
         from tt_boltz import esmfold2 as E
         from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
-        model = load_ttnn_esmfold2()
+        model = load_ttnn_esmfold2(fast=fast)
         model._esmc.preload()  # do the ~60 s ESMC-6B load under the "loading" stage
     except Exception as e:  # systemic load failure — report and exit (no hang)
         emit("done", name="<load>", time=0, status="error", error=repr(e))
@@ -1273,7 +1273,7 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
 
 def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_steps,
                       diffusion_samples, seed, override, ignored, num_devices, device_ids,
-                      debug, log):
+                      debug, log, fast=False):
     """On-device ttnn ESMFold2 over the same inputs / output layout as predict.
 
     Targets fan out across TT devices exactly like the Boltz path: one pinned
@@ -1321,7 +1321,7 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
         in_q.put(None)  # one sentinel per worker
     procs = [ctx.Process(target=_esmfold2_device_worker,
                          args=(assigns[d], in_q, out_q, ev_q, fold_kwargs, str(struct_dir),
-                               output_format, not debug))
+                               output_format, not debug, fast))
              for d in devices]
     for p in procs:
         p.start()
@@ -1450,7 +1450,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         _predict_esmfold2(
             Path(data).expanduser(), Path(out_dir).expanduser(), output_format,
             recycling_steps, sampling_steps, diffusion_samples, seed, override, ignored,
-            num_devices, device_ids, debug, log)
+            num_devices, device_ids, debug, log, fast)
         return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
