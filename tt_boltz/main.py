@@ -1145,29 +1145,34 @@ def msa(db, path, install_tools):
 # ESMFold2 (--model esmfold2): single-sequence, protein-only, on-device ttnn.
 # ---------------------------------------------------------------------------
 def _read_protein_chains(path):
-    """Extract [(chain_id, sequence)] protein entries from a FASTA or Boltz YAML.
+    """Extract [(chain_id, sequence, msa_spec)] protein entries from FASTA/YAML.
 
-    FASTA headers may be plain (``>name``) or Boltz-style (``>ID|TYPE|MSA``);
+    FASTA headers may be plain (``>name``) or Boltz-style (``>ID|TYPE|MSA``)
+    where the third field is an optional a3m path (``empty`` / blank = none);
     non-protein typed records are skipped, and comma-separated ids expand to
-    repeated chains. Each input file is one (possibly multi-chain) complex.
+    repeated chains (sharing the MSA). YAML protein entries may carry an
+    ``msa:`` path. ``msa_spec`` is the a3m path string or None. Each input file
+    is one (possibly multi-chain) complex.
     """
     suffix = path.suffix.lower()
-    chains: list[tuple[str, str]] = []
+    chains: list[tuple[str, str, str | None]] = []
     if suffix in (".fa", ".fas", ".fasta"):
-        cid, buf = None, []
+        cid, buf, msa = None, [], None
         def flush():
             if cid and buf:
                 for c in cid.split(","):
-                    chains.append((c.strip() or chr(65 + len(chains)), "".join(buf)))
+                    chains.append((c.strip() or chr(65 + len(chains)), "".join(buf), msa))
         for line in path.read_text().splitlines():
             line = line.strip()
             if line.startswith(">"):
                 flush()
                 parts = line[1:].split("|")
                 if len(parts) > 1 and parts[1].strip().lower() not in ("protein", ""):
-                    cid, buf = None, []  # skip non-protein chain
+                    cid, buf, msa = None, [], None  # skip non-protein chain
                 else:
                     cid, buf = parts[0].strip(), []
+                    m = parts[2].strip() if len(parts) > 2 else ""
+                    msa = m if m and m.lower() != "empty" else None
             elif line and cid is not None:
                 buf.append(line)
         flush()
@@ -1177,8 +1182,10 @@ def _read_protein_chains(path):
         for entry in doc.get("sequences", []):
             prot = entry.get("protein") if isinstance(entry, dict) else None
             if prot and prot.get("sequence"):
+                m = prot.get("msa")
+                m = str(m) if m and str(m).lower() not in ("", "empty") else None
                 for c in str(prot.get("id", "A")).split(","):
-                    chains.append((c.strip(), prot["sequence"]))
+                    chains.append((c.strip(), prot["sequence"], m))
     else:
         raise click.ClickException(f"Unsupported input for esmfold2: {path.name}")
     return chains
@@ -1202,7 +1209,8 @@ def _write_structure(complex_obj, outpath, output_format):
 
 
 def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_dir,
-                            output_format, quiet, fast=False):
+                            output_format, quiet, fast=False,
+                            esmfold2_repo="biohub/ESMFold2", msa_dir=None):
     """One ESMFold2 worker pinned to a TT device — folds targets pulled from a
     shared queue (dynamic load-balancing) until it receives the None sentinel,
     emitting progress events on ev_q for the live display.
@@ -1235,8 +1243,8 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
     emit("loading")
     try:
         from tt_boltz import esmfold2 as E
-        from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2
-        model = load_ttnn_esmfold2(fast=fast)
+        from tt_boltz.esmfold2_runtime import fold_complex, load_ttnn_esmfold2, resolve_msa
+        model = load_ttnn_esmfold2(esmfold2_repo=esmfold2_repo, fast=fast)
         model._esmc.preload()  # do the ~60 s ESMC-6B load under the "loading" stage
     except Exception as e:  # systemic load failure — report and exit (no hang)
         emit("done", name="<load>", time=0, status="error", error=repr(e))
@@ -1252,6 +1260,10 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
             if not chains:
                 emit("done", name=name, time=0, status="error", error="no protein sequences")
                 out_q.put((name, {"error": "no protein sequences"})); continue
+            # Resolve each chain's MSA (explicit a3m or a cached server/DB search
+            # in msa_dir); None -> single-sequence. The on-device MSA encoder runs
+            # whenever an MSA is present.
+            chains = [(cid, seq, resolve_msa(spec, seq, msa_dir)) for cid, seq, spec in chains]
             emit("start", name=name)
             emit("stage", stage="prep")
             t0 = time.time()
@@ -1260,7 +1272,8 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
             _write_structure(res.complex, struct_dir / f"{name}.{output_format}", output_format)
             dt = round(time.time() - t0, 1)
             entry = {"plddt": round(float(res.plddt.mean()), 4),
-                     "n_residues": sum(len(s) for _, s in chains), "n_chains": len(chains),
+                     "n_residues": sum(len(c[1]) for c in chains), "n_chains": len(chains),
+                     "msa": any(c[2] is not None for c in chains),
                      "device": dev, "time_s": dt}
             if getattr(res, "ptm", None) is not None:
                 entry["ptm"] = round(float(res.ptm), 4)
@@ -1271,22 +1284,52 @@ def _esmfold2_device_worker(assignment, in_q, out_q, ev_q, fold_kwargs, struct_d
             out_q.put((name, {"error": repr(e)}))
 
 
+def _generate_esmfold2_a3m(seqs, target_id, msa_dir, msa_db_path, use_envdb,
+                           msa_url, msa_strategy, msa_user, msa_pass, api_key):
+    """Write a cached ``{seq_hash}.a3m`` for each sequence (local DB or server).
+
+    ``seqs`` maps seq_hash -> sequence. Local-DB search (``compute_msa_offline``)
+    already writes ``{hash}.a3m``; the ColabFold server path runs an unpaired
+    mmseqs2 search and writes its a3m text directly (the esm MSA reader wants
+    a3m, unlike the Boltz CSV path).
+    """
+    if msa_db_path:
+        compute_msa_offline(seqs, target_id, msa_dir, msa_db_path,
+                            use_env=use_envdb, pairing_strategy=msa_strategy)
+        return
+    headers = {"Content-Type": "application/json", "X-API-Key": api_key} if api_key else None
+    res = run_mmseqs2(list(seqs.values()), msa_dir / f"{target_id}_esm_tmp", use_env=use_envdb,
+                      use_pairing=False, host_url=msa_url, pairing_strategy=msa_strategy,
+                      msa_server_username=msa_user, msa_server_password=msa_pass, auth_headers=headers)
+    for i, h in enumerate(seqs):
+        (msa_dir / f"{h}.a3m").write_text(res[i])
+
+
 def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_steps,
                       diffusion_samples, seed, override, ignored, num_devices, device_ids,
-                      debug, log, fast=False):
+                      debug, log, fast=False, esmfold2_repo="biohub/ESMFold2",
+                      use_msa_server=False, msa_db_path=None, cache=None, use_envdb=False,
+                      msa_url=None, msa_strategy="greedy", msa_user=None, msa_pass=None,
+                      api_key=None):
     """On-device ttnn ESMFold2 over the same inputs / output layout as predict.
 
     Targets fan out across TT devices exactly like the Boltz path: one pinned
     worker process per device (device set via detect_tenstorrent_devices /
     --num_devices / --device_ids), each pulling targets from a shared queue, and
     progress is rendered with the same Rich/debug displays. recycling_steps ->
-    num_loops, sampling_steps, diffusion_samples carry over; MSA / ligand /
-    affinity options don't apply to a single-sequence model.
+    num_loops, sampling_steps, diffusion_samples carry over.
+
+    MSA: a per-chain a3m may be given in the input (FASTA ``>id|protein|path.a3m``
+    or YAML ``msa:``); otherwise ``--use_msa_server`` / ``--msa_db_path`` triggers
+    a (cached) search here in the driver. With an MSA the on-device MSA encoder
+    runs; without one the model folds single-sequence. ``esmfold2_repo`` selects
+    the checkpoint (full ESMFold2 or the lighter ESMFold2-Fast).
     """
     from queue import Empty as QueueEmpty
 
     if ignored:
-        click.echo(f"Note: --model esmfold2 is single-sequence & protein-only; ignoring {', '.join(ignored)}")
+        click.echo(f"Note: --model {('esmfold2-fast' if 'Fast' in esmfold2_repo else 'esmfold2')} "
+                   f"is protein-only; ignoring {', '.join(ignored)}")
     files = ([data] if data.is_file()
              else sorted(p for ext in ("*.fasta", "*.fa", "*.fas", "*.yaml", "*.yml")
                          for p in data.glob(ext)))
@@ -1306,6 +1349,25 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
         click.echo("All predictions complete")
         return
 
+    # MSA resolution: explicit a3m paths in the input are used by the workers as-is;
+    # when a search is requested, generate a cached {seq_hash}.a3m per sequence here
+    # (once, shared across workers). No MSA -> single-sequence folding.
+    msa_dir = None
+    if use_msa_server or msa_db_path:
+        msa_dir = (Path(cache).expanduser() if cache else Path("~/.boltz").expanduser()) / "msa_dir"
+        msa_dir.mkdir(parents=True, exist_ok=True)
+        to_gen = {}
+        for f in todo:
+            for _cid, seq, spec in _read_protein_chains(f):
+                if spec and Path(spec).expanduser().exists():
+                    continue
+                h = hashlib.sha256(seq.encode()).hexdigest()[:16]
+                if not (msa_dir / f"{h}.a3m").exists():
+                    to_gen[h] = seq
+        if to_gen:
+            _generate_esmfold2_a3m(to_gen, data.stem, msa_dir, msa_db_path, use_envdb,
+                                   msa_url, msa_strategy, msa_user, msa_pass, api_key)
+
     devices = detect_tenstorrent_devices(device_ids, num_devices, max_workers=len(todo))
     assigns = _build_worker_device_assignments(devices)
     click.echo(f"ESMFold2 on TT device(s) {devices}; {len(todo)} target(s) "
@@ -1321,7 +1383,8 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
         in_q.put(None)  # one sentinel per worker
     procs = [ctx.Process(target=_esmfold2_device_worker,
                          args=(assigns[d], in_q, out_q, ev_q, fold_kwargs, str(struct_dir),
-                               output_format, not debug, fast))
+                               output_format, not debug, fast, esmfold2_repo,
+                               str(msa_dir) if msa_dir else None))
              for d in devices]
     for p in procs:
         p.start()
@@ -1401,9 +1464,11 @@ def _predict_esmfold2(data, out_dir, output_format, recycling_steps, sampling_st
 @click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for power reporting")
 @click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
-@click.option("--model", type=click.Choice(["boltz2", "esmfold2"]), default="boltz2", show_default=True,
-              help="Structure model. boltz2: MSA + Pairformer. esmfold2: single-sequence ESMC-6B + diffusion, "
-                   "run on-device via the ttnn pipeline (MSA / ligand / affinity options do not apply).")
+@click.option("--model", type=click.Choice(["boltz2", "esmfold2", "esmfold2-fast"]), default="boltz2", show_default=True,
+              help="Structure model. boltz2: MSA + Pairformer. esmfold2: ESMC-6B + 48-block trunk + diffusion. "
+                   "esmfold2-fast: the lighter 24-block ESMFold2-Fast checkpoint. Both esmfold2 variants run "
+                   "on-device via the ttnn pipeline and accept an optional MSA (--use_msa_server / --msa_db_path; "
+                   "ligand / affinity options do not apply).")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
@@ -1442,15 +1507,19 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    if model == "esmfold2":
+    if model in ("esmfold2", "esmfold2-fast"):
+        esmfold2_repo = "biohub/ESMFold2-Fast" if model == "esmfold2-fast" else "biohub/ESMFold2"
+        # MSA is now supported; only ligand/affinity/embedding options don't apply.
         ignored = [n for n, on in [
-            ("--use_msa_server", use_msa_server), ("--msa_db_path", bool(msa_db_path)),
             ("--use_potentials", use_potentials), ("--write_embeddings", write_embeddings),
             ("--checkpoint", bool(checkpoint))] if on]
         _predict_esmfold2(
             Path(data).expanduser(), Path(out_dir).expanduser(), output_format,
             recycling_steps, sampling_steps, diffusion_samples, seed, override, ignored,
-            num_devices, device_ids, debug, log, fast)
+            num_devices, device_ids, debug, log, fast, esmfold2_repo,
+            use_msa_server=use_msa_server, msa_db_path=msa_db_path, cache=cache,
+            use_envdb=use_envdb, msa_url=msa_server_url, msa_strategy=msa_pairing_strategy,
+            msa_user=msa_server_username, msa_pass=msa_server_password, api_key=api_key_value)
         return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")

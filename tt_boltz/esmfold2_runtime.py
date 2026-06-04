@@ -144,28 +144,41 @@ class _StructureHeadAdapter(_Adapter):
 
 # reference attribute -> (ttnn wrapper, state-dict prefix, reference kwarg order).
 # An empty kwarg tuple means "forward the first positional arg" (trunk/shim/
-# distogram). FoldingTrunk variants differ only in block count (48 / 4 / 2).
-_SPEC = {
-    "inputs_embedder": (lambda: E.InputsEmbedder(), "inputs_embedder.",
-        ("aatype", "profile", "deletion_mean", "ref_pos", "atom_attention_mask",
-         "ref_space_uid", "ref_charge", "ref_element", "ref_atom_name_chars", "atom_to_token")),
-    "rel_pos": (lambda: E.RelPosEncoding(), "rel_pos.",
-        ("residue_index", "asym_id", "sym_id", "entity_id", "token_index")),
-    "msa_encoder": (lambda: E.MSAEncoder(), "msa_encoder.",
-        ("x_pair", "x_inputs", "msa_oh", "has_deletion", "deletion_value", "msa_attention_mask")),
-    "language_model": (lambda: E.LanguageModelShim(), "language_model.", ()),
-    "lm_encoder": (lambda: E.FoldingTrunk(4), "lm_encoder.", ()),
-    "folding_trunk": (lambda: E.FoldingTrunk(48), "folding_trunk.", ()),
-    "parcae_coda": (lambda: E.FoldingTrunk(2), "parcae_coda.", ()),
-    "distogram_head": (lambda: E.DistogramHeadModel(), "distogram_head.", ()),
-    "structure_head": (lambda: E.StructureHead(sigma_data=16.0), "structure_head.", None),
-}
+# distogram). Block counts and MSA head width follow the checkpoint config, so
+# the same code loads both ESMFold2 (48 trunk blocks, msa_head_width 16) and
+# ESMFold2-Fast (24 trunk blocks, msa_head_width 32) — see _spec().
+def _spec(config):
+    """Build the component spec for this checkpoint's config (variant-aware)."""
+    ft, lm, pc, msa = (config.folding_trunk, config.lm_encoder,
+                       config.parcae, config.msa_encoder)
+    spec = {
+        "inputs_embedder": (lambda: E.InputsEmbedder(), "inputs_embedder.",
+            ("aatype", "profile", "deletion_mean", "ref_pos", "atom_attention_mask",
+             "ref_space_uid", "ref_charge", "ref_element", "ref_atom_name_chars", "atom_to_token")),
+        "rel_pos": (lambda: E.RelPosEncoding(), "rel_pos.",
+            ("residue_index", "asym_id", "sym_id", "entity_id", "token_index")),
+        "language_model": (lambda: E.LanguageModelShim(), "language_model.", ()),
+        "lm_encoder": (lambda: E.FoldingTrunk(lm.n_layers), "lm_encoder.", ()),
+        "folding_trunk": (lambda: E.FoldingTrunk(ft.n_layers), "folding_trunk.", ()),
+        "parcae_coda": (lambda: E.FoldingTrunk(pc.coda_n_layers), "parcae_coda.", ()),
+        "distogram_head": (lambda: E.DistogramHeadModel(), "distogram_head.", ()),
+        "structure_head": (lambda: E.StructureHead(sigma_data=16.0), "structure_head.", None),
+    }
+    # The MSA encoder exists only when enabled (ESMFold2-Fast ships without it),
+    # mirroring the reference (model.msa_encoder is None when disabled). Build it
+    # only then — patch_esmfold2 likewise uses it only if model.msa_encoder is set.
+    if getattr(msa, "enabled", True):
+        spec["msa_encoder"] = (
+            lambda: E.MSAEncoder(msa.n_layers, msa.n_heads_msa, msa.msa_head_width),
+            "msa_encoder.",
+            ("x_pair", "x_inputs", "msa_oh", "has_deletion", "deletion_value", "msa_attention_mask"))
+    return spec
 
 
-def _components(sd):
+def _components(sd, config):
     sub = lambda p: {k[len(p):]: v for k, v in sd.items() if k.startswith(p)}
     built = {}
-    for name, (factory, prefix, argnames) in _SPEC.items():
+    for name, (factory, prefix, argnames) in _spec(config).items():
         mod = factory()
         mod.load_state_dict(sub(prefix), strict=False)
         cls = _StructureHeadAdapter if argnames is None else _Adapter
@@ -255,7 +268,7 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
     for unusually large inputs, at the cost of an ESMC reload each fold.
     """
     sd = {k: v.float() for k, v in model.state_dict().items()}
-    comps = _components(sd)
+    comps = _components(sd, model.config)
 
     model.inputs_embedder = comps["inputs_embedder"]
     model.rel_pos = comps["rel_pos"]
@@ -339,19 +352,49 @@ def fold_sequences(model, sequences, *, num_loops=3, num_sampling_steps=20,
         yield pid, res, time.time() - t0
 
 
+def resolve_msa(msa_spec, sequence, msa_dir=None, max_sequences=16384):
+    """Resolve a chain's MSA to an esm ``MSA`` object (or None).
+
+    Tries, in order: an explicit a3m path (``msa_spec``); a cached
+    ``{sha256(seq)[:16]}.a3m`` in ``msa_dir`` (written by the predict driver
+    after a server / local-DB search). Returns None for single-sequence folding.
+    """
+    _ensure_reference_on_path()
+    import hashlib
+    from pathlib import Path
+
+    from esm.utils.msa.msa import MSA
+
+    candidates = []
+    if msa_spec:
+        candidates.append(Path(msa_spec).expanduser())
+    if msa_dir:
+        h = hashlib.sha256(sequence.encode()).hexdigest()[:16]
+        candidates.append(Path(msa_dir) / f"{h}.a3m")
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0:
+            return MSA.from_a3m(str(p), max_sequences=max_sequences)
+    return None
+
+
 def fold_complex(model, chains, *, num_loops=3, num_sampling_steps=20,
                  num_diffusion_samples=1, seed=0):
     """Fold one (possibly multi-chain) protein complex on an already-patched model.
 
-    `chains` is a list of ``(chain_id, sequence)``. Returns the reference fold
-    result (with `.complex`, `.plddt`, `.ptm`).
+    `chains` is a list of ``(chain_id, sequence)`` or ``(chain_id, sequence,
+    msa)`` where ``msa`` is an esm ``MSA`` object (or None for single-sequence).
+    When an MSA is given the on-device MSA encoder runs. Returns the reference
+    fold result (with `.complex`, `.plddt`, `.ptm`).
     """
     _ensure_reference_on_path()
     from esm.models.esmfold2 import (
         ESMFold2InputBuilder, ProteinInput, StructurePredictionInput)
 
-    spi = StructurePredictionInput(
-        sequences=[ProteinInput(id=cid, sequence=seq) for cid, seq in chains])
+    def _protein(c):
+        msa = c[2] if len(c) > 2 else None
+        return ProteinInput(id=c[0], sequence=c[1], msa=msa)
+
+    spi = StructurePredictionInput(sequences=[_protein(c) for c in chains])
     res = ESMFold2InputBuilder().fold(
         model, spi, num_loops=num_loops, num_sampling_steps=num_sampling_steps,
         num_diffusion_samples=num_diffusion_samples, seed=seed)
