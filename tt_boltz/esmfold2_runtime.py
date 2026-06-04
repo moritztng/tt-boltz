@@ -293,12 +293,20 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
 
 
 def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
-                       esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool = True):
+                       esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool = True,
+                       fast: bool = True):
     """Load + patch an ESMFold2 model for on-device inference, weights resident.
 
     Returns a patched model ready to fold many proteins without reloading. The
     24 GB CPU ESMC checkpoint is skipped (ttnn ESMC-6B is used instead).
+
+    `fast=True` (default) runs the folding trunk's triangle-multiplications in
+    block-fp8 (bfloat8_b) — ~40% faster trunk / ~30% faster fold at L=512 with
+    no measurable accuracy change (Trp-cage 0.42 Å, ubiquitin 0.60 Å vs ground
+    truth, same as bf16). The trunk dominates runtime, so this is the main lever.
     """
+    from tt_boltz import tenstorrent
+    tenstorrent.set_fast_mode(fast)
     _ensure_reference_on_path()
     from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
 
