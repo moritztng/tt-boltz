@@ -43,6 +43,17 @@ def set_dtype(dt):
     _DTYPE = dt
 
 
+# Cache step-invariant diffusion quantities (pair_bias from z, atom conditioning
+# c, the atom adaLN modulation) across the ~20 sampling steps, keyed by source-
+# tensor identity. Bit-identical to recomputing; on by default. Kill-switch for
+# A/B measurement / debugging.
+_STEP_CACHE = True
+
+def set_step_cache(on):
+    global _STEP_CACHE
+    _STEP_CACHE = bool(on)
+
+
 # Optional progress callback for the CLI display: report_progress(stage, step, total).
 # A no-op unless a worker installs one via set_progress(); never affects compute.
 _PROGRESS = None
@@ -241,6 +252,8 @@ class AttentionPairBias(Module):
         self.pair_norm_w = self.torch_to_tt("pair_norm.weight")
         self.pair_norm_b = self.torch_to_tt("pair_norm.bias")
         self.pair_bias_w = self.torch_to_tt("pair_bias_proj.weight")
+        self._pb = None       # cached pair_bias (see __call__)
+        self._pb_src = None   # identity of the z it was built from
 
         # head_dim may not be a tile multiple (e.g. 768/16=48 -> padded to 64 by
         # the nlp head ops). Fold the head un-padding into two constant scatter
@@ -298,16 +311,30 @@ class AttentionPairBias(Module):
         )
         ttnn.deallocate(qkv)
 
-        z_norm = ttnn.layer_norm(
-            z, weight=self.pair_norm_w, bias=self.pair_norm_b, epsilon=1e-5, compute_kernel_config=ck
-        )
-        pair_bias = lin(z_norm, self.pair_bias_w)  # [B, L, L, H]
-        ttnn.deallocate(z_norm)
-        pair_bias = ttnn.permute(pair_bias, (0, 3, 1, 2))  # [B, H, L, L]
+        # pair_bias = pair_bias_proj(layer_norm(z)) is a pure function of the
+        # pair conditioning z, which is constant across the diffusion sampling
+        # steps (the resident sampler feeds the same cached z object each step).
+        # So compute it once and reuse it while the same z is fed; a new protein
+        # passes a fresh z, which rebuilds it. Bit-identical to recomputing, and
+        # saves an O(L^2 . H) layer_norm + projection per step per layer — the
+        # single largest step-invariant cost in the token DiT.
+        if _STEP_CACHE and self._pb_src is z:
+            pair_bias = self._pb
+        else:
+            if self._pb is not None:
+                ttnn.deallocate(self._pb)
+            z_norm = ttnn.layer_norm(
+                z, weight=self.pair_norm_w, bias=self.pair_norm_b, epsilon=1e-5, compute_kernel_config=ck
+            )
+            pb = lin(z_norm, self.pair_bias_w)  # [B, L, L, H]
+            ttnn.deallocate(z_norm)
+            pair_bias = ttnn.permute(pb, (0, 3, 1, 2))  # [B, H, L, L]
+            ttnn.deallocate(pb)
+            self._pb = pair_bias
+            self._pb_src = z
 
         ctx = _attn_fp32(qh, kh, vh, pair_bias, head_dim**-0.5, ck)
         ttnn.deallocate(qh); ttnn.deallocate(kh); ttnn.deallocate(vh)
-        ttnn.deallocate(pair_bias)
         ctx = ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ctx = ttnn.squeeze(ctx, 1)  # [B, L, H*head_dim_pad]  (pad value dims are 0)
         # Gate + out_proj in the padded head layout, then project back to d_model.
@@ -585,6 +612,8 @@ class SWAAtomBlock(Module):
         self.attn = SWAAttention(n_heads, self.scope("attn"), compute_kernel_config)
         self.ffn_up = self.torch_to_tt("ffn.w_up.weight")
         self.ffn_down = self.torch_to_tt("ffn.w_down.weight")
+        self._mod = None       # cached adaLN modulation chunks (see __call__)
+        self._mod_src = None   # identity of the conditioning c_l they were built from
 
     def _modulate(self, x, scale, shift):
         ck = self.compute_kernel_config
@@ -593,9 +622,22 @@ class SWAAtomBlock(Module):
     def __call__(self, x, c_l, cos, sin, attn_mask, valid=None):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
-        mod = lin(ttnn.silu(c_l), self.adaln_w)  # [B,N,6d]
-        sa, ca, ga, sf, cf, gf = ttnn.chunk(mod, 6, dim=-1)
-        ttnn.deallocate(mod)
+        # The adaLN modulation is a pure function of the conditioning c_l, which
+        # is step-invariant during diffusion sampling (the encoder feeds the same
+        # cached c each step), so cache the 6 chunks keyed by c_l identity.
+        # Bit-identical to recomputing; saves a silu + O(N.6d) projection per
+        # step per atom block (3 encoder + 3 decoder).
+        if _STEP_CACHE and self._mod_src is c_l:
+            sa, ca, ga, sf, cf, gf = self._mod
+        else:
+            if self._mod is not None:
+                for _t in self._mod:
+                    ttnn.deallocate(_t)
+            mod = lin(ttnn.silu(c_l), self.adaln_w)  # [B,N,6d]
+            sa, ca, ga, sf, cf, gf = ttnn.chunk(mod, 6, dim=-1)
+            ttnn.deallocate(mod)
+            self._mod = (sa, ca, ga, sf, cf, gf)
+            self._mod_src = c_l
 
         attn_in = self._modulate(x, ca, sa)
         attn_out = self.attn(attn_in, cos, sin, attn_mask, valid)
@@ -677,11 +719,25 @@ class AtomEncoder(Module):
         self.coords_w = self.torch_to_tt("coords_linear.weight") if structure_prediction else None
         self.a2t_w = self.torch_to_tt("atom_to_token_linear.weight")
         self.transformer = SWAAtomTransformerModel(n_heads, n_blocks, self.scope("atom_transformer"), compute_kernel_config)
+        self._c = None       # cached atom conditioning c (see __call__)
+        self._c_src = None   # identity of the atom_feats it was built from
 
     def __call__(self, atom_feats, cos, sin, band, scatter_m, r_input=None, valid=None):
         ck = self.compute_kernel_config
         lin = lambda t, w: ttnn.linear(t, w, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)
-        c = ttnn.layer_norm(lin(atom_feats, self.atom_linear_w), weight=self.atom_norm_w, bias=self.atom_norm_b, epsilon=1e-5, compute_kernel_config=ck)
+        # c = layer_norm(atom_linear(atom_feats)) depends only on the (step-
+        # invariant) reference atom features, so cache it across sampling steps
+        # keyed by the atom_feats identity. This also keeps the SAME c object
+        # flowing into both atom transformers, which lets each SWAAtomBlock cache
+        # its adaLN modulation too. Bit-identical to recomputing.
+        if _STEP_CACHE and self._c_src is atom_feats:
+            c = self._c
+        else:
+            if self._c is not None:
+                ttnn.deallocate(self._c)
+            c = ttnn.layer_norm(lin(atom_feats, self.atom_linear_w), weight=self.atom_norm_w, bias=self.atom_norm_b, epsilon=1e-5, compute_kernel_config=ck)
+            self._c = c
+            self._c_src = atom_feats
         q = ttnn.add(c, lin(r_input, self.coords_w)) if self.structure_prediction else c
         q = self.transformer(q, c, cos, sin, band, valid)
         q_to_a = ttnn.relu(lin(q, self.a2t_w))  # [B,N,d_token]
