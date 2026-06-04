@@ -22,7 +22,6 @@ import torch
 import ttnn
 
 from tt_boltz.tenstorrent import (
-    CORE_GRID_MAIN,
     Module,
     TorchWrapper,
     Weights,
@@ -159,10 +158,7 @@ class Attention(Module):
             x, weight=self.in_norm_weight, bias=self.in_norm_bias,
             epsilon=1e-5, compute_kernel_config=ck,
         )
-        qkv = ttnn.linear(
-            x_norm, self.qkv_weight, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
-        )
+        qkv = self._lin(x_norm, self.qkv_weight)
         ttnn.deallocate(x_norm)
 
         q, k, v = ttnn.chunk(qkv, 3, dim=-1)
@@ -173,12 +169,7 @@ class Attention(Module):
         # Re-pack and use the tile-aware head split, then apply per-head RoPE.
         qkv = ttnn.concat([q, k, v], dim=-1)
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
-        qkv = ttnn.unsqueeze(qkv, 1)  # [B, 1, L, 3*d_model]
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=self.n_heads, num_kv_heads=self.n_heads,
-            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        ttnn.deallocate(qkv)
+        q, k, v = self._split_heads(qkv, self.n_heads)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         if key_valid is not None:
@@ -192,12 +183,8 @@ class Attention(Module):
             program_config=_sdpa_program_config_for_lengths(q.shape[2], k.shape[2]),
         )
         ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
-        o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        o = ttnn.squeeze(o, 1)  # [B, L, d_model]
-        out = ttnn.linear(
-            o, self.out_weight, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
-        )
+        o = self._merge_heads(o)  # [B, L, d_model]
+        out = self._lin(o, self.out_weight)
         ttnn.deallocate(o)
         return out
 
@@ -223,19 +210,13 @@ class SwiGLUFFN(Module):
             x, weight=self.norm_weight, bias=self.norm_bias,
             epsilon=1e-5, compute_kernel_config=ck,
         )
-        h = ttnn.linear(
-            x_norm, self.fc1_weight, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
-        )
+        h = self._lin(x_norm, self.fc1_weight)
         ttnn.deallocate(x_norm)
         x1, x2 = ttnn.chunk(h, 2, dim=-1)
         ttnn.deallocate(h)
         gated = ttnn.multiply(ttnn.silu(x1), x2)
         ttnn.deallocate(x1); ttnn.deallocate(x2)
-        out = ttnn.linear(
-            gated, self.fc2_weight, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
-        )
+        out = self._lin(gated, self.fc2_weight)
         ttnn.deallocate(gated)
         return out
 
@@ -280,19 +261,13 @@ class RegressionHead(Module):
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
-        a = ttnn.linear(
-            x, self.fc1_weight, bias=self.fc1_bias, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
-        )
+        a = self._lin(x, self.fc1_weight, bias=self.fc1_bias)
         a = ttnn.gelu(a)
         a = ttnn.layer_norm(
             a, weight=self.norm_weight, bias=self.norm_bias,
             epsilon=1e-5, compute_kernel_config=ck,
         )
-        logits = ttnn.linear(
-            a, self.fc2_weight, bias=self.fc2_bias, compute_kernel_config=ck,
-            dtype=ttnn.bfloat16, core_grid=CORE_GRID_MAIN,
-        )
+        logits = self._lin(a, self.fc2_weight, bias=self.fc2_bias)
         ttnn.deallocate(a)
         return logits
 

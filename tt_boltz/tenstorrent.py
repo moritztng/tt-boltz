@@ -265,6 +265,32 @@ class Module:
             dtype=dtype,
         )
 
+    def _lin(self, x, w, bias=None, dtype=ttnn.bfloat16, **kw):
+        """Shared linear projection: ttnn.linear on this module's kernel config +
+        the main core grid. Used across the ESMFold2 encoders / diffusion (which
+        bind ``lin = self._lin``) instead of repeating the call everywhere."""
+        return ttnn.linear(
+            x, w, bias=bias, compute_kernel_config=self.compute_kernel_config,
+            dtype=dtype, core_grid=CORE_GRID_MAIN, **kw,
+        )
+
+    def _split_heads(self, qkv, n_heads):
+        """Packed [B, L, 3*d] -> per-head (q, k, v) [B, H, L, d_head] via the
+        tile-aware nlp head split. Frees the packed input."""
+        qkv = ttnn.unsqueeze(qkv, 1)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=n_heads, num_kv_heads=n_heads,
+            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(qkv)
+        return q, k, v
+
+    def _merge_heads(self, ctx):
+        """Per-head ctx [B, H, L, d_head] -> [B, L, H*d_head]."""
+        return ttnn.squeeze(
+            ttnn.experimental.nlp_concat_heads(ctx, memory_config=ttnn.DRAM_MEMORY_CONFIG), 1
+        )
+
 
 class TriangleMultiplication(Module):
     def __init__(

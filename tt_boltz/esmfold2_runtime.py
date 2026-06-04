@@ -47,8 +47,6 @@ def _ensure_reference_on_path():
         if os.path.isdir(path) and path not in sys.path:
             sys.path.insert(0, path)
 
-NUM_RES_TYPES = 33
-
 
 class _ESMCAdapter:
     """Wrap the ttnn ESMC-6B to the `transformers` ESMC call contract.
@@ -331,25 +329,6 @@ def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
 
     model = ESMFold2Model.from_pretrained(esmfold2_repo, load_esmc=False).eval()
     return patch_esmfold2(model, esmc_repo=esmc_repo, persistent_lm=persistent_lm)
-
-
-def fold_sequences(model, sequences, *, num_loops=3, num_sampling_steps=20,
-                   num_diffusion_samples=1, seed=0):
-    """Fold an iterable of sequences with an already-patched, weight-resident model.
-
-    `sequences` is an iterable of ``(id, sequence)`` pairs (or bare sequence
-    strings). Yields ``(id, result, seconds)`` per protein. All weights stay
-    loaded across the batch — only the first protein pays the ESMC load.
-    """
-    import time
-
-    for i, item in enumerate(sequences):
-        pid, seq = item if isinstance(item, (tuple, list)) else (f"seq{i}", item)
-        t0 = time.time()
-        res = fold_complex(model, [("A", seq)], num_loops=num_loops,
-                           num_sampling_steps=num_sampling_steps,
-                           num_diffusion_samples=num_diffusion_samples, seed=seed)
-        yield pid, res, time.time() - t0
 
 
 def resolve_msa(msa_spec, sequence, msa_dir=None, max_sequences=16384):
