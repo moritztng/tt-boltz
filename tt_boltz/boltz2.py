@@ -1383,19 +1383,17 @@ def single_to_keys(single, indexing_matrix, W, H):
 
 def _tt_to(x, dtype=None):
     """Upload a (float) torch tensor to the TT device, tiled, bfloat16 by default."""
-    import tt_boltz.tenstorrent as _tt
-    ttnn = _tt.ttnn
+    ttnn = tenstorrent.ttnn
     return ttnn.from_torch(x.float() if torch.is_floating_point(x) else x,
                            layout=ttnn.TILE_LAYOUT, dtype=dtype or ttnn.bfloat16,
-                           device=_tt.get_device())
+                           device=tenstorrent.get_device())
 
 
 def _tt_ids(x):
     """Upload an integer torch tensor as a row-major uint32 device tensor (embedding lookups)."""
-    import tt_boltz.tenstorrent as _tt
-    ttnn = _tt.ttnn
+    ttnn = tenstorrent.ttnn
     return ttnn.from_torch(x.to(torch.uint32), layout=ttnn.ROW_MAJOR_LAYOUT,
-                           dtype=ttnn.uint32, device=_tt.get_device())
+                           dtype=ttnn.uint32, device=tenstorrent.get_device())
 
 
 class AtomEncoder(Module):
@@ -4045,9 +4043,8 @@ class AtomDiffusion(Module):
         update comes down each step. Per-step RNG and schedule scalars are
         precomputed on host.
         """
-        import tt_boltz.tenstorrent as tt
-        ttnn = tt.ttnn
-        dev = tt.get_device()
+        ttnn = tenstorrent.ttnn
+        dev = tenstorrent.get_device()
         bf16 = ttnn.bfloat16
         TILE = ttnn.TILE_LAYOUT
         sd, ns = self.sigma_data, self.noise_scale
@@ -5278,13 +5275,12 @@ class Boltz2(nn.Module):
         step 1). Builds the host feature contract from feats, runs on device,
         returns s_inputs as a torch tensor. Falls through to the caller for the
         rest of the forward."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
+        ttnn = tenstorrent.ttnn
         ie = getattr(self, "_tt_ie", None)
         if ie is None:
             kc = self.msa_module.compute_kernel_config
-            ie = _tt.InputEmbedder(
-                _tt.WeightScope.wrap(self.input_embedder.state_dict()), kc, 3, 4, 128)
+            ie = tenstorrent.InputEmbedder(
+                tenstorrent.WeightScope.wrap(self.input_embedder.state_dict()), kc, 3, 4, 128)
             self._tt_ie = ie
 
         g = self._atom_geom(feats)
@@ -5299,14 +5295,14 @@ class Boltz2(nn.Module):
         h = {
             "atom_feats": to(g["atom_feats"]), "d": to(g["d"]),
             "d_norm": to(g["d_norm"]), "v": to(g["v"]),
-            "idx_T": to(idx.t().contiguous()), "keys_idx": to(idx, _ttnn.bfloat4_b),
+            "idx_T": to(idx.t().contiguous()), "keys_idx": to(idx, ttnn.bfloat4_b),
             "atom_mask": to(feats["atom_pad_mask"].float()), "att_mean_T": to(att_mean_T),
             "res_type": to(feats["res_type"].float()), "profile_del": to(profile_del),
             "method": ids(feats["method_feature"]), "modified": ids(feats["modified"]),
             "cyclic": to(cyclic), "mol_type": ids(feats["mol_type"]),
         }
         out = ie(h, g["dims"])
-        return torch.Tensor(_ttnn.to_torch(out)).to(torch.float32)
+        return torch.Tensor(ttnn.to_torch(out)).to(torch.float32)
 
     def _atom_geom(self, feats, W=32, H=128):
         """Windowed per-atom geometry shared by the input-embedder and diffusion-
@@ -5336,16 +5332,17 @@ class Boltz2(nn.Module):
 
     def _atom_host_prep(self, feats, W=32, H=128):
         """ttnn host-feature dict for the diffusion-conditioning atom encoder."""
+        to = _tt_to
         g = self._atom_geom(feats, W, H)
         _, _, K, _, _ = g["dims"]
         tk = g["tk"]
         att = feats["atom_to_token"].float()
         att_k = tk(att).reshape(K, H, g["Ntok"])
         host = {
-            "atom_feats": _tt_to(g["atom_feats"]), "d": _tt_to(g["d"]),
-            "d_norm": _tt_to(g["d_norm"]), "v": _tt_to(g["v"]),
-            "idx_T": _tt_to(g["idx"].t().contiguous()), "att": _tt_to(att),
-            "att_q": _tt_to(att), "att_k": _tt_to(att_k),
+            "atom_feats": to(g["atom_feats"]), "d": to(g["d"]),
+            "d_norm": to(g["d_norm"]), "v": to(g["v"]),
+            "idx_T": to(g["idx"].t().contiguous()), "att": to(att),
+            "att_q": to(att), "att_k": to(att_k),
         }
         return host, g["dims"], tk
 
@@ -5376,24 +5373,22 @@ class Boltz2(nn.Module):
         """Device-resident chaining: if x's device version was stashed this
         forward, return a device-to-device CLONE (no host upload); else None so
         the caller uploads from host. Freed before the diffusion sample."""
-        import tt_boltz.tenstorrent as _tt
         cache = getattr(self, "_chain_cache", None)
         if cache:
             dev_t = cache.get(id(x))
             if dev_t is not None:
-                return _tt.ttnn.clone(dev_t)
+                return tenstorrent.ttnn.clone(dev_t)
         return None
 
     def _chain_free(self):
         """Free the stashed device activations, before the diffusion sample (a
         device-resident sampler must not coexist with leftover chained tensors)."""
-        import tt_boltz.tenstorrent as _tt
         cache = getattr(self, "_chain_cache", None)
         if not cache:
             return
         for t in cache.values():
             try:
-                _tt.ttnn.deallocate(t)
+                tenstorrent.ttnn.deallocate(t)
             except Exception:
                 pass
         self._chain_cache = None
@@ -5401,17 +5396,16 @@ class Boltz2(nn.Module):
     def _tt_z_init(self, s_inputs, feats):
         """Compute s_init, z_init, relative_position_encoding via ttnn (assembly).
         Returns torch tensors."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
+        ttnn = tenstorrent.ttnn
         ze = getattr(self, "_tt_zinit", None)
         if ze is None:
             kc = self.msa_module.compute_kernel_config
-            root = _tt.WeightScope.wrap(self.state_dict())
+            root = tenstorrent.WeightScope.wrap(self.state_dict())
             ze = {
-                "lin": _tt.PreTrunkLinears(root, kc),
-                "rel": _tt.RelPosLinear(root.child("rel_pos"), kc),
-                "tb": _tt.TypeBondEmbedding(root.child("token_bonds_type"), kc),
-                "cc": _tt.ContactConditioning(root.child("contact_conditioning"), kc),
+                "lin": tenstorrent.PreTrunkLinears(root, kc),
+                "rel": tenstorrent.RelPosLinear(root.child("rel_pos"), kc),
+                "tb": tenstorrent.TypeBondEmbedding(root.child("token_bonds_type"), kc),
+                "cc": tenstorrent.ContactConditioning(root.child("contact_conditioning"), kc),
             }
             self._tt_zinit = ze
 
@@ -5420,31 +5414,30 @@ class Boltz2(nn.Module):
         s_init, z = ze["lin"](si, to(feats["token_bonds"].float()))
         _drb, _dtb, _seb, _dcb = self._rel_pos_bins(feats)
         rpe = ze["rel"](ids(_drb), ids(_dtb), ids(_seb), ids(_dcb))
-        z = _ttnn.add(z, rpe)
-        z = _ttnn.add(z, ze["tb"](ids(feats["type_bonds"])))
+        z = ttnn.add(z, rpe)
+        z = ttnn.add(z, ze["tb"](ids(feats["type_bonds"])))
         cc = feats["contact_conditioning"].float(); thr = feats["contact_threshold"].float()
         thr_norm = ((thr - 4.0) / 16.0).unsqueeze(-1)
-        z = _ttnn.add(z, ze["cc"](to(cc[:, :, :, 2:]), to(thr_norm), to(cc[:, :, :, 0:1]), to(cc[:, :, :, 1:2])))
-        g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
+        z = ttnn.add(z, ze["cc"](to(cc[:, :, :, 2:]), to(thr_norm), to(cc[:, :, :, 0:1]), to(cc[:, :, :, 1:2])))
+        g = lambda x: torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
         s_init_t, z_t, rpe_t = g(s_init), g(z), g(rpe)
         # Device-resident chaining: stash a stable device clone of rel_pos (a 64MB
         # [1,N,N,128] tensor) so diffusion_conditioning reuses it without a host
         # re-upload. Keyed by the torch object id; cloned because the original is
         # about to be GC'd. Only when chaining is active for this forward.
         if getattr(self, "_chain_cache", None) is not None:
-            self._chain_cache[id(rpe_t)] = _ttnn.clone(rpe)
+            self._chain_cache[id(rpe_t)] = ttnn.clone(rpe)
         return s_init_t, z_t, rpe_t
 
     def _tt_confidence(self, s_inputs, s, z, x_pred, feats, multiplicity, pred_distogram_logits):
         """Confidence via ttnn ConfidenceModule.reps (conditioning + pairformer on
         device); the torch confidence_heads then does logits + ptm/iptm aggregation
         (host metric post-processing). multiplicity==1 (simplest case)."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
+        ttnn = tenstorrent.ttnn
         cm = getattr(self, "_tt_cm", None)
         if cm is None:
-            cm = _tt.ConfidenceModule(
-                _tt.WeightScope.wrap(self.confidence_module.state_dict()),
+            cm = tenstorrent.ConfidenceModule(
+                tenstorrent.WeightScope.wrap(self.confidence_module.state_dict()),
                 self.msa_module.compute_kernel_config,
                 pairformer=self.confidence_module.pairformer_stack.module)
             self._tt_cm = cm
@@ -5468,12 +5461,12 @@ class Boltz2(nn.Module):
         pf_mask = to(pair_p); pf_attn = to((1 - m1d_p).unsqueeze(1).unsqueeze(1) * -1e9)
         zpad_s = to(torch.zeros(B, pad_t, s.shape[-1])) if pad_t else None
         def pad_s(t):
-            return _ttnn.concat([t, zpad_s], dim=1) if pad_t else t
+            return ttnn.concat([t, zpad_s], dim=1) if pad_t else t
         def pad_z(t):
             if not pad_t:
                 return t
-            t = _ttnn.concat([t, to(torch.zeros(B, pad_t, Ntok, z.shape[-1]))], dim=1)
-            return _ttnn.concat([t, to(torch.zeros(B, P, pad_t, z.shape[-1]))], dim=2)
+            t = ttnn.concat([t, to(torch.zeros(B, pad_t, Ntok, z.shape[-1]))], dim=1)
+            return ttnn.concat([t, to(torch.zeros(B, P, pad_t, z.shape[-1]))], dim=2)
 
         cc = feats["contact_conditioning"].float(); thr = feats["contact_threshold"].float()
         _rb = self._rel_pos_bins(feats)
@@ -5488,7 +5481,7 @@ class Boltz2(nn.Module):
             "pad_s": pad_s, "pad_z": pad_z,
         }
         s_t, z_t = cm.reps(to(s_inputs), to(s), to(z), host, (B, Ntok))
-        g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
+        g = lambda x: torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
         s_t, z_t = g(s_t), g(z_t)
         out = self.confidence_module.confidence_heads(
             s=s_t, z=z_t, x_pred=x_pred, d=d, feats=feats,
@@ -5499,13 +5492,12 @@ class Boltz2(nn.Module):
         """Compute the diffusion conditioning (q, c, biases, to_keys) via the ttnn
         DiffusionConditioning. Returns torch tensors (or device tensors handed to
         the score model directly when chaining the conditioning) + to_keys."""
-        import tt_boltz.tenstorrent as _tt
-        _ttnn = _tt.ttnn
+        ttnn = tenstorrent.ttnn
         dc = getattr(self, "_tt_dc", None)
         if dc is None:
             kc = self.msa_module.compute_kernel_config
-            dc = _tt.DiffusionConditioning(
-                _tt.WeightScope.wrap(self.diffusion_conditioning.state_dict()), kc)
+            dc = tenstorrent.DiffusionConditioning(
+                tenstorrent.WeightScope.wrap(self.diffusion_conditioning.state_dict()), kc)
             self._tt_dc = dc
 
         to = _tt_to
@@ -5522,10 +5514,10 @@ class Boltz2(nn.Module):
             # The score model's static build (DiffusionModule.forward) detects ttnn
             # inputs and pads them on device. atom biases reshaped to [B,K,W,H,-1].
             out = (q, c, tk,
-                   _ttnn.reshape(aeb, (B, K, W, H, -1)),
-                   _ttnn.reshape(adb, (B, K, W, H, -1)), ttb)
+                   ttnn.reshape(aeb, (B, K, W, H, -1)),
+                   ttnn.reshape(adb, (B, K, W, H, -1)), ttb)
             return out
-        g = lambda x: torch.Tensor(_ttnn.to_torch(x)).to(torch.float32)
+        g = lambda x: torch.Tensor(ttnn.to_torch(x)).to(torch.float32)
         out = (g(q), g(c), tk,
                g(aeb).reshape(B, K, W, H, -1), g(adb).reshape(B, K, W, H, -1), g(ttb))
         return out
@@ -5684,16 +5676,15 @@ class Boltz2(nn.Module):
                 )
 
         if _resident:
-            import tt_boltz.tenstorrent as _tt
             _dm = getattr(self, "_tt_distogram", None)
             if _dm is None:
-                _dm = _tt.Distogram(_tt.WeightScope.wrap(self.distogram_module.state_dict()),
+                _dm = tenstorrent.Distogram(tenstorrent.WeightScope.wrap(self.distogram_module.state_dict()),
                                     self.msa_module.compute_kernel_config)
                 self._tt_distogram = _dm
             _zt = self._chain_get(z)  # device clone if chaining, else upload
             if _zt is None:
                 _zt = _tt_to(z)
-            _out = torch.Tensor(_tt.ttnn.to_torch(_dm(_zt))).to(torch.float32)
+            _out = torch.Tensor(tenstorrent.ttnn.to_torch(_dm(_zt))).to(torch.float32)
             pdistogram = _out.reshape(z.shape[0], z.shape[1], z.shape[2], 1, -1)
         else:
             pdistogram = self.distogram_module(z)
