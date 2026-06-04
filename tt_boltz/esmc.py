@@ -481,6 +481,10 @@ class ESMCLanguageModel(TorchWrapper):
         return ESMCHiddenStatesModel(self.n_heads, self.n_layers, weights, self.compute_kernel_config)
 
     def forward(self, input_ids: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # NB: the LM length is NOT bucketed. Padding the LM input + masking the
+        # padded keys measurably perturbs the real tokens' hidden states (~0.04 Å
+        # RMSD regression on ubiquitin) — unlike the trunk / atom paths, the ESMC
+        # attention doesn't zero invalid outputs, so its padding isn't exact.
         tokens_tt = ttnn.from_torch(
             input_ids.to(torch.int32), device=self.tt_device,
             layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,

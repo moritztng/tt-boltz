@@ -90,7 +90,11 @@ def _sdpa_bf16(q, k, v, attn_mask, scale):
     return ctx
 
 C_Z = 256  # pair channels
-PAD_MULTIPLE = 32  # pad seq to a tile multiple so the triangle contraction excludes padding
+BUCKET = 64  # bucket varying-length dims to multiples of 64 (matches tt-boltz
+#              PAIRFORMER_PAD_MULTIPLE) so kernels are shared across nearby
+#              lengths instead of recompiling per length. Padding is masked out,
+#              so results are identical.
+PAD_MULTIPLE = BUCKET  # token-dim bucket for the folding trunk (pads + masks + slices)
 
 
 def _remap_trimul(sd: dict, prefix: str) -> WeightScope:
