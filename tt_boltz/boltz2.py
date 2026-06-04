@@ -4019,18 +4019,19 @@ class AtomDiffusion(Module):
         self, atom_coords, atom_mask, sigmas_and_gammas, step_scale,
         network_condition_kwargs, progress_fn, n_steps,
     ):
-        """Device-resident reverse-diffusion loop (simplest case).
+        """Reverse-diffusion loop keeping the score model device-resident.
 
-        The atom coords stay on the TT device for the whole loop; per step the
-        augmentation, noise, preconditioning, score-model forward, on-device
-        Kabsch alignment and EDM update all run on device. Per-step RNG and
-        schedule scalars are precomputed on host and fed in.
+        The expensive score model stays on the TT device with its conditioning
+        cached once; the cheap per-step glue (augmentation, noise, preconditioning,
+        Kabsch alignment, EDM update) runs in host fp32 torch — bit-identical to
+        the CPU/main path — so only the padded r/times go up and the [1,N,3]
+        update comes down each step. Per-step RNG and schedule scalars are
+        precomputed on host.
         """
         import tt_boltz.tenstorrent as tt
         ttnn = tt.ttnn
         dev = tt.get_device()
-        kc = self.score_model.compute_kernel_config
-        f32, bf16 = ttnn.float32, ttnn.bfloat16
+        bf16 = ttnn.bfloat16
         TILE = ttnn.TILE_LAYOUT
         sd, ns = self.sigma_data, self.noise_scale
 
@@ -4063,52 +4064,37 @@ class AtomDiffusion(Module):
         N_padded = self.score_model._cache_get("N_padded")  # noqa: SLF001
         atom_pad = N_padded - N
 
-        def to(x, dtype=f32):
-            return ttnn.from_torch(x, layout=TILE, dtype=dtype, device=dev)
-
-        coords = to(atom_coords.float())                       # [1,N,3] f32
-        weights = to(atom_mask.float().unsqueeze(-1))           # [1,N,1] f32
-        zeros_pad = to(torch.zeros(1, atom_pad, 3), bf16) if atom_pad else None
-        inv_n = 1.0 / N
-
-        def step_body(coords, st):
-            # augmentation: center (plain mean over atoms), rotate, translate
-            mean = ttnn.multiply(ttnn.sum(coords, dim=1, keepdim=True), inv_n)
-            ac = ttnn.subtract(coords, mean)
-            ac = ttnn.matmul(ac, st["R"], compute_kernel_config=kc, dtype=f32)
-            ac = ttnn.add(ac, st["tr"])
-            noisy = ttnn.add(ac, st["eps"])                    # [1,N,3] f32
-            # preconditioned score-model forward: r_noisy = c_in*noisy (fp32),
-            # cast bf16 + zero-pad to N_padded for the score model.
-            r_noisy = ttnn.typecast(ttnn.multiply(noisy, st["c_in"]), bf16)
-            np_ = ttnn.concat([r_noisy, zeros_pad], dim=1) if atom_pad else r_noisy
-            upd = self.score_model.forward_device(np_, st["times"])   # [1,N_padded,3]
-            upd = ttnn.typecast(ttnn.slice(upd, [0, 0, 0], [1, N, 3]), f32)
-            denoised = ttnn.add(ttnn.multiply(noisy, st["c_skip"]),
-                                ttnn.multiply(upd, st["c_out"]))          # [1,N,3] f32
-            aligned = tt.weighted_rigid_align_tt(noisy, denoised, weights, kc)
-            nxt = ttnn.add(aligned, ttnn.multiply(ttnn.subtract(aligned, denoised), st["coef"]))
-            return nxt
-
-        def host_inputs(st):
-            return {
-                "R": st["R"], "tr": st["tr"], "eps": st["eps"],
-                "times": torch.full((1,), st["times"]),
-                "c_in": torch.full((1, 1, 1), st["c_in"]),
-                "c_skip": torch.full((1, 1, 1), st["c_skip"]),
-                "c_out": torch.full((1, 1, 1), st["c_out"]),
-                "coef": torch.full((1, 1, 1), st["coef"]),
-            }
-
-        _dtypes = {"R": f32, "tr": f32, "eps": f32, "times": bf16,
-                   "c_in": f32, "c_skip": f32, "c_out": f32, "coef": f32}
-
+        # The reverse-diffusion glue (augmentation, preconditioning, Kabsch
+        # alignment, EDM update) runs on host in fp32 torch — bit-identical to the
+        # CPU/main path, so the structure accuracy matches main exactly. Only the
+        # expensive score model stays device-resident: its conditioning is cached
+        # (primed above), so each step just uploads the padded r/times and
+        # downloads the [1,N,3] update via forward_device (no per-step wrapper or
+        # conditioning re-upload). The on-device glue was both imprecise (bf16
+        # matmul augmentation) and unnecessary — the coords are tiny.
+        pad = torch.nn.functional.pad
+        am = atom_mask.float()                                  # [1, N]
+        coords = atom_coords.float()                            # [1, N, 3] torch
         for i, st in enumerate(steps):
             if progress_fn and i % 10 == 0:
                 progress_fn("diffusion", step=i, total=n_steps)
-            hi = host_inputs(st)
-            coords = step_body(coords, {k: to(v, _dtypes[k]) for k, v in hi.items()})
-        return torch.Tensor(ttnn.to_torch(coords)).to(torch.float32)[:, :N, :]
+            # augmentation: center (plain mean), rotate, translate, add noise
+            mean = coords.mean(dim=1, keepdim=True)
+            noisy = torch.einsum("bmd,bds->bms", coords - mean, st["R"]) + st["tr"] + st["eps"]
+            # preconditioned score model forward on device (conditioning cached)
+            r_noisy = (noisy * st["c_in"]).to(torch.float32)
+            if atom_pad:
+                r_noisy = pad(r_noisy, (0, 0, 0, atom_pad))
+            r_dev = ttnn.from_torch(r_noisy, layout=TILE, dtype=bf16, device=dev)
+            t_dev = ttnn.from_torch(torch.full((1,), st["times"]), layout=TILE, dtype=bf16, device=dev)
+            upd_dev = self.score_model.forward_device(r_dev, t_dev)   # [1, N_padded, 3]
+            # slice to real atoms on device so only [1,N,3] crosses the bus
+            upd_dev = ttnn.slice(upd_dev, [0, 0, 0], [1, N, 3]) if atom_pad else upd_dev
+            upd = torch.Tensor(ttnn.to_torch(upd_dev)).to(torch.float32)
+            denoised = noisy * st["c_skip"] + upd * st["c_out"]
+            aligned = weighted_rigid_align(noisy, denoised, am, am)
+            coords = aligned + (aligned - denoised) * st["coef"]
+        return coords[:, :N, :]
 
     def sample(
         self,

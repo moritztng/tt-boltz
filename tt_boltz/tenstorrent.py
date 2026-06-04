@@ -2774,69 +2774,6 @@ class TrunkModule(TorchWrapper):
         return s, z
 
 
-# ---------------------------------------------------------------------------
-# On-device weighted rigid (Kabsch) alignment.
-#
-# Replaces boltz2.weighted_rigid_align's torch SVD with a matmul-only Newton-
-# Schulz polar decomposition so the diffusion reverse-alignment can run on the
-# TT device (ttnn has no svd/eig/qr). For coords of the same molecule (noisy =
-# denoised + noise, identical chirality) the optimal alignment is a proper
-# rotation (det +1), so the orthogonal polar factor equals the Kabsch rotation
-# and no reflection correction is needed. Validated against the torch SVD
-# reference to ~1e-5 (see scripts/verify_kabsch_tt.py).
-# ---------------------------------------------------------------------------
-
-NEWTON_SCHULZ_ITERS = 8
-
-
-def weighted_rigid_align_tt(
-    true_coords: ttnn.Tensor,      # [B, N, 3]
-    pred_coords: ttnn.Tensor,      # [B, N, 3]
-    weights: ttnn.Tensor,          # [B, N, 1]
-    compute_kernel_config,
-    iters: int = NEWTON_SCHULZ_ITERS,
-) -> ttnn.Tensor:
-    """Align true_coords onto pred_coords (weighted Kabsch), entirely on device.
-
-    Mirrors boltz2.weighted_rigid_align(true, pred, weights, mask) for the
-    diffusion call where mask == weights. Returns aligned true_coords [B, N, 3].
-    """
-    mm = lambda a, b, **kw: ttnn.matmul(a, b, compute_kernel_config=compute_kernel_config,
-                                        dtype=ttnn.float32, **kw)
-
-    # Work in fp32 throughout: the tensors are tiny ([B,N,3] / [B,3,3]) so the
-    # cost is negligible, and the alignment is sensitive enough that bf16 coords
-    # measurably degrade the diffusion trajectory.
-    true_coords = ttnn.typecast(true_coords, ttnn.float32)
-    pred_coords = ttnn.typecast(pred_coords, ttnn.float32)
-    weights = ttnn.typecast(weights, ttnn.float32)
-
-    w_sum = ttnn.sum(weights, dim=1, keepdim=True)               # [B,1,1]
-    inv_w = ttnn.reciprocal(w_sum)
-    true_centroid = ttnn.multiply(ttnn.sum(ttnn.multiply(true_coords, weights), dim=1, keepdim=True), inv_w)
-    pred_centroid = ttnn.multiply(ttnn.sum(ttnn.multiply(pred_coords, weights), dim=1, keepdim=True), inv_w)
-    t = ttnn.subtract(true_coords, true_centroid)                # [B,N,3]
-    p = ttnn.subtract(pred_coords, pred_centroid)
-
-    # cov = (w * p)^T @ t  -> [B,3,3]
-    wp = ttnn.multiply(p, weights)
-    cov = mm(wp, t, transpose_a=True)                            # [B,3,3]
-
-    # Scale by 1/Frobenius so all singular values land in (0, 1) < sqrt(3)
-    fro = ttnn.sqrt(ttnn.sum(ttnn.multiply(cov, cov), dim=[1, 2], keepdim=True))
-    Y = ttnn.multiply(cov, ttnn.reciprocal(fro))
-
-    # Newton-Schulz: Y <- 1.5 Y - 0.5 Y Y^T Y  (converges to the polar factor U V^T)
-    for _ in range(iters):
-        yt = mm(Y, Y, transpose_a=True)            # Y^T Y  [B,3,3]
-        yyty = mm(Y, yt)                            # Y (Y^T Y)
-        Y = ttnn.subtract(ttnn.multiply(Y, 1.5), ttnn.multiply(yyty, 0.5))
-
-    # aligned = t @ Y^T + pred_centroid
-    aligned = ttnn.add(mm(t, Y, transpose_b=True), pred_centroid)
-    return aligned
-
-
 class Distogram(Module):
     """ttnn DistogramModule: z = z + z^T (over token dims); Linear(token_z -> bins).
 
