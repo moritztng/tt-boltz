@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 import gemmi
 from rdkit import Chem, rdBase
-from rdkit.Chem import AllChem, HybridizationType
+from rdkit.Chem import AllChem, Descriptors, HybridizationType
 from sklearn.neighbors import KDTree
 from tt_boltz.data.mol import load_molecules
 from tt_boltz.data.types import (
@@ -2938,7 +2938,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 ref_mol = get_mol(code, ccd, mol_dir)
 
                 if affinity:
-                    affinity_mw = AllChem.Descriptors.MolWt(ref_mol)
+                    affinity_mw = Descriptors.MolWt(ref_mol)
 
                     # Add error and warning messaging when computing affinity with ligands too large
                     if ref_mol.GetNumAtoms() > 128:
@@ -3010,7 +3010,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     print("WARNING: the ligand used for affinity calculation is larger than 56 heavy-atoms, "
                           "which was the maximum during training, therefore the affinity output might be inaccurate.")
 
-            affinity_mw = AllChem.Descriptors.MolWt(mol_no_h) if affinity else None
+            affinity_mw = Descriptors.MolWt(mol_no_h) if affinity else None
             extra_mols[f"LIG{ligand_id}"] = mol_no_h
             residue = parse_ccd_residue(
                 name=f"LIG{ligand_id}",

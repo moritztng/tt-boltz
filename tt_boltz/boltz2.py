@@ -4775,9 +4775,13 @@ class AffinityModule(nn.Module):
         num_dist_bins=64,
         max_dist=22,
         groups: dict = {},
+        use_cross_transformer: bool = False,
         use_tenstorrent: bool = False,
     ):
         super().__init__()
+        # The released affinity checkpoint sets this off; the cross-transformer
+        # variant isn't ported, so accept the arg but only support the off path.
+        assert not use_cross_transformer, "use_cross_transformer affinity head not supported"
         self.use_tenstorrent = use_tenstorrent
         boundaries = torch.linspace(2, max_dist, num_dist_bins - 1)
         self.register_buffer("boundaries", boundaries)
