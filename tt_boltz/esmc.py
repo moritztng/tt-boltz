@@ -27,6 +27,7 @@ from tt_boltz.tenstorrent import (
     TorchWrapper,
     Weights,
     WeightScope,
+    _dtype,
     _sdpa_program_config_for_lengths,
     get_device,
 )
@@ -138,10 +139,14 @@ class Attention(Module):
         self.n_heads = n_heads
         self.in_norm_weight = self.torch_to_tt("layernorm_qkv.0.weight")
         self.in_norm_bias = self.torch_to_tt("layernorm_qkv.0.bias")
-        self.qkv_weight = self.torch_to_tt("layernorm_qkv.1.weight")
+        # The two big projection weights (qkv, out_proj) carry the bulk of the
+        # ESMC-6B's parameters; in fast mode they load as block-fp8 (bfloat8_b),
+        # halving their weight-read bandwidth and resident size. _dtype() is bf16
+        # otherwise (full precision, the default).
+        self.qkv_weight = self.torch_to_tt("layernorm_qkv.1.weight", dtype=_dtype())
         self.q_ln_weight = self.torch_to_tt("q_ln.weight")
         self.k_ln_weight = self.torch_to_tt("k_ln.weight")
-        self.out_weight = self.torch_to_tt("out_proj.weight")
+        self.out_weight = self.torch_to_tt("out_proj.weight", dtype=_dtype())
 
     def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor,
                  attn_mask: ttnn.Tensor | None = None,
@@ -206,8 +211,11 @@ class SwiGLUFFN(Module):
         super().__init__(state_dict, compute_kernel_config)
         self.norm_weight = self.torch_to_tt("0.weight")
         self.norm_bias = self.torch_to_tt("0.bias")
-        self.fc1_weight = self.torch_to_tt("1.weight")
-        self.fc2_weight = self.torch_to_tt("3.weight")
+        # fc1/fc2 are the FFN's big matmuls (and the bulk of the ESMC-6B FLOPs);
+        # block-fp8 in fast mode, bf16 otherwise. Shared with the folding trunk's
+        # pair-transition, so fast mode bf8's that too.
+        self.fc1_weight = self.torch_to_tt("1.weight", dtype=_dtype())
+        self.fc2_weight = self.torch_to_tt("3.weight", dtype=_dtype())
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
