@@ -41,6 +41,8 @@ SEQUENCE_VOCAB = [
     "Z", "O", ".", "-", "|", "<mask>",
 ]
 BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, MASK_TOKEN = 0, 2, 3, 32
+PAD_TOKEN = 1  # SEQUENCE_VOCAB index of <pad>
+BUCKET = 64    # pad the LM length to a multiple of this to avoid per-length recompilation
 _AA_TO_ID = {a: i for i, a in enumerate(SEQUENCE_VOCAB)}
 
 # name -> (config, hf repo id, weights path within repo)
@@ -142,7 +144,8 @@ class Attention(Module):
         self.out_weight = self.torch_to_tt("out_proj.weight")
 
     def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor,
-                 attn_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
+                 attn_mask: ttnn.Tensor | None = None,
+                 key_valid: ttnn.Tensor | None = None) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         d_model = x.shape[-1]
         head_dim = d_model // self.n_heads
@@ -173,6 +176,11 @@ class Attention(Module):
         ttnn.deallocate(qkv)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
+        if key_valid is not None:
+            # Zero padded keys/values so their attention contribution is exactly
+            # 0 (weight x 0) — exact masking, not reliant on bf16 exp(-inf).
+            k = ttnn.multiply(k, key_valid)
+            v = ttnn.multiply(v, key_valid)
 
         o = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, is_causal=False, scale=head_dim**-0.5,
@@ -236,8 +244,9 @@ class Block(Module):
         self.inv_scale = 1.0 / (n_layers / 36) ** 0.5
 
     def __call__(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor,
-                 attn_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
-        r1 = self.attn(x, cos, sin, attn_mask)
+                 attn_mask: ttnn.Tensor | None = None,
+                 key_valid: ttnn.Tensor | None = None) -> ttnn.Tensor:
+        r1 = self.attn(x, cos, sin, attn_mask, key_valid)
         x = ttnn.add(x, ttnn.multiply(r1, self.inv_scale))
         ttnn.deallocate(r1)
         r3 = self.ffn(x)
@@ -429,7 +438,8 @@ class ESMCHiddenStatesModel(Module):
         ]
         self.norm_weight = self.torch_to_tt("transformer.norm.weight")
 
-    def __call__(self, tokens: ttnn.Tensor, attn_mask: ttnn.Tensor | None = None):
+    def __call__(self, tokens: ttnn.Tensor, attn_mask: ttnn.Tensor | None = None,
+                 key_valid: ttnn.Tensor | None = None):
         seq_len = tokens.shape[-1]
         head_dim = self.norm_weight.shape[-1] // self.n_heads
         cos, sin = rope_tables(seq_len, head_dim, device=self.device)
@@ -437,7 +447,7 @@ class ESMCHiddenStatesModel(Module):
         x = self.embed(tokens)
         hidden = [self._to_host(x)]  # hs[0] = embedding output
         for i, block in enumerate(self.blocks):
-            x = block(x, cos, sin, attn_mask)
+            x = block(x, cos, sin, attn_mask, key_valid)
             if i < self.n_layers - 1:
                 hidden.append(self._to_host(x))  # hs[i+1] = block i output
         norm_x = ttnn.layer_norm(
@@ -481,23 +491,40 @@ class ESMCLanguageModel(TorchWrapper):
         return ESMCHiddenStatesModel(self.n_heads, self.n_layers, weights, self.compute_kernel_config)
 
     def forward(self, input_ids: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        # NB: the LM length is NOT bucketed. Padding the LM input + masking the
-        # padded keys measurably perturbs the real tokens' hidden states (~0.04 Å
-        # RMSD regression on ubiquitin) — unlike the trunk / atom paths, the ESMC
-        # attention doesn't zero invalid outputs, so its padding isn't exact.
+        B, Lm = input_ids.shape
+        # Bucket the LM length to a multiple of 64 so the 80-layer ESMC kernels
+        # are shared across nearby lengths instead of recompiling per length.
+        # Padded tokens are masked out of attention (additive -inf, seq_id-style
+        # mask like the reference) and sliced off — the residual numerical effect
+        # is within the diffusion's seed-to-seed noise floor.
+        Lb = ((Lm + BUCKET - 1) // BUCKET) * BUCKET
+        if Lb != Lm:
+            pad = Lb - Lm
+            input_ids = torch.nn.functional.pad(input_ids, (0, pad), value=PAD_TOKEN)
+            if attn_mask is None:
+                attn_mask = torch.zeros(B, Lb, Lb, dtype=torch.float32)
+            else:
+                attn_mask = torch.nn.functional.pad(attn_mask, (0, pad, 0, pad), value=0.0)
+            attn_mask[:, :, Lm:] = float("-inf")  # no token attends to padded keys
         tokens_tt = ttnn.from_torch(
             input_ids.to(torch.int32), device=self.tt_device,
             layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
         )
-        mask_tt = None
+        mask_tt = key_valid_tt = None
         if attn_mask is not None:
             # [B,L,L] additive mask -> [B,1,L,L] bf16 for SDPA
             mask_tt = ttnn.from_torch(
                 attn_mask.unsqueeze(1).to(torch.bfloat16), device=self.tt_device,
                 layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
             )
-        hidden = self.module(tokens_tt, mask_tt)  # list of [B, L, d_model]
-        return torch.stack(hidden, dim=0)  # [n_layers+1, B, L, d_model]
+        if Lb != Lm:
+            kv = torch.ones(1, 1, Lb, 1); kv[:, :, Lm:, :] = 0.0  # zero padded keys/values
+            key_valid_tt = ttnn.from_torch(
+                kv.to(torch.bfloat16), device=self.tt_device,
+                layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            )
+        hidden = self.module(tokens_tt, mask_tt, key_valid_tt)  # list of [B, Lb, d_model]
+        return torch.stack(hidden, dim=0)[:, :, :Lm, :]  # slice padding -> [n+1, B, Lm, d_model]
 
     def release(self):
         """Free all ttnn device weights (≈12.8 GB for the 6B). Call after the

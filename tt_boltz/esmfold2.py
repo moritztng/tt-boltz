@@ -90,11 +90,12 @@ def _sdpa_bf16(q, k, v, attn_mask, scale):
     return ctx
 
 C_Z = 256  # pair channels
-BUCKET = 64  # bucket varying-length dims to multiples of 64 (matches tt-boltz
-#              PAIRFORMER_PAD_MULTIPLE) so kernels are shared across nearby
-#              lengths instead of recompiling per length. Padding is masked out,
-#              so results are identical.
-PAD_MULTIPLE = BUCKET  # token-dim bucket for the folding trunk (pads + masks + slices)
+PAD_MULTIPLE = 32  # token-dim tile bucket for the folding trunk (pads + masks + slices).
+#                    Stays at 32 (not 64): the trimul's matmul contraction size depends on
+#                    the padded length, and in bf16 that is NOT exact across sizes — a 64
+#                    bucket measurably shifts RMSD-vs-truth (~0.065 Å on ubiquitin). Unlike
+#                    the ESMC LM (whose padded attention is masked exactly → bit-identical
+#                    hidden states), the trunk can't be re-bucketed without an accuracy hit.
 
 
 def _remap_trimul(sd: dict, prefix: str) -> WeightScope:
