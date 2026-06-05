@@ -378,6 +378,14 @@ def load_esmc6b_state_dict(snapshot_dir: str) -> dict:
 
     from safetensors import safe_open
 
+    import tt_boltz.tenstorrent as _tt
+
+    # Load straight to bf16 (the device dtype) so the upload moves/tiles half the
+    # data — ~2.6x faster ESMC-6B load, bit-identical (fp32->bf16 rounding just
+    # happens once, here vs in from_torch). In fast mode the big matmul weights
+    # become block-fp8, whose quantization is sensitive to the fp32 mantissa, so
+    # keep fp32 there to preserve exact fast-mode numerics.
+    load_dtype = torch.float32 if _tt._FAST_MODE else torch.bfloat16
     idx_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
     weight_map = json.load(open(idx_path))["weight_map"]
     by_shard: dict[str, list[str]] = {}
@@ -395,7 +403,7 @@ def load_esmc6b_state_dict(snapshot_dir: str) -> dict:
                 nk = k[len("esmc."):]  # drop the "esmc." prefix
                 for src, dst in _TE_KEY_REMAP:
                     nk = nk.replace(src, dst)
-                sd[nk] = f.get_tensor(k).float()
+                sd[nk] = f.get_tensor(k).to(load_dtype)
     _ = glob  # (kept for symmetry with other loaders)
     return sd
 
