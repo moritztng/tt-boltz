@@ -217,6 +217,7 @@ class _WorkerState:
             "plddt": round(float(res.plddt.mean()), 4),
             "n_residues": sum(len(c[1]) for c in chains), "n_chains": len(chains),
             "msa": any(c[2] is not None for c in chains),
+            "samples": cfg["diffusion_samples"],  # best-of-N: report N (plddt is the winner's)
         }
         if getattr(res, "ptm", None) is not None:
             metrics["ptm"] = round(float(res.ptm), 4)

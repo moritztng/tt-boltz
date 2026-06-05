@@ -1195,7 +1195,7 @@ class StructureHead(TorchWrapper):
         return DiffusionModuleModel(weights.child("diffusion_module"), self.compute_kernel_config)
 
     def sample(self, z_trunk, s_inputs, relpos, ref_pos, ref_charge, ref_mask, ref_element,
-               ref_atom_name_chars, ref_space_uid, tok_idx, steps=14, seed=0):
+               ref_atom_name_chars, ref_space_uid, tok_idx, steps=14, seed=0, multiplicity=1):
         # Build the step-invariant tensors ONCE and keep them resident on the
         # device for the whole trajectory: the pair conditioning, atom features,
         # 3D-RoPE / band / scatter / gather tables. Only the (tiny) noisy coords
@@ -1217,6 +1217,22 @@ class StructureHead(TorchWrapper):
         dmm.prepare(ft(s_inputs), ft(z_trunk), ft(relpos), ft(atom_feats.float()),
                     ft(cos.float()), ft(sin.float()), ft(band.float()),
                     ft(scatter_m.float()), ft(gather_g.float()), ft(valid))
+
+        # Best-of-N batching: the conditioning above is molecule-only (identical
+        # across diffusion samples), so replicate the resident tensors to
+        # `multiplicity` once — then a SINGLE B=N trajectory draws N distinct
+        # samples (different noise per batch row) for ~1x the device cost of one
+        # (B=1 underutilizes the grid). B=1 is untouched (bit-identical). The
+        # only data crossing PCIe per step stays the tiny noisy coords.
+        if multiplicity > 1:
+            def _rep(v):
+                if not isinstance(v, ttnn.Tensor):
+                    return v
+                r = ttnn.repeat(v, [multiplicity] + [1] * (len(v.shape) - 1))
+                ttnn.deallocate(v)
+                return r
+            dmm._ctx = {k: _rep(v) for k, v in dmm._ctx.items()}
+            ref_mask = ref_mask.repeat(multiplicity, 1)
 
         def denoise(x_noisy, t_hat):
             t = torch.as_tensor(t_hat, dtype=torch.float32).reshape(-1)
