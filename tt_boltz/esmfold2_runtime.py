@@ -123,21 +123,25 @@ class _Adapter(torch.nn.Module):
 
 
 class _StructureHeadAdapter(_Adapter):
-    """Diffusion sampler adapter — runs the ttnn sampler once per diffusion
-    sample (distinct seeds) to mirror the reference's multi-sample batching."""
+    """Diffusion sampler adapter — runs best-of-N as ONE batched B=N trajectory.
+
+    The diffusion conditioning is molecule-only (shared across samples), and a
+    single B=1 sample underutilizes the device, so the N samples run as one
+    B=N pass (distinct noise per row) for ~1x the cost of one — instead of N
+    serial calls. Output is [N, n_atoms, 3], the contract the confidence head
+    and best-of-N selection already expect."""
 
     def sample(self, *, z_trunk, s_inputs, relative_position_encoding, ref_pos, ref_charge,
                ref_mask, ref_element, ref_atom_name_chars, ref_space_uid, tok_idx,
                num_diffusion_samples: int = 1, num_sampling_steps=None, seed: int = 0,
                **_ignored):
         steps = 20 if num_sampling_steps is None else int(num_sampling_steps)
-        samples = [
-            self.m.sample(z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
-                          ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
-                          ref_atom_name_chars.float(), ref_space_uid, tok_idx, steps=steps, seed=seed + i)
-            for i in range(max(1, num_diffusion_samples))
-        ]
-        return {"sample_atom_coords": torch.cat(samples, dim=0)}  # [B*ns, N, 3]
+        coords = self.m.sample(
+            z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
+            ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
+            ref_atom_name_chars.float(), ref_space_uid, tok_idx,
+            steps=steps, seed=seed, multiplicity=max(1, num_diffusion_samples))
+        return {"sample_atom_coords": coords}  # [N, n_atoms, 3]
 
 
 # reference attribute -> (ttnn wrapper, state-dict prefix, reference kwarg order).
@@ -364,6 +368,11 @@ def fold_complex(model, chains, *, num_loops=3, num_sampling_steps=20,
     msa)`` where ``msa`` is an esm ``MSA`` object (or None for single-sequence).
     When an MSA is given the on-device MSA encoder runs. Returns the reference
     fold result (with `.complex`, `.plddt`, `.ptm`).
+
+    With ``num_diffusion_samples > 1`` the diffusion head emits one structure per
+    sample (distinct seeds); the reference ``fold`` returns them as a list. This
+    is best-of-N folding, so we return the single highest-confidence sample,
+    ranked by mean pLDDT (ESMFold's confidence metric) — not sample 0.
     """
     _ensure_reference_on_path()
     from esm.models.esmfold2 import (
@@ -377,4 +386,6 @@ def fold_complex(model, chains, *, num_loops=3, num_sampling_steps=20,
     res = ESMFold2InputBuilder().fold(
         model, spi, num_loops=num_loops, num_sampling_steps=num_sampling_steps,
         num_diffusion_samples=num_diffusion_samples, seed=seed)
-    return res[0] if isinstance(res, list) else res
+    if isinstance(res, list):
+        return max(res, key=lambda r: float(r.plddt.mean()))
+    return res
