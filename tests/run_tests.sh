@@ -3,17 +3,17 @@ set -e
 
 # Robust paths relative to this script's location
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TT_BOLTZ_DIR="$(dirname "$TESTS_DIR")"
-WORKSPACE="$(dirname "$TT_BOLTZ_DIR")"
+TT_BIO_DIR="$(dirname "$TESTS_DIR")"
+WORKSPACE="$(dirname "$TT_BIO_DIR")"
 TT_METAL_DIR="$WORKSPACE/tt-metal"
-LOGFILE="$TT_BOLTZ_DIR/test_run.log"
+LOGFILE="$TT_BIO_DIR/test_run.log"
 
 log() {
     echo -e "$1" | tee -a "$LOGFILE"
 }
 
 setup_env() {
-    cd "$TT_BOLTZ_DIR"
+    cd "$TT_BIO_DIR"
     source env/bin/activate
     
     # Ensure sfpi runtime is linked for TT hardware
@@ -34,16 +34,16 @@ build_stack() {
     log "--> Building tt-metal"
     ./build_metal.sh >> "$LOGFILE" 2>&1
 
-    log "--> Updating tt-boltz"
-    cd "$TT_BOLTZ_DIR"
+    log "--> Updating tt-bio"
+    cd "$TT_BIO_DIR"
     git pull origin main >> "$LOGFILE" 2>&1 || true
 
     log "--> Updating python virtual environment"
     source env/bin/activate
     
-    log "--> Installing tt-metal (ttnn) and tt-boltz"
+    log "--> Installing tt-metal (ttnn) and tt-bio"
     pip install -e "$TT_METAL_DIR" >> "$LOGFILE" 2>&1
-    # Strip strict ttnn versions before installing tt-boltz locally to allow the source metal wheel
+    # Strip strict ttnn versions before installing tt-bio locally to allow the source metal wheel
     sed -i 's/"ttnn==[0-9.]*"/"ttnn"/g' pyproject.toml
     pip install -e . >> "$LOGFILE" 2>&1
     # Restore the strict dependency for the repo
@@ -53,16 +53,16 @@ build_stack() {
 test_correctness() {
     log "=== Correctness Test Started: $(date) ==="
     setup_env
-    cd "$TT_BOLTZ_DIR"
+    cd "$TT_BIO_DIR"
     local SEED=48
     
     log "--> Predict (Normal): hemoglobin"
-    tt-boltz predict examples/hemoglobin.yaml --use_msa_server --override --seed $SEED >> "$LOGFILE" 2>&1
+    tt-bio predict examples/hemoglobin.yaml --use_msa_server --override --seed $SEED >> "$LOGFILE" 2>&1
     log "--> Eval (Normal):"
     python tests/test_structure.py hemoglobin | tee -a "$LOGFILE"
 
     log "--> Predict (Fast): hemoglobin"
-    tt-boltz predict examples/hemoglobin.yaml --use_msa_server --override --fast --seed $SEED >> "$LOGFILE" 2>&1
+    tt-bio predict examples/hemoglobin.yaml --use_msa_server --override --fast --seed $SEED >> "$LOGFILE" 2>&1
     log "--> Eval (Fast):"
     python tests/test_structure.py hemoglobin | tee -a "$LOGFILE"
 }
@@ -71,8 +71,8 @@ test_memory() {
     local MAX_LEN=${1:-1536}
     log "=== Memory Test Started: $(date) ==="
     setup_env
-    cd "$TT_BOLTZ_DIR"
-    local INPUT_DIR="$TT_BOLTZ_DIR/memory_inputs"
+    cd "$TT_BIO_DIR"
+    local INPUT_DIR="$TT_BIO_DIR/memory_inputs"
     local SEED=1337
 
     log "--> Generating random inputs up to seq len $MAX_LEN (step 32)"
@@ -81,10 +81,10 @@ test_memory() {
     python tests/generate_random_protein_sweep.py --out-dir "$INPUT_DIR" --max-len $MAX_LEN --step 32 >> "$LOGFILE" 2>&1
 
     log "--> Running Memory Test (Normal mode)"
-    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --debug --log >> "$LOGFILE" 2>&1 || log "Normal mode encountered an error/OOM!"
+    tt-bio predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --debug --log >> "$LOGFILE" 2>&1 || log "Normal mode encountered an error/OOM!"
 
     log "--> Running Memory Test (Fast mode)"
-    tt-boltz predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --fast --debug --log >> "$LOGFILE" 2>&1 || log "Fast mode encountered an error/OOM!"
+    tt-bio predict "$INPUT_DIR/inputs" --override --recycling_steps 0 --sampling_steps 10 --diffusion_samples 5 --seed $SEED --fast --debug --log >> "$LOGFILE" 2>&1 || log "Fast mode encountered an error/OOM!"
 }
 
 print_usage() {

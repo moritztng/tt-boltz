@@ -14,7 +14,7 @@ def random_sequence(length: int, rng: random.Random) -> str:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate random single-chain TT-Boltz inputs and matching random A3M files."
+        description="Generate random single-chain TT-Bio inputs and matching random A3M files."
     )
     parser.add_argument(
         "--out-dir",

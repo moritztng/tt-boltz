@@ -1,20 +1,20 @@
-tt-boltz bundles third-party code under tt_boltz/_vendor/. Each component keeps
+tt-bio bundles third-party code under tt_bio/_vendor/. Each component keeps
 its upstream license alongside it.
 
-1. tt_boltz/_vendor/esm/ — ESMFold2 host-side reference: sequence/atom
+1. tt_bio/_vendor/esm/ — ESMFold2 host-side reference: sequence/atom
    featurization, MSA handling, and mmCIF assembly (no neural compute; that runs
-   on Tenstorrent via tt_boltz.esmc / tt_boltz.esmfold2).
+   on Tenstorrent via tt_bio.esmc / tt_bio.esmfold2).
    Source:        github.com/Biohub/esm @ b6b0e88
    License:       MIT — Copyright 2026 Chan Zuckerberg Biohub, Inc.
-                  (tt_boltz/_vendor/esm/LICENSE)
+                  (tt_bio/_vendor/esm/LICENSE)
    Modifications: only the files on the ESMFold2 fold path are included; absolute
-                  `esm.` imports rewritten to `tt_boltz._vendor.esm.`.
+                  `esm.` imports rewritten to `tt_bio._vendor.esm.`.
 
-2. tt_boltz/_vendor/esmfold2_hf/ — the ESMFold2 model definition for HuggingFace
+2. tt_bio/_vendor/esmfold2_hf/ — the ESMFold2 model definition for HuggingFace
    `transformers` (runs on top of the stock `transformers` wheel).
    Source:        Biohub `transformers` fork (based on transformers 4.57.6),
                   src/transformers/models/esmfold2
    License:       Apache-2.0 — Copyright The HuggingFace team and Chan Zuckerberg
-                  Biohub, Inc. (tt_boltz/_vendor/esmfold2_hf/LICENSE)
+                  Biohub, Inc. (tt_bio/_vendor/esmfold2_hf/LICENSE)
    Modifications: the three inference files only; transformers-core relative
                   imports rewritten to absolute `transformers.`.

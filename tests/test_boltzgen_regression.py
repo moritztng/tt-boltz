@@ -18,8 +18,8 @@ that our slimmed Boltz drops, which perturbs trunk numerics out of bf16
 tolerance while leaving bond chemistry intact).
 
 The reference data is a 36 MB tarball at
-``https://storage.googleapis.com/tt-boltz-artifacts/boltzgen_regression.tar.gz``,
-downloaded once on first run to ``~/.cache/tt-boltz/regression/``. The
+``https://storage.googleapis.com/tt-bio-artifacts/boltzgen_regression.tar.gz``,
+downloaded once on first run to ``~/.cache/tt-bio/regression/``. The
 tarball's README documents how to regenerate it.
 """
 from __future__ import annotations
@@ -35,10 +35,10 @@ import pytest
 
 
 REGRESSION_URL = (
-    "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen_regression.tar.gz"
+    "https://storage.googleapis.com/tt-bio-artifacts/boltzgen_regression.tar.gz"
 )
-_CACHE = Path.home() / ".cache/tt-boltz/regression"
-_ROOT = _CACHE / "tt_boltz_regression_v1"
+_CACHE = Path.home() / ".cache/tt-bio/regression"
+_ROOT = _CACHE / "tt_bio_regression_v1"
 
 _DESIGN_CKPT = (
     Path.home()
@@ -139,9 +139,9 @@ def test_designed_structure_bond_geometry_matches_gpu(
     # three bond types. 5× gives headroom; a catastrophic dispersion
     # (sampler collapse, exploded bonds) would push the ratio well past it.
     std_ratio_max  = 30.0 if fast else 5.0
-    tt_boltz_bin = shutil.which("tt-boltz")
-    if tt_boltz_bin is None:
-        pytest.skip("tt-boltz CLI not on PATH; activate the venv before running")
+    tt_bio_bin = shutil.which("tt-bio")
+    if tt_bio_bin is None:
+        pytest.skip("tt-bio CLI not on PATH; activate the venv before running")
 
     # Stage a working copy of the spec under its original filename:
     #  * the yaml's design "id" is derived from the yaml filename stem,
@@ -157,7 +157,7 @@ def test_designed_structure_bond_geometry_matches_gpu(
 
     out_dir = tmp_path / "regression_out"
     cmd = [
-        tt_boltz_bin, "gen", "run", str(spec_yaml),
+        tt_bio_bin, "gen", "run", str(spec_yaml),
         "--output", str(out_dir),
         "--num_designs", "1",
         # Pin to one card: this asserts the single-device output layout

@@ -20,7 +20,7 @@ def yaml_msa_path(path: Path) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate a random single-chain tt-boltz YAML input and matching random A3M."
+        description="Generate a random single-chain tt-bio YAML input and matching random A3M."
     )
     parser.add_argument("length", type=int, help="Protein sequence length.")
     parser.add_argument(

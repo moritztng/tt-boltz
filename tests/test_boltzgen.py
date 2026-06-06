@@ -1,7 +1,7 @@
 """Tenstorrent-only BoltzGen smoke tests.
 
 The earlier random-weight comparison tests are gone — they compared
-tt-boltz's ttnn modules against PyTorch reference modules in
+tt-bio's ttnn modules against PyTorch reference modules in
 ``boltzgen/model/layers/{pairformer,miniformer,...}.py``, all of which
 have been deleted as part of the Tenstorrent-only strip. The model now
 constructs ttnn modules directly in ``Boltz.__init__`` and the PyTorch
@@ -33,7 +33,7 @@ FOLD_CKPT = Path(os.environ.get("BOLTZGEN_FOLD_CKPT", _CKPT_ROOT / "boltz2_conf_
 
 def _load(ckpt: Path) -> int:
     """Build Boltz from ``ckpt`` via the public adapter; no-op assertion sanity check."""
-    from tt_boltz.boltzgen import load_boltz_checkpoint
+    from tt_bio.boltzgen import load_boltz_checkpoint
 
     model = load_boltz_checkpoint(str(ckpt), strict=False)
     # Model is already in eval() and weights are loaded; the call would

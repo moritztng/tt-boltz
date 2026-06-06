@@ -4,10 +4,10 @@ import os
 from pathlib import Path
 from functools import partial
 
-from tt_boltz.tenstorrent import WeightScope, PairformerModule, MSAModule, DiffusionModule
-from tt_boltz.reference import MSAModule as MSAModuleTorch, DiffusionModule as DiffusionModuleTorch
-from tt_boltz.reference import PairformerModule as PairformerModuleTorch, PairformerNoSeqModule as PairformerNoSeqModuleTorch
-from tt_boltz.boltz2 import get_indexing_matrix, single_to_keys
+from tt_bio.tenstorrent import WeightScope, PairformerModule, MSAModule, DiffusionModule
+from tt_bio.reference import MSAModule as MSAModuleTorch, DiffusionModule as DiffusionModuleTorch
+from tt_bio.reference import PairformerModule as PairformerModuleTorch, PairformerNoSeqModule as PairformerNoSeqModuleTorch
+from tt_bio.boltz2 import get_indexing_matrix, single_to_keys
 
 torch.set_grad_enabled(False)
 torch.manual_seed(893)

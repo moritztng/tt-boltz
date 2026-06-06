@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark tt-boltz against GPU baselines (Boltz-1, AlphaFold3, Chai-1).
+"""Benchmark tt-bio against GPU baselines (Boltz-1, AlphaFold3, Chai-1).
 
 Usage:
     python benchmark.py setup                                   # download dataset
-    tt-boltz predict eval_data/queries/ --out_dir eval_data/     # predict
+    tt-bio predict eval_data/queries/ --out_dir eval_data/     # predict
     python benchmark.py compare                                 # evaluate & compare
 
 Dataset: 542 PDB targets from the Boltz-1 paper (Wohlwend et al. 2024).
@@ -78,7 +78,7 @@ def cmd_setup(args):
     _check_docker(pull=True)
 
     print(f"\nSetup complete. Next:")
-    print(f"  tt-boltz predict {QUERIES}/ --out_dir {DATA}/")
+    print(f"  tt-bio predict {QUERIES}/ --out_dir {DATA}/")
     print(f"  python benchmark.py compare")
 
 
@@ -182,7 +182,7 @@ def cmd_compare(args):
     if not PRED_DIR.exists() or not list(PRED_DIR.glob("*.cif")):
         sys.exit(
             f"No predictions found at {PRED_DIR}\n"
-            f"Run: tt-boltz predict {QUERIES}/ --out_dir {DATA}/"
+            f"Run: tt-bio predict {QUERIES}/ --out_dir {DATA}/"
         )
     if not TARGETS.exists():
         sys.exit(f"No targets at {TARGETS}. Run: python benchmark.py setup")
@@ -287,7 +287,7 @@ def _print_results(tt, targets):
     print(f"  Evaluation: OpenStructure 2.11.1 (--lddt-no-stereochecks)")
     print(f"{'=' * 74}")
 
-    hdr = f"  {'':16} {'TT-Boltz-2':>{w}}"
+    hdr = f"  {'':16} {'TT-Bio-2':>{w}}"
     if gpu is not None:
         for _, label in tools:
             hdr += f" {label:>{w}}"
@@ -316,9 +316,9 @@ def _print_results(tt, targets):
 
     print()
     print("  * = key metrics from the Boltz-1 paper (Figure 1)")
-    print(f"  TT-Boltz-2: 1 sample | GPU baselines: top-1 of 5 samples")
+    print(f"  TT-Bio-2: 1 sample | GPU baselines: top-1 of 5 samples")
 
-    out = EVAL_DIR / "tt_boltz_results.csv"
+    out = EVAL_DIR / "tt_bio_results.csv"
     tt.to_csv(out, index=False)
     print(f"\n  Per-target results saved to: {out}")
 

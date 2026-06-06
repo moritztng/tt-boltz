@@ -1,32 +1,34 @@
 ![](banner.png)
 
-# TT-Boltz
+# TT-Bio
+
+> **TT-Boltz is now TT-Bio.** The project was renamed to reflect that it now runs ESMFold2 alongside Boltz-2 and BoltzGen. The `tt-bio` CLI replaces `tt-boltz` (same commands).
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz runs Boltz-2 and [ESMFold2](#esmfold2) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
+TT-Bio runs Boltz-2 and [ESMFold2](#esmfold2) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
 ## Installation
 
-Create a Python virtual environment with Python 3.10 or 3.12, install TT-Boltz, then install the matching Tenstorrent system dependencies.
+Create a Python virtual environment with Python 3.10 or 3.12, install TT-Bio, then install the matching Tenstorrent system dependencies.
 
 ```bash
 python3.10 -m venv env
 source env/bin/activate
-pip install "tt-boltz @ git+https://github.com/moritztng/tt-boltz.git"
-tt-boltz install-deps
+pip install "tt-bio @ git+https://github.com/moritztng/tt-bio.git"
+tt-bio install-deps
 ```
 
-`tt-boltz install-deps` installs the SFPI compiler version that matches the installed `ttnn` wheel and clears stale TT-Metal kernel cache entries. It may ask for your sudo password.
+`tt-bio install-deps` installs the SFPI compiler version that matches the installed `ttnn` wheel and clears stale TT-Metal kernel cache entries. It may ask for your sudo password.
 
 ### Advanced Install (editable local clone)
 ```bash
-git clone https://github.com/moritztng/tt-boltz.git
-cd tt-boltz
+git clone https://github.com/moritztng/tt-bio.git
+cd tt-bio
 pip install -e .
-tt-boltz install-deps
+tt-bio install-deps
 ```
 
 ### Optional: Build TT-Metal / TT-NN from Source
@@ -34,9 +36,9 @@ If you need to build from source, follow the [Tenstorrent Installation Guide](ht
 
 ### Verify Installation
 ```bash
-tt-boltz --help
-tt-boltz predict --help
-tt-boltz msa --help
+tt-bio --help
+tt-bio predict --help
+tt-bio msa --help
 ```
 
 ## Basic Usage
@@ -44,7 +46,7 @@ tt-boltz msa --help
 ### Structure Prediction
 
 ```bash
-tt-boltz predict examples/prot.yaml --use_msa_server --override
+tt-bio predict examples/prot.yaml --use_msa_server --override
 ```
 
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
@@ -60,7 +62,7 @@ the display (`quietbox:tt0`, `quietbox:tt1`, ...). Models load once per card
 and stay resident, so jobs flow through without per-protein reloads:
 
 ```bash
-tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
+tt-bio predict proteins/ --out_dir results --use_msa_server --fast
 ```
 
 If you have additional machines with Tenstorrent cards, you can add them to a
@@ -71,10 +73,10 @@ single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-
 `--model esmfold2` and `--model esmfold2-fast` fold proteins with the ESMFold2 family (an ESMC-6B language model plus a diffusion structure head), entirely on-device. They fold from a **single sequence** — no MSA required — so they skip the MSA step Boltz-2 needs (an MSA is still accepted via `--use_msa_server` / `--msa_db_path`). `esmfold2-fast` is the lighter 24-block checkpoint for high-throughput single-sequence folding; `esmfold2` is the full 48-block model. Input is a FASTA or YAML of protein chains (ligand / affinity options do not apply); everything else — multi-card, multi-machine, `--fast`, output layout — works exactly as above.
 
 ```bash
-tt-boltz predict seq.fasta --model esmfold2-fast --fast
+tt-bio predict seq.fasta --model esmfold2-fast --fast
 ```
 
-No extra setup is required: the ESMFold2 host-side reference code is bundled with tt-boltz (`tt_boltz/_vendor`, see [`NOTICE`](NOTICE)) and runs on the stock `transformers` wheel installed as a normal dependency. Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
+No extra setup is required: the ESMFold2 host-side reference code is bundled with tt-bio (`tt_bio/_vendor`, see [`NOTICE`](NOTICE)) and runs on the stock `transformers` wheel installed as a normal dependency. Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
 
 ### Offline MSA (Optional)
 
@@ -82,25 +84,25 @@ Use this if you have enough disk and RAM and want local MSA.
 This avoids external MSA server calls and is faster for repeated runs.
 
 ```bash
-tt-boltz msa
-tt-boltz predict examples/prot.yaml --override
+tt-bio msa
+tt-bio predict examples/prot.yaml --override
 ```
 
-`tt-boltz msa` downloads UniRef30 to `~/.boltz/msa_db` (~100GB download, ~500GB on disk after indexing). `predict` auto-detects this path.
+`tt-bio msa` downloads UniRef30 to `~/.boltz/msa_db` (~100GB download, ~500GB on disk after indexing). `predict` auto-detects this path.
 
 To add EnvDB and use it in prediction:
 EnvDB can improve MSA coverage when UniRef30 hits are weak, at higher disk/RAM cost.
 
 ```bash
-tt-boltz msa --db all
-tt-boltz predict examples/prot.yaml --use_envdb --override
+tt-bio msa --db all
+tt-bio predict examples/prot.yaml --use_envdb --override
 ```
 
 **Key Options:**
 - `--override`: Re-run from scratch, ignoring cached files
 - `--use_msa_server`: Generate MSA via ColabFold API
 - `--msa_db_path`: Use a local database at a custom path (e.g. `--msa_db_path /data/colabfold_db`)
-- `--use_envdb`: Include EnvDB in offline MSA (`tt-boltz msa --db all`)
+- `--use_envdb`: Include EnvDB in offline MSA (`tt-bio msa --db all`)
 - `--accelerator=tenstorrent`: Use Tenstorrent hardware (default, or use `cpu`/`gpu`)
 - `--fast`: Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close
 - `--debug`: Show all raw output from the hardware and libraries instead of the progress display
@@ -111,7 +113,7 @@ tt-boltz predict examples/prot.yaml --use_envdb --override
 Predict binding affinity for protein-ligand complexes:
 
 ```bash
-tt-boltz predict examples/affinity.yaml --use_msa_server --override --affinity_mw_correction
+tt-bio predict examples/affinity.yaml --use_msa_server --override --affinity_mw_correction
 ```
 
 The `--affinity_mw_correction` flag applies molecular weight correction for more accurate predictions.
@@ -342,13 +344,13 @@ For `--use_msa_server`:
 ```bash
 export BOLTZ_MSA_USERNAME=myuser
 export BOLTZ_MSA_PASSWORD=mypassword
-tt-boltz predict ... --use_msa_server
+tt-bio predict ... --use_msa_server
 ```
 
 **API Key Authentication:**
 ```bash
 export MSA_API_KEY_VALUE=your-api-key
-tt-boltz predict ... --use_msa_server
+tt-bio predict ... --use_msa_server
 ```
 
 ## Optional: Multi-Machine Prediction
@@ -359,14 +361,14 @@ or more QuietBoxes, one or more Galaxy servers — into a single run.
 On the machine driving the run:
 
 ```bash
-tt-boltz predict ./proteins --listen 8765 --use_msa_server --fast
+tt-bio predict ./proteins --listen 8765 --use_msa_server --fast
 ```
 
 On every additional machine, replace `HOST` with the driving machine's
 hostname or IP:
 
 ```bash
-tt-boltz worker --connect http://HOST:8765
+tt-bio worker --connect http://HOST:8765
 ```
 
 ## Optional: Energy Measurement
@@ -374,7 +376,7 @@ tt-boltz worker --connect http://HOST:8765
 Use `--report-energy` to profile energy during prediction:
 
 ```bash
-tt-boltz predict examples/686.yaml --override --device_ids 0 --report-energy --energy-metric both --energy-sample-hz 5
+tt-bio predict examples/686.yaml --override --device_ids 0 --report-energy --energy-metric both --energy-sample-hz 5
 ```
 
 Behavior:
@@ -397,7 +399,7 @@ Behavior:
 [BoltzGen](https://github.com/HannesStark/boltzgen) designs protein binders against a target. The pipeline runs design → inverse folding → folding → analysis → filtering and writes the top-ranked binders to `<output>/final_ranked_designs/`.
 
 ```bash
-tt-boltz gen run examples/binder.yaml --num_designs 10
+tt-bio gen run examples/binder.yaml --num_designs 10
 ```
 
 This automatically uses every available card (splitting the designs across them and merging the results) and writes to `./binder/`. Add `--device_ids 0,2` to run on specific cards only.
@@ -416,7 +418,7 @@ entities:
             id: A
 ```
 
-`80..120` randomises the binder length per design; a fixed integer pins it. Ligand, DNA, and RNA targets use the same YAML grammar as `tt-boltz predict`. See the [BoltzGen examples](https://github.com/HannesStark/boltzgen/tree/main/example) for binding sites, scaffolds, and residue constraints.
+`80..120` randomises the binder length per design; a fixed integer pins it. Ligand, DNA, and RNA targets use the same YAML grammar as `tt-bio predict`. See the [BoltzGen examples](https://github.com/HannesStark/boltzgen/tree/main/example) for binding sites, scaffolds, and residue constraints.
 
 ### Protocols
 
@@ -436,8 +438,8 @@ entities:
 `--steps` restricts the pipeline.
 
 ```bash
-tt-boltz gen run examples/binder.yaml --steps design --num_designs 10
-tt-boltz gen run examples/binder.yaml --output existing/ --steps analysis filtering
+tt-bio gen run examples/binder.yaml --steps design --num_designs 10
+tt-bio gen run examples/binder.yaml --output existing/ --steps analysis filtering
 ```
 
 ### Command-Line Options
@@ -507,4 +509,4 @@ In addition if you use the automatic MSA generation, please cite:
 
 ## License
 
-MIT License. tt-boltz also bundles third-party ESMFold2 reference code under `tt_boltz/_vendor/` (MIT and Apache-2.0) — see [`NOTICE`](NOTICE) for sources, licenses, and modifications.
+MIT License. tt-bio also bundles third-party ESMFold2 reference code under `tt_bio/_vendor/` (MIT and Apache-2.0) — see [`NOTICE`](NOTICE) for sources, licenses, and modifications.

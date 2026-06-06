@@ -14,7 +14,7 @@ UnifiedTransformerBlock / TransformerStack / RegressionHead. ``ESMCReference``
 below mirrors ``esm/models/esmc.py:123-191`` (with ``use_flash_attn=False``).
 
 This is the golden reference our ttnn implementation is tested against. We load
-identical weights into both and compare (the tt-boltz test idiom).
+identical weights into both and compare (the tt-bio test idiom).
 """
 
 from __future__ import annotations

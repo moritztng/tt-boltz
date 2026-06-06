@@ -26,8 +26,8 @@ from esmfold2_reference import (  # noqa: E402
     make_swa_atom_transformer,
 )
 
-from tt_boltz import esmfold2 as tt_ef2  # noqa: E402
-from tt_boltz.tenstorrent import get_device  # noqa: E402
+from tt_bio import esmfold2 as tt_ef2  # noqa: E402
+from tt_bio.tenstorrent import get_device  # noqa: E402
 
 torch.set_grad_enabled(False)
 torch.manual_seed(893)

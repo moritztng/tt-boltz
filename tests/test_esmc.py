@@ -2,7 +2,7 @@
 
 Idiom (matching tests/test_tenstorrent.py): build the reference with random
 weights, load the *same* state_dict into the ttnn module, run both, compare.
-Everything runs on TT device 0 (see tt_boltz.tenstorrent.get_device).
+Everything runs on TT device 0 (see tt_bio.tenstorrent.get_device).
 """
 
 import os
@@ -15,8 +15,8 @@ import ttnn
 sys.path.insert(0, os.path.dirname(__file__))
 from esmc_reference import ESMC_300M, VOCAB_SIZE, make_esmc_300m  # noqa: E402
 
-from tt_boltz.tenstorrent import WeightScope, get_device  # noqa: E402
-from tt_boltz import esmc as tt_esmc  # noqa: E402
+from tt_bio.tenstorrent import WeightScope, get_device  # noqa: E402
+from tt_bio import esmc as tt_esmc  # noqa: E402
 
 torch.set_grad_enabled(False)
 torch.manual_seed(893)
