@@ -2,7 +2,8 @@
 
 # TT-Bio
 
-> **TT-Boltz is now TT-Bio.** The project was renamed to reflect that it now runs ESMFold2 alongside Boltz-2 and BoltzGen. The `tt-bio` CLI replaces `tt-boltz` (same commands).
+> [!IMPORTANT]
+> # TT-Boltz is now TT-Bio
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
