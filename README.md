@@ -12,8 +12,6 @@
 
 TT-Bio runs [Boltz-2](https://github.com/jwohlwend/boltz) and [ESMFold2](https://github.com/Biohub/esm) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
-For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
-
 ## Installation
 
 Create a Python virtual environment with Python 3.10 or 3.12, install TT-Bio, then install the matching Tenstorrent system dependencies.
