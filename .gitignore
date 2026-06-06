@@ -18,6 +18,7 @@ generated/
 msa/
 mgtbind_inputs/
 tests/random_protein_sweep/
+prot8/          # local scratch batch for ESMFold2 runs (not repo content)
 
 # ...but keep the vendored ESM MSA package (the msa/ rule above would hide it)
 !tt_bio/_vendor/esm/utils/msa/
