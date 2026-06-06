@@ -68,10 +68,11 @@ class ProgressDisplay:
         {"worker": str, "dev": int, "event": "done",    "name": str, "time": float, "status": str}
     """
 
-    def __init__(self, queue, total: int, n_workers: int):
+    def __init__(self, queue, total: int, n_workers: int, model: str | None = None):
         self.queue = queue
         self.total = total
         self.n_workers = n_workers
+        self.model = model
 
         self.devices: dict[str, DeviceState] = {}
         self.completed = 0
@@ -152,7 +153,7 @@ class ProgressDisplay:
             d.name = ""
         elif kind == "start":
             d.name = ev["name"]
-            d.stage = "msa"
+            d.stage = "prep" if self.model in ("esmfold2", "esmfold2-fast") else "msa"
             d.step = 0
             d.total_steps = 0
             d.assigned += 1
@@ -165,8 +166,9 @@ class ProgressDisplay:
             if ev.get("status") != "ok":
                 self.failed += 1
             d.done += 1
-            d.stage = "idle"
-            d.name = ""
+            # Show the bar full on completion (idle would render 0% and the bar
+            # would appear to never finish); the next "start" resets it.
+            d.stage = "done"
             self.recent.append(ev)
             if len(self.recent) > RECENT_MAX:
                 self.recent.pop(0)
@@ -219,6 +221,11 @@ class ProgressDisplay:
         pct = f"{self.completed * 100 // self.total}%" if self.total else "–"
         hdr = Text("  ")
         hdr.append("tt-bio", style="bold cyan")
+        if self.model:
+            color = {"boltz2": "bold green",
+                     "esmfold2": "bold magenta",
+                     "esmfold2-fast": "bold magenta"}.get(self.model, "bold yellow")
+            hdr.append(f"  {self.model}", style=color)
         visible_workers = self.n_workers or len(self.devices)
         hdr.append(f"  {visible_workers} worker{'s' if visible_workers != 1 else ''}", style="dim")
         hdr.append(f"  {self.completed}/{self.total}", style="bold")
@@ -264,7 +271,7 @@ class ProgressDisplay:
             if r.get("status") == "ok":
                 ln.append("✓ ", style="green")
                 ln.append(r.get("name", "?"))
-                ln.append(f"  {r.get('time', 0):.0f}s", style="dim")
+                ln.append(f"  {r.get('time', 0):.1f}s", style="dim")
             else:
                 ln.append("✗ ", style="red")
                 ln.append(r.get("name", "?"), style="red")
@@ -339,7 +346,7 @@ class DebugDisplay:
                 print(f"[{who}]   {s} {step}/{total}" if total else f"[{who}]   {s}", flush=True)
             elif kind == "done":
                 sym = "✓" if ev.get("status") == "ok" else "✗"
-                print(f"[{who}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.0f}s", flush=True)
+                print(f"[{who}] {sym} {ev.get('name', '?')} — {ev.get('time', 0):.1f}s", flush=True)
 
 
 def make_progress_fn(queue, device_id: int | str, worker_id: str | None = None, metadata: dict | None = None):

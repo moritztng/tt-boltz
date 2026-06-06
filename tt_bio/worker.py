@@ -386,7 +386,10 @@ def _execute_job(
         except Exception as exc:
             raise RuntimeError(f"failed to decode input bytes: {exc}") from exc
 
-        emit("stage", stage="msa")
+        # ESMFold2 does no MSA work in the worker (single-sequence; any MSA
+        # generation is driver-side), so show the featurization stage instead.
+        is_esmfold = cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast")
+        emit("stage", stage="prep" if is_esmfold else "msa")
         metrics, best, feats = state.predict_one(input_path, job_cfg)
         emit("stage", stage="saving")
         if metrics:

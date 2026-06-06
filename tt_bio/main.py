@@ -878,7 +878,7 @@ def _public_join_url(bind_host: str, port: int) -> str:
 
 def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: int,
                 debug: bool, log: bool, results_path: Path | None = None,
-                struct_dir: Path | None = None) -> int:
+                struct_dir: Path | None = None, model: str | None = None) -> int:
     """Stream events from a controller and render progress; return failed count.
 
     On every done event we fetch that job's output files from the controller
@@ -889,7 +889,7 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
 
     pq = ThreadQueue()
     display = (
-        ProgressDisplay(pq, total=total, n_workers=n_workers) if not debug
+        ProgressDisplay(pq, total=total, n_workers=n_workers, model=model) if not debug
         else DebugDisplay(pq) if log else NullDisplay(pq)
     )
     display.start()
@@ -1370,7 +1370,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 click.echo(f"Workers may join: tt-bio worker --connect {public_url}")
             run_id = client.create_run(run_payload)["run_id"]
             _stream_run(client, run_id, total=len(jobs), n_workers=len(workers), debug=debug,
-                        log=log, results_path=results_path, struct_dir=struct_dir)
+                        log=log, results_path=results_path, struct_dir=struct_dir, model=model)
             _persist_run_results(client, run_id, results_path)
         return
 
@@ -1503,7 +1503,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         run_id = client.create_run(run_payload)["run_id"]
         failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers),
                              debug=debug, log=log, results_path=results_path,
-                             struct_dir=struct_dir)
+                             struct_dir=struct_dir, model=model)
         _persist_run_results(client, run_id, results_path)
 
     if energy_profiler is not None:
