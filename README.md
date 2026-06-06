@@ -50,8 +50,10 @@ tt-bio msa --help
 ### Structure Prediction
 
 ```bash
-tt-bio predict examples/prot.yaml --use_msa_server --override
+tt-bio predict examples/prot.yaml --model boltz2 --use_msa_server --override
 ```
+
+Every command names its model with `--model` (`boltz2`, `esmfold2`, or `esmfold2-fast`).
 
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
@@ -66,7 +68,7 @@ the display (`quietbox:tt0`, `quietbox:tt1`, ...). Models load once per card
 and stay resident, so jobs flow through without per-protein reloads:
 
 ```bash
-tt-bio predict proteins/ --out_dir results --use_msa_server --fast
+tt-bio predict proteins/ --model boltz2 --out_dir results --use_msa_server --fast
 ```
 
 If you have additional machines with Tenstorrent cards, you can add them to a
@@ -80,7 +82,7 @@ single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-
 tt-bio predict seq.fasta --model esmfold2-fast --fast
 ```
 
-No extra setup is required: the ESMFold2 host-side reference code is bundled with tt-bio (`tt_bio/_vendor`, see [`NOTICE`](NOTICE)) and runs on the stock `transformers` wheel installed as a normal dependency. Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
+Weights download to the Hugging Face cache on the first fold.
 
 ### Offline MSA (Optional)
 
@@ -89,7 +91,7 @@ This avoids external MSA server calls and is faster for repeated runs.
 
 ```bash
 tt-bio msa
-tt-bio predict examples/prot.yaml --override
+tt-bio predict examples/prot.yaml --model boltz2 --override
 ```
 
 `tt-bio msa` downloads UniRef30 to `~/.boltz/msa_db` (~100GB download, ~500GB on disk after indexing). `predict` auto-detects this path.
@@ -99,7 +101,7 @@ EnvDB can improve MSA coverage when UniRef30 hits are weak, at higher disk/RAM c
 
 ```bash
 tt-bio msa --db all
-tt-bio predict examples/prot.yaml --use_envdb --override
+tt-bio predict examples/prot.yaml --model boltz2 --use_envdb --override
 ```
 
 **Key Options:**
@@ -117,7 +119,7 @@ tt-bio predict examples/prot.yaml --use_envdb --override
 Predict binding affinity for protein-ligand complexes:
 
 ```bash
-tt-bio predict examples/affinity.yaml --use_msa_server --override --affinity_mw_correction
+tt-bio predict examples/affinity.yaml --model boltz2 --use_msa_server --override --affinity_mw_correction
 ```
 
 The `--affinity_mw_correction` flag applies molecular weight correction for more accurate predictions.
@@ -348,13 +350,13 @@ For `--use_msa_server`:
 ```bash
 export BOLTZ_MSA_USERNAME=myuser
 export BOLTZ_MSA_PASSWORD=mypassword
-tt-bio predict ... --use_msa_server
+tt-bio predict ... --model boltz2 --use_msa_server
 ```
 
 **API Key Authentication:**
 ```bash
 export MSA_API_KEY_VALUE=your-api-key
-tt-bio predict ... --use_msa_server
+tt-bio predict ... --model boltz2 --use_msa_server
 ```
 
 ## Optional: Multi-Machine Prediction
@@ -365,7 +367,7 @@ or more QuietBoxes, one or more Galaxy servers — into a single run.
 On the machine driving the run:
 
 ```bash
-tt-bio predict ./proteins --listen 8765 --use_msa_server --fast
+tt-bio predict ./proteins --model boltz2 --listen 8765 --use_msa_server --fast
 ```
 
 On every additional machine, replace `HOST` with the driving machine's
@@ -380,7 +382,7 @@ tt-bio worker --connect http://HOST:8765
 Use `--report-energy` to profile energy during prediction:
 
 ```bash
-tt-bio predict examples/686.yaml --override --device_ids 0 --report-energy --energy-metric both --energy-sample-hz 5
+tt-bio predict examples/686.yaml --model boltz2 --override --device_ids 0 --report-energy --energy-metric both --energy-sample-hz 5
 ```
 
 Behavior:
