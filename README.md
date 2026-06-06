@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz runs Boltz-2 structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
+TT-Boltz runs Boltz-2 and [ESMFold2](#esmfold2) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -65,6 +65,24 @@ tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
 
 If you have additional machines with Tenstorrent cards, you can add them to a
 single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-prediction).
+
+### ESMFold2
+
+`--model esmfold2` and `--model esmfold2-fast` fold proteins with the ESMFold2 family (an ESMC-6B language model plus a diffusion structure head), entirely on-device. They fold from a **single sequence** — no MSA required — so they skip the MSA step Boltz-2 needs (an MSA is still accepted via `--use_msa_server` / `--msa_db_path`). `esmfold2-fast` is the lighter 24-block checkpoint for high-throughput single-sequence folding; `esmfold2` is the full 48-block model. Input is a FASTA or YAML of protein chains (ligand / affinity options do not apply); everything else — multi-card, multi-machine, `--fast`, output layout — works exactly as above.
+
+```bash
+tt-boltz predict seq.fasta --model esmfold2-fast --fast
+```
+
+The ESMFold2 path additionally needs the ESM reference packages (host-side featurization + the ESMFold2 `transformers` fork). Clone them as siblings of your tt-boltz checkout — they are auto-discovered, or point `ESM_PATH` / `BIOHUB_TRANSFORMERS_PATH` at them — and install their dependencies:
+
+```bash
+git clone https://github.com/Biohub/esm.git ../esm
+git clone https://github.com/Biohub/transformers.git ../biohub-transformers
+pip install -e ../esm    # pulls the transformers fork + esm's deps (zstd, tokenizers, huggingface_hub<1.0, ...)
+```
+
+Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
 
 ### Offline MSA (Optional)
 
@@ -279,6 +297,7 @@ templates:
 | `--out_dir` | `./` | Output directory |
 | `--cache` | `~/.boltz` | Model cache directory |
 | `--accelerator` | `tenstorrent` | `tenstorrent`, `cpu`, or `gpu` |
+| `--model` | `boltz2` | `boltz2`, `esmfold2`, or `esmfold2-fast` (single-sequence ESMFold2) |
 | `--recycling_steps` | `3` | Number of recycling iterations |
 | `--sampling_steps` | `200` | Diffusion sampling steps |
 | `--diffusion_samples` | `1` | Number of structure samples |
@@ -483,6 +502,14 @@ If you use this code or the models in your research, please cite the following p
   year = {2024},
   doi = {10.1101/2024.11.19.624167},
   journal = {bioRxiv}
+}
+
+@misc{candido2026language,
+  author = {Candido, Salvatore and Hayes, Thomas and Derry, Alexander and Rao, Roshan and Lin, Zeming and Verkuil, Robert and others},
+  title = {Language Modeling Materializes a World Model of Protein Biology},
+  year = {2026},
+  url = {https://biohub.ai/papers/esm_protein.pdf},
+  note = {Preprint; ESMC / ESMFold2}
 }
 ```
 
