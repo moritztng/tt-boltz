@@ -4,7 +4,7 @@
 
 [Original Repo](https://github.com/jwohlwend/boltz) | [Boltz-1 Paper](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2 Paper](https://doi.org/10.1101/2025.06.14.659707)
 
-TT-Boltz runs Boltz-2 structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
+TT-Boltz runs Boltz-2 and [ESMFold2](#esmfold2) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -65,6 +65,16 @@ tt-boltz predict proteins/ --out_dir results --use_msa_server --fast
 
 If you have additional machines with Tenstorrent cards, you can add them to a
 single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-prediction).
+
+### ESMFold2
+
+`--model esmfold2` and `--model esmfold2-fast` fold proteins with the ESMFold2 family (an ESMC-6B language model plus a diffusion structure head), entirely on-device. They fold from a **single sequence** — no MSA required — so they skip the MSA step Boltz-2 needs (an MSA is still accepted via `--use_msa_server` / `--msa_db_path`). `esmfold2-fast` is the lighter 24-block checkpoint for high-throughput single-sequence folding; `esmfold2` is the full 48-block model. Input is a FASTA or YAML of protein chains (ligand / affinity options do not apply); everything else — multi-card, multi-machine, `--fast`, output layout — works exactly as above.
+
+```bash
+tt-boltz predict seq.fasta --model esmfold2-fast --fast
+```
+
+No extra setup is required: the ESMFold2 host-side reference code is bundled with tt-boltz (`tt_boltz/_vendor`, see [`NOTICE`](NOTICE)) and runs on the stock `transformers` wheel installed as a normal dependency. Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
 
 ### Offline MSA (Optional)
 
@@ -279,6 +289,7 @@ templates:
 | `--out_dir` | `./` | Output directory |
 | `--cache` | `~/.boltz` | Model cache directory |
 | `--accelerator` | `tenstorrent` | `tenstorrent`, `cpu`, or `gpu` |
+| `--model` | `boltz2` | `boltz2`, `esmfold2`, or `esmfold2-fast` (single-sequence ESMFold2) |
 | `--recycling_steps` | `3` | Number of recycling iterations |
 | `--sampling_steps` | `200` | Diffusion sampling steps |
 | `--diffusion_samples` | `1` | Number of structure samples |
@@ -339,17 +350,6 @@ tt-boltz predict ... --use_msa_server
 export MSA_API_KEY_VALUE=your-api-key
 tt-boltz predict ... --use_msa_server
 ```
-
-## Performance
-
-Runtime for a 686 amino acid protein:
-
-| Hardware | Time |
-|----------|------|
-| AMD Ryzen 5 8600G | ~45 min |
-| Nvidia T4 | ~9 min |
-| Tenstorrent Blackhole p150 | ~1 min |
-| Nvidia RTX 5090 | ~1 min |
 
 ## Optional: Multi-Machine Prediction
 
@@ -484,6 +484,14 @@ If you use this code or the models in your research, please cite the following p
   doi = {10.1101/2024.11.19.624167},
   journal = {bioRxiv}
 }
+
+@misc{candido2026language,
+  author = {Candido, Salvatore and Hayes, Thomas and Derry, Alexander and Rao, Roshan and Lin, Zeming and Verkuil, Robert and others},
+  title = {Language Modeling Materializes a World Model of Protein Biology},
+  year = {2026},
+  url = {https://biohub.ai/papers/esm_protein.pdf},
+  note = {Preprint; ESMC / ESMFold2}
+}
 ```
 
 In addition if you use the automatic MSA generation, please cite:
@@ -499,4 +507,4 @@ In addition if you use the automatic MSA generation, please cite:
 
 ## License
 
-MIT License
+MIT License. tt-boltz also bundles third-party ESMFold2 reference code under `tt_boltz/_vendor/` (MIT and Apache-2.0) — see [`NOTICE`](NOTICE) for sources, licenses, and modifications.
