@@ -31,7 +31,6 @@ dependencies = [
     "pydssp",
     "tqdm",
     "rich",
-    "pytest",
     "huggingface_hub<1.0",  # esmc.py weight download; <1.0 also matches the vendored ESMFold2 model
     "safetensors",          # esmc.py: safe_open for the sharded 6B checkpoint
     # ESMFold2 reference code is vendored under tt_boltz/_vendor (see NOTICE); these
@@ -43,6 +42,9 @@ dependencies = [
     "cloudpathlib",          # esm (vendored)
     "ttnn==0.68.0",
 ]
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [project.scripts]
 tt-boltz = "tt_boltz.main:cli"
