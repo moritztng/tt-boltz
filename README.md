@@ -74,15 +74,7 @@ single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-
 tt-boltz predict seq.fasta --model esmfold2-fast --fast
 ```
 
-The ESMFold2 path additionally needs the ESM reference packages (host-side featurization + the ESMFold2 `transformers` fork). Clone them as siblings of your tt-boltz checkout — they are auto-discovered, or point `ESM_PATH` / `BIOHUB_TRANSFORMERS_PATH` at them — and install their dependencies:
-
-```bash
-git clone https://github.com/Biohub/esm.git ../esm
-git clone https://github.com/Biohub/transformers.git ../biohub-transformers
-pip install -e ../esm    # pulls the transformers fork + esm's deps (zstd, tokenizers, huggingface_hub<1.0, ...)
-```
-
-Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
+No extra setup is required: the ESMFold2 host-side reference code is bundled with tt-boltz (`tt_boltz/_vendor`, see [`NOTICE`](NOTICE)) and runs on the stock `transformers` wheel installed as a normal dependency. Weights (ESMC-6B ≈24 GB plus the chosen checkpoint) download to the Hugging Face cache (`~/.cache/huggingface`, override with `HF_HOME`) on the first fold.
 
 ### Offline MSA (Optional)
 
@@ -526,4 +518,4 @@ In addition if you use the automatic MSA generation, please cite:
 
 ## License
 
-MIT License
+MIT License. tt-boltz also bundles third-party ESMFold2 reference code under `tt_boltz/_vendor/` (MIT and Apache-2.0) — see [`NOTICE`](NOTICE) for sources, licenses, and modifications.

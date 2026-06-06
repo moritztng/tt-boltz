@@ -1,7 +1,8 @@
 """Run the full ESMFold2 model on Tenstorrent hardware end-to-end.
 
-The Biohub `transformers` ESMFold2 model does the host-side work that is *not*
-the neural network — sequence tokenisation, CCD reference-conformer lookup, the
+The vendored ESMFold2 reference (`tt_boltz._vendor`, see its NOTICE) does the
+host-side work that is *not* the neural network — sequence tokenisation, CCD
+reference-conformer lookup, the
 atom/token featurisation, the parcae state-space recurrence, the LM BOS/EOS
 chain wrapping, and assembling the predicted `mmCIF` structure. This module
 keeps all of that and swaps **every learnable submodule** for its ttnn
@@ -10,7 +11,7 @@ forward — ESMC-6B language model, folding trunk, encoders, diffusion structure
 head and confidence head — executes on the TT device.
 
 Usage:
-    from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+    from tt_boltz._vendor.esmfold2_hf.modeling_esmfold2 import ESMFold2Model
     from tt_boltz.esmfold2_runtime import patch_esmfold2
 
     model = ESMFold2Model.from_pretrained("biohub/ESMFold2", load_esmc=False)
@@ -24,7 +25,6 @@ loaded from its own sharded safetensors instead.
 from __future__ import annotations
 
 import os
-import sys
 import types
 
 import torch
@@ -34,21 +34,10 @@ from tt_boltz import esmfold2 as E
 from tt_boltz.esmc import ESMCLanguageModel
 
 
-def _ensure_reference_on_path():
-    """Put the Biohub `esm` + `transformers` (ESMFold2 fork) on sys.path.
-
-    They supply the host-side featurization and mmCIF assembly (not the neural
-    compute, which is ttnn). By default we look for sibling clones next to this
-    repo (``../esm`` and ``../biohub-transformers/src``); override with the
-    ESM_PATH / BIOHUB_TRANSFORMERS_PATH env vars for other layouts.
-    """
-    import pathlib
-    sib = pathlib.Path(__file__).resolve().parents[2]  # dir that contains this repo
-    for env, rel in [("BIOHUB_TRANSFORMERS_PATH", "biohub-transformers/src"),
-                     ("ESM_PATH", "esm")]:
-        path = os.environ.get(env) or str(sib / rel)
-        if os.path.isdir(path) and path not in sys.path:
-            sys.path.insert(0, path)
+# The ESMFold2 host-side reference (featurization + mmCIF assembly) and the
+# ESMFold2 `transformers` model are vendored under `tt_boltz._vendor` (see that
+# package's NOTICE), so there are no external clones / sys.path shims: they
+# import like any other dependency, on top of the stock `transformers` wheel.
 
 
 class _ESMCAdapter:
@@ -397,8 +386,7 @@ def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
     """
     from tt_boltz import tenstorrent
     tenstorrent.set_fast_mode(fast)
-    _ensure_reference_on_path()
-    from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+    from tt_boltz._vendor.esmfold2_hf.modeling_esmfold2 import ESMFold2Model
 
     model = ESMFold2Model.from_pretrained(esmfold2_repo, load_esmc=False).eval()
     return patch_esmfold2(model, esmc_repo=esmc_repo, persistent_lm=persistent_lm)
@@ -411,11 +399,10 @@ def resolve_msa(msa_spec, sequence, msa_dir=None, max_sequences=16384):
     ``{sha256(seq)[:16]}.a3m`` in ``msa_dir`` (written by the predict driver
     after a server / local-DB search). Returns None for single-sequence folding.
     """
-    _ensure_reference_on_path()
     import hashlib
     from pathlib import Path
 
-    from esm.utils.msa.msa import MSA
+    from tt_boltz._vendor.esm.utils.msa.msa import MSA
 
     candidates = []
     if msa_spec:
@@ -443,8 +430,7 @@ def fold_complex(model, chains, *, num_loops=3, num_sampling_steps=20,
     is best-of-N folding, so we return the single highest-confidence sample,
     ranked by mean pLDDT (ESMFold's confidence metric) — not sample 0.
     """
-    _ensure_reference_on_path()
-    from esm.models.esmfold2 import (
+    from tt_boltz._vendor.esm.models.esmfold2 import (
         ESMFold2InputBuilder, ProteinInput, StructurePredictionInput)
 
     def _protein(c):

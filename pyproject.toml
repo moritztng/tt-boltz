@@ -32,8 +32,15 @@ dependencies = [
     "tqdm",
     "rich",
     "pytest",
-    "huggingface_hub<1.0",  # esmc.py weight download; <1.0 also matches the ESMFold2 transformers fork
+    "huggingface_hub<1.0",  # esmc.py weight download; <1.0 also matches the vendored ESMFold2 model
     "safetensors",          # esmc.py: safe_open for the sharded 6B checkpoint
+    # ESMFold2 reference code is vendored under tt_boltz/_vendor (see NOTICE); these
+    # are the stock PyPI runtime deps it needs — no git clones / external repos.
+    "transformers==4.57.6",  # the vendored ESMFold2 model runs on the stock transformers core
+    "zstd",                  # esm MSA utils (vendored)
+    "msgpack-numpy",         # esm structure serialization (vendored)
+    "brotli",                # esm (vendored)
+    "cloudpathlib",          # esm (vendored)
     "ttnn==0.68.0",
 ]
 
@@ -41,9 +48,15 @@ dependencies = [
 tt-boltz = "tt_boltz.main:cli"
 
 [tool.setuptools]
+license-files = ["LICENSE", "NOTICE"]
 
 [tool.setuptools.packages.find]
 include = ["tt_boltz*"]
+
+[tool.setuptools.package-data]
+# ship the vendored third-party license texts inside the wheel (see NOTICE)
+"tt_boltz._vendor.esm" = ["LICENSE"]
+"tt_boltz._vendor.esmfold2_hf" = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
