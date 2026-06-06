@@ -283,7 +283,7 @@ class ProgressDisplay:
                 ln.append(f"  {r.get('error', 'failed')[:36]}", style="dim red")
             log_lines.append(ln)
 
-        parts = [hdr, sep, Text(""), tbl]
+        parts = [Text(""), hdr, sep, Text(""), tbl]
         if log_lines:
             parts.append(Text(""))
             parts.append(sep)
