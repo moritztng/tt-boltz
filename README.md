@@ -351,17 +351,6 @@ export MSA_API_KEY_VALUE=your-api-key
 tt-boltz predict ... --use_msa_server
 ```
 
-## Performance
-
-Runtime for a 686 amino acid protein:
-
-| Hardware | Time |
-|----------|------|
-| AMD Ryzen 5 8600G | ~45 min |
-| Nvidia T4 | ~9 min |
-| Tenstorrent Blackhole p150 | ~1 min |
-| Nvidia RTX 5090 | ~1 min |
-
 ## Optional: Multi-Machine Prediction
 
 Combine the cards across any mix of Tenstorrent machines — a workstation, one
