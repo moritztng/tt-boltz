@@ -5,10 +5,15 @@ and a rolling log of completed structures. Communicates with
 worker processes via a multiprocessing Queue.
 """
 
+import os
 import threading
 import time
 from dataclasses import dataclass
 from queue import Empty
+
+# Live display refresh rate (Hz). Override with TT_BIO_REFRESH_HZ; higher makes
+# fast stages (e.g. short diffusion) animate more smoothly at a small CPU cost.
+REFRESH_HZ = max(1.0, float(os.environ.get("TT_BIO_REFRESH_HZ", "10")))
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -90,7 +95,7 @@ class ProgressDisplay:
     def start(self):
         self._live = Live(
             self._render(), console=Console(stderr=True),
-            refresh_per_second=4, transient=False,
+            refresh_per_second=REFRESH_HZ, transient=False,
         )
         self._live.start()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -119,7 +124,7 @@ class ProgressDisplay:
             self._drain()
             if self._live:
                 self._live.update(self._render())
-            self._stop.wait(0.25)
+            self._stop.wait(1.0 / REFRESH_HZ)
 
     def _drain(self):
         while True:
