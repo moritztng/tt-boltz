@@ -10,7 +10,7 @@
 > [!IMPORTANT]
 > **TT-Boltz is now TT-Bio**
 
-TT-Bio runs [Boltz-2](https://github.com/jwohlwend/boltz) and [ESMFold2](#esmfold2) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
+TT-Bio runs [Boltz-2](https://github.com/jwohlwend/boltz) and ESMFold2 structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 For an intuitive understanding of AlphaFold 3, I recommend [The Illustrated AlphaFold](https://elanapearl.github.io/blog/2024/the-illustrated-alphafold).
 
@@ -73,16 +73,6 @@ tt-bio predict proteins/ --model boltz2 --out_dir results --use_msa_server --fas
 
 If you have additional machines with Tenstorrent cards, you can add them to a
 single run — see [Optional: Multi-Machine Prediction](#optional-multi-machine-prediction).
-
-### ESMFold2
-
-`--model esmfold2` and `--model esmfold2-fast` fold proteins with the ESMFold2 family (an ESMC-6B language model plus a diffusion structure head), entirely on-device. They fold from a **single sequence** — no MSA required — so they skip the MSA step Boltz-2 needs (an MSA is still accepted via `--use_msa_server` / `--msa_db_path`). `esmfold2-fast` is the lighter 24-block checkpoint for high-throughput single-sequence folding; `esmfold2` is the full 48-block model. Input is a FASTA or YAML of protein chains (ligand / affinity options do not apply); everything else — multi-card, multi-machine, `--fast`, output layout — works exactly as above.
-
-```bash
-tt-bio predict seq.fasta --model esmfold2-fast --fast
-```
-
-Weights download to the Hugging Face cache on the first fold.
 
 ### Offline MSA (Optional)
 
