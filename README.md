@@ -53,7 +53,16 @@ tt-bio msa --help
 tt-bio predict examples/prot.yaml --model boltz2 --use_msa_server --override
 ```
 
-Every command names its model with `--model` (`boltz2`, `esmfold2`, or `esmfold2-fast`).
+Every command names its model with `--model`:
+
+- **`boltz2`** — folds complexes of proteins, DNA, RNA, and ligands and predicts binding affinity. Needs an MSA for each protein chain.
+- **`esmfold2`** / **`esmfold2-fast`** — fold a single protein sequence on-device, no MSA required (`esmfold2-fast` is the lighter, faster checkpoint):
+
+```bash
+tt-bio predict seq.fasta --model esmfold2-fast --fast
+```
+
+ESMFold2 is single-sequence and protein-only, so the MSA, ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only** (ESMFold2 still uses an MSA if you pass one). The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, and the multi-card / multi-machine flags — work for every model.
 
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
@@ -104,7 +113,7 @@ tt-bio predict examples/prot.yaml --model boltz2 --use_envdb --override
 - `--debug`: Show all raw output from the hardware and libraries instead of the progress display
 - `--debug --log`: Same as `--debug`, but also print what each device is currently working on
 
-### Binding Affinity Prediction
+### Binding Affinity Prediction (Boltz-2)
 
 Predict binding affinity for protein-ligand complexes:
 
@@ -115,6 +124,8 @@ tt-bio predict examples/affinity.yaml --model boltz2 --use_msa_server --override
 The `--affinity_mw_correction` flag applies molecular weight correction for more accurate predictions.
 
 ### Input Format
+
+ESMFold2 takes a plain protein FASTA or a YAML with one or more `protein` chains. The richer inputs below — ligands, affinity, DNA/RNA, constraints, and templates — are Boltz-2 features.
 
 Create a YAML file describing your complex:
 
@@ -164,7 +175,7 @@ MSA results are cached in `<out_dir>/msa/` (default `./msa/`), keyed by sequence
 
 ### Confidence Scores
 
-Each target entry in `results.json` contains confidence metrics:
+Each target entry in `results.json` contains confidence metrics. The fields below are Boltz-2's; an ESMFold2 entry instead carries `plddt` (mean, 0-1), `ptm` when available, and `n_residues` / `n_chains`.
 
 ```json
 {
@@ -280,38 +291,40 @@ templates:
 
 ### Command-Line Options
 
+Options apply to every model unless tagged **(Boltz-2)**.
+
 **Common Options:**
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--out_dir` | `./` | Output directory |
-| `--cache` | `~/.boltz` | Model cache directory |
-| `--accelerator` | `tenstorrent` | `tenstorrent`, `cpu`, or `gpu` |
 | `--model` | `boltz2` | `boltz2`, `esmfold2`, or `esmfold2-fast` (single-sequence ESMFold2) |
+| `--out_dir` | `./` | Output directory |
+| `--cache` | `~/.boltz` | **(Boltz-2)** model cache directory; ESMFold2 uses the Hugging Face cache |
+| `--accelerator` | `tenstorrent` | **(Boltz-2)** `tenstorrent`, `cpu`, or `gpu`; ESMFold2 always runs on Tenstorrent |
 | `--recycling_steps` | `3` | Number of recycling iterations |
 | `--sampling_steps` | `200` | Diffusion sampling steps |
 | `--diffusion_samples` | `1` | Number of structure samples |
 | `--output_format` | `cif` | `cif` or `pdb` |
 | `--override` | `False` | Re-run from scratch |
-| `--use_msa_server` | `False` | Use online ColabFold API for MSAs |
-| `--use_potentials` | `False` | Apply physical constraints |
-| `--affinity_mw_correction` | `False` | Apply MW correction to affinity |
+| `--use_msa_server` | `False` | Use online ColabFold API for MSAs (required for Boltz-2, optional for ESMFold2) |
+| `--use_potentials` | `False` | **(Boltz-2)** Apply physical constraints |
+| `--affinity_mw_correction` | `False` | **(Boltz-2)** Apply MW correction to affinity |
 | `--num_devices` | `0` | Number of TT devices (0=all available) |
 | `--device_ids` | — | Comma-separated TT device IDs (e.g. `0,2`) |
 | `--fast` | `False` | Makes some operations use block-fp8, a lower-precision numeric format that runs faster; accuracy is typically very close |
-| `--report-energy` | `False` | Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
-| `--energy-metric` | `both` | Choose power channel(s): `tdp`, `input`, or `both` |
 | `--listen` | — | Accept worker connections from other machines; see [Multi-Machine Prediction](#optional-multi-machine-prediction) |
-| `--energy-sample-hz` | `20.0` | Sampling rate in Hz for both `power_w` and `input_power_w` channels |
+| `--report-energy` | `False` | **(Boltz-2)** Enables optional energy profiling for one TT device (requires `tt-mgmt` add-on); writes `power_profile.csv` and `power_profile.png` |
+| `--energy-metric` | `both` | **(Boltz-2)** Choose power channel(s): `tdp`, `input`, or `both` |
+| `--energy-sample-hz` | `20.0` | **(Boltz-2)** Sampling rate in Hz for both `power_w` and `input_power_w` channels |
 
-**Affinity-Specific Options:**
+**Affinity-Specific Options (Boltz-2):**
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--sampling_steps_affinity` | `200` | Sampling steps for affinity |
 | `--diffusion_samples_affinity` | `5` | Number of affinity samples |
 
-**MSA Options:**
+**MSA Options** (Boltz-2; used by ESMFold2 only when you opt into an MSA):
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -367,7 +380,7 @@ hostname or IP:
 tt-bio worker --connect http://HOST:8765
 ```
 
-## Optional: Energy Measurement
+## Optional: Energy Measurement (Boltz-2)
 
 Use `--report-energy` to profile energy during prediction:
 
@@ -505,4 +518,4 @@ In addition if you use the automatic MSA generation, please cite:
 
 ## License
 
-MIT License. tt-bio also bundles third-party ESMFold2 reference code under `tt_bio/_vendor/` (MIT and Apache-2.0) — see [`NOTICE`](NOTICE) for sources, licenses, and modifications.
+tt-bio is released under the MIT License (see [`LICENSE`](LICENSE)). It bundles third-party ESMFold2 host-side reference code under `tt_bio/_vendor/`: the `esm` input/output pipeline (MIT, © Chan Zuckerberg Biohub) and the HuggingFace ESMFold2 model definition (Apache-2.0, © The HuggingFace team and Chan Zuckerberg Biohub). See [`NOTICE`](NOTICE) for sources, versions, and modifications.
