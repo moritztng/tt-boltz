@@ -121,9 +121,21 @@ class _Adapter(torch.nn.Module):
 # on a Blackhole p150a: max safe single-pass batch is K=24@L128, 4@L256, 1@L512;
 # 300000 yields caps {32,32,18,4,1,1} with no first-try failure at any length.
 # The clash is shape-specific (not a clean budget), so shrink-on-OOM below is the
-# real safety net; this just sets a good starting chunk. Override per card with
+# real safety net; this just sets a good starting chunk, halved on small grids
+# (e.g. Wormhole 8x8, ~55% of Blackhole's aggregate L1). Override per card with
 # TT_ESMFOLD2_DIFFUSION_BUDGET.
 _DIFFUSION_BUDGET = 300000
+
+
+def _diffusion_budget() -> int:
+    """Largest B·L² to attempt per best-of-N pass: env override wins, else the
+    Blackhole-calibrated default, halved on small grids (Wormhole). Shrink-on-OOM
+    is the real safety net, so this only needs to be a sensible starting point."""
+    env = os.environ.get("TT_ESMFOLD2_DIFFUSION_BUDGET")
+    if env:
+        return int(env)
+    from tt_boltz import tenstorrent
+    return _DIFFUSION_BUDGET // 2 if getattr(tenstorrent, "_IS_SMALL_GRID", False) else _DIFFUSION_BUDGET
 
 
 def _is_oom(exc: Exception) -> bool:
@@ -153,7 +165,7 @@ class _StructureHeadAdapter(_Adapter):
         args = (z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
                 ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
                 ref_atom_name_chars.float(), ref_space_uid, tok_idx)
-        budget = int(os.environ.get("TT_ESMFOLD2_DIFFUSION_BUDGET", _DIFFUSION_BUDGET))
+        budget = _diffusion_budget()
         chunk = max(1, min(n, budget // (L * L)))
         out, done = [], 0
         while done < n:
@@ -334,7 +346,7 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
         if x_pred is None or z is None or n <= 1:
             return _orig_conf(*args, **kw)
         L = int(z.shape[1])
-        budget = int(os.environ.get("TT_ESMFOLD2_DIFFUSION_BUDGET", _DIFFUSION_BUDGET))
+        budget = _diffusion_budget()
         chunk = max(1, min(n, budget // (L * L)))
         if chunk >= n:
             return _orig_conf(*args, **kw)
