@@ -38,12 +38,15 @@ def _ensure_reference_on_path():
     """Put the Biohub `esm` + `transformers` (ESMFold2 fork) on sys.path.
 
     They supply the host-side featurization and mmCIF assembly (not the neural
-    compute, which is ttnn). Locations default to the standard sibling clones
-    and can be overridden with the ESM_PATH / BIOHUB_TRANSFORMERS_PATH env vars.
+    compute, which is ttnn). By default we look for sibling clones next to this
+    repo (``../esm`` and ``../biohub-transformers/src``); override with the
+    ESM_PATH / BIOHUB_TRANSFORMERS_PATH env vars for other layouts.
     """
-    for env, default in [("BIOHUB_TRANSFORMERS_PATH", "/home/ttuser/biohub-transformers/src"),
-                         ("ESM_PATH", "/home/ttuser/esm")]:
-        path = os.environ.get(env, default)
+    import pathlib
+    sib = pathlib.Path(__file__).resolve().parents[2]  # dir that contains this repo
+    for env, rel in [("BIOHUB_TRANSFORMERS_PATH", "biohub-transformers/src"),
+                     ("ESM_PATH", "esm")]:
+        path = os.environ.get(env) or str(sib / rel)
         if os.path.isdir(path) and path not in sys.path:
             sys.path.insert(0, path)
 
@@ -122,26 +125,58 @@ class _Adapter(torch.nn.Module):
         pass
 
 
-class _StructureHeadAdapter(_Adapter):
-    """Diffusion sampler adapter — runs best-of-N as ONE batched B=N trajectory.
+# Largest diffusion batch B·L² we attempt in one pass. Best-of-N replicates the
+# per-sample conditioning, so cost grows ~B·L² and a single B=N pass exceeds the
+# device (static circular-buffer clash / L1 OOM, and a hard process abort at very
+# large N·L) well before the recommended N=32 fits past short lengths. Calibrated
+# on a Blackhole p150a: max safe single-pass batch is K=24@L128, 4@L256, 1@L512;
+# 300000 yields caps {32,32,18,4,1,1} with no first-try failure at any length.
+# The clash is shape-specific (not a clean budget), so shrink-on-OOM below is the
+# real safety net; this just sets a good starting chunk. Override per card with
+# TT_ESMFOLD2_DIFFUSION_BUDGET.
+_DIFFUSION_BUDGET = 300000
 
-    The diffusion conditioning is molecule-only (shared across samples), and a
-    single B=1 sample underutilizes the device, so the N samples run as one
-    B=N pass (distinct noise per row) for ~1x the cost of one — instead of N
-    serial calls. Output is [N, n_atoms, 3], the contract the confidence head
-    and best-of-N selection already expect."""
+
+def _is_oom(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(t in s for t in ("out of memory", "circular buffer", "clash", "not enough space", "allocate"))
+
+
+class _StructureHeadAdapter(_Adapter):
+    """Diffusion sampler adapter — runs best-of-N in memory-safe batched chunks.
+
+    A single B=1 sample underutilizes the device, so batching the N samples is a
+    big speedup — but the conditioning is replicated per sample, so memory grows
+    ~B·L² and a full B=N pass OOMs / hard-crashes for large N·L (e.g. the
+    recommended N=32 past short lengths). We therefore run the largest sub-batch
+    that fits a B·L² budget, looping until all N are drawn, and shrink-on-OOM as
+    a safety net. Distinct per-chunk seeds keep samples independent. Small N·L
+    still runs in one pass. Output is [N, n_atoms, 3] — the contract the
+    confidence head and best-of-N selection expect."""
 
     def sample(self, *, z_trunk, s_inputs, relative_position_encoding, ref_pos, ref_charge,
                ref_mask, ref_element, ref_atom_name_chars, ref_space_uid, tok_idx,
                num_diffusion_samples: int = 1, num_sampling_steps=None, seed: int = 0,
                **_ignored):
         steps = 20 if num_sampling_steps is None else int(num_sampling_steps)
-        coords = self.m.sample(
-            z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
-            ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
-            ref_atom_name_chars.float(), ref_space_uid, tok_idx,
-            steps=steps, seed=seed, multiplicity=max(1, num_diffusion_samples))
-        return {"sample_atom_coords": coords}  # [N, n_atoms, 3]
+        n = max(1, num_diffusion_samples)
+        L = int(s_inputs.shape[1])  # residue (token) count
+        args = (z_trunk.float(), s_inputs.float(), relative_position_encoding.float(),
+                ref_pos.float(), ref_charge.float(), ref_mask.float(), ref_element.float(),
+                ref_atom_name_chars.float(), ref_space_uid, tok_idx)
+        budget = int(os.environ.get("TT_ESMFOLD2_DIFFUSION_BUDGET", _DIFFUSION_BUDGET))
+        chunk = max(1, min(n, budget // (L * L)))
+        out, done = [], 0
+        while done < n:
+            k = min(chunk, n - done)
+            try:
+                out.append(self.m.sample(*args, steps=steps, seed=seed + done, multiplicity=k))
+                done += k
+            except RuntimeError as exc:
+                if k == 1 or not _is_oom(exc):
+                    raise
+                chunk = max(1, k // 2)  # too big for this length/card — halve and retry
+        return {"sample_atom_coords": torch.cat(out, dim=0)}  # [N, n_atoms, 3]
 
 
 # reference attribute -> (ttnn wrapper, state-dict prefix, reference kwarg order).
@@ -294,6 +329,40 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
     conf_trunk = E.FoldingTrunk(n_conf_blocks)
     conf_trunk.load_state_dict(sub("confidence_head.folding_trunk."), strict=False)
     model.confidence_head.folding_trunk = _Adapter(conf_trunk)
+
+    # Best-of-N: the confidence head replicates the pair state to B=N
+    # (`pair = repeat_batch(z, N)` -> [N,L,L,c]) before its triangle-mult trunk,
+    # so it OOMs / circular-buffer-clashes at the recommended N=32 past short
+    # lengths — independently of the diffusion sampler. Chunk it over samples
+    # the same way (same B·L² budget); it runs AFTER the shared LM+trunk, so
+    # chunking here costs nothing extra on those. Every confidence output is
+    # per-sample ([B,...]), so chunks concatenate cleanly.
+    _orig_conf = model.confidence_head.forward
+
+    def _chunked_confidence(*args, **kw):
+        n = int(kw.get("num_diffusion_samples", 1))
+        x_pred, z = kw.get("x_pred"), kw.get("z")
+        if x_pred is None or z is None or n <= 1:
+            return _orig_conf(*args, **kw)
+        L = int(z.shape[1])
+        budget = int(os.environ.get("TT_ESMFOLD2_DIFFUSION_BUDGET", _DIFFUSION_BUDGET))
+        chunk = max(1, min(n, budget // (L * L)))
+        if chunk >= n:
+            return _orig_conf(*args, **kw)
+        outs, done = [], 0
+        while done < n:
+            k = min(chunk, n - done)
+            kw2 = dict(kw, x_pred=x_pred[done:done + k], num_diffusion_samples=k)
+            try:
+                outs.append(_orig_conf(*args, **kw2))
+                done += k
+            except RuntimeError as exc:
+                if k == 1 or not _is_oom(exc):
+                    raise
+                chunk = max(1, k // 2)
+        return {key: torch.cat([o[key] for o in outs], dim=0) for key in outs[0]}
+
+    model.confidence_head.forward = _chunked_confidence
 
     # ttnn ESMC-6B language model. Loaded lazily on the first fold; with
     # persistent_lm it then stays resident for all subsequent folds.

@@ -32,6 +32,8 @@ dependencies = [
     "tqdm",
     "rich",
     "pytest",
+    "huggingface_hub",  # esmc.py: snapshot_download / hf_hub_download (ESMC-6B + ESMFold2 weights)
+    "safetensors",      # esmc.py: safe_open for the sharded 6B checkpoint
     "ttnn==0.68.0",
 ]
 
