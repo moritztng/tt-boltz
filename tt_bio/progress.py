@@ -193,26 +193,9 @@ class ProgressDisplay:
         end = STAGE_END.get(s, base)
         if d.total_steps > 0:
             return base + (end - base) * min(d.step / d.total_steps, 1.0)
-        return base
-
-    @staticmethod
-    def _pulse_bar(phase: float, width: int = BAR_WIDTH, seg: int = 4) -> Text:
-        """Indeterminate bar: a lit segment bouncing across the track.
-
-        Used for stages with no step granularity (loading / MSA search / prep /
-        confidence / saving) so they visibly render as *working* — a network MSA
-        search may take seconds to minutes, and a static empty bar reads as
-        frozen. Driven by wall-clock ``phase`` so it animates at the display's
-        refresh rate even though the worker emits no sub-steps.
-        """
-        span = max(width - seg, 1)
-        cell = int(phase * 12) % (2 * span)  # ~12 cells/sec, then bounce back
-        pos = cell if cell <= span else 2 * span - cell
-        txt = Text()
-        txt.append("░" * pos, style="bright_black")
-        txt.append("█" * seg, style="cyan")
-        txt.append("░" * (width - pos - seg), style="bright_black")
-        return txt
+        # Stepless stage (MSA search / prep / confidence / saving): park mid-band
+        # so the bar is never empty and still advances forward between stages.
+        return (base + end) / 2
 
     @staticmethod
     def _bar(frac: float, failed: bool = False) -> Text:
@@ -280,18 +263,11 @@ class ProgressDisplay:
             failed = d.stage == "failed"
             active = d.stage not in ("idle", "loading")
             stage_style = "bold red" if failed else "bold cyan" if active else "dim"
-            # Determinate fill for terminal/stepped stages; an animated pulse for
-            # the indeterminate ones (loading / MSA / prep / confidence / saving)
-            # so they render as working rather than as a frozen empty bar.
-            if d.stage in ("done", "failed", "idle") or d.total_steps > 0:
-                bar = self._bar(self._frac(d), failed)
-            else:
-                bar = self._pulse_bar(elapsed)
             tbl.add_row(
                 d.label or f"device {d.device_id}",
                 Text(d.name[:18] if d.name else "·",
                      style="bold" if active else "dim"),
-                bar,
+                self._bar(self._frac(d), failed),
                 Text(self._stage_label(d), style=stage_style),
                 f"{d.done}/{d.assigned}" if d.assigned else "",
             )
