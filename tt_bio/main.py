@@ -443,11 +443,13 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
 def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
                      use_msa, msa_url, msa_strategy, msa_user, msa_pass, api_key,
                      max_msa, msa_db_path=None, use_envdb=False, method=None,
-                     affinity=False, pred_structure=None):
+                     affinity=False, pred_structure=None, progress=None):
     """Parse, resolve MSA, tokenize, featurize — all in memory.
 
     MSA files are cached in msa_dir by sequence hash — the same
     protein sequence is never searched twice across any input file or run.
+    ``progress`` is an optional ``fn(stage)`` callback used to mark the
+    transition from the MSA stage to featurization ("prep").
     Returns (features_dict, input_structure).
     """
     suffix = path.suffix.lower()
@@ -503,6 +505,10 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
             p = Path(key)
             msa_cache[key] = parse_a3m(p, None, max_msa) if p.suffix == ".a3m" else parse_csv(p, max_msa)
         msas[chain.chain_id] = msa_cache[key]
+
+    # MSA resolution is done; the rest is featurization ("prep" stage).
+    if progress:
+        progress("prep")
 
     # Build Input and tokenize
     templates = target.templates if target.templates else None

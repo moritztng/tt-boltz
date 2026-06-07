@@ -341,6 +341,7 @@ def patch_esmfold2(model, esmc_repo: str = "biohub/ESMC-6B", persistent_lm: bool
     _orig_conf = model.confidence_head.forward
 
     def _chunked_confidence(*args, **kw):
+        E.report_progress("confidence")  # confidence head runs an on-device pair trunk
         n = int(kw.get("num_diffusion_samples", 1))
         x_pred, z = kw.get("x_pred"), kw.get("z")
         if x_pred is None or z is None or n <= 1:

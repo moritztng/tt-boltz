@@ -97,6 +97,7 @@ class _WorkerState:
         self.model = None
         self.aff_model = None
         self.prepare = None
+        self.pfn = None  # progress callback (set per run), shared by both models
         if accelerator == "gpu" and torch.cuda.is_available():
             self.torch_device = torch.device("cuda:0")
         else:
@@ -109,6 +110,7 @@ class _WorkerState:
         self.model = None
         self.aff_model = None
         self.prepare = None
+        self.pfn = None
         self.run_id = None
         self.config_hash = None
         gc.collect()
@@ -179,7 +181,7 @@ class _WorkerState:
 
         from tt_bio.main import to_batch, write_result
 
-        feats, input_struct = self.prepare(path, method=cfg.get("method"))
+        feats, input_struct = self.prepare(path, method=cfg.get("method"), progress=self.pfn)
         batch = to_batch(feats, self.torch_device)
         with torch.no_grad():
             pred = self.model.predict_step(batch)
@@ -356,6 +358,7 @@ def run_worker_loop(
                         HttpProgressQueue(client, run_id, worker_id),
                         worker_info["device_id"], worker_id, meta,
                     )
+                    state.pfn = pfn
                     if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
                         from tt_bio import esmfold2 as _E
 
