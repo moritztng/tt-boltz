@@ -1382,9 +1382,10 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             if public_url:
                 click.echo(f"Workers may join: tt-bio worker --connect {public_url}")
             run_id = client.create_run(run_payload)["run_id"]
-            _stream_run(client, run_id, total=len(jobs), n_workers=len(workers), debug=debug,
-                        log=log, results_path=results_path, struct_dir=struct_dir, model=model)
+            failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers), debug=debug,
+                                 log=log, results_path=results_path, struct_dir=struct_dir, model=model)
             _persist_run_results(client, run_id, results_path)
+        click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
         return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
