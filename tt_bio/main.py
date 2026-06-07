@@ -942,6 +942,25 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
     return failed
 
 
+def _dispatch_run(run_payload: dict, workers, *, total: int, results_path: Path,
+                  struct_dir: Path, model: str, listen, debug: bool, log: bool) -> int:
+    """Run jobs through the scheduler, stream progress, persist results, and
+    print the final summary. The single lifecycle shared by every predict
+    path — keep it the one place so the paths can't drift apart. Returns the
+    number of failed jobs.
+    """
+    with _scheduler_session(listen, workers, debug) as (client, public_url):
+        if public_url:
+            click.echo(f"Workers may join: tt-bio worker --connect {public_url}")
+        run_id = client.create_run(run_payload)["run_id"]
+        failed = _stream_run(client, run_id, total=total, n_workers=len(workers),
+                             debug=debug, log=log, results_path=results_path,
+                             struct_dir=struct_dir, model=model)
+        _persist_run_results(client, run_id, results_path)
+    click.echo(f"\nDone: {total - failed} ok, {failed} failed — {results_path}")
+    return failed
+
+
 def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
                        struct_dir: Path) -> None:
     """Fetch a completed job's output files and write them under struct_dir."""
@@ -1378,14 +1397,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
                        "jobs": job_payloads(jobs), "config": worker_cfg}
         workers = _local_workers("tenstorrent", num_devices, device_ids, max_workers=max(len(jobs), 1))
-        with _scheduler_session(listen, workers, debug) as (client, public_url):
-            if public_url:
-                click.echo(f"Workers may join: tt-bio worker --connect {public_url}")
-            run_id = client.create_run(run_payload)["run_id"]
-            failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers), debug=debug,
-                                 log=log, results_path=results_path, struct_dir=struct_dir, model=model)
-            _persist_run_results(client, run_id, results_path)
-        click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
+        _dispatch_run(run_payload, workers, total=len(jobs), results_path=results_path,
+                      struct_dir=struct_dir, model=model, listen=listen, debug=debug, log=log)
         return
 
     os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
@@ -1511,14 +1524,8 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                 click.echo(f"Energy profiler unavailable: {e}")
                 energy_profiler = None
 
-    with _scheduler_session(listen, workers, debug) as (client, public_url):
-        if public_url:
-            click.echo(f"Workers may join: tt-bio worker --connect {public_url}")
-        run_id = client.create_run(run_payload)["run_id"]
-        failed = _stream_run(client, run_id, total=len(jobs), n_workers=len(workers),
-                             debug=debug, log=log, results_path=results_path,
-                             struct_dir=struct_dir, model=model)
-        _persist_run_results(client, run_id, results_path)
+    _dispatch_run(run_payload, workers, total=len(jobs), results_path=results_path,
+                  struct_dir=struct_dir, model=model, listen=listen, debug=debug, log=log)
 
     if energy_profiler is not None:
         energy_profiler.stop()
@@ -1558,8 +1565,6 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             title=f"TT device {devices[0]} power vs time",
         )
         click.echo(f"  power_plot:     {energy_plot_path}" if wrote_plot else "  power_plot:     failed (matplotlib not available)")
-
-    click.echo(f"\nDone: {len(jobs) - failed} ok, {failed} failed — {results_path}")
 
 
 @cli.command()
