@@ -1368,7 +1368,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             if on:
                 click.echo(f"Note: --model {model} is protein-only; ignoring {n}")
         if model == "esmfold2-fast" and (use_msa_server or msa_db_path):
-            click.echo("Note: --model esmfold2-fast has no MSA encoder; folding single-sequence "
+            click.echo("\nNote: --model esmfold2-fast has no MSA encoder; folding single-sequence "
                        "(use --model esmfold2 to use the MSA).")
         data = Path(data).expanduser()
         out_dir_path = Path(out_dir).expanduser()
