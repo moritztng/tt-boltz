@@ -404,12 +404,35 @@ def load_ttnn_esmfold2(esmfold2_repo: str = "biohub/ESMFold2",
     return patch_esmfold2(model, esmc_repo=esmc_repo, persistent_lm=persistent_lm)
 
 
+def _msa_from_csv(path, max_sequences):
+    """Build an esm ``MSA`` from a Boltz-2 ``{hash}.csv`` cache.
+
+    The CSV is ``key,sequence`` rows (query first) with a3m-style lowercase
+    insertions; strip them so every row aligns to the query, matching what
+    ``MSA.from_a3m`` does. Lets the esm path reuse a Boltz-2 server search.
+    """
+    from pathlib import Path
+
+    from tt_bio._vendor.esm.utils.msa.msa import MSA
+
+    seqs = []
+    for line in Path(path).read_text().splitlines()[1:]:  # skip "key,sequence" header
+        _, _, seq = line.partition(",")
+        if seq:
+            seqs.append(seq)
+        if len(seqs) >= max_sequences:
+            break
+    return MSA.from_sequences(seqs, remove_insertions=True) if seqs else None
+
+
 def resolve_msa(msa_spec, sequence, msa_dir=None, max_sequences=16384):
     """Resolve a chain's MSA to an esm ``MSA`` object (or None).
 
     Tries, in order: an explicit a3m path (``msa_spec``); a cached
-    ``{sha256(seq)[:16]}.a3m`` in ``msa_dir`` (written by the predict driver
-    after a server / local-DB search). Returns None for single-sequence folding.
+    ``{sha256(seq)[:16]}.a3m``; then ``{hash}.csv`` (the Boltz-2 server cache)
+    in the shared ``msa_dir``. The a3m and csv caches are written by either
+    model, so a sequence searched once serves both. Returns None for
+    single-sequence folding.
     """
     import hashlib
     from pathlib import Path
@@ -422,8 +445,11 @@ def resolve_msa(msa_spec, sequence, msa_dir=None, max_sequences=16384):
     if msa_dir:
         h = hashlib.sha256(sequence.encode()).hexdigest()[:16]
         candidates.append(Path(msa_dir) / f"{h}.a3m")
+        candidates.append(Path(msa_dir) / f"{h}.csv")
     for p in candidates:
         if p.exists() and p.stat().st_size > 0:
+            if p.suffix == ".csv":
+                return _msa_from_csv(p, max_sequences)
             return MSA.from_a3m(str(p), max_sequences=max_sequences)
     return None
 

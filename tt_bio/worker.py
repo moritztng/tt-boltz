@@ -196,16 +196,42 @@ class _WorkerState:
         return metrics, best, feats
 
     def _predict_esmfold2_one(self, path: Path, cfg: dict[str, Any]):
+        import hashlib
         import types
 
+        from tt_bio.esmfold2 import report_progress
         from tt_bio.esmfold2_runtime import fold_complex, resolve_msa
-        from tt_bio.main import _read_protein_chains, _write_structure
+        from tt_bio.main import _generate_esmfold2_a3m, _read_protein_chains, _write_structure
 
         chains = _read_protein_chains(path)
         if not chains:
             raise RuntimeError("no protein sequences")
-        msa_dir = cfg.get("msa_dir")
-        chains = [(cid, seq, resolve_msa(spec, seq, msa_dir)) for cid, seq, spec in chains]
+        msa_dir = Path(cfg["msa_dir"])
+        max_msa = cfg.get("max_msa_seqs") or 16384
+
+        # MSA phase — rendered as the "MSA" stage, exactly like Boltz-2 (which
+        # generates worker-side in prepare_features). When a source is given we
+        # search any chain whose {seq_hash}.a3m/.csv is not already cached, into
+        # the shared msa_dir. MSA is optional: with no source, fold single-seq.
+        report_progress("msa")
+        if cfg.get("use_msa_server") or cfg.get("msa_db_path"):
+            to_gen = {}
+            for _cid, seq, spec in chains:
+                if spec and Path(spec).expanduser().exists():
+                    continue
+                h = hashlib.sha256(seq.encode()).hexdigest()[:16]
+                if not (msa_dir / f"{h}.a3m").exists() and not (msa_dir / f"{h}.csv").exists():
+                    to_gen[h] = seq
+            if to_gen:
+                _generate_esmfold2_a3m(
+                    to_gen, path.stem, msa_dir, cfg.get("msa_db_path"), cfg.get("use_envdb", False),
+                    cfg.get("msa_server_url"), cfg.get("msa_pairing_strategy"),
+                    cfg.get("msa_server_username"), cfg.get("msa_server_password"),
+                    cfg.get("api_key_value"))
+
+        report_progress("prep")
+        chains = [(cid, seq, resolve_msa(spec, seq, msa_dir, max_sequences=max_msa))
+                  for cid, seq, spec in chains]
         res = fold_complex(
             self.model, chains,
             num_loops=cfg["recycling_steps"], num_sampling_steps=cfg["sampling_steps"],
@@ -386,10 +412,9 @@ def _execute_job(
         except Exception as exc:
             raise RuntimeError(f"failed to decode input bytes: {exc}") from exc
 
-        # ESMFold2 does no MSA work in the worker (single-sequence; any MSA
-        # generation is driver-side), so show the featurization stage instead.
-        is_esmfold = cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast")
-        emit("stage", stage="prep" if is_esmfold else "msa")
+        # Both model families start in the MSA stage and resolve/search MSAs
+        # worker-side; the esmfold2 path then reports "prep" before folding.
+        emit("stage", stage="msa")
         metrics, best, feats = state.predict_one(input_path, job_cfg)
         emit("stage", stage="saving")
         if metrics:

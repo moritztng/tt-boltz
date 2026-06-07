@@ -1216,7 +1216,11 @@ def _read_protein_chains(path):
             if prot and prot.get("sequence"):
                 m = prot.get("msa")
                 m = str(m) if m and str(m).lower() not in ("", "empty") else None
-                for c in str(prot.get("id", "A")).split(","):
+                # `id` may be a YAML list ([A, C]) or a comma-separated string.
+                ids = prot.get("id", "A")
+                id_list = ([str(x) for x in ids] if isinstance(ids, (list, tuple))
+                           else str(ids).split(","))
+                for c in id_list:
                     chains.append((c.strip(), prot["sequence"], m))
     else:
         raise click.ClickException(f"Unsupported input for esmfold2: {path.name}")
@@ -1371,27 +1375,19 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             click.echo("All predictions complete" if done else "No input files found")
             return
 
-        # Driver-side MSA search (cached {seq_hash}.a3m in msa_dir) when requested;
-        # workers resolve per chain via resolve_msa. Explicit a3m paths are used as-is.
-        if use_msa_server or msa_db_path:
-            to_gen = {}
-            for j in jobs:
-                for _cid, seq, spec in _read_protein_chains(j.path):
-                    if spec and Path(spec).expanduser().exists():
-                        continue
-                    h = hashlib.sha256(seq.encode()).hexdigest()[:16]
-                    if not (msa_dir / f"{h}.a3m").exists():
-                        to_gen[h] = seq
-            if to_gen:
-                _generate_esmfold2_a3m(to_gen, data.stem, msa_dir, msa_db_path, use_envdb,
-                                       msa_server_url, msa_pairing_strategy, msa_server_username,
-                                       msa_server_password, api_key_value)
-
+        # MSA is resolved + searched worker-side, exactly like Boltz-2: the worker
+        # renders the "MSA" stage, generates any missing {seq_hash}.a3m into the
+        # shared msa_dir cache, and folds. MSA is optional here (single-sequence
+        # folding when no source is given), so unlike Boltz-2 it never errors out.
         worker_cfg = {
             "model": model, "fast": fast, "output_format": output_format,
             "recycling_steps": recycling_steps, "sampling_steps": sampling_steps,
             "diffusion_samples": diffusion_samples, "seed": seed or 0,
             "msa_dir": str(msa_dir), "struct_dir": str(struct_dir),
+            "use_msa_server": use_msa_server, "msa_db_path": msa_db_path, "use_envdb": use_envdb,
+            "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
+            "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
+            "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
         }
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),

@@ -158,7 +158,7 @@ class ProgressDisplay:
             d.name = ""
         elif kind == "start":
             d.name = ev["name"]
-            d.stage = "prep" if self.model in ("esmfold2", "esmfold2-fast") else "msa"
+            d.stage = "msa"  # both families resolve/search MSAs first
             d.step = 0
             d.total_steps = 0
             d.assigned += 1
