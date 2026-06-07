@@ -210,13 +210,18 @@ class _WorkerState:
             raise RuntimeError("no protein sequences")
         msa_dir = Path(cfg["msa_dir"])
         max_msa = cfg.get("max_msa_seqs") or 16384
+        # Only the checkpoints that ship an MSA encoder can use an MSA. ESMFold2
+        # has one; ESMFold2-Fast does not (model.msa_encoder is None), so there's
+        # nothing to consume an alignment — skip the search and fold single-seq
+        # rather than do wasted work and falsely report msa=true.
+        uses_msa = getattr(self.model, "msa_encoder", None) is not None
 
         # MSA phase — rendered as the "MSA" stage, exactly like Boltz-2 (which
         # generates worker-side in prepare_features). When a source is given we
         # search any chain whose {seq_hash}.a3m/.csv is not already cached, into
         # the shared msa_dir. MSA is optional: with no source, fold single-seq.
         report_progress("msa")
-        if cfg.get("use_msa_server") or cfg.get("msa_db_path"):
+        if uses_msa and (cfg.get("use_msa_server") or cfg.get("msa_db_path")):
             to_gen = {}
             for _cid, seq, spec in chains:
                 if spec and Path(spec).expanduser().exists():
@@ -232,7 +237,7 @@ class _WorkerState:
                     cfg.get("api_key_value"))
 
         report_progress("prep")
-        chains = [(cid, seq, resolve_msa(spec, seq, msa_dir, max_sequences=max_msa))
+        chains = [(cid, seq, resolve_msa(spec, seq, msa_dir, max_sequences=max_msa) if uses_msa else None)
                   for cid, seq, spec in chains]
         res = fold_complex(
             self.model, chains,
