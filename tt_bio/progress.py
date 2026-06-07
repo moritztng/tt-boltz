@@ -168,12 +168,14 @@ class ProgressDisplay:
             d.total_steps = ev.get("total", 0)
         elif kind == "done":
             self.completed += 1
-            if ev.get("status") != "ok":
+            ok = ev.get("status") == "ok"
+            if not ok:
                 self.failed += 1
             d.done += 1
-            # Show the bar full on completion (idle would render 0% and the bar
-            # would appear to never finish); the next "start" resets it.
-            d.stage = "done"
+            # Terminal state for this slot — "done" (green) on success, "failed"
+            # (red) on error. We fill the bar either way: idle would render 0%
+            # and look stuck. The next "start" resets it.
+            d.stage = "done" if ok else "failed"
             self.recent.append(ev)
             if len(self.recent) > RECENT_MAX:
                 self.recent.pop(0)
@@ -185,7 +187,7 @@ class ProgressDisplay:
         s = d.stage
         if s in ("idle", "loading"):
             return 0.0
-        if s == "done":
+        if s in ("done", "failed"):
             return 1.0
         base = STAGE_START.get(s, 0.0)
         end = STAGE_END.get(s, base)
@@ -194,10 +196,10 @@ class ProgressDisplay:
         return base
 
     @staticmethod
-    def _bar(frac: float) -> Text:
+    def _bar(frac: float, failed: bool = False) -> Text:
         filled = int(frac * BAR_WIDTH)
         txt = Text()
-        txt.append("█" * filled, style="green")
+        txt.append("█" * filled, style="red" if failed else "green")
         txt.append("░" * (BAR_WIDTH - filled), style="bright_black")
         return txt
 
@@ -212,7 +214,7 @@ class ProgressDisplay:
         if d.stage == "diffusion":
             return f"Diffusion {d.step}/{d.total_steps}" if d.total_steps else "Diffusion"
         return {"msa": "MSA", "prep": "Featurize", "confidence": "Confidence",
-                "saving": "Saving", "done": "Done"}.get(d.stage, d.stage)
+                "saving": "Saving", "done": "Done", "failed": "Failed"}.get(d.stage, d.stage)
 
     def _render(self) -> Group:
         with self._lock:
@@ -257,14 +259,15 @@ class ProgressDisplay:
         for worker_id in sorted(self.devices):
             d = self.devices[worker_id]
             frac = self._frac(d)
+            failed = d.stage == "failed"
             active = d.stage not in ("idle", "loading")
+            stage_style = "bold red" if failed else "bold cyan" if active else "dim"
             tbl.add_row(
                 d.label or f"device {d.device_id}",
                 Text(d.name[:18] if d.name else "·",
                      style="bold" if active else "dim"),
-                self._bar(frac),
-                Text(self._stage_label(d),
-                     style="bold cyan" if active else "dim"),
+                self._bar(frac, failed),
+                Text(self._stage_label(d), style=stage_style),
                 f"{d.done}/{d.assigned}" if d.assigned else "",
             )
 
@@ -278,9 +281,11 @@ class ProgressDisplay:
                 ln.append(r.get("name", "?"))
                 ln.append(f"  {r.get('time', 0):.1f}s", style="dim")
             else:
+                # Just the symbol + name here; the full reason is printed once
+                # in the post-run failure summary, so showing a lossy one-line
+                # clip too would be redundant.
                 ln.append("✗ ", style="red")
                 ln.append(r.get("name", "?"), style="red")
-                ln.append(f"  {r.get('error', 'failed')[:36]}", style="dim red")
             log_lines.append(ln)
 
         parts = [Text(""), hdr, sep, Text(""), tbl]

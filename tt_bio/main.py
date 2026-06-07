@@ -895,6 +895,7 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
     display.start()
     after = 0
     failed = 0
+    failures: dict[str, str] = {}  # this run's failures: job id -> error message
     rows_by_id: dict[str, dict] = {}
     if results_path is not None:
         rows_by_id = {r["id"]: r for r in _load_results_resilient(results_path)
@@ -911,6 +912,8 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
                 if ev.get("event") == "done":
                     row = ev.get("row")
                     if isinstance(row, dict) and "id" in row:
+                        if row.get("status") == "failed":
+                            failures[row["id"]] = row.get("error") or "failed"
                         if results_path is not None:
                             rows_by_id[row["id"]] = row
                             try:
@@ -926,6 +929,16 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
             time.sleep(0.5)
     finally:
         display.stop()
+    if failures:
+        # The rolling log only had room for a one-line clip per job; print the
+        # full message here so any actionable guidance (e.g. how to supply
+        # MSAs) is readable once the live display is gone.
+        click.echo(f"\n{len(failures)} failed:")
+        for job_id, error in failures.items():
+            lines = str(error).splitlines() or [""]
+            click.echo(f"  ✗ {job_id}: {lines[0]}")
+            for extra in lines[1:]:
+                click.echo(f"      {extra}")
     return failed
 
 
