@@ -15,16 +15,20 @@ import ttnn
 
 sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
+    make_transition,
     make_triangle_attention,
     make_triangle_multiplication,
     pcc,
+    remap_transition,
     remap_triangle_attention,
     remap_triangle_multiplication,
+    run_reference_transition,
     run_reference_triangle_attention,
     run_reference_triangle_multiplication,
 )
 
 from tt_bio.tenstorrent import (  # noqa: E402
+    Transition,
     TriangleAttention,
     TriangleMultiplication,
     get_device,
@@ -79,3 +83,19 @@ def test_triangle_attention_parity(starting, ending):
     out = torch.Tensor(ttnn.to_torch(ta(xt))).float()
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f} (starting={starting}, ending={ending})"
+
+
+# Protenix Transition (SwiGLU) -> tt-bio Transition.
+@pytest.mark.parametrize("c_in", [128, 384])
+def test_transition_parity(c_in):
+    L, n = 64, 4
+    mod, sd = make_transition(c_in=c_in, n=n, seed=0)
+    x = torch.randn(1, L, L, c_in) if c_in == 128 else torch.randn(1, L, c_in)
+    ref = run_reference_transition(mod, x).float()
+
+    dev = get_device()
+    tr = Transition(state_dict=remap_transition(sd), compute_kernel_config=_ck(dev))
+    xt = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    out = torch.Tensor(ttnn.to_torch(tr(xt))).float()
+    p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f} (c_in={c_in})"

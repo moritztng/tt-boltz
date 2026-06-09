@@ -114,6 +114,34 @@ def run_reference_triangle_attention(mod, x, mask=None):
         return mod(x, mask=mask)
 
 
+# --- Transition (SwiGLU; used as pair_transition + single_transition) ---------
+def make_transition(c_in=128, n=4, seed=0):
+    from protenix.model.modules.primitives import Transition
+
+    torch.manual_seed(seed)
+    mod = Transition(c_in=c_in, n=n).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.5)
+    return mod, mod.state_dict()
+
+
+def remap_transition(ref_sd: dict) -> dict:
+    """Protenix Transition -> tt-bio Transition. Both: out = linear(silu(a)*b),
+    a/b = linear_{a,b}(LN(x)). tt-bio folds silu into fc1."""
+    return {
+        "norm.weight": ref_sd["layernorm1.weight"],
+        "norm.bias": ref_sd["layernorm1.bias"],
+        "fc1.weight": ref_sd["linear_no_bias_a.weight"],  # gets silu in tt-bio
+        "fc2.weight": ref_sd["linear_no_bias_b.weight"],
+        "fc3.weight": ref_sd["linear_no_bias.weight"],
+    }
+
+
+def run_reference_transition(mod, x):
+    with torch.no_grad():
+        return mod(x)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
