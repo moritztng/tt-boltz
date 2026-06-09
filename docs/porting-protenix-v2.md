@@ -1328,3 +1328,18 @@ in the token DiT, or run the 24-block DiT path in fp32). If <1.0, a residual str
 diff remains. THEN check end-to-end Ca-RMSD tolerance: coords = c_skip*x_noisy +
 c_out*r_update; over 200 sampler steps the DiT error may partially average — measure actual
 Ca-RMSD before over-investing in DiT precision. Everything else in the denoiser is exact (1.0).
+
+## DECISIVE: torch-fp32 24-block DiT = golden (PCC 1.0) — ENTIRE v2 FORWARD LOGIC CORRECT
+
+torch fp32 24-block token DiT (from golden dit_in/s_single/normalize(pair_z)) reproduces
+golden dit_out EXACTLY (PCC 1.0). So the DiT is logically correct; ttnn dit_out 0.31 is
+PURELY bf16 deployment precision (near-identity blocks, per-block bf16 compute noise
+accumulates). => The ENTIRE Protenix-v2 forward (trunk + denoiser incl. DiT + confidence)
+is LOGICALLY VALIDATED on real v2 weights. Only remaining is bf16 precision tuning of the
+24-block DiT for end-to-end Ca-RMSD quality.
+ttnn FIX for the token DiT (small N_token ~38): replace SDPA with EXPLICIT fp32
+attention (Q@K^T/sqrt(d)+bias -> softmax -> @V via ttnn.matmul with dtype=float32,
+fp32 dest acc) and run the block linears at higher precision; SDPA forces bf16, but
+explicit matmul on 38 tokens is cheap and can be fp32. Keep a_t fp32 across blocks (done).
+Then dit_out -> ~1.0 -> denoiser coords ~1.0 -> EDM sampler -> Ca-RMSD. Alternatively,
+measure Ca-RMSD with bf16 DiT first — the EDM 200-step average may tolerate it.
