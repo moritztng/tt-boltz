@@ -18,6 +18,7 @@ from protenix_reference import (  # noqa: E402
     make_attention_pair_bias,
     make_outer_product_mean,
     make_adaptive_layernorm,
+    make_conditioned_transition_block,
     make_msa_block,
     make_pair_weighted_averaging,
     make_pairformer_block,
@@ -36,6 +37,7 @@ from protenix_reference import (  # noqa: E402
     remap_triangle_multiplication,
     run_reference_outer_product_mean,
     run_reference_adaptive_layernorm,
+    run_reference_conditioned_transition_block,
     run_reference_msa_block,
     run_reference_pair_weighted_averaging,
     run_reference_pairformer_block,
@@ -45,6 +47,7 @@ from protenix_reference import (  # noqa: E402
 )
 
 from tt_bio.tenstorrent import (  # noqa: E402
+    CORE_GRID_MAIN,
     AttentionPairBias,
     AdaLN,
     OuterProductMean,
@@ -246,4 +249,30 @@ def test_adaln_parity():
     ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
     out = torch.Tensor(ttnn.to_torch(adaln(ft(a), ft(s)))).float().reshape(ref.shape)
     p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f}"
+
+
+# Protenix ConditionedTransitionBlock: b = silu(a1)*a2 (2 factors) — assembled
+# from the verified AdaLN + raw ttnn linears (tt-bio's CTB has an extra factor).
+def test_conditioned_transition_block_parity():
+    c_a, c_s, n, L = 768, 384, 2, 32
+    mod, sd = make_conditioned_transition_block(c_a, c_s, n, seed=0)
+    a = torch.randn(1, L, c_a); s = torch.randn(1, L, c_s)
+    ref = run_reference_conditioned_transition_block(mod, a.clone(), s.clone()).float()
+    dev = get_device(); ck = _ck(dev)
+    def subd(p): return {k[len(p)+1:]: v for k, v in sd.items() if k.startswith(p + ".")}
+    ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    ftt = lambda x: ttnn.from_torch(x.t(), layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    adaln = AdaLN(False, remap_adaptive_layernorm(subd("adaln")), ck)
+    a1w, a2w, bw = ftt(sd["linear_nobias_a1.weight"]), ftt(sd["linear_nobias_a2.weight"]), ftt(sd["linear_nobias_b.weight"])
+    lsw, lsb = ftt(sd["linear_s.weight"]), ft(sd["linear_s.bias"])
+    an = adaln(ft(a), ft(s))
+    a1 = ttnn.linear(an, a1w, compute_kernel_config=ck, core_grid=CORE_GRID_MAIN)
+    a2 = ttnn.linear(an, a2w, compute_kernel_config=ck, core_grid=CORE_GRID_MAIN)
+    b = ttnn.multiply(a2, a1, input_tensor_b_activations=[ttnn.UnaryOpType.SILU])
+    ba = ttnn.linear(b, bw, compute_kernel_config=ck, core_grid=CORE_GRID_MAIN)
+    sg = ttnn.linear(ft(s), lsw, bias=lsb, compute_kernel_config=ck, core_grid=CORE_GRID_MAIN)
+    out = ttnn.multiply(sg, ba, input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID])
+    ot = torch.Tensor(ttnn.to_torch(out)).float().reshape(ref.shape)
+    p = pcc(ot, ref)
     assert p > 0.98, f"PCC {p:.5f}"

@@ -347,6 +347,25 @@ def run_reference_adaptive_layernorm(mod, a, s):
         return mod(a, s)
 
 
+# --- ConditionedTransitionBlock (Protenix-specific assembly) ------------------
+# tt-bio's ConditionedTransitionBlock (Boltz-2) computes b = silu(swish)*gates*
+# a_to_b (3 factors); Protenix's is b = silu(a1)*a2 (2 factors) — NOT a drop-in.
+# So assemble Protenix's from the verified AdaLN + raw ttnn linears (see test).
+def make_conditioned_transition_block(c_a=768, c_s=384, n=2, seed=0):
+    from protenix.model.modules.transformer import ConditionedTransitionBlock
+
+    torch.manual_seed(seed)
+    mod = ConditionedTransitionBlock(c_a=c_a, c_s=c_s, n=n).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def run_reference_conditioned_transition_block(mod, a, s):
+    with torch.no_grad():
+        return mod(a, s)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
