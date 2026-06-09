@@ -758,3 +758,18 @@ structural bug. DEBUG LEADS for next iteration:
 - confirm pair_z IS get_pairformer_output's returned z (vs some normalized/other z) —
   re-capture by hooking get_pairformer_output return directly, not diffusion kwargs.
 - check ttnn reshape (1,38,38,256) readout vs (38,38,256) golden (38 not tile-aligned).
+
+## MILESTONE: FULL 10-CYCLE TRUNK VALIDATED on-device (s 0.991, z 0.990)
+
+Root cause of the earlier z=0.02: pair_z in the diffusion kwargs is the
+DiffusionConditioning-PROCESSED pair (relpe + transitions), NOT the raw trunk z.
+The trunk's true return z is in ~/protenix_trunk_gold.pkl (scripts/
+protenix_extract_trunk_gold.py monkeypatches get_pairformer_output to capture s,z).
+Re-validated scripts/protenix_trunk_assembly.py vs the TRUE trunk return:
+  s PCC 0.99110, z PCC 0.98967  (10 cycles, bf16). TRUNK DONE.
+Confirmed: s_trunk(diffusion kwargs) == trunk return s (PCC 1.0); pair_z != trunk z.
+=> For the DIFFUSION stage: pair_z fed to diffusion_module is DiffusionConditioning's
+output, so implement DiffusionConditioning (relpe + 2 transitions on z; Fourier(noise)
++ single cond on s) -> (s_single, pair_z) BEFORE the diffusion transformer.
+Next: DiffusionConditioning + DiffusionModule (AtomAttnEncoder has_coords=True + token
+DiT 24 blocks + AtomAttnDecoder) + EDM sampler -> coords; then confidence -> Ca-RMSD.

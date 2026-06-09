@@ -14,7 +14,7 @@ s_inputs=d['intermediates']['input_embedder']['out'].float()           # golden 
 relp=d['intermediates'].get('input_embedder')  # need relp/token_bonds: pull from trunkin gold
 tg=pickle.load(open('/home/ttuser/protenix_trunkin_gold.pkl','rb'))
 relp=tg['relp']; token_bonds=tg['token_bonds']
-dk=d['intermediates']['diffusion_module']['kwargs']; s_gold=dk['s_trunk'].float(); z_gold=dk['pair_z'].float()
+tgld=pickle.load(open('/home/ttuser/protenix_trunk_gold.pkl','rb')); s_gold=tgld['s'].float(); z_gold=tgld['z'].float()
 N=38
 dev=get_device()
 ckc=ttnn.init_device_compute_kernel_config(dev.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True)
