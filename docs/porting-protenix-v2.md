@@ -145,6 +145,11 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       module port = a small Protenix-ordered assembly reusing those verified
       ttnn primitives. (Pattern: composition layers may diverge from Boltz-2
       even when every primitive matches — check each module's forward order.)
+- [~] MSA-layer assembly WIP: OPM-first order composes (OPM runs, output adds
+      to z); but PairWeightedAveraging hits a ttnn slice/layout snag on the
+      *composed* z (it passes in isolation — a plumbing detail, not architectural).
+      Next debug: normalize z's memory_config after the OPM add, or inspect pwa's
+      per-head z slicing at L=32. Then assemble MSAModule (N blocks + input proj).
 - [ ] Next: build the Protenix-ordered MSA layer (reuse verified primitives) ->
       MSAModule (N blocks + input proj). Reconcile order vs
       Protenix MSABlock) + PairformerStack (N-block) + s/z init linears →
