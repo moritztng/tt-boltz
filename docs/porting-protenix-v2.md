@@ -1498,3 +1498,25 @@ is the coarse N_step=10 smoke + MSA-less tiny protein, not a bug). FULL ON-DEVIC
 (denoiser + sampler) VALIDATED END-TO-END.
 Remaining release work: top-level Protenix class (trunk loop -> cond -> edm_sample),
 worker/CLI --model protenix-v2, data-pipeline vendoring (no clones), --fast, README.
+
+## TOP-LEVEL Protenix CLASS + FULL ON-DEVICE FOLD VALIDATED (capstone)
+
+tt_bio.protenix.Protenix (load_from_checkpoint + fold(feats)) composes the validated
+submodules into the full forward: InputFeatureEmbedder atom encoder -> s_inputs;
+diffusion atom cache (AtomFeaturization, c_l/p_lm) ; Trunk (10-cycle) -> s_trunk,z_trunk;
+DiffusionConditioning pair branch -> conditioned pair_z; EDM sampler (edm_sample) -> coords.
+scripts/protenix_fold_e2e.py runs the WHOLE pipeline on-device from a golden feats dict:
+finite non-collapsed structure (Rg 16.3A), seed0-vs-reference Kabsch RMSD 8.37A within the
+sampler's own seed-to-seed variance 7.93A -> the fold output is a typical draw from the
+reference distribution. tests/test_protenix_fold.py guards it (Rg>10, vs-ref within band).
+
+TWO latent conditioning bugs found+fixed during assembly (both silently degrade structure,
+neither shows in per-module PCC): (1) the diffusion atom-cache p_lm must ADD the
+broadcast_token_to_local_atom_pair(W_z(LN_z(pair_z))) term (Protenix prepare_cache r_l path)
+-- base-only p_lm PCC 0.42, base+z PCC 1.0; (2) the denoiser's pair_z is the
+DiffusionConditioning pair output (concat[z_trunk, relpe(relp)] -> LN -> linear_z ->
++transition_z1+z2), NOT raw trunk z (raw-z pair_z PCC vs golden 0.02 -> structure collapse
+Rg 5.6A; conditioned -> Rg 16.3A). Both now in Protenix.fold.
+
+REMAINING (pure packaging): data-pipeline vendoring (sequence/CCD -> feats dict, no clones),
+worker/CLI --model protenix-v2, --fast block-fp8, unified README + I/O.

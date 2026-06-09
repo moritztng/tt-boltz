@@ -449,6 +449,148 @@ class DiffusionModule:
         }
 
 
+class Protenix:
+    """Top-level Protenix-v2 structure predictor on Tenstorrent (inference-only).
+
+    fold(feats) composes the validated submodules into the full forward:
+      InputFeatureEmbedder atom encoder      -> s_inputs (per-token, c_s_inputs=449)
+      diffusion atom-cache (AtomFeaturization) -> c_l, p_lm  (t-independent)
+      Trunk (10-cycle recycling)             -> s_trunk, z_trunk
+      EDM ancestral sampler (edm_sample, DiffusionModule denoiser) -> atom coords
+
+    Every submodule is validated on-device vs the real v2 reference (see
+    docs/porting-protenix-v2.md / tests/test_protenix*.py); the full diffusion is
+    validated end-to-end (sampler draws structures within the reference's sample
+    variance). feats is a dict of model-ready tensors (from the v2 data pipeline)."""
+
+    def __init__(self, model_state_dict, compute_kernel_config, device=None):
+        from .tenstorrent import get_device
+        self.sd = model_state_dict
+        self.ckc = compute_kernel_config
+        self.dev = device or get_device()
+        def under(pfx):
+            return {k[len(pfx):]: v for k, v in self.sd.items() if k.startswith(pfx)}
+        self.input_aae = AtomAttentionEncoder(under("input_embedder.atom_attention_encoder."), compute_kernel_config)
+        self.diff_feat = AtomFeaturization(under("diffusion_module.atom_attention_encoder."), compute_kernel_config)
+        self.trunk = Trunk(model_state_dict, compute_kernel_config)
+        self.diffusion = DiffusionModule(under("diffusion_module."), self.dev, compute_kernel_config)
+
+    @classmethod
+    def load_from_checkpoint(cls, path, compute_kernel_config=None, device=None):
+        """Load a v2 checkpoint (.pt) and build the model. Untrusted weights are read
+        with weights_only=True."""
+        import torch
+        import ttnn
+        from .tenstorrent import get_device
+        dev = device or get_device()
+        ckc = compute_kernel_config or ttnn.init_device_compute_kernel_config(
+            dev.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True)
+        ck = torch.load(path, map_location="cpu", weights_only=True)
+        ck = ck.get("model", ck)
+        sd = {k[len("module."):] if k.startswith("module.") else k: v for k, v in ck.items()}
+        return cls(sd, ckc, dev)
+
+    def _tt(self, x):
+        return ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
+
+    @staticmethod
+    def _to_host(t, shape=None):
+        import torch
+        h = torch.Tensor(ttnn.to_torch(t)).float()
+        return h.reshape(shape) if shape is not None else h
+
+    def _atom_feat_inputs(self, feats):
+        """Build the per-atom feature tensors shared by both atom encoders."""
+        import torch
+        N = feats["ref_pos"].shape[0]
+        f_in = torch.cat([feats["ref_mask"].reshape(N, 1), feats["ref_element"].reshape(N, 128),
+                          feats["ref_atom_name_chars"].reshape(N, 256)], dim=-1)
+        nb, nq, nk, _ = feats["d_lm"].shape
+        M = nb * nq * nk
+        d = feats["d_lm"].reshape(M, 3); v = feats["v_lm"].reshape(M, 1)
+        invd = (1.0 / (1.0 + (feats["d_lm"] ** 2).sum(-1, keepdim=True))).reshape(M, 1)
+        mt = feats["mask_trunked"]
+        a2t = feats["atom_to_token_idx"].long(); NT = int(a2t.max()) + 1
+        S = torch.zeros(N, NT); S[torch.arange(N), a2t] = 1.0
+        return dict(N=N, NT=NT, nb=nb, nq=nq, nk=nk, f_in=f_in, d=d, v=v, invd=invd,
+                    mt=mt, a2t=a2t, S=S, ref_charge_asinh=torch.arcsinh(feats["ref_charge"]).reshape(N, 1))
+
+    def _diffusion_pair_cond(self, z_trunk_tt, relp):
+        """DiffusionConditioning pair branch (computed once; t-independent):
+        zc = LN(concat[z_trunk, relpe(relp)]); pz = linear_z(zc); pz += transition_z1 +
+        transition_z2. Reference diffusion_module.diffusion_conditioning. Validated
+        PCC ~1.0 (scripts/protenix_diffcond_parity.py). Returns conditioned pair_z host."""
+        from .tenstorrent import Transition
+        C = "diffusion_module.diffusion_conditioning."
+        relpe = ttnn.linear(self._tt(relp), self._tt(self.sd[C + "relpe.linear_no_bias.weight"].t().contiguous()),
+                            compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
+        z_trunk_tt = ttnn.reshape(z_trunk_tt, (relpe.shape[0], relpe.shape[1], -1))
+        zc = ttnn.concat([z_trunk_tt, relpe], dim=-1)
+        zc = ttnn.layer_norm(zc, weight=self._tt(self.sd[C + "layernorm_z.weight"]), epsilon=1e-5,
+                             compute_kernel_config=self.ckc)
+        pz = ttnn.linear(zc, self._tt(self.sd[C + "linear_no_bias_z.weight"].t().contiguous()),
+                         compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
+        for nm in ("transition_z1", "transition_z2"):
+            sub = {k[len(C + nm + "."):]: v for k, v in self.sd.items() if k.startswith(C + nm + ".")}
+            t = Transition(DiffusionModule._remap_transition(sub), self.ckc)
+            pz = ttnn.add(pz, ttnn.reshape(t(pz), tuple(pz.shape)))
+        return self._to_host(pz)
+
+    def _plm_z_term(self, pair_z, a2t, nb, nq, nk):
+        """broadcast_token_to_local_atom_pair: W_z(LN_z(z_trunk)) gathered into windowed
+        atom-pair blocks (nb,nq,nk,16). The diffusion atom-encoder's p_lm cache adds this
+        trunk-pair-z term (reference transformer.py prepare_cache, r_l path)."""
+        import torch
+        import torch.nn.functional as F
+        E = "diffusion_module.atom_attention_encoder."
+        lnz = F.layer_norm(pair_z, (pair_z.shape[-1],)) * self.sd[E + "layernorm_z.weight"]
+        ztok = F.linear(lnz, self.sd[E + "linear_no_bias_z.weight"])     # (NT,NT,16)
+        N = a2t.shape[0]; NQ, NK, PADL = 32, 128, 48; NP = nb * NQ
+        aq = torch.cat([a2t, torch.zeros(NP - N, dtype=torch.long)]).reshape(nb, NQ)
+        ak_src = torch.cat([torch.zeros(PADL, dtype=torch.long), a2t,
+                            torch.zeros(PADL + NP + NK, dtype=torch.long)])
+        ak = torch.stack([ak_src[b * NQ:b * NQ + NK] for b in range(nb)], 0)   # (nb,nk)
+        return torch.stack([ztok[aq[b][:, None].expand(NQ, NK), ak[b][None, :].expand(NQ, NK)]
+                            for b in range(nb)], 0)                            # (nb,nq,nk,16)
+
+    def fold(self, feats, *, n_step=200, n_sample=1, seed=None, progress_fn=None):
+        """Run the full pipeline. feats: model-ready tensor dict. Returns coords
+        (n_sample, N, 3) host tensor."""
+        import torch
+        fi = self._atom_feat_inputs(feats)
+        N, NT, nb, nq, nk = fi["N"], fi["NT"], fi["nb"], fi["nq"], fi["nk"]
+        mt = fi["mt"]; S = fi["S"]
+        tt = self._tt
+        # 1) s_inputs (input embedder atom encoder)
+        Mmat = (S.t() / (S.t().sum(-1, keepdim=True) + 1e-6))
+        dm = feats["deletion_mean"]; dm = dm.reshape(-1, 1) if dm.dim() == 1 else dm
+        s_inputs_tt = self.input_aae(
+            tt(feats["ref_pos"]), tt(fi["ref_charge_asinh"]), tt(feats["ref_mask"].reshape(N, 1)),
+            tt(fi["f_in"]), tt(fi["d"]), tt(fi["v"]), tt(fi["invd"]), mt, tt(Mmat),
+            tt(feats["restype"]), tt(feats["profile"]), tt(dm))
+        s_inputs = self._to_host(s_inputs_tt)[:NT]
+        # 2) diffusion atom cache (c_l, p_lm) -- t-independent
+        mt_dev = tt(mt.reshape(-1, 1).float())
+        c_l = self._to_host(self.diff_feat.c_l(tt(feats["ref_pos"]), tt(fi["ref_charge_asinh"]),
+                                               tt(feats["ref_mask"].reshape(N, 1)), tt(fi["f_in"])), (N, 128))
+        p_lm = self._to_host(self.diff_feat.p_lm(tt(fi["d"]), tt(fi["v"]), tt(fi["invd"]), mt_dev), (nb, nq, nk, 16))
+        # 3) trunk
+        s_trunk_tt, z_tt = self.trunk(feats, s_inputs, feats["relp"], feats["token_bonds"], progress_fn=progress_fn)
+        s_trunk = self._to_host(s_trunk_tt, (NT, s_trunk_tt.shape[-1]))
+        # diffusion pair conditioning (once, t-independent): conditioned pair_z
+        pair_z = self._diffusion_pair_cond(z_tt, feats["relp"]).reshape(NT, NT, self.trunk.C_Z)
+        # diffusion p_lm cache also carries the (conditioned) pair-z broadcast to atom pairs
+        p_lm = p_lm + self._plm_z_term(pair_z, fi["a2t"], nb, nq, nk)
+        # 4) EDM sampler
+        cond = {"s_trunk": s_trunk, "s_inputs": s_inputs, "pair_z": pair_z, "c_l": c_l,
+                "p_lm": p_lm, "S": S, "mask_trunked": mt.float()}
+        coords = []
+        for k in range(n_sample):
+            sd_seed = None if seed is None else seed + k
+            coords.append(edm_sample(self.diffusion, cond, N, n_step=n_step, seed=sd_seed)[0])
+        return torch.stack(coords, 0)
+
+
 class Trunk:
     """Protenix-v2 trunk: s_inputs -> (s_trunk, z_trunk) over 10 recycling cycles.
 
