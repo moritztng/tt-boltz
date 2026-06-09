@@ -705,3 +705,16 @@ All inputs verified present for direct implementation:
   (asym_id eq), pm=ones. Loop 4 templates, average, linear_u(relu).
 - golden: ~/protenix_ref_out.pkl['intermediates']['template_embedder'] out (38,38,256).
 Everything needed is on hand; no further reference reads required to implement.
+
+## MILESTONE: TemplateEmbedder validated on-device (PCC 0.99985) — TRUNK COMPONENTS COMPLETE
+
+v2 template_embedder (2 pair-only pairformer blocks + feature concat + linears)
+reproduces real golden z-update at PCC 0.99985 (tests/test_protenix_trunk_template.py).
+template pairformer: heads=2, head_dim=32, c_z=64; 4 dummy template slots averaged.
+ALL TRUNK COMPONENTS now implemented + validated on-device vs real v2 golden:
+atom encoder->s_inputs, trunk input->s_init/z_init, template embedder, MSA module,
+48-block pairformer. ONLY REMAINING TRUNK PIECE: recycle linears (layernorm_z_cycle/
+linear_no_bias_z_cycle/layernorm_s/linear_no_bias_s) + the 10-cycle loop assembly:
+  z = z_init + lin_z_cycle(ln_z_cycle(z)); z += template; z = msa(z); 
+  s = s_init + lin_s(ln_s(s)); s,z = pairformer(s,z)   x N_cycle=10
+-> trunk output s,z (golden captured). Then diffusion + sampler -> coords; confidence.
