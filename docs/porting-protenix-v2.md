@@ -858,3 +858,17 @@ Remaining suspects (op-level single-block trace next, fresh context):
   verify the pair-bias add + softmax precision.
 NEXT: decompose ONE block — compare adaln_a out, apb attn out, gated attn, ctb out to
 a golden single-block sub-trace (hook inside block 0) to find the ~3% leak.
+
+## DiT debug: STRUCTURAL (not bf16) — reproduces in torch fp32 (block0 0.964)
+
+torch fp32 block-0 reimpl from golden inputs+weights -> PCC 0.964 vs golden block0
+(== ttnn 0.966), so the ~3.6%/block leak is STRUCTURAL, not bf16. Variant sweep:
+V1 ff(attn+a)+(attn+a)=0.9641 (best), no-a-resid=0.18, no-linear_a_last=0.96,
+no-qk-scale=0.965 — residual/gate/scale are right; the leak is subtler (large maxerr
+40 => a few elements far off). RULED OUT: bf16, AdaLN remap, residual structure, gate,
+qk scale. Reproduces in PURE TORCH (debug without ttnn — fast).
+NEXT (fresh context): hook the REFERENCE block-0's attention_pair_bias + 
+conditioned_transition_block sub-outputs (venv) and compare to the torch fp32 reimpl
+sub-steps to find the exact op that diverges. Suspect: pair-bias path (linear_nobias_z
+on z; permute_final_dims order) or the Attention class's exact softmax/scale/gating
+detail vs my reimpl. golden: ~/protenix_dit_blocks_gold.pkl + diffusion_gold.pkl.
