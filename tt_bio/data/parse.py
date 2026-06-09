@@ -2668,13 +2668,30 @@ def parse_polymer(
 def token_spec_to_ids(
     chain_name, residue_index_or_atom_name, chain_to_idx, atom_idx_map, chains
 ):
+    if chain_name not in chains:
+        raise ValueError(
+            f"Constraint references chain '{chain_name}', which is not in the input."
+        )
     if chains[chain_name].type == const.chain_type_ids["NONPOLYMER"]:
         # Non-polymer chains are indexed by atom name
-        _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
+        key = (chain_name, 0, residue_index_or_atom_name)
+        if key not in atom_idx_map:
+            raise ValueError(
+                f"Constraint references atom '{residue_index_or_atom_name}' on ligand "
+                f"'{chain_name}', which does not exist."
+            )
+        _, _, atom_idx = atom_idx_map[key]
         return (chain_to_idx[chain_name], atom_idx)
     else:
-        # Polymer chains are indexed by residue index
-        return chain_to_idx[chain_name], residue_index_or_atom_name - 1
+        # Polymer chains are indexed by residue index (1-indexed)
+        n_res = len(chains[chain_name].residues)
+        ridx = residue_index_or_atom_name
+        if not isinstance(ridx, int) or not (1 <= ridx <= n_res):
+            raise ValueError(
+                f"Constraint references residue {ridx} on chain '{chain_name}', "
+                f"which has {n_res} residues (1-indexed)."
+            )
+        return chain_to_idx[chain_name], ridx - 1
 
 
 def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
@@ -2894,8 +2911,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             chain_type = const.chain_type_ids[entity_type.upper()]
             unk_token = const.unk_token[entity_type.upper()]
 
-            # Extract sequence
-            raw_seq = items[0][entity_type]["sequence"]
+            # Extract sequence. Upper-case it: single-letter residue codes are
+            # upper-case, and a lower-case sequence would otherwise tokenize to
+            # all-UNK and silently fold garbage. (SMILES, which is case-
+            # sensitive, is a ligand and never reaches this polymer branch.)
+            raw_seq = items[0][entity_type]["sequence"].upper()
             entity_to_seq[entity_id] = raw_seq
 
             # Convert sequence to tokens
@@ -3288,6 +3308,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
 
             binder = constraint["pocket"]["binder"]
+            if binder not in chain_to_idx:
+                raise ValueError(f"Could not find binder with name {binder} in the input!")
             binder = chain_to_idx[binder]
 
             contacts = []
