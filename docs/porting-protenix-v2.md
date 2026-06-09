@@ -267,3 +267,27 @@ correct on real weights. Flag for end-to-end: watch CTB intermediate precision
 (bf16 storage of large activations) when validating real-input end-to-end RMSD;
 HiFi4 fp32 accumulation is already on. A meaningful full-block real-weight check
 needs realistic (in-distribution) inputs, not random.
+
+## Boundary of autonomous parity work (where this paused)
+
+Verified on device (17 tests: 15 random-weight + 3 real-weight; the diffusion
+full-block real-weight check is bf16-sensitive under random inputs — see above):
+the ENTIRE token-level compute core (Pairformer trunk, MSA module, diffusion
+token-transformer block, AdaLN, CTB, DistogramHead), with real-weight
+confirmation (public v0.5.0 checkpoint) on Pairformer/MSA/Distogram.
+
+The remaining work is NO LONGER module parity — it's INTEGRATION:
+- **Atom encoder/decoder**: tt-bio's AtomEncoder consumes a full Boltz-2 `feats`
+  dict (ref_pos/charge/element/atom_name_chars/atom_to_token/res_type/mol_type ->
+  atom single+pair, windowed bias, to_keys). Porting Protenix's atom path means
+  replicating an atom-featurization pipeline with contracts that differ from
+  Protenix's — integration, multi-session.
+- **Full featurization pipeline**: input parsing -> MSA/template/CCD/ligand ->
+  the feature dict the model consumes (large host code).
+- **Orchestration + sampler + ConfidenceHead**, then end-to-end Cα-RMSD.
+- **Release gate (needs user):** the v2 (464M) checkpoint is 403/gated; only the
+  base/v1 are public. Real-weight end-to-end on v2 needs that checkpoint.
+
+To resume: re-run `/loop ...` and I'll undertake the atom-featurization
+integration; or provide the v2 checkpoint and I'll wire end-to-end. The verified
+modules + remaps + reconciliation catalog + real-weight tests are all committed.
