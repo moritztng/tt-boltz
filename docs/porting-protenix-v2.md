@@ -1560,3 +1560,22 @@ from a SEQUENCE STRING -> Protenix.fold -> structure: e.g. the HIV-protease frag
 GSSGSSGQITLWQRPLVTIKIGGQLKEALLDTGADDTV folds to a finite 275-atom structure (Rg 14.93A).
 No protenix dependency. The model regenerates relp/d_lm/v_lm/mask_trunked internally;
 ref_pos uses the bundled reference conformer (stochastic reference -> any valid one folds).
+
+## PORT COMPLETE — final status
+
+The Protenix-v2 -> Tenstorrent port is complete and verified end-to-end:
+- Model: every module validated on-device vs real v2 weights; full fold within sample
+  variance of the reference (tt_bio/protenix.py: AtomAttentionEncoder, Trunk, DiffusionModule,
+  edm_sample, ConfidenceHead, top-level Protenix).
+- Data pipeline (tt_bio/protenix_data.py): build_protein_features(sequence) -> feats, no
+  protenix dependency; token + atom features validated EXACT vs golden; derived feats
+  (relp, d_lm/v_lm/mask_trunked) regenerated inside the model; bundled CCD conformers.
+- CLI/worker: `tt-bio predict --model protenix-v2 seq.fasta` -> on-device fold -> PDB/mmCIF
+  + results.json (plddt, n_residues/atoms). Verified end-to-end incl. --fast (fp8 trunk;
+  diffusion stays bf16 for accuracy) and the shared scheduler/progress/--debug/--log path.
+- Tests: tests/test_protenix_*.py (per-module parity, full-trajectory denoiser, trunk class,
+  fold capstone, token+atom featurizer exact, sequence->structure integration).
+- README updated. Inference-only; reuses tt_bio.tenstorrent primitives + Boltz-2 augmentation
+  + tt_bio.data.const (no redundancy, no clones/vendored deps).
+Optional future work: fp8 on the hand-coded diffusion linears (currently bf16 by design),
+multi-chain inputs (currently concatenated), external MSA/template support.
