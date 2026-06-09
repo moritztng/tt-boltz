@@ -364,3 +364,23 @@ def test_real_weight_pairformer_block():
     zo = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(z_ref.shape)
     ps, pz = pcc(so, s_ref), pcc(zo, z_ref)
     assert ps > 0.98 and pz > 0.98, f"real-weight PCC s={ps:.5f} z={pz:.5f}"
+
+
+@pytest.mark.skipif(not os.path.exists(_CKPT), reason="protenix base checkpoint not downloaded")
+def test_real_weight_distogram_head():
+    from tt_bio.esmfold2 import DistogramHead
+    from protenix.model.modules.head import DistogramHead as RefDH
+    ck = torch.load(_CKPT, map_location="cpu", weights_only=False)["model"]
+    sd = {k[len("module.distogram_head."):]: v for k, v in ck.items()
+          if k.startswith("module.distogram_head.")}
+    no_bins, c_z = sd["linear.weight"].shape
+    mod = RefDH(c_z=c_z, no_bins=no_bins).eval()
+    mod.load_state_dict(sd, strict=True)
+    L = 32
+    z = torch.randn(1, L, L, c_z)
+    ref = mod(z.clone()).float()
+    dev = get_device()
+    dh = DistogramHead(remap_distogram_head(mod.state_dict()), _ck(dev))
+    out = torch.Tensor(ttnn.to_torch(dh(ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)))).float().reshape(ref.shape)
+    p = pcc(out, ref)
+    assert p > 0.98, f"real-weight distogram PCC {p:.5f}"
