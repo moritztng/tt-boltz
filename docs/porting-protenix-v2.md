@@ -569,3 +569,35 @@ Remaining trunk: recycle linears (layernorm_z_cycle, linear_no_bias_z_cycle,
 layernorm_s, linear_no_bias_s) + recycle loop over msa_module + pairformer_stack
 (both already validated on v2 weights). template_embedder: check n_blocks for v2.
 Then diffusion (conditioning + module + EDM sampler) -> coords; confidence head.
+
+## TRUNK STRUCTURE (v2) + remaining roadmap
+
+v2 trunk recompute (get_pairformer_output): N_cycle=10 recycles, each:
+  z = z_init + linear_no_bias_z_cycle(layernorm_z_cycle(z))
+  z += template_embedder(feat, z)        # n_blocks=2 ACTIVE (runs on dummy template
+                                          # feats when use_template=False; golden incl. it)
+  z = msa_module(feat, z, s_inputs)       # 4 blocks  [validated on v2]
+  s = s_init + linear_no_bias_s(layernorm_s(s))
+  s, z = pairformer_stack(s, z)           # 48 blocks [validated on v2]
+-> returns s_inputs, s, z (golden s,z captured in ~/protenix_ref_out.pkl intermediates).
+
+DONE on-device (all PCC>0.9999 vs real v2): AtomFeaturization, AtomTransformer
+(windowed), AtomAttentionEncoder->s_inputs, TrunkInput->s_init/z_init. Token core
+(Pairformer/MSA/distogram) validated on v2 (test_protenix.py).
+
+REMAINING (the bulk):
+1. TEMPLATE EMBEDDER (2 blocks, new): triangle mult/attn + transitions over template
+   feats -> z update. Reuse tenstorrent.py TriangleMultiplication/Attention/Transition.
+2. RECYCLE WIRING: recycle linears (layernorm_z_cycle, linear_no_bias_z_cycle,
+   layernorm_s, linear_no_bias_s) + 10-cycle loop over template/msa/pairformer with v2
+   weight remaps -> validate trunk output s,z vs golden.
+3. DIFFUSION: DiffusionConditioning (relpe + transitions + Fourier(noise) + single cond)
+   + DiffusionModule (AtomAttentionEncoder has_coords=True + token DiT 24 blocks +
+   AtomAttentionDecoder) + EDM sampler loop (gamma/noise schedule, N_step) -> coords.
+   golden diffusion_module I/O captured (x_noisy,t,feat,s_inputs,s_trunk,pair_z,... ->
+   x(1,275,3)).
+4. CONFIDENCE HEAD: distance one-hot embed -> 4x PairformerLayer -> PAE/PDE/pLDDT/
+   resolved + softmax-weighted aggregation. golden I/O captured.
+5. END-TO-END: wire full forward -> Ca-RMSD vs ~/protenix_ref_out.pkl coords.
+6. RELEASE: --fast block-fp8, CLI --model protenix-v2 + scheduler/worker wiring,
+   vendoring (no clones), unified README.
