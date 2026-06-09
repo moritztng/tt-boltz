@@ -342,3 +342,18 @@ Remaining for a reference forward (then tt-bio end-to-end):
    (download from the public TOS endpoint).
 4. feats via json_to_feature for a tiny protein -> Protenix.forward -> coords ->
    compare structure / validate the tt-bio modules in the real pipeline.
+
+## MILESTONE: full Protenix-v2 reference model loads on-box (real weights)
+
+The complete 464.4M Protenix-v2 reference model now instantiates and loads the
+real v2 weights with strict=True (missing=0, unexpected=0). Recipe (scripts/
+protenix_ref_build.py):
+1. Repo checkout for configs/+runner/ (GIT_LFS_SKIP_SMUDGE=1 shallow clone; set
+   PROTENIX_SRC). The runner/configs are NOT in the PyPI wheel.
+2. Stub protenix.model.layer_norm.layer_norm.FusedLayerNorm with a torch
+   LayerNorm-equivalent (the real one JIT-compiles a CUDA ext; no CUDA here).
+3. Config = deep_update({**configs_base, "data":data_configs, **inference_configs},
+   model_configs["protenix-v2"]) -> parse_configs(fill_required_with_null=True).
+4. Protenix(cfg).eval(); load_state_dict(strip 'module.' prefix, strict).
+Next: feats via the data pipeline (download CCD components.cif) for a tiny
+protein -> model.forward -> reference structure -> validate tt-bio end-to-end.
