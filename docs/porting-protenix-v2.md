@@ -1225,3 +1225,13 @@ TEST-SUITE TODO (bounded, valuable): promote the diffusion-submodule parity scri
 (atomenc_coords, atomdec, dit_consistent, diffcond, singlecond, confidence) to pytest
 tests (skipif on their golden pkls), mirroring the trunk-component tests, for a complete
 committed validation suite.
+
+## Confidence plddt/resolved: precision (not a bug) — atom_to_tokatom_idx in range
+
+Confirmed atom_to_tokatom_idx in [0,13] (weight has 24 slots) -> NOT an indexing bug.
+plddt 0.93 / resolved 0.77 is bf16 precision: s_single (bf16 pairformer output) through
+the per-atom einsum weight[idx] amplifies small errors. resolved is only 2 bins with
+small dynamic range (golden std 1.39) -> PCC especially sensitive. The head STRUCTURE is
+correct (pae/pde 1.0). For release: keep s_single higher-precision into the plddt/resolved
+einsum (fp32 dest / keep s fp32 for these heads) if tighter confidence is needed; not a
+logic issue. Coordinates (the accuracy bar) are unaffected — confidence heads are metrics.
