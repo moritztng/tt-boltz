@@ -2911,11 +2911,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             chain_type = const.chain_type_ids[entity_type.upper()]
             unk_token = const.unk_token[entity_type.upper()]
 
-            # Extract sequence. Upper-case it: single-letter residue codes are
-            # upper-case, and a lower-case sequence would otherwise tokenize to
-            # all-UNK and silently fold garbage. (SMILES, which is case-
-            # sensitive, is a ligand and never reaches this polymer branch.)
-            raw_seq = items[0][entity_type]["sequence"].upper()
+            # Normalise the sequence: strip whitespace (sequences pasted from
+            # formatted sources carry spaces/newlines) and upper-case it.
+            # Otherwise those characters tokenize to UNK and silently fold
+            # garbage. (SMILES, which is case-sensitive, is a ligand and never
+            # reaches this polymer branch.)
+            raw_seq = "".join(items[0][entity_type]["sequence"].split()).upper()
             entity_to_seq[entity_id] = raw_seq
 
             # Convert sequence to tokens
