@@ -334,3 +334,33 @@ def test_distogram_head_parity():
     out = torch.Tensor(ttnn.to_torch(dh(ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)))).float().reshape(ref.shape)
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f}"
+
+
+# Real-weight validation against the public Protenix base checkpoint (v0.5.0).
+# Skipped if the checkpoint isn't present. Strongest validation: confirms the
+# weight remaps reproduce the reference on REAL trained weights, not just random.
+_CKPT = "/home/ttuser/protenix_ckpt/protenix_base_default_v0.5.0.pt"
+
+
+@pytest.mark.skipif(not os.path.exists(_CKPT), reason="protenix base checkpoint not downloaded")
+def test_real_weight_pairformer_block():
+    from protenix.model.modules.pairformer import PairformerBlock
+    ck = torch.load(_CKPT, map_location="cpu", weights_only=False)["model"]
+    pfx = "module.pairformer_stack.blocks.0."
+    blk_sd = {k[len(pfx):]: v for k, v in ck.items() if k.startswith(pfx)}
+    mod = PairformerBlock(n_heads=16, c_z=128, c_s=384, c_hidden_mul=128,
+                          c_hidden_pair_att=32, no_heads_pair=4).eval()
+    mod.load_state_dict(blk_sd, strict=True)  # real weights, exact load
+    L = 64
+    s = torch.randn(1, L, 384); z = torch.randn(1, L, L, 128)
+    s_ref, z_ref = run_reference_pairformer_block(mod, s.clone(), z.clone())
+    s_ref, z_ref = s_ref.float(), z_ref.float()
+    dev = get_device()
+    layer = PairformerLayer(32, 4, 24, 16, True,
+                            remap_pairformer_block(mod.state_dict()), _ck(dev))
+    ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    s_out, z_out = layer(ft(s), ft(z))
+    so = torch.Tensor(ttnn.to_torch(s_out)).float().reshape(s_ref.shape)
+    zo = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(z_ref.shape)
+    ps, pz = pcc(so, s_ref), pcc(zo, z_ref)
+    assert ps > 0.98 and pz > 0.98, f"real-weight PCC s={ps:.5f} z={pz:.5f}"

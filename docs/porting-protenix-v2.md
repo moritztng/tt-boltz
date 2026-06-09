@@ -34,6 +34,22 @@ then Cα-RMSD validation, robustness, --fast, CLI --model protenix-v2, vendoring
 README. The compute core being verified does NOT mean releasable — end-to-end
 accuracy on real weights is the gate, and it requires the checkpoint.
 
+## Checkpoint status + real-weight validation (UPDATE)
+
+- protenix-v2.pt (464M) is **403/gated** at its official URL — NOT publicly
+  downloadable yet. But the v0.5.0/v1.0.0 base checkpoints ARE public
+  (`https://protenix.tos-cn-beijing.volces.com/checkpoint/...`). Downloaded
+  `protenix_base_default_v0.5.0.pt` (1.47GB) to /home/ttuser/protenix_ckpt/ —
+  same AF3 architecture at the base dims already verified.
+- **Real-weight validation PASSES:** the full PairformerBlock, loaded with REAL
+  trained block-0 weights from the checkpoint (strict load, missing=0/unexpected=0),
+  reproduces the Protenix reference on device at PCC s=1.00000 z=0.99829 — far
+  stronger than random-weight parity. Codified as a checkpoint-guarded test
+  (tests/test_protenix.py::test_real_weight_pairformer_block).
+- The checkpoint key names match the reference module names exactly, so every
+  verified module can be real-weight-validated the same way. v2 (larger dims)
+  drops into the same dim-parametric modules once its checkpoint is public.
+
 ## What Protenix-v2 is (Phase 0 findings)
 
 - ByteDance's open-source **AlphaFold3 reproduction** (Apache-2.0). Protenix-v2
