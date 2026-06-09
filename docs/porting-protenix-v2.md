@@ -841,3 +841,20 @@ PCC 0.62 => small per-block error compounding over 24 blocks. DEBUG (fresh conte
   z is constant; confirm reference doesn't evolve z).
 Single-block parity (random) passes >0.98, so the wiring is close; the gap is a
 real-weight per-block detail amplified x24.
+
+## DiT debug: localized to per-block fidelity (block0 0.966, steady decay)
+
+Captured per-block DiT golden (scripts/protenix_extract_dit_blocks.py ->
+~/protenix_dit_blocks_gold.pkl). Per-block PCC of my 24-block DiT: block0 0.966,
+block1 0.866, ... block16 0.57, ... block23 0.63 (gradual decay = each block ~0.97
+fidelity compounding). => NOT an accumulation-structure bug; each block is slightly
+unfaithful. RULED OUT: AdaLN remap (remap_adaptive_layernorm == remap_adaln, identical).
+Remaining suspects (op-level single-block trace next, fresh context):
+- attention precision: c_a=768, n_heads=16, head_dim=48 (padded to 64 in
+  AttentionPairBias non-atom path) — bf16 on 768-dim attn may limit to ~0.97/block.
+- z pair-bias: z fed pre-normalized then re-normalized by tt-bio APB layer_norm;
+  efficient_fusion uses scale-only on pre-normed z — check exact equivalence.
+- try fp32 dest acc / HiFi4 already on; consider keeping DiT activations bf16 but
+  verify the pair-bias add + softmax precision.
+NEXT: decompose ONE block — compare adaln_a out, apb attn out, gated attn, ctb out to
+a golden single-block sub-trace (hook inside block 0) to find the ~3% leak.
