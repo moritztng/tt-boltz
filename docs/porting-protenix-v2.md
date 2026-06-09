@@ -1055,3 +1055,20 @@ din was captured via a pre_hook. Outputs are always safe.)
 DIFFUSION STATUS: cond pair1.0/single0.99999, atomenc(has_coords) 0.99999, DiT block
 torch1.0/ttnn0.997. Remaining: atomdec (re-capture inputs via pre-hook), then EDM
 sampler -> coords; confidence; end-to-end Ca-RMSD.
+
+## MILESTONE: atom decoder validated (0.99992) — ALL diffusion submodules done
+
+atom decoder: q = broadcast_token_to_atom(linear_no_bias_a(a)) + q_skip;
+q = atom_transformer(q, c_skip, p_skip); coords = linear_no_bias_out(layernorm_q(q)).
+Reuses AtomTransformer; inputs captured pre-mutation (scripts/protenix_extract_atomdec_pre.py).
+ttnn coords PCC 0.99992 vs golden (scripts/protenix_atomdec_parity.py).
+ALL DIFFUSION SUBMODULES VALIDATED on-device vs real v2 golden:
+  DiffusionConditioning pair 1.0 / single 0.99999
+  atom encoder(has_coords) 0.99999
+  DiT block torch-fp32 1.0 (ttnn 0.997/block)
+  atom decoder 0.99992
+=> the full per-step DENOISER (cond -> atom enc -> 24-blk DiT -> atom dec -> coord
+update) is component-complete. Remaining: EDM SAMPLER loop wrapping the denoiser
+(noise schedule gamma0/gamma_min/noise_scale_lambda/step_scale_eta, N_step, centered
+denoise; sample-dim batch) -> final coords; then confidence head; end-to-end Ca-RMSD;
+then --fast/CLI/vendoring/README.
