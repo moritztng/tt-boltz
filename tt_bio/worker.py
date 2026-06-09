@@ -60,6 +60,18 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
     """
     cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
     cache.mkdir(parents=True, exist_ok=True)
+    # Protenix-v2: resolve the v2 checkpoint. Prefer $PROTENIX_CKPT, then the worker
+    # cache, then download from the Hugging Face weights mirror on first use.
+    if cfg.get("model") == "protenix-v2":
+        cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
+        ckpt = os.environ.get("PROTENIX_CKPT") or str(cache / "protenix-v2.pt")
+        if not Path(ckpt).exists():
+            from huggingface_hub import hf_hub_download
+
+            ckpt = hf_hub_download(repo_id="TMF001/protenix-v2-weights",
+                                   filename="protenix-v2.pt", local_dir=str(cache))
+        cfg["protenix_ckpt"] = ckpt
+        return
     # ESMFold2 loads its weights from HF on the first fold and needs no Boltz-2
     # checkpoints / molecule library — only a writable MSA dir.
     if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
@@ -142,6 +154,18 @@ class _WorkerState:
             self.config_hash = _hash_run_config(cfg)
             return
 
+        # Protenix-v2 family: load the ttnn model (no Boltz-2 tokenizer/featurizer;
+        # sequences are featurized in predict_one via tt_bio.protenix_data). Symmetric
+        # to the ESMFold2 branch above.
+        if cfg.get("model") == "protenix-v2":
+            from tt_bio.protenix import Protenix
+
+            self.model = Protenix.load_from_checkpoint(cfg["protenix_ckpt"])
+            self.prepare = None
+            self.run_id = run_id
+            self.config_hash = _hash_run_config(cfg)
+            return
+
         from tt_bio.boltz2 import Boltz2
         from tt_bio.data.featurizer import Boltz2Featurizer
         from tt_bio.data.mol import load_canonicals
@@ -176,6 +200,8 @@ class _WorkerState:
         self.config_hash = _hash_run_config(cfg)
 
     def predict_one(self, path: Path, cfg: dict[str, Any]):
+        if cfg.get("model") == "protenix-v2":
+            return self._predict_protenix_one(path, cfg)
         if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
             return self._predict_esmfold2_one(path, cfg)
 
@@ -257,6 +283,37 @@ class _WorkerState:
         # _execute_job inspects feats["record"].affinity; ESMFold2 has no affinity.
         feats = {"record": types.SimpleNamespace(affinity=False)}
         return metrics, None, feats
+
+    def _predict_protenix_one(self, path: Path, cfg: dict[str, Any]):
+        """Protenix-v2 single-protein fold: sequence(s) -> on-device fold -> structure.
+        Offline (no MSA/template); multiple FASTA chains are concatenated into one chain."""
+        import types
+
+        from tt_bio.esmfold2 import report_progress
+        from tt_bio.main import _read_protein_chains, _write_protenix_structure
+        from tt_bio.protenix_data import aatype_from_sequence, build_protein_features
+
+        chains = _read_protein_chains(path)
+        if not chains:
+            raise RuntimeError("no protein sequences")
+        seq = "".join(c[1] for c in chains)
+        report_progress("prep")
+        feats = build_protein_features(seq)
+
+        def _pfn(stage, step, total):
+            report_progress("diffusion" if stage == "trunk" else stage)
+
+        coords = self.model.fold(
+            feats, n_step=cfg["sampling_steps"], n_sample=cfg["diffusion_samples"],
+            seed=cfg.get("seed") or 0, progress_fn=_pfn,
+        )
+        out = Path(cfg["struct_dir"]) / f"{path.stem}.{cfg['output_format']}"
+        _write_protenix_structure(coords[0], feats, aatype_from_sequence(seq), out, cfg["output_format"])
+        metrics = {
+            "n_residues": len(seq), "n_chains": len(chains),
+            "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
+        }
+        return metrics, None, {"record": types.SimpleNamespace(affinity=False)}
 
     def predict_affinity(self, path: Path, pred_structure, cfg: dict[str, Any]) -> dict[str, float]:
         from tt_bio.boltz2 import Boltz2

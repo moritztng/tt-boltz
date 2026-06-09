@@ -1233,6 +1233,45 @@ def _read_protein_chains(path):
     return chains
 
 
+def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
+    """Write a Protenix-v2 prediction (coords + atom metadata) as PDB/mmCIF via biotite.
+    Reconstructs atom names/residues from tt_bio.data.const.ref_atoms (+ C-terminal OXT)."""
+    import biotite.structure as struc
+    import biotite.structure.io.pdb as _pdb
+    import biotite.structure.io.pdbx as _pdbx
+
+    from tt_bio.data import const
+    from tt_bio.protenix_data import RESTYPE_ORDER
+
+    l2r = {v: k for k, v in const.prot_token_to_letter.items()}
+    a2t = feats["atom_to_token_idx"].tolist()
+    znum = (feats["ref_element"].argmax(-1) + 1).tolist()
+    z2sym = {1: "H", 6: "C", 7: "N", 8: "O", 16: "S"}
+    n_tok = int(max(a2t)) + 1
+    names = []
+    for t in range(n_tok):
+        res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
+        atoms = list(const.ref_atoms[res])
+        if t == n_tok - 1:
+            atoms = atoms + ["OXT"]
+        names.extend(atoms)
+    arr = struc.AtomArray(coords.shape[0])
+    arr.coord = coords.numpy().astype("float32")
+    for i in range(coords.shape[0]):
+        t = a2t[i]
+        res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
+        arr.chain_id[i] = "A"
+        arr.res_id[i] = t + 1
+        arr.res_name[i] = res
+        arr.atom_name[i] = names[i]
+        arr.element[i] = z2sym.get(int(znum[i]), "C")
+    outpath = Path(outpath)
+    if output_format == "pdb":
+        pf = _pdb.PDBFile(); pf.set_structure(arr); pf.write(str(outpath))
+    else:
+        cf = _pdbx.CIFFile(); _pdbx.set_structure(cf, arr); cf.write(str(outpath))
+
+
 def _write_structure(complex_obj, outpath, output_format):
     if output_format == "pdb" and hasattr(complex_obj, "to_pdb"):
         outpath.write_text(complex_obj.to_pdb())
@@ -1316,11 +1355,12 @@ def _generate_esmfold2_a3m(seqs, target_id, msa_dir, msa_db_path, use_envdb,
 @click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for power reporting")
 @click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
-@click.option("--model", type=click.Choice(["boltz2", "esmfold2", "esmfold2-fast"]), default="boltz2", show_default=True,
+@click.option("--model", type=click.Choice(["boltz2", "esmfold2", "esmfold2-fast", "protenix-v2"]), default="boltz2", show_default=True,
               help="Structure model. boltz2: MSA + Pairformer. esmfold2: ESMC-6B + 48-block trunk + diffusion. "
-                   "esmfold2-fast: the lighter 24-block ESMFold2-Fast checkpoint. Both esmfold2 variants run "
-                   "on-device via the ttnn pipeline and accept an optional MSA (--use_msa_server / --msa_db_path; "
-                   "ligand / affinity options do not apply).")
+                   "esmfold2-fast: the lighter 24-block ESMFold2-Fast checkpoint. protenix-v2: AF3-family "
+                   "(Pairformer trunk + atom diffusion), single-sequence protein folding on-device, no MSA. "
+                   "All run on-device via the ttnn pipeline (esmfold2 accepts an optional MSA; "
+                   "ligand / affinity options apply to boltz2 only).")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
             seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
