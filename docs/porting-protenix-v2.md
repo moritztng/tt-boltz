@@ -131,7 +131,10 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       pre_norm_s←attention_pair_bias.layernorm_a, transition_s←single_transition.
       Residual order matches. **8/8 parity tests pass.** This is the bulk of the
       trunk (×48).
-- [ ] Next: PairformerStack (N-block iteration) + the s/z init linears →
+- [x] OuterProductMean (MSA->pair) parity on device, PCC 0.99962 (direct remap:
+      norm<-layer_norm, proj_a/b<-linear_1/2, proj_o<-linear_out). 9/9 tests pass.
+- [ ] Next: PairWeightedAveraging + full MSALayer/MSAModule (reconcile order vs
+      Protenix MSABlock) + PairformerStack (N-block) + s/z init linears →
       MSA block/module → diffusion transformer + atom encoder/decoder +
       DiffusionModule → input/relpos/template/constraint embedders →
       distogram + confidence heads. Then real-weight load + end-to-end.

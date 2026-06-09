@@ -223,6 +223,35 @@ def run_reference_pairformer_block(mod, s, z):
         return mod(s, z, pair_mask)  # -> (s, z)
 
 
+# --- OuterProductMean (MSA -> pair) -------------------------------------------
+def make_outer_product_mean(c_m=128, c_z=128, c_hidden=32, seed=0):
+    from protenix.openfold_local.model.outer_product_mean import OuterProductMean as RefOPM
+
+    torch.manual_seed(seed)
+    mod = RefOPM(c_m=c_m, c_z=c_z, c_hidden=c_hidden).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_outer_product_mean(ref_sd: dict) -> dict:
+    """OpenFold OuterProductMean -> tt-bio OuterProductMean. Direct (verified
+    PCC 0.99962; the c_hidden^2 flatten order matches, no permute needed)."""
+    return {
+        "norm.weight": ref_sd["layer_norm.weight"],
+        "norm.bias": ref_sd["layer_norm.bias"],
+        "proj_a.weight": ref_sd["linear_1.weight"],
+        "proj_b.weight": ref_sd["linear_2.weight"],
+        "proj_o.weight": ref_sd["linear_out.weight"],
+        "proj_o.bias": ref_sd["linear_out.bias"],
+    }
+
+
+def run_reference_outer_product_mean(mod, m):
+    with torch.no_grad():
+        return mod(m, mask=torch.ones(m.shape[:-1], dtype=m.dtype))  # [B,L,L,c_z]
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()

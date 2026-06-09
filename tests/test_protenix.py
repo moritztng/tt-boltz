@@ -16,16 +16,19 @@ import ttnn
 sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
     make_attention_pair_bias,
+    make_outer_product_mean,
     make_pairformer_block,
     make_transition,
     make_triangle_attention,
     make_triangle_multiplication,
     pcc,
     remap_attention_pair_bias,
+    remap_outer_product_mean,
     remap_pairformer_block,
     remap_transition,
     remap_triangle_attention,
     remap_triangle_multiplication,
+    run_reference_outer_product_mean,
     run_reference_pairformer_block,
     run_reference_transition,
     run_reference_triangle_attention,
@@ -34,6 +37,7 @@ from protenix_reference import (  # noqa: E402
 
 from tt_bio.tenstorrent import (  # noqa: E402
     AttentionPairBias,
+    OuterProductMean,
     PairformerLayer,
     Transition,
     TriangleAttention,
@@ -151,3 +155,19 @@ def test_pairformer_block_parity():
     z_o = torch.Tensor(ttnn.to_torch(z_out)).float()
     ps, pz = pcc(s_o, s_ref), pcc(z_o, z_ref)
     assert ps > 0.98 and pz > 0.98, f"PCC s={ps:.5f} z={pz:.5f}"
+
+
+# OuterProductMean (MSA -> pair).
+def test_outer_product_mean_parity():
+    c_m, c_z, c_hidden, S, L = 128, 128, 32, 8, 32
+    mod, sd = make_outer_product_mean(c_m, c_z, c_hidden, seed=0)
+    m = torch.randn(1, S, L, c_m)
+    ref = run_reference_outer_product_mean(mod, m).float()[0]
+    dev = get_device()
+    opm = OuterProductMean(remap_outer_product_mean(sd), _ck(dev))
+    mt = ttnn.from_torch(m, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    out = torch.Tensor(ttnn.to_torch(opm(mt, None, None))).float()
+    if out.dim() == 4:
+        out = out[0]
+    p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f}"
