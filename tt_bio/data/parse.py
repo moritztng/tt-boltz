@@ -2901,11 +2901,18 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             # Convert sequence to tokens
             seq = [token_map.get(c, unk_token) for c in list(raw_seq)]
 
-            # Apply modifications
+            # Apply modifications (position is 1-indexed). Validate the range so
+            # an out-of-bounds position gives a clear error instead of an
+            # IndexError (or, for position 0, silently editing the last residue).
             for mod in items[0][entity_type].get("modifications", []):
-                code = mod["ccd"]
-                idx = mod["position"] - 1  # 1-indexed
-                seq[idx] = code
+                pos = mod["position"]
+                if not isinstance(pos, int) or not (1 <= pos <= len(seq)):
+                    raise ValueError(
+                        f"Modification position {pos} is out of range for chain "
+                        f"{items[0][entity_type].get('id')} (sequence length {len(seq)}); "
+                        "positions are 1-indexed."
+                    )
+                seq[pos - 1] = mod["ccd"]
 
             cyclic = items[0][entity_type].get("cyclic", False)
 
