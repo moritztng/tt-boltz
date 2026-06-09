@@ -1399,9 +1399,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    if model in ("esmfold2", "esmfold2-fast"):
-        # ESMFold2 rides the SAME scheduler / worker / progress path as Boltz-2
-        # (build a run config, fan jobs across devices via _local_workers +
+    if model in ("esmfold2", "esmfold2-fast", "protenix-v2"):
+        # ESMFold2 and Protenix-v2 ride the SAME scheduler / worker / progress path as
+        # Boltz-2 (build a run config, fan jobs across devices via _local_workers +
         # _scheduler_session, stream results). Only the per-model config differs.
         for n, on in [("--use_potentials", use_potentials),
                       ("--write_embeddings", write_embeddings), ("--checkpoint", bool(checkpoint))]:
