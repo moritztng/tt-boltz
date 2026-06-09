@@ -142,6 +142,36 @@ def run_reference_transition(mod, x):
         return mod(x)
 
 
+# --- AttentionPairBias (Pairformer single-attn-with-pair-bias, has_s=False) ---
+def make_attention_pair_bias(c_a=384, c_z=128, n_heads=16, seed=0):
+    from protenix.model.modules.transformer import AttentionPairBias as RefAPB
+
+    torch.manual_seed(seed)
+    mod = RefAPB(has_s=False, create_offset_ln_z=True, n_heads=n_heads,
+                 c_a=c_a, c_z=c_z).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_attention_pair_bias(ref_sd: dict) -> dict:
+    """Protenix AttentionPairBias -> tt-bio AttentionPairBias (atom_level=False,
+    compute_pair_bias=True). The input-`a` LayerNorm is applied externally by the
+    caller (tt-bio does it via PairformerLayer.pre_norm_s); here the test feeds
+    layernorm_a(a). Verified raw mapping (PCC 0.99986) — q has a bias."""
+    return {
+        "proj_q.weight": ref_sd["attention.linear_q.weight"],
+        "proj_q.bias": ref_sd["attention.linear_q.bias"],
+        "proj_k.weight": ref_sd["attention.linear_k.weight"],
+        "proj_v.weight": ref_sd["attention.linear_v.weight"],
+        "proj_g.weight": ref_sd["attention.linear_g.weight"],
+        "proj_o.weight": ref_sd["attention.linear_o.weight"],
+        "proj_z.0.weight": ref_sd["layernorm_z.weight"],
+        "proj_z.0.bias": ref_sd["layernorm_z.bias"],
+        "proj_z.1.weight": ref_sd["linear_nobias_z.weight"],
+    }
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()

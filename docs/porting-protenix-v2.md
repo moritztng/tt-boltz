@@ -117,17 +117,17 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
 - [x] Transition (SwiGLU) parity on device (c_z=128 pair + c_s=384 single,
       PCC>0.98). Remap: norm←layernorm1, fc1←linear_no_bias_a (silu folded in),
       fc2←linear_no_bias_b, fc3←linear_no_bias. **6/6 parity tests pass.**
-- [ ] **AttentionPairBias — needs structural reconciliation** (not a clean
-      drop-in): Protenix puts the input-`a` LayerNorm (and AdaptiveLayerNorm when
-      `has_s`) *inside* the module; tt-bio's Boltz-2 `AttentionPairBias` has no
-      `a`-norm (caller normalizes) and only `proj_{q,k,v,g,o}` + `proj_z.{0,1}`.
-      Plan: parity-test with the `a`-norm applied externally (Pairformer `has_s=False`
-      case first), map `attention.linear_{q,k,v,o,g}`→`proj_{q,k,v,g,o}` (q-bias=0),
-      `layernorm_z`→`proj_z.0`, `linear_nobias_z`→`proj_z.1`; handle AdaLN/`has_s`
-      for the diffusion-transformer use separately.
-- [ ] Then: full PairformerBlock/Stack → MSA block/module → diffusion
-      transformer + atom encoder/decoder + DiffusionModule → input/relpos/
-      template/constraint embedders → distogram + confidence heads.
+- [x] **AttentionPairBias (Pairformer, has_s=False) parity on device, PCC 0.99986.**
+      Reconciliation: apply the input-`a` LayerNorm externally (tt-bio does it via
+      `PairformerLayer.pre_norm_s`); remap `attention.linear_{q,k,v,o,g}`→
+      `proj_{q,k,v,g,o}` (q HAS a bias), `layernorm_z`→`proj_z.0`,
+      `linear_nobias_z`→`proj_z.1` (raw — tt-bio's internal ×√d is correct as-is).
+      **7/7 parity tests pass.** Still TODO: the AdaLN/`has_s=True` variant used by
+      the diffusion token transformer.
+- [ ] Then: full PairformerBlock/Stack (compose the 4 verified sub-modules +
+      pre-norms/residuals) → MSA block/module → diffusion transformer +
+      atom encoder/decoder + DiffusionModule → input/relpos/template/constraint
+      embedders → distogram + confidence heads.
 - [ ] Phase 2: download the v2 (464M) checkpoint, pin v2 dims, load real weights,
       end-to-end on device, Cα-RMSD vs ground truth.
 - [ ] Phases 3–6: robustness (all entity types/sizes/no-OOM), optimize

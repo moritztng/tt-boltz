@@ -15,10 +15,12 @@ import ttnn
 
 sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
+    make_attention_pair_bias,
     make_transition,
     make_triangle_attention,
     make_triangle_multiplication,
     pcc,
+    remap_attention_pair_bias,
     remap_transition,
     remap_triangle_attention,
     remap_triangle_multiplication,
@@ -28,6 +30,7 @@ from protenix_reference import (  # noqa: E402
 )
 
 from tt_bio.tenstorrent import (  # noqa: E402
+    AttentionPairBias,
     Transition,
     TriangleAttention,
     TriangleMultiplication,
@@ -99,3 +102,24 @@ def test_transition_parity(c_in):
     out = torch.Tensor(ttnn.to_torch(tr(xt))).float()
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f} (c_in={c_in})"
+
+
+# Protenix AttentionPairBias (Pairformer, has_s=False) -> tt-bio AttentionPairBias.
+# Input-a LayerNorm is applied externally (tt-bio does it via PairformerLayer.pre_norm_s).
+def test_attention_pair_bias_parity():
+    c_a, c_z, n_heads, L = 384, 128, 16, 64
+    head_dim = c_a // n_heads
+    mod, sd = make_attention_pair_bias(c_a, c_z, n_heads, seed=0)
+    a = torch.randn(1, L, c_a)
+    z = torch.randn(1, L, L, c_z)
+    ref = mod(a, None, z).float()
+    a_normed = mod.layernorm_a(a)  # external a-norm
+
+    dev = get_device()
+    apb = AttentionPairBias(head_dim, n_heads, True, False,
+                            remap_attention_pair_bias(sd), _ck(dev))
+    s_t = ttnn.from_torch(a_normed, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    z_t = ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    out = torch.Tensor(ttnn.to_torch(apb(s_t, z_t))).float()
+    p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f}"
