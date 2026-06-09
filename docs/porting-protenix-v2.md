@@ -1072,3 +1072,27 @@ update) is component-complete. Remaining: EDM SAMPLER loop wrapping the denoiser
 (noise schedule gamma0/gamma_min/noise_scale_lambda/step_scale_eta, N_step, centered
 denoise; sample-dim batch) -> final coords; then confidence head; end-to-end Ca-RMSD;
 then --fast/CLI/vendoring/README.
+
+## SPEC: EDM diffusion sampler (wraps the validated denoiser) — full recipe
+
+noise_schedule = sigma_data * (s_max^(1/p) + t*(s_min^(1/p) - s_max^(1/p)))^p,
+  t = arange(0, 1+eps, dt). (sigma_data=16; s_max/s_min/p/dt from sample_diffusion cfg;
+  N_step = len(schedule)-1, default 200.)
+loop (generator.py sample_diffusion):
+  x_l = noise_schedule[0] * randn(N_sample, N_atom, 3)
+  for (c_tau_last, c_tau) in zip(sched[:-1], sched[1:]):
+    x_l = centre_random_augmentation(x_l)         # center coords + random rotation/translation
+    gamma = gamma0 (0.8) if c_tau > gamma_min (1.0) else 0
+    t_hat = c_tau_last * (gamma+1)
+    x_noisy = x_l + noise_scale_lambda(1.003) * sqrt(t_hat^2 - c_tau_last^2) * randn(...)
+    x_denoised = denoise_net(x_noisy, t_hat, feat, s_inputs, s_trunk, z_trunk=None,
+                             pair_z, p_lm, c_l)    # THE VALIDATED DENOISER (cond+atomenc+DiT+atomdec)
+    delta = (x_noisy - x_denoised) / t_hat
+    x_l = x_noisy + step_scale_eta(1.5) * (c_tau - t_hat) * delta
+  return x_l   # (N_sample, N_atom, 3)
+NOTE: stochastic (randn + random augmentation) -> validate via Ca-RMSD of final
+structure vs reference (the accuracy bar), NOT PCC. The denoiser is the heavy part
+(validated 0.999+). p_lm/c_l = the encoder's prepare_cache(z) built ONCE before the loop
+(reuse AtomFeaturization + the z-broadcast); pair_z/s_single = DiffusionConditioning(once).
+This is the gateway to END-TO-END: trunk -> conditioning(once) -> sampler loop -> coords.
+Then confidence head -> plddt/pae/pde/resolved. Then Ca-RMSD vs ~/protenix_ref_out.pkl coords.
