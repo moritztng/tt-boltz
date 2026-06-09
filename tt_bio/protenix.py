@@ -504,6 +504,24 @@ class Protenix:
         return h.reshape(shape) if shape is not None else h
 
     @staticmethod
+    def _generate_relp(feats, r_max=32, s_max=2):
+        """RelativePositionEncoder feature (reference embedders.generate_relp): one-hot of
+        clipped residue/token/chain offsets + same-entity. dims 2(r_max+1)+2(r_max+1)+1+
+        2(s_max+1) = 139. Model-side; lets the data pipeline emit only the index features."""
+        import torch
+        import torch.nn.functional as F
+        asym = feats["asym_id"].long(); res = feats["residue_index"].long()
+        ent = feats["entity_id"].long(); tok = feats["token_index"].long(); sym = feats["sym_id"].long()
+        sc = (asym[:, None] == asym[None, :]).long()
+        sr = (res[:, None] == res[None, :]).long()
+        se = (ent[:, None] == ent[None, :]).long()
+        d_res = torch.clip(res[:, None] - res[None, :] + r_max, 0, 2 * r_max) * sc + (1 - sc) * (2 * r_max + 1)
+        d_tok = torch.clip(tok[:, None] - tok[None, :] + r_max, 0, 2 * r_max) * sc * sr + (1 - sc * sr) * (2 * r_max + 1)
+        d_ch = torch.clip(sym[:, None] - sym[None, :] + s_max, 0, 2 * s_max) * se + (1 - se) * (2 * s_max + 1)
+        return torch.cat([F.one_hot(d_res, 2 * (r_max + 1)), F.one_hot(d_tok, 2 * (r_max + 1)),
+                          se[..., None], F.one_hot(d_ch, 2 * (s_max + 1))], dim=-1).float()
+
+    @staticmethod
     def _atom_pair_feats(ref_pos, ref_space_uid):
         """Algorithm 5 lines 1-3 (reference update_input_feature_dict): windowed atom-pair
         feats from ref_pos + ref_space_uid (NQ=32, NK=128, pad_left=48). Validated vs the
@@ -613,10 +631,11 @@ class Protenix:
                                                tt(feats["ref_mask"].reshape(N, 1)), tt(fi["f_in"])), (N, 128))
         p_lm = self._to_host(self.diff_feat.p_lm(tt(fi["d"]), tt(fi["v"]), tt(fi["invd"]), mt_dev), (nb, nq, nk, 16))
         # 3) trunk
-        s_trunk_tt, z_tt = self.trunk(feats, s_inputs, feats["relp"], feats["token_bonds"], progress_fn=progress_fn)
+        relp = feats["relp"] if "relp" in feats else self._generate_relp(feats)
+        s_trunk_tt, z_tt = self.trunk(feats, s_inputs, relp, feats["token_bonds"], progress_fn=progress_fn)
         s_trunk = self._to_host(s_trunk_tt, (NT, s_trunk_tt.shape[-1]))
         # diffusion pair conditioning (once, t-independent): conditioned pair_z
-        pair_z = self._diffusion_pair_cond(z_tt, feats["relp"]).reshape(NT, NT, self.trunk.C_Z)
+        pair_z = self._diffusion_pair_cond(z_tt, relp).reshape(NT, NT, self.trunk.C_Z)
         # diffusion p_lm cache also carries the (conditioned) pair-z broadcast to atom pairs
         p_lm = p_lm + self._plm_z_term(pair_z, fi["a2t"], nb, nq, nk)
         # 4) EDM sampler

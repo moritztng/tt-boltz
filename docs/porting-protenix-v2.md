@@ -1532,3 +1532,19 @@ dropped, model recomputes) -> Rg 16.05A, vs-ref 8.61A within variance. This shri
 pipeline's required outputs to BASE features only (no d_lm/v_lm/mask_trunked):
   ref_pos, ref_space_uid, ref_charge, ref_element, ref_atom_name_chars, ref_mask,
   atom_to_token_idx, relp, token_bonds, restype, profile, deletion_mean, msa, template_*, asym_id.
+
+## relp also moved into model (generate_relp); featurizer surface shrunk further
+
+Protenix._generate_relp ports embedders.generate_relp (RelativePositionEncoder feature,
+r_max=32/s_max=2 -> 139 dims): one-hot clipped residue/token/chain offsets + same-entity.
+EXACT match to golden relp (torch.equal). fold() now generates relp from base index features.
+Full fold from BASE features (d_lm/v_lm/mask_trunked/relp all dropped, model regenerates):
+Rg 16.05A, vs-ref 8.61A within variance. The data pipeline now needs only:
+  CCD atom feats: ref_pos, ref_space_uid, ref_charge, ref_element, ref_atom_name_chars,
+                  ref_mask, atom_to_token_idx
+  token indices : asym_id, residue_index, entity_id, token_index, sym_id
+  token feats   : restype, profile, deletion_mean, token_bonds
+  msa           : msa, has_deletion, deletion_value  (offline: query row, zeros)
+  template_*    : (empty when no templates)
+The CCD-sourced atom features (residue->atom expansion) are the remaining delicate part;
+all index/relpos/atom-pair derived features are now computed inside the model.
