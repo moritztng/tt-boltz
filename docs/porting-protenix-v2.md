@@ -1369,3 +1369,19 @@ REMAINING: (1) ttnn fp32 token-DiT (mirror the torch fp32 here). (2) EDM sampler
 (generator recipe) wrapping the denoiser, N_step centered denoise -> coords (N_sample,N_atom,3).
 (3) Ca-RMSD vs ~/protenix_ref_out.pkl coords. (4) productionize tt_bio Protenix class+worker.
 (5) --fast/CLI(--model protenix-v2)/vendoring/README per SKILL.md. Compute+logic DONE.
+
+## SAMPLER PARAMS (complete) + end-to-end Ca-RMSD validation plan
+
+inference_noise_scheduler: sigma_data=16.0, s_max=160.0, s_min=0.0004, p (EDM, ~7),
+dt (-> N_step=len(schedule)-1). sample_diffusion: gamma0=0.8, gamma_min=1.0,
+noise_scale_lambda=1.003, step_scale_eta=1.5, N_step=200, N_sample=5 (smoke used N_step=10).
+noise_schedule = 16*(160^(1/p) + arange(0,1+eps,dt)*(0.0004^(1/p)-160^(1/p)))^p.
+Sampler loop (generator recipe, validated denoiser): x = sched[0]*randn(N_sample,N_atom,3);
+for (c_last,c) in pairs: x=centre_random_augmentation(x); gamma=0.8 if c>1.0 else 0;
+t_hat=c_last*(gamma+1); x_noisy=x+1.003*sqrt(t_hat^2-c_last^2)*randn; x_den=denoiser(
+x_noisy,t_hat,...); x = x_noisy + 1.5*(c-t_hat)*(x_noisy-x_den)/t_hat. -> coords.
+END-TO-END Ca-RMSD: stochastic, so for a DETERMINISTIC match to ~/protenix_ref_out.pkl
+coords, replicate seed_everything(seed_from_modelSeeds=42) + the exact randn/aug draw order
+(else compare structures via Kabsch-aligned Ca-RMSD — acceptable if model correct). The
+per-step denoiser is validated (coords 0.9998 w/ fp32 DiT), so the sampler is control-flow
++ RNG-order fidelity. Get exact p/dt from cfg.diffusion_module's inference_noise_scheduler.
