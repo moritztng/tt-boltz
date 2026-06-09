@@ -986,3 +986,19 @@ the hook captured a tuple in a different order. NEXT (fresh context): hook the r
 aggregate_atom_to_token call inputs/output directly (or linear_no_bias_q I/O) inside the
 diffusion atom encoder to see the true x_atom -> a mapping. Everything ELSE in the atom
 encoder is validated (0.9999+).
+
+## atom encoder aggregation: FORMULA confirmed (scatter-mean PCC 1.0); x_atom source TBD
+
+Within one run, scatter-mean(captured x_atom, idx) == captured aggregate out: PCC 1.0.
+So the aggregation = scatter(reduce=mean) over atom_to_token_idx is CORRECT.
+BUT (consistent golden run): scatter-mean(relu(linear_q(golden out[1]))) = 0.842 != golden
+a (out[0]) — even using GOLDEN q_l. => the true x_atom (which scatter-means to golden a)
+!= relu(linear_no_bias_q(out[1])). So one of: (a) out[1] (returned q) is NOT the tensor
+fed to linear_no_bias_q (e.g., it's q_skip = a pre/post variant), (b) linear_no_bias_q
+weight differs, or (c) x_atom has an extra op (mask/scale) before aggregate.
+DEFINITIVE NEXT (one venv run, fresh context): capture, in the SAME forward, the diffusion
+atom encoder's returned (a, q_l, c, p) AND the internal aggregate x_atom; then check
+relu(linear_no_bias_q(q_l)) vs x_atom (PCC). If !=, inspect transformer.py 938-949 for
+what exactly feeds linear_no_bias_q (re-read: q_l reassigned by atom_transformer at 938,
+then x_atom=relu(linear_q(q_l)) at 944 — verify no intermediate reassignment/mask).
+NOTE: everything else in the atom encoder is validated (c 1.0, q_out 0.99999, formula 1.0).
