@@ -898,3 +898,21 @@ the ATOM transformer via tt_bio AdaLN+remap_adaln; here I hand-coded adaln() in 
 for the fp32 reimpl — verify the hand-coded version matches, or just use tt_bio AdaLN.)
 Also re-check: layernorm_a config (create_scale=False?), and whether s fed to AdaLN is
 correct (golden dit kwargs s = s_single).
+
+## RESOLVED: DiT logic CORRECT; "bug" was stochastic-capture mismatch + bf16 accumulation
+
+CRITICAL LESSON: the diffusion is STOCHASTIC (samples noise) — golden inputs AND outputs
+MUST come from ONE consistent capture (scripts/protenix_extract_dit_consistent.py ->
+~/protenix_dit_consistent.pkl: din(a,s,z) + per-block outputs). My earlier
+diffusion_gold.pkl (inputs) and dit_blocks_gold.pkl (outputs) were SEPARATE venv runs
+with different noise -> phantom "0.62 bug".
+With consistent data:
+- torch fp32 block0 vs golden: PCC 1.000000  => DiT block math is CORRECT.
+- ttnn block0: 0.99681 (bf16); block11 0.663; block23 0.605.
+=> the 24-block degradation is bf16 ACCUMULATION in the near-identity residual stream,
+not a logic error. (Cf. trunk pairformer 48 blocks: s 0.993 — same effect, milder.)
+PRECISION OPTIONS for the DiT (and possibly trunk): keep residual stream a_t in fp32
+(ttnn bfloat8/fp32 dest), or accumulate residual in higher precision; revisit if
+end-to-end Ca-RMSD needs it. The DiT is logically done.
+ACTION ITEM: redo the diffusion submodule golden (cond/atomenc/dit/atomdec) as ONE
+consistent capture before validating atomenc/atomdec.
