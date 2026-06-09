@@ -1282,3 +1282,18 @@ the DiT INPUT a), then after +linear_s, then after DiT, to localize. My standalo
 validated 0.99999 with s=s_trunk golden, so the inline encoder must match that exactly
 (verify s_trunk vs s_single, the token aggregation matrix, z handling). Once the denoiser
 unit matches golden coords, wrap in the EDM sampler loop -> Ca-RMSD.
+
+## DENOISER per-stage debug approach (fresh context)
+
+Hooking the FULL model on the diffusion path keeps erroring (4-tuple unpack / f_forward
+path artifacts) — don't. Instead, build a STANDALONE DiffusionModule (mirror the standalone
+AtomAttentionEncoder success in scripts/): instantiate protenix DiffusionModule with v2
+config, load 'module.diffusion_module.*' weights, feed ~/protenix_denoiser_pre.pkl kwargs
+to f_forward, and capture internals (encoder a_token, a_token after +linear_no_bias_s,
+DiT-input a, DiT-output, decoder coords) via simple monkeypatch/hooks on the standalone
+instance. Then compare scripts/protenix_denoiser_parity.py intermediates stage-by-stage to
+localize where it diverges (PCC 0.11 -> -0.04 after the 3-step fix suggests a remaining
+wiring error: re-verify (a) encoder a_token vs standalone-validated atomenc a (both with
+s=s_trunk), (b) the +linear_no_bias_s(layernorm_s(s_single)) add, (c) DiT s=s_single,
+(d) layernorm_a, (e) decoder skips q/c/p ordering). The corrected f_forward recipe is in
+the section above. Per-module PCCs are all 0.99+, so the bug is in the CHAINING, not a module.
