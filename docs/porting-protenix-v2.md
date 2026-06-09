@@ -452,3 +452,16 @@ AtomAttentionEncoder(has_coords=False) flow to port (transformer.py:820-949):
   LOCAL WINDOWED attention (32 queries x 128 keys per block) — the new ttnn primitive.
 - a = mean-aggregate(relu(linear_q(q_l)) atom->token) -> [38, c_token=384].
 - s_inputs = cat([a, restype(32), profile(32), deletion_mean(1)]) = 449.
+
+## MILESTONE: first v2 ttnn module — atom featurization (c_l, p_lm) on-device
+
+tt_bio/protenix.py AtomFeaturization ports AtomAttentionEncoder.prepare_cache
+(has_coords=False): c_l (atom single [275,128]) and windowed p_lm
+([9,32,128,16]) from ref features (pure linears + arcsinh + elementwise). Validated
+on a p150a vs real v2 golden (PCC c_l 0.999997, p_lm 0.999978).
+- Reference extraction: scripts/protenix_extract_atomfeat.py (py3.11 venv) dumps
+  ~/protenix_atomfeat_gold.pkl. On-device test tests/test_protenix_atomfeat.py loads
+  that pkl + runs ttnn — NEEDS NO protenix in system python3 (robust to shared-env
+  churn from other agents). Pattern for all subsequent v2 module tests.
+Next: the local windowed atom attention (DiffusionTransformer cross_attention_mode,
+32 queries x 128 keys, per-head pair bias) to complete AtomAttentionEncoder.
