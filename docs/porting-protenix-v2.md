@@ -1260,3 +1260,25 @@ This is the per-step DENOISER the EDM sampler calls. Chain the VALIDATED modules
 Compare to golden out coords (expect ~0.99, bf16 accumulation across 4 stages). This
 validates the denoiser unit end-to-end; then wrap in the EDM sampler loop (recipe above)
 -> full coords -> Ca-RMSD. NOTE: t_hat enters cond single via Fourier(log(t/sigma)/4).
+
+## CORRECTED denoiser (f_forward) structure — 3 steps I'd missed
+
+diffusion_module.f_forward (diffusion.py) is NOT simply cond->atomenc->DiT->atomdec.
+Exact order (corrects the assembly checklist):
+  s_single, z_pair = diffusion_conditioning(t_hat, relp, s_inputs, s_trunk, z_trunk, pair_z)
+    # z_pair == passed pair_z when provided
+  s_trunk_exp = expand(s_trunk, N_sample); z_pair = expand(z_pair, N_sample)
+  a_token, q_skip, c_skip, p_skip = atom_attention_encoder(..., r_l=r_noisy,
+    s=s_trunk_exp,  # <-- s_trunk, NOT s_single!
+    z=z_pair, p_lm=p_lm, c_l=c_l)
+  a_token = a_token + diffusion_module.linear_no_bias_s(diffusion_module.layernorm_s(s_single))  # MISSED
+  a_token = diffusion_transformer(a=a_token, s=s_single, z=z_pair)   # DiT uses s_single
+  a_token = diffusion_module.layernorm_a(a_token)                    # MISSED (weight-only)
+  r_update = atom_attention_decoder(a_token, q_skip, c_skip, p_skip)
+Weights: diffusion_module.{linear_no_bias_s(384->768), layernorm_s(384), layernorm_a(768)}.
+scripts/protenix_denoiser_parity.py chains these but still off (PCC low) — DEBUG per-stage
+(fresh context): compare my a_token after encoder to a re-captured golden a_token (pre-hook
+the DiT INPUT a), then after +linear_s, then after DiT, to localize. My standalone atomenc
+validated 0.99999 with s=s_trunk golden, so the inline encoder must match that exactly
+(verify s_trunk vs s_single, the token aggregation matrix, z handling). Once the denoiser
+unit matches golden coords, wrap in the EDM sampler loop -> Ca-RMSD.
