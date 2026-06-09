@@ -773,3 +773,21 @@ output, so implement DiffusionConditioning (relpe + 2 transitions on z; Fourier(
 + single cond on s) -> (s_single, pair_z) BEFORE the diffusion transformer.
 Next: DiffusionConditioning + DiffusionModule (AtomAttnEncoder has_coords=True + token
 DiT 24 blocks + AtomAttnDecoder) + EDM sampler -> coords; then confidence -> Ca-RMSD.
+
+## MILESTONE: DiffusionConditioning pair path -> pair_z (PCC 1.0)
+
+scripts/protenix_diffcond_parity.py: cat[z_trunk, relpe(relp)] -> layernorm_z(512,
+no offset) -> linear_no_bias_z(512->256) -> +transition_z1 +transition_z2 reproduces
+the golden pair_z EXACTLY (PCC 1.0, fed golden z_trunk). Reuses Transition +
+remap_transition + relpe linear. DIFFUSION STAGE STARTED.
+Remaining diffusion:
+- DiffusionConditioning SINGLE path: s=cat[s_trunk,s_inputs]->layernorm_s->linear_s
+  + fourier_embedding(noise_level)->layernorm_n->linear_n + transition_s1/s2 -> s_single.
+  (FourierEmbedding: Protenix has trainable w,b — load them.)
+- DiffusionModule: AtomAttentionEncoder(has_coords=True: + r_l noisy coords, + s/z
+  trunk broadcast) -> token-level: a = linear(s_single) + atom-aggregated; 24-block
+  DiffusionTransformer (token DiT, c_a=768, standard attn w/ pair bias from pair_z) ->
+  AtomAttentionDecoder -> coords update. golden diffusion_module I/O captured (x_noisy,
+  t_hat, ..., -> x(1,275,3)).
+- EDM sampler: N_step centered denoise loop (gamma0/gamma_min/noise_scale/step_scale)
+  calling diffusion_module; sample-dim batch. -> final coords. Then confidence -> Ca-RMSD.
