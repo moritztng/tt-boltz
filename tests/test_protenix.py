@@ -20,6 +20,7 @@ from protenix_reference import (  # noqa: E402
     make_adaptive_layernorm,
     make_conditioned_transition_block,
     make_diffusion_transformer_block,
+    make_distogram_head,
     make_msa_block,
     make_pair_weighted_averaging,
     make_pairformer_block,
@@ -40,6 +41,8 @@ from protenix_reference import (  # noqa: E402
     run_reference_adaptive_layernorm,
     run_reference_conditioned_transition_block,
     run_reference_diffusion_transformer_block,
+    run_reference_distogram_head,
+    remap_distogram_head,
     run_reference_msa_block,
     run_reference_pair_weighted_averaging,
     run_reference_pairformer_block,
@@ -316,4 +319,18 @@ def test_diffusion_transformer_block_parity():
     out = ttnn.add(attn, ff)
     ot = torch.Tensor(ttnn.to_torch(out)).float().reshape(out_ref.shape)
     p = pcc(ot, out_ref)
+    assert p > 0.98, f"PCC {p:.5f}"
+
+
+# DistogramHead (pair -> distogram bins, symmetrized).
+def test_distogram_head_parity():
+    from tt_bio.esmfold2 import DistogramHead
+    c_z, no_bins, L = 128, 64, 32
+    mod, sd = make_distogram_head(c_z, no_bins, seed=0)
+    z = torch.randn(1, L, L, c_z)
+    ref = run_reference_distogram_head(mod, z.clone()).float()
+    dev = get_device()
+    dh = DistogramHead(remap_distogram_head(sd), _ck(dev))
+    out = torch.Tensor(ttnn.to_torch(dh(ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)))).float().reshape(ref.shape)
+    p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f}"

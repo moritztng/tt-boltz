@@ -384,6 +384,28 @@ def run_reference_diffusion_transformer_block(mod, a, s, z):
         return mod(a, s, z)[0]  # out_a
 
 
+# --- DistogramHead -----------------------------------------------------------
+def make_distogram_head(c_z=128, no_bins=64, seed=0):
+    from protenix.model.modules.head import DistogramHead
+
+    torch.manual_seed(seed)
+    mod = DistogramHead(c_z=c_z, no_bins=no_bins).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_distogram_head(ref_sd: dict) -> dict:
+    """Protenix: logits=linear(z); out=logits+logits.T -> W(z+zT)+2b.
+    tt-bio esmfold2 DistogramHead: linear(z+zT) -> W(z+zT)+b. So bias must double."""
+    return {"weight": ref_sd["linear.weight"], "bias": 2.0 * ref_sd["linear.bias"]}
+
+
+def run_reference_distogram_head(mod, z):
+    with torch.no_grad():
+        return mod(z)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
