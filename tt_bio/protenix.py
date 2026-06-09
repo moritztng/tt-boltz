@@ -254,3 +254,34 @@ class AtomAttentionEncoder(Module):
         a = ttnn.matmul(atom_to_token_mean, q, compute_kernel_config=self.compute_kernel_config,
                         core_grid=CORE_GRID_MAIN)                            # (N_token,384)
         return ttnn.concat([a, restype, profile, deletion_mean], dim=-1)     # (N_token,449)
+
+
+class TrunkInput(Module):
+    """Protenix trunk input construction: s_inputs -> s_init, z_init.
+    s_init = linear_sinit(s_inputs); z_init = zinit1(s_init)[:,None] + zinit2(s_init)[None]
+    + relative_position_encoding(relp) + token_bond(token_bonds). All LinearNoBias.
+    Reference: protenix/model/protenix.py get_pairformer_output (lines 208-226).
+    Validated vs real v2 golden (PCC 0.999997). (Constraint embedder omitted: the
+    inference feat carries no active constraints for plain folding.)"""
+
+    def __init__(self, state_dict, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self._w = {k: v for k, v in self.weights.data.items()}
+
+    def _lin(self, x, key):
+        w = ttnn.from_torch(self._w[key].t().contiguous(), layout=ttnn.TILE_LAYOUT,
+                            device=self.device, dtype=ttnn.bfloat16)
+        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN)
+
+    def __call__(self, s_inputs, relp, token_bonds):
+        """s_inputs (N,449); relp (N,N,139); token_bonds (N,N,1). Returns (s_init (N,c_s),
+        z_init (N,N,c_z))."""
+        N = s_inputs.shape[0]
+        s_init = self._lin(s_inputs, "linear_no_bias_sinit.weight")
+        cz = self._w["linear_no_bias_zinit1.weight"].shape[0]
+        z1 = ttnn.reshape(self._lin(s_init, "linear_no_bias_zinit1.weight"), (N, 1, cz))
+        z2 = ttnn.reshape(self._lin(s_init, "linear_no_bias_zinit2.weight"), (1, N, cz))
+        z = ttnn.add(z1, z2)
+        z = ttnn.add(z, self._lin(relp, "relative_position_encoding.linear_no_bias.weight"))
+        z = ttnn.add(z, self._lin(token_bonds, "linear_no_bias_token_bond.weight"))
+        return s_init, z

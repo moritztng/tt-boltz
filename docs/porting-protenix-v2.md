@@ -557,3 +557,15 @@ THE TRUNK ENTRY POINT IS DONE. Next up the trunk: s_init=linear(s_inputs);
 z_init from s_init + relative_position_encoding + token_bond; recycling
 {template(n_blocks may be 0 for v2), msa_module, pairformer_stack} -> s,z. Then
 diffusion (conditioning + diffusion_module + EDM sampler) -> coords; confidence head.
+
+## MILESTONE: trunk input (s_init, z_init) on-device (PCC 0.999997)
+
+tt_bio/protenix.py TrunkInput: s_init=linear_sinit(s_inputs); z_init=zinit1(s_init)
+broadcast + zinit2(s_init) broadcast + relp_linear(relp) + token_bond(token_bonds).
+All LinearNoBias. Validated vs real v2 golden (s_init/z_init PCC 0.999997,
+tests/test_protenix_trunkin.py). Constraint embedder omitted (no active constraints
+in plain folding feat; add later if constraint inputs used).
+Remaining trunk: recycle linears (layernorm_z_cycle, linear_no_bias_z_cycle,
+layernorm_s, linear_no_bias_s) + recycle loop over msa_module + pairformer_stack
+(both already validated on v2 weights). template_embedder: check n_blocks for v2.
+Then diffusion (conditioning + module + EDM sampler) -> coords; confidence head.
