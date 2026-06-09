@@ -323,3 +323,22 @@ einops/optree):
 This is the featurization-pipeline INTEGRATION — a focused multi-session effort,
 not a per-iteration parity gate. The verified, dim-parametric tt-bio modules
 (real-weight-validated on base + v2) are ready to receive its feats.
+
+## End-to-end integration progress (in flight)
+
+Deps installed into env/ to make the Protenix REFERENCE importable (all kept the
+ttnn torch build intact at 2.11.0+cpu): `absl-py`, `biotite==1.0.1` (pinned —
+1.2.0 breaks json_to_feature), `fair-esm` (--no-deps), `modelcif`. Now importing:
+protenix.model.protenix, protenix.config.config, and the full data pipeline
+(json_to_feature, infer_data_pipeline, ccd, parser, featurizer).
+
+Remaining for a reference forward (then tt-bio end-to-end):
+1. `protenix.runner` is NOT in the PyPI wheel (repo-level script). Build the model
+   via `protenix.config.config.parse_configs(...)` -> `Protenix(configs)` and a
+   minimal orchestration, OR fetch runner/ from the repo.
+2. Construct config: default ConfigManager gives BASE dims; do base first
+   (v0.5.0) then override to v2 dims (c_z=256, no_heads_pair=8, c_a=768, c_m=128).
+3. CCD data file (components.v20240608.cif[.rdkit_mol.pkl]) for featurization
+   (download from the public TOS endpoint).
+4. feats via json_to_feature for a tiny protein -> Protenix.forward -> coords ->
+   compare structure / validate the tt-bio modules in the real pipeline.
