@@ -449,6 +449,144 @@ class DiffusionModule:
         }
 
 
+class Trunk:
+    """Protenix-v2 trunk: s_inputs -> (s_trunk, z_trunk) over 10 recycling cycles.
+
+    Each cycle: z = z_init + linear_z_cycle(LN(z)); z += template_embedder(z);
+    z = msa_module(z, m); s = s_init + linear_s_cycle(LN(s)); (s,z) = pairformer48(s,z).
+    Composes TrunkInput + 48-block Pairformer + template embedder (nt templates x 2
+    pair-only blocks) + 4-block MSA module, all reusing tt_bio.tenstorrent primitives
+    with v2 weights (tt_bio.protenix_weights remaps). Validated vs the real v2 reference
+    (PCC s 0.991 / z 0.990; scripts/protenix_trunk_assembly.py). Reference:
+    protenix/model/protenix.py get_pairformer_output."""
+
+    N_CYCLES = 10
+    C_Z = 256
+
+    def __init__(self, model_state_dict, compute_kernel_config):
+        """model_state_dict: full v2 model dict with the 'module.' prefix STRIPPED."""
+        import re
+        from .tenstorrent import (get_device, Pairformer, PairformerLayer,
+                                   OuterProductMean, PairWeightedAveraging, Transition)
+        from . import protenix_weights as PW
+        self.sd = model_state_dict
+        self.ckc = compute_kernel_config
+        self.dev = get_device()
+        ti_keys = ("linear_no_bias_sinit", "linear_no_bias_zinit1", "linear_no_bias_zinit2",
+                   "linear_no_bias_token_bond", "relative_position_encoding")
+        ti_sd = {k: v for k, v in self.sd.items() if any(k.startswith(p) for p in ti_keys)}
+        self.trunk_input = TrunkInput(ti_sd, compute_kernel_config)
+        # 48-block pairformer
+        nb_pf = 1 + max(int(re.search(r"pairformer_stack\.blocks\.(\d+)\.", k).group(1))
+                        for k in self.sd if "pairformer_stack.blocks." in k)
+        comb = {}
+        for i in range(nb_pf):
+            blk = {k[len(f"pairformer_stack.blocks.{i}."):]: v for k, v in self.sd.items()
+                   if k.startswith(f"pairformer_stack.blocks.{i}.")}
+            for k, v in PW.remap_pairformer_block(blk).items():
+                comb[f"layers.{i}.{k}"] = v
+        self.PF = Pairformer(nb_pf, 32, 8, 384 // 16, 16, True, comb, compute_kernel_config)
+        # template embedder: 2 pair-only PairformerLayers
+        tpl = {k[len(f"template_embedder.pairformer_stack.blocks.{b}."):]: v for b in range(2)
+               for k, v in self.sd.items()
+               if k.startswith(f"template_embedder.pairformer_stack.blocks.{b}.")}
+        self.TPL = [PairformerLayer(32, 2, None, None, False,
+                    PW.remap_msa_pair_stack({k[len(f"template_embedder.pairformer_stack.blocks.{b}."):]: v
+                                             for k, v in self.sd.items()
+                                             if k.startswith(f"template_embedder.pairformer_stack.blocks.{b}.")}),
+                    compute_kernel_config) for b in range(2)]
+        # 4-block MSA module
+        self.MSA = []
+        nb_msa = 4
+        for i in range(nb_msa):
+            P = f"msa_module.blocks.{i}."
+            sub = lambda pp: {k[len(pp):]: v for k, v in self.sd.items() if k.startswith(pp)}
+            opm = OuterProductMean(PW.remap_outer_product_mean(sub(P + "outer_product_mean_msa.")), compute_kernel_config)
+            pl = PairformerLayer(32, 8, None, None, False, PW.remap_msa_pair_stack(sub(P + "pair_stack.")), compute_kernel_config)
+            has = any(k.startswith(P + "msa_stack.") for k in self.sd)
+            pwa = tm = None
+            if has:
+                pwa = PairWeightedAveraging(8, 8, PW.remap_pair_weighted_averaging(sub(P + "msa_stack.msa_pair_weighted_averaging.")), compute_kernel_config)
+                tm = Transition(PW.remap_transition(sub(P + "msa_stack.transition_m.")), compute_kernel_config)
+            self.MSA.append((opm, pwa, tm, pl))
+
+    def _T(self, x):
+        return ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
+
+    def _g(self, k):
+        return self.sd[k]
+
+    def _lin(self, x, k):
+        return ttnn.linear(x, self._T(self.sd[k].t().contiguous()),
+                           compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
+
+    def _ln(self, x, wk, bk=None):
+        return ttnn.layer_norm(x, weight=self._T(self._g(wk)), bias=(self._T(self._g(bk)) if bk else None),
+                               epsilon=1e-5, compute_kernel_config=self.ckc)
+
+    def _template(self, z3, te_at, N, nt):
+        zn = self._ln(z3, "template_embedder.layernorm_z.weight", "template_embedder.layernorm_z.bias")
+        u = None
+        for t in range(nt):
+            v = ttnn.add(self._lin(self._T(te_at[t].unsqueeze(0)), "template_embedder.linear_no_bias_a.weight"),
+                         self._lin(zn, "template_embedder.linear_no_bias_z.weight"))
+            for pl in self.TPL:
+                v = pl(None, v)[1]
+            v = self._ln(v, "template_embedder.layernorm_v.weight", "template_embedder.layernorm_v.bias")
+            u = v if u is None else ttnn.add(u, v)
+        u = ttnn.multiply(u, 1.0 / (1e-7 + nt))
+        return self._lin(ttnn.relu(u), "template_embedder.linear_no_bias_u.weight")
+
+    def _msa(self, z3, m_feat):
+        for (opm, pwa, tm, pl) in self.MSA:
+            z3 = ttnn.add(z3, opm(m_feat, None, None))
+            if pwa is not None:
+                m_feat = ttnn.add(m_feat, ttnn.reshape(pwa(m_feat, ttnn.clone(z3)), tuple(m_feat.shape)))
+                m_feat = ttnn.add(m_feat, ttnn.reshape(tm(m_feat), tuple(m_feat.shape)))
+            z3 = pl(None, z3)[1]
+        return z3
+
+    def __call__(self, feat, s_inputs, relp, token_bonds, progress_fn=None):
+        """feat: dict with template_* / msa / has_deletion / deletion_value / asym_id (host
+        tensors). s_inputs (N,449), relp (N,N,139), token_bonds (N,N) host. Returns
+        (s_trunk (N,384), z_trunk (1,N,N,256)) as ttnn tensors."""
+        import torch
+        import torch.nn.functional as F
+        N = s_inputs.shape[0]
+        s_init, z_init = self.trunk_input(self._T(s_inputs), self._T(relp), self._T(token_bonds.unsqueeze(-1)))
+        # template feature concat (per template)
+        asym = feat["asym_id"]; mc = (asym[:, None] == asym[None, :]).float(); pm = torch.ones(N, N)
+        nt = feat["template_aatype"].shape[0]
+        te_at = []
+        for t in range(nt):
+            dg = feat["template_distogram"][t] * mc[..., None] * pm[..., None]
+            pb = (feat["template_pseudo_beta_mask"][t] * mc * pm).unsqueeze(-1)
+            aa = F.one_hot(feat["template_aatype"][t].long(), 32).float()
+            aai = aa[None].expand(N, N, 32); aaj = aa[:, None].expand(N, N, 32)
+            uv = feat["template_unit_vector"][t] * mc[..., None] * pm[..., None]
+            bb = (feat["template_backbone_frame_mask"][t] * mc * pm).unsqueeze(-1)
+            te_at.append(torch.cat([dg, pb, aai, aaj, uv, bb], -1))
+        # msa feature
+        msa = F.one_hot(feat["msa"].long(), 32).float()
+        ms = torch.cat([msa, feat["has_deletion"].unsqueeze(-1), feat["deletion_value"].unsqueeze(-1)], -1).unsqueeze(0)
+        m_feat = ttnn.add(self._lin(self._T(ms), "msa_module.linear_no_bias_m.weight"),
+                          self._lin(self._T(s_inputs), "msa_module.linear_no_bias_s.weight"))
+        z3 = ttnn.reshape(ttnn.mul(z_init, 0.0), (1, N, N, self.C_Z))
+        s = ttnn.mul(s_init, 0.0)
+        for cyc in range(self.N_CYCLES):
+            if progress_fn:
+                progress_fn("trunk", step=cyc, total=self.N_CYCLES)
+            zc = self._lin(self._ln(z3, "layernorm_z_cycle.weight", "layernorm_z_cycle.bias"), "linear_no_bias_z_cycle.weight")
+            z3 = ttnn.add(ttnn.reshape(z_init, (1, N, N, self.C_Z)), zc)
+            z3 = ttnn.add(z3, self._template(z3, te_at, N, nt))
+            z3 = self._msa(z3, m_feat)
+            sc = self._lin(self._ln(s, "layernorm_s.weight", "layernorm_s.bias"), "linear_no_bias_s.weight")
+            s = ttnn.add(s_init, sc)
+            s, z3 = self.PF(ttnn.reshape(s, (1, N, 384)), z3)
+            s = ttnn.reshape(s, (N, 384))
+        return s, z3
+
+
 def edm_sample(diffusion_module, cond, n_atoms, *, n_step=200, gamma0=0.8, gamma_min=1.0,
                noise_scale=1.003, step_scale=1.5, sigma_data=16.0, s_max=160.0, s_min=4e-4,
                rho=7.0, seed=None):
