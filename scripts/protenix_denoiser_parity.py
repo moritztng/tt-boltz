@@ -61,15 +61,24 @@ z_t=T(pz_n.unsqueeze(0)); s_t=s_single
 sub2=lambda pp:{k[len(P+pp)+1:]:v for k,v in ck.items() if k.startswith(P+pp)}
 s2=lambda d,pp:{k[len(pp)+1:]:v for k,v in d.items() if k.startswith(pp+'.')}
 ftt=lambda x: ttnn.from_torch(x.t(),layout=ttnn.TILE_LAYOUT,device=dev,dtype=ttnn.bfloat16); ft=lambda x: ttnn.from_torch(x,layout=ttnn.TILE_LAYOUT,device=dev,dtype=ttnn.bfloat16)
+import torch.nn.functional as _F
+a_h=torch.Tensor(ttnn.to_torch(a_t)).float().reshape(NT,768); s_h=torch.Tensor(ttnn.to_torch(s_t)).float().reshape(NT,384); z_h=torch.Tensor(ttnn.to_torch(z_t)).float().reshape(NT,NT,256)
+gP=lambda k: ck[P+k].float()
+def _adaln(a,s,pre):
+    an=_F.layer_norm(a,(a.shape[-1],)); sn=_F.layer_norm(s,(s.shape[-1],))*gP(pre+'layernorm_s.weight')
+    return torch.sigmoid(_F.linear(sn,gP(pre+'linear_s.weight'),gP(pre+'linear_s.bias')))*an+_F.linear(sn,gP(pre+'linear_nobias_s.weight'))
 for b in range(nbk):
-    asd=sub2(f'blocks.{b}.attention_pair_bias'); adA=AdaLN(False,remap_adaptive_layernorm(s2(asd,'layernorm_a')),ckc); apb=AttentionPairBias(hd,nh,True,False,remap_attention_pair_bias(asd),ckc)
-    lalw,lalb=ftt(asd['linear_a_last.weight']),ft(asd['linear_a_last.bias']); ctb=sub2(f'blocks.{b}.conditioned_transition_block'); adC=AdaLN(False,remap_adaptive_layernorm(s2(ctb,'adaln')),ckc)
-    a1w,a2w,bw=ftt(ctb['linear_nobias_a1.weight']),ftt(ctb['linear_nobias_a2.weight']),ftt(ctb['linear_nobias_b.weight']); lsw,lsb=ftt(ctb['linear_s.weight']),ft(ctb['linear_s.bias'])
-    an=adA(a_t,s_t); attn=apb(an,z_t); gate=ttnn.linear(s_t,lalw,bias=lalb,compute_kernel_config=ckc,core_grid=CORE)
-    attn=ttnn.multiply(gate,attn,input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID]); attn=ttnn.add(attn,a_t)
-    cn=adC(attn,s_t); c1=ttnn.linear(cn,a1w,compute_kernel_config=ckc,core_grid=CORE);c2=ttnn.linear(cn,a2w,compute_kernel_config=ckc,core_grid=CORE)
-    cb=ttnn.multiply(c2,c1,input_tensor_b_activations=[ttnn.UnaryOpType.SILU]);cba=ttnn.linear(cb,bw,compute_kernel_config=ckc,core_grid=CORE)
-    csg=ttnn.linear(s_t,lsw,bias=lsb,compute_kernel_config=ckc,core_grid=CORE);ff=ttnn.multiply(csg,cba,input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID]);a_t=ttnn.add(attn,ff)
+    A=f'blocks.{b}.attention_pair_bias.'; Cc=f'blocks.{b}.conditioned_transition_block.'
+    an=_adaln(a_h,s_h,A+'layernorm_a.')
+    zb=_F.layer_norm(z_h,(256,))*gP(A+'layernorm_z.weight'); bias=_F.linear(zb,gP(A+'linear_nobias_z.weight')).permute(2,0,1)
+    Q=_F.linear(an,gP(A+'attention.linear_q.weight'),gP(A+'attention.linear_q.bias')).reshape(NT,nh,hd).permute(1,0,2)
+    K=_F.linear(an,gP(A+'attention.linear_k.weight')).reshape(NT,nh,hd).permute(1,0,2); V=_F.linear(an,gP(A+'attention.linear_v.weight')).reshape(NT,nh,hd).permute(1,0,2)
+    o=torch.einsum('hij,hjd->hid',torch.softmax(torch.einsum('hid,hjd->hij',Q,K)/(hd**0.5)+bias,-1),V).permute(1,0,2).reshape(NT,nh*hd)
+    o=o*torch.sigmoid(_F.linear(an,gP(A+'attention.linear_g.weight'))); attn=_F.linear(o,gP(A+'attention.linear_o.weight'))
+    attn=torch.sigmoid(_F.linear(s_h,gP(A+'linear_a_last.weight'),gP(A+'linear_a_last.bias')))*attn; ao=attn+a_h
+    an2=_adaln(ao,s_h,Cc+'adaln.'); bb=_F.silu(_F.linear(an2,gP(Cc+'linear_nobias_a1.weight')))*_F.linear(an2,gP(Cc+'linear_nobias_a2.weight'))
+    a_h=torch.sigmoid(_F.linear(s_h,gP(Cc+'linear_s.weight'),gP(Cc+'linear_s.bias')))*_F.linear(bb,gP(Cc+'linear_nobias_b.weight'))+ao
+a_t=T(a_h.reshape(1,NT,768))
 # 4) atom decoder
 print('dit_out PCC %.4f'%_p(torch.Tensor(ttnn.to_torch(a_t)).float().reshape(NT,768), DMS['dit_out'].float().reshape(NT,768)),flush=True)
 a_t=ttnn.layer_norm(a_t,weight=T(ck['module.diffusion_module.layernorm_a.weight']),epsilon=1e-5,compute_kernel_config=ckc)

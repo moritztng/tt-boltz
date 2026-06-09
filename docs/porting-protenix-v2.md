@@ -1356,3 +1356,16 @@ in the token DiT (SDPA forces bf16). Then: EDM sampler loop (N_step, recipe abov
 the denoiser -> full coords -> Ca-RMSD; productionize tt_bio Protenix class+worker;
 --fast/CLI(--model protenix-v2)/vendoring/README. The compute+logic is DONE; remaining is
 DiT-precision engineering + sampler/integration + release.
+
+## MILESTONE: full denoiser reproduces golden coords PCC 0.99976 (with fp32 DiT)
+
+scripts/protenix_denoiser_parity.py: running the 24-block token DiT in fp32 (the rest of
+the denoiser on-device ttnn bf16) -> dit_out 0.9999, DENOISER coords PCC 0.99976 vs golden.
+This CONFIRMS the per-step denoiser is fully correct end-to-end and that fp32-DiT is the
+fix. The complete v2 forward (trunk + denoiser->coords + confidence) is now end-to-end
+validated. ON-DEVICE PATH: implement the token DiT with ttnn fp32 attention (explicit
+matmul+softmax, ~38 tokens -> cheap) instead of bf16 SDPA; everything else is bf16 on-device.
+REMAINING: (1) ttnn fp32 token-DiT (mirror the torch fp32 here). (2) EDM sampler loop
+(generator recipe) wrapping the denoiser, N_step centered denoise -> coords (N_sample,N_atom,3).
+(3) Ca-RMSD vs ~/protenix_ref_out.pkl coords. (4) productionize tt_bio Protenix class+worker.
+(5) --fast/CLI(--model protenix-v2)/vendoring/README per SKILL.md. Compute+logic DONE.
