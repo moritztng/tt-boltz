@@ -399,3 +399,39 @@ Remaining tt-bio build order (simplest first, validate each vs golden):
 2. trunk linears (s_init/z_init) + relative_position_encoding + recycling.
 3. DiffusionModule (DiffusionConditioning + AtomAttn enc/dec + DiT) + sampler.
 4. ConfidenceHead. 5. wire end-to-end -> Ca-RMSD vs ~/protenix_ref_out.pkl coords.
+
+## STRATEGY: reuse map (Boltz-2 ttnn stack + tenstorrent.py primitives already cover most of v2)
+
+tt-bio already has the full AF3 stack on ttnn (boltz2.py) AND Protenix-MATCHED
+primitives in tenstorrent.py (AdaLN, ConditionedTransitionBlock, AttentionPairBias,
+PairformerLayer, Transition, OuterProductMean, PairWeightedAveraging, Triangle*) —
+the latter are already validated vs the Protenix reference (random + real v2). So
+the v2 port is mostly remap + small reconcile, plus a few genuinely-new pieces.
+
+Per-module plan (from a focused Boltz-2-vs-Protenix-v2 diff):
+- AtomTransformer: REMAP — thin wrapper over the diffusion transformer; reuse
+  tenstorrent.py DiT primitives. NEW: local windowed attention (n_queries=32,
+  n_keys=128) over precomputed d_lm/v_lm/pad_info window tensors.
+- AtomAttentionEncoder / Decoder: NEEDS-RECONCILE — same AF3 flow; build Protenix
+  variants on tenstorrent.py primitives. Encoder: ref-feat linears + atom-pair small
+  MLP (5-layer, zeros-final) + AtomTransformer + mean atom->token aggregate. Decoder:
+  broadcast token->atom + skip + AtomTransformer + LayerNorm->Linear(3).
+- DiffusionTransformer (DiT block): tenstorrent.py AttentionPairBias(atom_level)+
+  AdaLN+ConditionedTransitionBlock ALREADY match Protenix (validated; boltz2.py's
+  SwiGLU variant is Boltz-2-specific — do NOT use it for v2).
+- DiffusionConditioning: REMAP — RelativePositionEncoding + LayerNorm/Linear +
+  2x Transition (single & pair) + FourierEmbedding(noise). Protenix Fourier is
+  trainable (load weights), unlike Boltz-2's frozen one.
+- ConfidenceHead: distance one-hot embed -> 4x PairformerLayer (have it, validated)
+  -> PAE/PDE/pLDDT/resolved heads + softmax-weighted aggregation.
+- Diffusion sampler: EDM noise schedule (gamma0/gamma_min/noise_scale/step_scale),
+  N_step centered denoise loop calling diffusion_module; batch N_sample on sample dim.
+
+Genuinely-new ttnn work (rest is remap/reconcile of validated primitives):
+1. local windowed atom attention (32x128 blocks) in AtomTransformer.
+2. atom featurization (ref_pos/charge/element/name_chars -> q/c, d_lm/v_lm -> p_lm).
+3. EDM diffusion sampler loop. 4. confidence distance-embed + aggregation.
+
+Build order: InputFeatureEmbedder (AtomAttnEncoder has_coords=False -> s_inputs 449)
+-> trunk linears/recycle -> DiffusionConditioning -> DiffusionModule(+AtomAttn
+has_coords=True + Decoder)+sampler -> ConfidenceHead -> end-to-end Ca-RMSD.
