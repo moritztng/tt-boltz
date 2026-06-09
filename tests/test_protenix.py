@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
     make_attention_pair_bias,
     make_outer_product_mean,
+    make_msa_block,
     make_pair_weighted_averaging,
     make_pairformer_block,
     make_transition,
@@ -25,12 +26,14 @@ from protenix_reference import (  # noqa: E402
     pcc,
     remap_attention_pair_bias,
     remap_outer_product_mean,
+    remap_msa_pair_stack,
     remap_pair_weighted_averaging,
     remap_pairformer_block,
     remap_transition,
     remap_triangle_attention,
     remap_triangle_multiplication,
     run_reference_outer_product_mean,
+    run_reference_msa_block,
     run_reference_pair_weighted_averaging,
     run_reference_pairformer_block,
     run_reference_transition,
@@ -197,3 +200,32 @@ def test_pair_weighted_averaging_parity():
         out = out.reshape(ref.shape)
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f} (shapes out={tuple(out.shape)} ref={tuple(ref.shape)})"
+
+
+# Full MSABlock: Protenix-ordered assembly of verified sub-modules (OPM-first).
+# Reference mutates m,z in place -> clone before the reference call.
+def test_msa_block_parity():
+    c_m, c_z, S, L = 64, 128, 8, 32
+    mod, sd = make_msa_block(c_m, c_z, 32, seed=0)
+    m = torch.randn(1, S, L, c_m); z = torch.randn(1, L, L, c_z)
+    m0, z0 = m.clone(), z.clone()  # reference mutates m,z in place
+    ref_m, ref_z = run_reference_msa_block(mod, m, z)
+    ref_m, ref_z = ref_m.float(), ref_z.float()
+
+    def sub(d, p):
+        return {k[len(p) + 1:]: v for k, v in d.items() if k.startswith(p + ".")}
+    dev = get_device(); ck = _ck(dev)
+    opm = OuterProductMean(remap_outer_product_mean(sub(sd, "outer_product_mean_msa")), ck)
+    pwa = PairWeightedAveraging(8, 8, remap_pair_weighted_averaging(sub(sd, "msa_stack.msa_pair_weighted_averaging")), ck)
+    tm = Transition(remap_transition(sub(sd, "msa_stack.transition_m")), ck)
+    pl = PairformerLayer(32, 4, None, None, False, remap_msa_pair_stack(sub(sd, "pair_stack")), ck)
+    ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    m_t = ft(m0)
+    z1 = ttnn.add(ft(z0), opm(m_t, None, None))                       # z += OPM(m)
+    m_t = ttnn.add(m_t, ttnn.reshape(pwa(m_t, ttnn.clone(z1)), tuple(m_t.shape)))  # m += pwa(m,z)
+    m_t = ttnn.add(m_t, ttnn.reshape(tm(m_t), tuple(m_t.shape)))      # m += transition(m)
+    z_out = pl(None, z1)[1]                                            # z = pair_stack(z)
+    mm = torch.Tensor(ttnn.to_torch(m_t)).float().reshape(ref_m.shape)
+    zz = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(ref_z.shape)
+    pm_, pz_ = pcc(mm, ref_m), pcc(zz, ref_z)
+    assert pm_ > 0.98 and pz_ > 0.98, f"m={pm_:.5f} z={pz_:.5f}"

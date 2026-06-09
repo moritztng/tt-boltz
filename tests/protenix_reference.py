@@ -282,6 +282,44 @@ def run_reference_pair_weighted_averaging(mod, m, z):
         return mod(m, z)
 
 
+# --- Full MSABlock (Protenix-ordered assembly of verified sub-modules) --------
+# NOTE: Protenix reference forwards mutate m/z IN PLACE (inplace_safe), so any
+# parity test must clone the inputs before calling the reference and feed the
+# pristine clones to the tt-bio side.
+def make_msa_block(c_m=64, c_z=128, c_hidden=32, seed=0):
+    from protenix.model.modules.pairformer import MSABlock
+
+    torch.manual_seed(seed)
+    mod = MSABlock(c_m=c_m, c_z=c_z, c_hidden=c_hidden, is_last_block=False).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_msa_pair_stack(ps_sd: dict) -> dict:
+    """Pair-only remap for the MSA block's pair_stack (PairformerBlock c_s=0)."""
+    def s(p):
+        return {k[len(p) + 1:]: v for k, v in ps_sd.items() if k.startswith(p + ".")}
+    out = {}
+    for k, v in remap_triangle_multiplication(s("tri_mul_out")).items():
+        out[f"tri_mul_out.{k}"] = v
+    for k, v in remap_triangle_multiplication(s("tri_mul_in")).items():
+        out[f"tri_mul_in.{k}"] = v
+    for k, v in s("tri_att_start").items():
+        out[f"tri_att_start.{k}"] = v
+    for k, v in s("tri_att_end").items():
+        out[f"tri_att_end.{k}"] = v
+    for k, v in remap_transition(s("pair_transition")).items():
+        out[f"transition_z.{k}"] = v
+    return out
+
+
+def run_reference_msa_block(mod, m, z):
+    """Reference MSABlock forward. MUTATES m,z in place — pass clones."""
+    with torch.no_grad():
+        return mod(m, z, torch.ones(z.shape[:-1], dtype=z.dtype))  # (m, z)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
