@@ -26,10 +26,64 @@ RESTYPE_ORDER = "ARNDCQEGHILKMFPSTWYV"
 RESTYPE_DIM = 32  # protenix restype width (20 aa + X/gap/other slots)
 _AA1_TO_IDX = {c: i for i, c in enumerate(RESTYPE_ORDER)}
 
+# CCD formal charges on amino-acid atoms (the v2 reference's neutral-CCD convention:
+# only the protonated guanidinium / ammonium nitrogens carry +1; validated vs golden).
+_FORMAL_CHARGE = {("ARG", "NH2"): 1.0, ("LYS", "NZ"): 1.0}
+
 
 def aatype_from_sequence(seq: str) -> torch.Tensor:
     """One-letter protein sequence -> aatype indices (unknown -> 20)."""
     return torch.tensor([_AA1_TO_IDX.get(c.upper(), 20) for c in seq], dtype=torch.long)
+
+
+def protein_atom_features(aatype: torch.Tensor, conformers: dict) -> dict:
+    """Atom-level features for a single offline protein chain.
+
+    Reuses tt_bio.data.const.ref_atoms (per-residue atom names, in the canonical CCD order
+    that matches the v2 reference exactly -- validated 20/20 residue types). Per-atom:
+      ref_element  = one_hot(atomic_number - 1, 128)   (C->5, N->6, O->7, ... validated)
+      ref_charge   = 0  (neutral CCD reference)
+      ref_atom_name_chars = one_hot over 64 of (ord(c)-32) for 4 chars (space-padded)
+      ref_mask     = 1
+      atom_to_token_idx = residue index per atom; ref_space_uid = same (per-residue frame)
+      ref_pos      = conformers[res] (a valid per-residue reference conformer; the reference
+                     uses a STOCHASTIC RDKit conformer, so any valid one folds correctly).
+    conformers: {3-letter resname: (n_atom, 3) local coords in ref_atoms order}.
+    """
+    from .data import const
+    letter_to_res = {v: k for k, v in const.prot_token_to_letter.items()}
+    z_of = const.element_to_atomic_num  # symbol -> atomic number
+    n_tok = aatype.shape[0]
+    ref_pos, ref_charge, ref_mask, a2t, ruid = [], [], [], [], []
+    elem_idx, name_chars = [], []
+    for t, aa in enumerate(aatype.tolist()):
+        res = letter_to_res[RESTYPE_ORDER[aa]] if aa < len(RESTYPE_ORDER) else "UNK"
+        atoms = list(const.ref_atoms[res])
+        conf = torch.as_tensor(conformers[res], dtype=torch.float32)
+        if t == n_tok - 1:  # C-terminal residue carries the extra OXT (carboxylate) oxygen
+            atoms = atoms + ["OXT"]
+            # synthesize OXT as the carboxylate mirror of O through C (any valid ref conformer)
+            c_i, o_i = const.ref_atoms[res].index("C"), const.ref_atoms[res].index("O")
+            conf = torch.cat([conf, (2 * conf[c_i] - conf[o_i])[None]], 0)
+        for k, nm in enumerate(atoms):
+            elem_idx.append(z_of[nm[0]] - 1)
+            ref_charge.append(_FORMAL_CHARGE.get((res, nm), 0.0))
+            ref_mask.append(1.0)
+            a2t.append(t); ruid.append(t)
+            padded = (nm + "    ")[:4]
+            name_chars.append([ord(c) - 32 for c in padded])
+        ref_pos.append(conf)
+    ref_pos = torch.cat(ref_pos, 0)
+    N = ref_pos.shape[0]
+    return {
+        "ref_pos": ref_pos,
+        "ref_element": torch.nn.functional.one_hot(torch.tensor(elem_idx), const.num_elements).float(),
+        "ref_charge": torch.tensor(ref_charge),
+        "ref_atom_name_chars": torch.nn.functional.one_hot(torch.tensor(name_chars), 64).float(),
+        "ref_mask": torch.tensor(ref_mask),
+        "atom_to_token_idx": torch.tensor(a2t, dtype=torch.long),
+        "ref_space_uid": torch.tensor(ruid, dtype=torch.long),
+    }
 
 
 def protein_token_features(aatype: torch.Tensor) -> dict:
