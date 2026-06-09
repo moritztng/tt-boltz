@@ -20,9 +20,6 @@ Status (all on-device, validated vs real v2 golden; see tests/test_protenix_*.py
 - ConfidenceHead (pae/pde ; plddt/resolved)              PCC 1.0 ; 0.93/0.77
 EVERY v2 compute module validated on-device. Remaining: end-to-end assembly
 (docs/porting-protenix-v2.md checklist) -> Ca-RMSD; then --fast/CLI/vendoring/README.
-Remaining: msa-module input featurization + recycle wiring + template embedder
-(trunk output); diffusion (conditioning + module + EDM sampler); confidence head;
-end-to-end Ca-RMSD; then --fast/CLI/vendoring/README. See docs/porting-protenix-v2.md.
 """
 import torch
 import ttnn
