@@ -10,7 +10,7 @@
 > [!IMPORTANT]
 > **TT-Boltz is now TT-Bio**
 
-TT-Bio runs [Boltz-2](https://github.com/jwohlwend/boltz) and [ESMFold2](https://github.com/Biohub/esm) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
+TT-Bio runs [Boltz-2](https://github.com/jwohlwend/boltz), [ESMFold2](https://github.com/Biohub/esm), and [Protenix-v2](https://github.com/bytedance/Protenix) structure prediction and [BoltzGen](#boltzgen) binder design on Tenstorrent Blackhole and Wormhole, supporting single-card and multi-card configurations (e.g. QuietBox with 4 cards or Galaxy server with 32 cards). Multiple machines can also be combined into a single prediction run.
 
 ## Installation
 
@@ -55,12 +55,14 @@ Every command names its model with `--model`:
 
 - **`boltz2`** — folds complexes of proteins, DNA, RNA, and ligands and predicts binding affinity. Needs an MSA for each protein chain.
 - **`esmfold2`** / **`esmfold2-fast`** — fold a single protein sequence on-device, no MSA required (`esmfold2-fast` is the lighter, faster checkpoint):
+- **`protenix-v2`** — AlphaFold3-family folder (Pairformer trunk + atom diffusion, the [Protenix-v2](https://github.com/bytedance/Protenix) reproduction) for single-sequence protein folding on-device, no MSA or templates required:
 
 ```bash
 tt-bio predict seq.fasta --model esmfold2-fast --fast
+tt-bio predict seq.fasta --model protenix-v2
 ```
 
-ESMFold2 is single-sequence and protein-only, so the MSA, ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only** (ESMFold2 still uses an MSA if you pass one). The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, and the multi-card / multi-machine flags — work for every model.
+ESMFold2 and Protenix-v2 are single-sequence and protein-only, so the MSA, ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only** (ESMFold2 still uses an MSA if you pass one). The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, and the multi-card / multi-machine flags — work for every model. Protenix-v2 loads its weights from the Hugging Face mirror on first use (override with `$PROTENIX_CKPT`).
 
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
@@ -295,7 +297,7 @@ Options apply to every model unless tagged **(Boltz-2)**.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model` | `boltz2` | `boltz2`, `esmfold2`, or `esmfold2-fast` (single-sequence ESMFold2) |
+| `--model` | `boltz2` | `boltz2`, `esmfold2`, `esmfold2-fast` (single-sequence ESMFold2), or `protenix-v2` (single-sequence AlphaFold3-family folder) |
 | `--out_dir` | `./` | Output directory |
 | `--cache` | `~/.boltz` | **(Boltz-2)** model cache directory; ESMFold2 uses the Hugging Face cache |
 | `--accelerator` | `tenstorrent` | **(Boltz-2)** `tenstorrent`, `cpu`, or `gpu`; ESMFold2 always runs on Tenstorrent |
