@@ -25,17 +25,30 @@ def write_pdb(path, coords, z, a2t):
     open(path, 'w').write("\n".join(lines) + "\n")
     return len(lines)
 
+def _load_feats(inp):
+    """inp: a .pkl feats dict, a .fasta file, or a raw one-letter sequence string."""
+    if inp.endswith('.pkl'):
+        return pickle.load(open(inp, 'rb'))
+    if os.path.exists(inp) and (inp.endswith('.fasta') or inp.endswith('.fa') or inp.endswith('.seq')):
+        seq = ''.join(l.strip() for l in open(inp) if not l.startswith('>'))
+    else:
+        seq = inp.strip()
+    from tt_bio.protenix_data import build_protein_features
+    return build_protein_features(seq)
+
+
 def main():
-    feats_pkl, ckpt, out_pdb = sys.argv[1], sys.argv[2], sys.argv[3]
+    inp, ckpt, out_pdb = sys.argv[1], sys.argv[2], sys.argv[3]
     n_step = int(sys.argv[4]) if len(sys.argv) > 4 else 200
     seed = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-    feats = pickle.load(open(feats_pkl, 'rb'))
+    feats = _load_feats(inp)
     dev = get_device()
     ckc = ttnn.init_device_compute_kernel_config(dev.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
                                                   fp32_dest_acc_en=True, packer_l1_acc=True)
     model = Protenix.load_from_checkpoint(ckpt, compute_kernel_config=ckc, device=dev)
     coords = model.fold(feats, n_step=n_step, n_sample=1, seed=seed)[0]   # (N,3)
-    z = feats['ref_element'].argmax(-1) if feats['ref_element'].dim() > 1 else feats['ref_element']
+    # ref_element one-hot index is (atomic_number - 1); +1 recovers Z
+    z = feats['ref_element'].argmax(-1) + 1 if feats['ref_element'].dim() > 1 else feats['ref_element'] + 1
     a2t = feats['atom_to_token_idx'].long()
     n = write_pdb(out_pdb, coords, z, a2t)
     rg = float((coords - coords.mean(0)).pow(2).sum(-1).mean().sqrt())
