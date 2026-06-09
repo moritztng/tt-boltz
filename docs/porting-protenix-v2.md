@@ -1385,3 +1385,21 @@ coords, replicate seed_everything(seed_from_modelSeeds=42) + the exact randn/aug
 (else compare structures via Kabsch-aligned Ca-RMSD — acceptable if model correct). The
 per-step denoiser is validated (coords 0.9998 w/ fp32 DiT), so the sampler is control-flow
 + RNG-order fidelity. Get exact p/dt from cfg.diffusion_module's inference_noise_scheduler.
+
+## EXACT noise schedule (sampler now 100% specified)
+
+InferenceNoiseScheduler (generator.py): rho=7, s_max=160, s_min=4e-4, sigma_data=16.
+  step_size = 1/N_step; i = arange(N_step+1)
+  t[i] = sigma_data * (s_max^(1/rho) + i*step_size*(s_min^(1/rho) - s_max^(1/rho)))^rho
+  t[-1] = 0   # last noise level forced to 0
+centre_random_augmentation: protenix/model/utils.py (center coords + random rotation).
+denoise_net for the sampler = DiffusionModule.forward (EDM-preconditioned: r_noisy=x/
+sqrt(sigma^2+t^2) -> f_forward -> x_denoised=x/(1+sr^2)+t/sqrt(1+sr^2)*r_update). VALIDATED
+(coords 0.9998 w/ fp32 DiT). Conditioning (pair_z,p_lm,c_l,s_inputs,s_trunk,z_trunk)
+captured in ~/protenix_denoiser_pre.pkl (deterministic from trunk).
+=> SAMPLER FULLY SPECIFIED. End-to-end port (ttnn): trunk -> conditioning(once) -> this
+sampler loop (N_step, calling the ttnn denoiser w/ fp32 token-DiT) -> coords -> Kabsch
+Ca-RMSD vs ~/protenix_ref_out.pkl coords. For a deterministic match, replicate the full
+reference forward's RNG (seed=modelSeeds[0]) up to the sampler, or compare aligned
+structures. Everything for the port is now specified + validated; remaining is mechanical
+assembly + the ttnn fp32 DiT + release (--fast/CLI/vendoring/README).
