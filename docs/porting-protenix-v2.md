@@ -1403,3 +1403,23 @@ Ca-RMSD vs ~/protenix_ref_out.pkl coords. For a deterministic match, replicate t
 reference forward's RNG (seed=modelSeeds[0]) up to the sampler, or compare aligned
 structures. Everything for the port is now specified + validated; remaining is mechanical
 assembly + the ttnn fp32 DiT + release (--fast/CLI/vendoring/README).
+
+## DiT precision is HARDWARE-LIMITED on TT (ttnn fp32 = 0.54; torch fp32 = 1.0)
+
+scripts/protenix_dit_fp32_parity.py: 24-block token DiT in ttnn float32 (explicit
+fp32 matmul attention, no SDPA) -> PCC 0.536 vs golden dit_out (bf16 was 0.31).
+torch fp32 = 1.0. So TT's "fp32" matmul (HiFi4 ~= bf16x3, fp32 dest acc) is NOT true
+fp32; the near-identity 24-block DiT (c_a=768) accumulates matmul precision error ->
+~0.5 ceiling on-device. The DiT LOGIC is exact (torch 1.0); this is a TT hardware
+matmul-precision limit on deep near-identity residual stacks.
+IMPLICATIONS / NEXT:
+- Measure end-to-end Ca-RMSD with the on-device DiT: coords = c_skip*x_noisy +
+  c_out*r_update over N_step=200; per-step DiT error may average out / be dominated by
+  c_skip*x_noisy at low noise. The DiT error may be tolerable for structure quality
+  even at dit_out~0.5. MEASURE before further precision work.
+- If intolerable: explore (a) ttnn matmul with higher fidelity / fp32 accumulation paths,
+  (b) reformulate the near-identity residual to reduce relative error, (c) chunked
+  higher-precision accumulation. This is a general TT lesson for deep DiT-style stacks.
+LESSON (skill): deep near-identity residual transformer stacks (small per-block updates)
+are TT-bf16-precision-sensitive; validate logic in torch fp32, then measure end-to-end
+tolerance rather than assuming per-block PCC translates to output quality.
