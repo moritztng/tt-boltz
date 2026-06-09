@@ -252,6 +252,36 @@ def run_reference_outer_product_mean(mod, m):
         return mod(m, mask=torch.ones(m.shape[:-1], dtype=m.dtype))  # [B,L,L,c_z]
 
 
+# --- MSAPairWeightedAveraging (pair-biased MSA averaging) ---------------------
+def make_pair_weighted_averaging(c_m=64, c=32, c_z=128, n_heads=8, seed=0):
+    from protenix.model.modules.pairformer import MSAPairWeightedAveraging
+
+    torch.manual_seed(seed)
+    mod = MSAPairWeightedAveraging(c_m=c_m, c=c, c_z=c_z, n_heads=n_heads).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_pair_weighted_averaging(ref_sd: dict) -> dict:
+    """Protenix MSAPairWeightedAveraging -> tt-bio PairWeightedAveraging."""
+    return {
+        "norm_m.weight": ref_sd["layernorm_m.weight"],
+        "norm_m.bias": ref_sd["layernorm_m.bias"],
+        "norm_z.weight": ref_sd["layernorm_z.weight"],
+        "norm_z.bias": ref_sd["layernorm_z.bias"],
+        "proj_m.weight": ref_sd["linear_no_bias_mv.weight"],  # value
+        "proj_g.weight": ref_sd["linear_no_bias_mg.weight"],  # gate
+        "proj_z.weight": ref_sd["linear_no_bias_z.weight"],   # z -> per-head bias
+        "proj_o.weight": ref_sd["linear_no_bias_out.weight"],
+    }
+
+
+def run_reference_pair_weighted_averaging(mod, m, z):
+    with torch.no_grad():
+        return mod(m, z)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()

@@ -133,7 +133,9 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       trunk (×48).
 - [x] OuterProductMean (MSA->pair) parity on device, PCC 0.99962 (direct remap:
       norm<-layer_norm, proj_a/b<-linear_1/2, proj_o<-linear_out). 9/9 tests pass.
-- [ ] Next: PairWeightedAveraging + full MSALayer/MSAModule (reconcile order vs
+- [x] MSAPairWeightedAveraging parity on device, PCC>0.98 (norm_m<-layernorm_m,
+      proj_m<-linear_no_bias_mv, proj_g<-mg, proj_z<-z, proj_o<-out). 10/10 tests pass.
+- [ ] Next: full MSALayer/MSAModule (reconcile order vs
       Protenix MSABlock) + PairformerStack (N-block) + s/z init linears →
       MSA block/module → diffusion transformer + atom encoder/decoder +
       DiffusionModule → input/relpos/template/constraint embedders →

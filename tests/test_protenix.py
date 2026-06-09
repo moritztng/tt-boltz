@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
     make_attention_pair_bias,
     make_outer_product_mean,
+    make_pair_weighted_averaging,
     make_pairformer_block,
     make_transition,
     make_triangle_attention,
@@ -24,11 +25,13 @@ from protenix_reference import (  # noqa: E402
     pcc,
     remap_attention_pair_bias,
     remap_outer_product_mean,
+    remap_pair_weighted_averaging,
     remap_pairformer_block,
     remap_transition,
     remap_triangle_attention,
     remap_triangle_multiplication,
     run_reference_outer_product_mean,
+    run_reference_pair_weighted_averaging,
     run_reference_pairformer_block,
     run_reference_transition,
     run_reference_triangle_attention,
@@ -38,6 +41,7 @@ from protenix_reference import (  # noqa: E402
 from tt_bio.tenstorrent import (  # noqa: E402
     AttentionPairBias,
     OuterProductMean,
+    PairWeightedAveraging,
     PairformerLayer,
     Transition,
     TriangleAttention,
@@ -171,3 +175,25 @@ def test_outer_product_mean_parity():
         out = out[0]
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f}"
+
+
+# MSAPairWeightedAveraging.
+def test_pair_weighted_averaging_parity():
+    c_m, c, c_z, n_heads, S, L = 64, 32, 128, 8, 8, 32
+    mod, sd = make_pair_weighted_averaging(c_m, c, c_z, n_heads, seed=0)
+    m = torch.randn(1, S, L, c_m)
+    z = torch.randn(1, L, L, c_z)
+    ref = run_reference_pair_weighted_averaging(mod, m, z).float()
+    dev = get_device()
+    pwa = PairWeightedAveraging(head_dim=c, n_heads=n_heads,
+                                state_dict=remap_pair_weighted_averaging(sd),
+                                compute_kernel_config=_ck(dev))
+    m_t = ttnn.from_torch(m, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    z_t = ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    out = torch.Tensor(ttnn.to_torch(pwa(m_t, z_t))).float()
+    while out.dim() > ref.dim():
+        out = out[0]
+    if out.shape != ref.shape and out.dim() == ref.dim():
+        out = out.reshape(ref.shape)
+    p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f} (shapes out={tuple(out.shape)} ref={tuple(ref.shape)})"
