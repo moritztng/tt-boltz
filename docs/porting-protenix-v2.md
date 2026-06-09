@@ -1246,3 +1246,17 @@ diffusion atom encoder(coords)+decoder, DiffusionConditioning pair+single, confi
 pae/pde. (DiT 24-block + plddt/resolved validated via scripts/, precision-documented.)
 This is the committed regression suite for the v2 compute graph. Remaining: end-to-end
 wiring (Ca-RMSD) + --fast/CLI/vendoring/README.
+
+## NEXT: denoiser-as-a-unit integration test (inputs captured pre-mutation)
+
+scripts/protenix_extract_denoiser_pre.py -> ~/protenix_denoiser_pre.pkl (forward_pre_hook
+clone of diffusion_module): kwargs (x_noisy(1,275,3), t_hat_noise_level(1,), feat,
+s_inputs, s_trunk, z_trunk, pair_z, p_lm, c_l) -> out coords (1,275,3).
+This is the per-step DENOISER the EDM sampler calls. Chain the VALIDATED modules:
+  s_single = DiffusionConditioning.single(s_trunk, s_inputs, t_hat)   [pair_z passed in]
+  a,q,c,p  = AtomAttentionEncoder(has_coords)(x_noisy as r_l, s_single, pair_z, p_lm, c_l)
+  a        = DiffusionTransformer24(a, s_single, pair_z)
+  coords   = AtomAttentionDecoder(a, q_skip=q, c_skip=c, p_skip=p)
+Compare to golden out coords (expect ~0.99, bf16 accumulation across 4 stages). This
+validates the denoiser unit end-to-end; then wrap in the EDM sampler loop (recipe above)
+-> full coords -> Ca-RMSD. NOTE: t_hat enters cond single via Fourier(log(t/sigma)/4).
