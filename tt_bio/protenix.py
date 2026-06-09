@@ -6,7 +6,15 @@ ConditionedTransitionBlock, PairformerLayer, Transition). This module adds the
 genuinely-new v2 pieces, built component-by-component and validated against the
 real v2 reference (see scripts/protenix_*.py and tests/test_protenix.py).
 
-Status: atom featurization (c_l, p_lm) ported + validated on-device (PCC>0.9999).
+Status (all on-device, validated vs real v2 golden; see tests/test_protenix_*.py):
+- AtomFeaturization (c_l, p_lm)                          PCC > 0.9999
+- AtomTransformer (3-block windowed atom attention)      PCC 0.999998
+- AtomAttentionEncoder -> s_inputs (full InputFeatureEmbedder atom encoder) PCC 0.999999
+- TrunkInput -> s_init, z_init                           PCC 0.999997
+- 48-block Pairformer stack vs real trunk I/O            PCC s 0.993 / z 0.980
+Remaining: msa-module input featurization + recycle wiring + template embedder
+(trunk output); diffusion (conditioning + module + EDM sampler); confidence head;
+end-to-end Ca-RMSD; then --fast/CLI/vendoring/README. See docs/porting-protenix-v2.md.
 """
 import torch
 import ttnn
