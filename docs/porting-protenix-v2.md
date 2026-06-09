@@ -465,3 +465,29 @@ on a p150a vs real v2 golden (PCC c_l 0.999997, p_lm 0.999978).
   churn from other agents). Pattern for all subsequent v2 module tests.
 Next: the local windowed atom attention (DiffusionTransformer cross_attention_mode,
 32 queries x 128 keys, per-head pair bias) to complete AtomAttentionEncoder.
+
+## SPEC: local windowed atom attention (the core new ttnn primitive)
+
+Golden target: scripts/protenix_extract_atomtx.py -> ~/protenix_atomtx_gold.pkl
+(q,c,p [275,128]/[275,128]/[9,32,128,16] -> qout [275,128]; 81 weights, 3 blocks).
+Atom transformer = DiffusionTransformer(cross_attention_mode=True, n_blocks=3,
+c_a=c_atom=128, c_s=c_atom=128, c_z=c_atompair=16, n_heads=4, d_head=32). Each block:
+DiffusionTransformerBlock = AttentionPairBias + ConditionedTransitionBlock, residuals
+(attn_out=APB(a,s,z); a1=attn_out+a; out=CTB(a1,s)+a1). s=c (atom single cond).
+
+AttentionPairBias (cross_attention_mode, has_s=True), per block:
+- q_norm = AdaLN_a(a, s);  kv_norm = AdaLN_kv(q_norm, s)   [note: kv AdaLN takes q_norm]
+- Q=linear_q(q_norm) (+bias); K=linear_k(kv_norm), V=linear_v(kv_norm) (no bias);
+  heads=4, d_head=32; scale q by 1/sqrt(32).
+- pair bias = linear_nobias_z(layernorm_z(p)) -> [9,32,128,4] -> permute [4,9,32,128].
+- WINDOWING: n_blocks=ceil(N/32)=9, q_pad=9*32-275=13, pad_left=48. After left-pad 48,
+  block i key window = padded_kv[i*32 : i*32+128] (clean stride-32/width-128 sliding).
+  Per-block SDPA: scores = q_blk@k_blk^T/sqrt(32) + pair_bias + pad_bias; pad_bias =
+  (mask_trunked-1)*1e9 (mask_trunked [9,32,128] from pad_info = key validity per window).
+  softmax -> @v_blk -> [9,4,32,32]; scatter back to [275,4,32].
+- gate: o *= sigmoid(linear_g(q_norm)); out = linear_o(merge_heads(o)) (no bias).
+- final per-block APB add: a_last = linear_a_last(s) (BiasInit -2.0); attn = out ... 
+  (verify: a = sigmoid? in DiT it's out_a=ff+attn; linear_a_last applies in has_s gate)
+ttnn plan: SDPA with batch=n_blocks(9), heads=4 + additive mask (pair+pad). Window
+gather via left-pad + 9 slices/concat (overlap => unfold, not reshape). Reuse
+tenstorrent.py AdaLN + ConditionedTransitionBlock (already Protenix-matched/validated).
