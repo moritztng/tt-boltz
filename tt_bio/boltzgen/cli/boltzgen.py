@@ -649,6 +649,10 @@ def run_command(args: argparse.Namespace) -> None:
         raise ValueError("--num_designs must be at least 1")
     if getattr(args, "budget", None) is not None and args.budget < 1:
         raise ValueError("--budget must be at least 1")
+    dbs = getattr(args, "diffusion_batch_size", None)
+    if dbs is not None and dbs < 1:
+        # ceil(num_designs / diffusion_batch_size) divides by zero otherwise.
+        raise ValueError("--diffusion_batch_size must be at least 1")
 
     # Default --output to ./<spec basename>/ (documented), so a bare
     # `tt-bio gen run spec.yaml` works.
