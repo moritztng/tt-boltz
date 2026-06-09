@@ -173,3 +173,13 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
 **Not release-ready yet** — this is the start of Phase 1 (the keystone module is
 proven on hardware). The remaining modules + real-weight end-to-end + accuracy
 + robustness + CLI/vendoring are required before public Protenix-v2 support.
+
+## Atom encoder/decoder — approach (biggest remaining sub-piece)
+
+Protenix's `AtomAttentionEncoder`/`AtomAttentionDecoder` use AF3 **local
+cross-attention** (n_queries=32 / n_keys=128 windowing + `c_atompair=16` pair
+bias), NOT 3D-RoPE. So map them onto tt-bio's **Boltz-2** atom modules
+(`boltz2.py`: `AtomAttentionEncoder`@1552, `AtomAttentionDecoder`@1633,
+`AtomTransformer`@1904) — also AF3 — **not** the esmfold2 SWA (3D-RoPE, wrong
+formulation). The parity harness needs full atom featurization (ref_pos / charge
+/ element / atom_name_chars / atom_to_token + atompair features); multi-step.
