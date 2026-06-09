@@ -474,7 +474,10 @@ def fold_complex(model, chains, *, num_loops=3, num_sampling_steps=20,
 
     def _protein(c):
         msa = c[2] if len(c) > 2 else None
-        return ProteinInput(id=c[0], sequence=c[1], msa=msa)
+        # Upper-case: single-letter residue codes are upper-case, and a
+        # lower-case sequence otherwise tokenizes to unknowns and crashes the
+        # MSA-feature step (matches the Boltz-2 parser's behaviour).
+        return ProteinInput(id=c[0], sequence=c[1].upper(), msa=msa)
 
     spi = StructurePredictionInput(sequences=[_protein(c) for c in chains])
     res = ESMFold2InputBuilder().fold(
