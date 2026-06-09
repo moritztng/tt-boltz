@@ -872,3 +872,14 @@ conditioned_transition_block sub-outputs (venv) and compare to the torch fp32 re
 sub-steps to find the exact op that diverges. Suspect: pair-bias path (linear_nobias_z
 on z; permute_final_dims order) or the Attention class's exact softmax/scale/gating
 detail vs my reimpl. golden: ~/protenix_dit_blocks_gold.pkl + diffusion_gold.pkl.
+
+## DiT debug KEY INSIGHT: blocks are near-identity; debug the UPDATE (out - a)
+
+pcc(block0 input a, block0 golden out)=0.9554 — each DiT block is a near-identity
+residual (out ~= a + small update). So full-output PCC (0.964) and the variant sweep
+are DOMINATED by the identity term and DO NOT discriminate update quality. The real
+error lives in the residual update (out - a). NEXT (fresh context, pure torch, fast):
+compute pcc(my_update, golden_update) where update = out - a; this will show the true
+(large) error and let the variant sweep actually discriminate. Then localize which
+sub-op (attn vs ff, pair-bias, etc.) produces the wrong update. This likely also
+explains the trunk pairformer z at 0.98 (same near-identity masking of update error).
