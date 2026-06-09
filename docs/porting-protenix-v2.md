@@ -614,3 +614,28 @@ attention_pair_bias n_heads=16. => the trunk's largest component works end-to-en
 real tensors+weights. With msa (validated) + trunk input + atom encoder, only the
 recycle wiring (recycle linears + template embedder + 10-cycle loop) remains for the
 full trunk output.
+
+## SPEC: MSA module (ready to implement; golden I/O already captured)
+
+v2 MSAModule (pairformer.py): n_blocks=4, c_m=128 (v2), c_z=256, c_s_inputs=449.
+Golden I/O already in ~/protenix_ref_out.pkl['intermediates']['msa_module']
+(in: feat, z(38,38,256), s_inputs(38,449); out: z). Weights: checkpoint
+'module.msa_module.*' (no venv needed — pure remap + golden, like the pairformer test).
+
+forward (N_msa=1 for plain folding -> sampling is trivial, take the row):
+1. msa_onehot = one_hot(feat['msa'], 32); msa_sample = cat([msa_onehot(32),
+   has_deletion(1), deletion_value(1)], -1) -> (N_msa, N_token, 34).
+2. msa_sample = linear_no_bias_m(msa_sample)           # 34 -> c_m
+3. msa_sample = msa_sample + linear_no_bias_s(s_inputs) # 449 -> c_m, broadcast over msa rows
+4. for 4 MSABlocks: (m,z) update [SAME structure as the validated msa_block test]:
+     z = z + outer_product_mean_msa(m)
+     m = m + msa_pair_weighted_averaging(m, z)          # PairWeightedAveraging
+     m = m + transition_m(m)                            # Transition
+     s, z = pair_stack(None, z)                         # PairformerLayer (transform_s=False)
+5. return z.
+Reuse tenstorrent.py OuterProductMean, PairWeightedAveraging, Transition,
+PairformerLayer + remaps in protenix_reference.py (remap_outer_product_mean,
+remap_pair_weighted_averaging, remap_transition, remap_msa_pair_stack). Validate the
+4-block stack vs golden msa_module I/O (like test_protenix_trunk_pairformer.py).
+Then recycle wiring: recycle linears (layernorm_z_cycle/linear_no_bias_z_cycle/
+layernorm_s/linear_no_bias_s) + template embedder + 10-cycle loop -> trunk output.
