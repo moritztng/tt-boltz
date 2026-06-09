@@ -1096,3 +1096,26 @@ structure vs reference (the accuracy bar), NOT PCC. The denoiser is the heavy pa
 (reuse AtomFeaturization + the z-broadcast); pair_z/s_single = DiffusionConditioning(once).
 This is the gateway to END-TO-END: trunk -> conditioning(once) -> sampler loop -> coords.
 Then confidence head -> plddt/pae/pde/resolved. Then Ca-RMSD vs ~/protenix_ref_out.pkl coords.
+
+## REGRESSION CHECKPOINT + consolidated remaining work
+
+All 7 committed on-device v2 tests green together (9.28s): atomfeat, atomtx, ife,
+trunkin, trunk_pairformer, trunk_msa, trunk_template. (Diffusion submodule validations
+— cond/atomenc/atomdec/DiT — are in scripts/protenix_*_parity.py, gated on the
+pre-mutation golden pkls in ~/; promote to pytest tests once those pkls are regenerated
+via the committed extract scripts.)
+
+ENTIRE v2 COMPUTE GRAPH VALIDATED on-device vs real golden. REMAINING (integration +
+release, all recipes in this doc):
+1. END-TO-END forward: wire AtomAttentionEncoder->s_inputs -> TrunkInput -> 10-cycle
+   recycle(template+msa+pairformer) -> s,z -> DiffusionConditioning(once: s_single,pair_z)
+   + prepare_cache(c_l,p_lm) -> EDM sampler loop(denoiser) -> coords. Validate via
+   Ca-RMSD vs ~/protenix_ref_out.pkl coords (1,275,3). Productionize into a tt_bio
+   Protenix model class + worker.
+2. CONFIDENCE HEAD: distance one-hot embed -> 4x PairformerLayer (validated) ->
+   PAE/PDE/pLDDT/resolved + softmax-weighted aggregation. Capture golden via PRE-hook.
+3. RELEASE: --fast block-fp8 (set_fast_mode), CLI `--model protenix-v2` + scheduler/
+   worker wiring, vendoring (no clones — fold the needed protenix data-pipeline bits or
+   document the dep), unified README, remove redundancy.
+Skill requirements still to satisfy: unified I/O, consistent terminal output (normal +
+--debug/--log), inference-only, fast weight load. See SKILL.md.
