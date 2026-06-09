@@ -269,6 +269,186 @@ class AtomAttentionEncoder(Module):
         return ttnn.concat([a, restype, profile, deletion_mean], dim=-1)     # (N_token,449)
 
 
+class DiffusionModule:
+    """Protenix-v2 diffusion denoiser (one EDM-preconditioned step).
+
+    denoise(x_noisy, t_hat, cond) -> denoised coords, where cond holds the fixed
+    trunk conditioning (s_trunk, s_inputs, pair_z, c_l, p_lm, atom->token matrix S,
+    mask_trunked). Composition (validated end-to-end vs the real v2 reference across
+    the full sigma schedule, PCC 0.99961..1.0; scripts/protenix_traj_replay.py,
+    tests/test_protenix_traj.py):
+
+      single cond  : LN(cat[s_trunk,s_inputs])->W_s + LN(fourier(log(t/sd)/4))->W_n,
+                     + transition_s1 + transition_s2  -> s_single
+      atom encoder : c_la = c_l + S @ W_s(LN(s_trunk)); q = c_la + W_r(x/sqrt(sd^2+t^2));
+                     p = p_lm + windowed(W_cl(relu c_la)) + windowed(W_cm(...)) + small_mlp;
+                     AtomTransformer; a_tok = meanpool_atom->token(relu W_q(q_out))
+      a_tok += W_s(LN(s_single))   [diffusion_module.linear_no_bias_s]
+      token DiT    : 24-block AttentionPairBias(token-level, per-block pair bias from
+                     LN(pair_z)) + s-gate sigmoid(linear_a_last(s)) + ConditionedTransition
+      a = LN(a)    [diffusion_module.layernorm_a]
+      atom decoder : q = S @ W_a(a) + q_skip; AtomTransformer; r = W_out(LN(q))
+      EDM precond  : denoised = x/(1+sr^2) + t/sqrt(1+sr^2)*r,  sr = t/sigma_data(16)
+
+    The 24-block token DiT runs in fp32 on host (HiFi4 ttnn matmul ~= bf16x3 caps the
+    near-identity 24-block stack at ~0.54 PCC; the structural effect of bf16 DiT is
+    2.30A < 2.68A seed-to-seed sample variance, so the bf16 on-device path is also a
+    valid sample -- see docs/porting-protenix-v2.md). NT is tiny (~tokens) so the
+    host DiT is cheap. Everything else is on-device (ttnn, HiFi4)."""
+
+    SIGMA_DATA = 16.0
+    NQ, NK, PAD_LEFT = 32, 128, 48
+    DIT_BLOCKS, DIT_HEAD_DIM, DIT_N_HEADS = 24, 48, 16
+
+    def __init__(self, diffusion_state_dict, device, compute_kernel_config):
+        """diffusion_state_dict: {key: tensor} for diffusion_module.* (prefix stripped)."""
+        import torch.nn.functional as F  # noqa: F401  (used in DiT)
+        self.w = dict(diffusion_state_dict)
+        self.dev = device
+        self.ckc = compute_kernel_config
+        self.atxE = AtomTransformer(3, {k[len("atom_attention_encoder.atom_transformer."):]: v
+                                        for k, v in self.w.items()
+                                        if k.startswith("atom_attention_encoder.atom_transformer.")},
+                                    compute_kernel_config)
+        self.atxD = AtomTransformer(3, {k[len("atom_attention_decoder.atom_transformer."):]: v
+                                        for k, v in self.w.items()
+                                        if k.startswith("atom_attention_decoder.atom_transformer.")},
+                                    compute_kernel_config)
+
+    def _T(self, key):
+        return ttnn.from_torch(self.w[key].t().contiguous(), layout=ttnn.TILE_LAYOUT,
+                               device=self.dev, dtype=ttnn.bfloat16)
+
+    def _dev(self, t):
+        return ttnn.from_torch(t, layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
+
+    def _lin(self, x, key):
+        return ttnn.linear(x, self._T(key), compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
+
+    def _ln(self, x, wkey):
+        return ttnn.layer_norm(x, weight=self._T(wkey), epsilon=1e-5, compute_kernel_config=self.ckc)
+
+    def denoise(self, x_noisy, t_hat, cond):
+        """x_noisy (1,N,3) host; t_hat scalar host tensor (1,); cond dict with host
+        tensors s_trunk (NT,c_s), s_inputs (NT,449), pair_z (NT,NT,c_z), c_l (N,128),
+        p_lm (nb,nq,nk,16), S (N,NT) atom->token onehot, mask_trunked (nb,nq,nk).
+        Returns denoised coords (1,N,3) host tensor."""
+        import torch.nn.functional as F
+        s_trunk = cond["s_trunk"].float(); s_inputs = cond["s_inputs"].float()
+        pair_z = cond["pair_z"].float(); c_l = cond["c_l"].float()
+        p_lm = cond["p_lm"].float(); S = cond["S"].float(); mt = cond["mask_trunked"].float()
+        sd = self.SIGMA_DATA
+        N = c_l.shape[0]; NT = s_inputs.shape[0]
+        NP = ((N + self.NQ - 1) // self.NQ) * self.NQ; nb = NP // self.NQ
+        T = self._dev
+
+        # 1) single conditioning
+        ss = self._lin(self._ln(T(torch.cat([s_trunk, s_inputs], -1)),
+                                "diffusion_conditioning.layernorm_s.weight"),
+                       "diffusion_conditioning.linear_no_bias_s.weight")
+        wf = self.w["diffusion_conditioning.fourier_embedding.w"]; bf = self.w["diffusion_conditioning.fourier_embedding.b"]
+        tp = torch.log(t_hat / sd) / 4
+        fou = torch.cos(2 * torch.pi * (tp.unsqueeze(-1) * wf + bf))
+        nn_ = self._lin(self._ln(T(fou), "diffusion_conditioning.layernorm_n.weight"),
+                        "diffusion_conditioning.linear_no_bias_n.weight")
+        ss = ttnn.reshape(ttnn.add(ss, nn_), (1, NT, ss.shape[-1]))
+        for nm in ("transition_s1", "transition_s2"):
+            pre = f"diffusion_conditioning.{nm}."
+            sub = {k[len(pre):]: v for k, v in self.w.items() if k.startswith(pre)}
+            from .tenstorrent import Transition
+            t = Transition(self._remap_transition(sub), self.ckc)
+            ss = ttnn.add(ss, ttnn.reshape(t(ss), tuple(ss.shape)))
+        s_single = ss
+
+        # 2) atom encoder (has_coords)
+        E = "atom_attention_encoder."
+        sp = self._lin(self._ln(T(s_trunk), E + "layernorm_s.weight"), E + "linear_no_bias_s.weight")
+        c_la = ttnn.add(T(c_l), ttnn.matmul(T(S), sp, compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN))
+        r_noisy = x_noisy / torch.sqrt(torch.tensor(sd ** 2) + t_hat ** 2).reshape(-1, 1, 1)
+        q_l = ttnn.add(c_la, self._lin(T(r_noisy[0]), E + "linear_no_bias_r.weight"))
+        clq = ttnn.relu(self._winq(c_la, N, NP)); clk = ttnn.relu(self._winkv(c_la, N, NP))
+        p = ttnn.add(ttnn.add(T(p_lm), ttnn.unsqueeze(self._lin(clq, E + "linear_no_bias_cl.weight"), 2)),
+                     ttnn.unsqueeze(self._lin(clk, E + "linear_no_bias_cm.weight"), 1))
+        mm = self._lin(ttnn.relu(p), E + "small_mlp.1.weight")
+        mm = self._lin(ttnn.relu(mm), E + "small_mlp.3.weight")
+        mm = self._lin(ttnn.relu(mm), E + "small_mlp.5.weight")
+        p = ttnn.add(p, mm)
+        q_out = self.atxE(ttnn.reshape(q_l, (1, N, 128)), ttnn.reshape(c_la, (1, N, 128)), p, mt)
+        Smean = S.t().contiguous() / (S.sum(0, keepdim=True).t() + 1e-6)
+        a_tok = ttnn.matmul(T(Smean), ttnn.reshape(ttnn.relu(self._lin(q_out, E + "linear_no_bias_q.weight")), (N, 768)),
+                            compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
+        q_skip = q_out; c_skip = c_la; p_skip = p
+        a_tok = ttnn.add(a_tok, ttnn.reshape(
+            self._lin(self._ln(ttnn.reshape(s_single, (NT, s_single.shape[-1])), "layernorm_s.weight"),
+                      "linear_no_bias_s.weight"), (NT, 768)))
+
+        # 3) token DiT (fp32 host; precision-limited on-device, see class docstring)
+        a_h = torch.Tensor(ttnn.to_torch(ttnn.reshape(a_tok, (1, NT, 768)))).float().reshape(NT, 768)
+        s_h = torch.Tensor(ttnn.to_torch(s_single)).float().reshape(NT, s_single.shape[-1])
+        z_h = F.layer_norm(pair_z, (pair_z.shape[-1],))
+        a_h = self._token_dit(a_h, s_h, z_h, NT)
+        a_t = self._ln(T(a_h.reshape(1, NT, 768)), "layernorm_a.weight")
+
+        # 4) atom decoder
+        DE = "atom_attention_decoder."
+        q = ttnn.add(ttnn.matmul(T(S), self._lin(ttnn.reshape(a_t, (NT, 768)), DE + "linear_no_bias_a.weight"),
+                                 compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN),
+                     ttnn.reshape(q_skip, (N, 128)))
+        qd = self.atxD(ttnn.reshape(q, (1, N, 128)), ttnn.reshape(c_skip, (1, N, 128)), p_skip, mt)
+        qn = self._ln(qd, DE + "layernorm_q.weight")
+        r_update = torch.Tensor(ttnn.to_torch(self._lin(qn, DE + "linear_no_bias_out.weight"))).float().reshape(1, N, 3)[:, :N]
+
+        # EDM preconditioning
+        sr = (t_hat / sd).reshape(-1, 1, 1)
+        return (1.0 / (1.0 + sr ** 2)) * x_noisy[:, :N] + (t_hat.reshape(-1, 1, 1) / torch.sqrt(1.0 + sr ** 2)) * r_update
+
+    # --- windowing helpers (atom encoder p augmentation) ---
+    def _winq(self, x, N, NP):
+        nb = NP // self.NQ
+        x = ttnn.to_layout(ttnn.reshape(x, (1, N, 128)), ttnn.ROW_MAJOR_LAYOUT)
+        x = ttnn.pad(x, [[0, 0], [0, NP - N], [0, 0]], 0.0)
+        return ttnn.to_layout(ttnn.reshape(x, (nb, self.NQ, 128)), ttnn.TILE_LAYOUT)
+
+    def _winkv(self, x, N, NP):
+        nb = NP // self.NQ; Lp = self.PAD_LEFT + NP + self.NK
+        x = ttnn.to_layout(ttnn.reshape(x, (1, N, 128)), ttnn.ROW_MAJOR_LAYOUT)
+        x = ttnn.pad(x, [[0, 0], [self.PAD_LEFT, Lp - self.PAD_LEFT - N], [0, 0]], 0.0)
+        bl = [ttnn.slice(x, [0, i * self.NQ, 0], [1, i * self.NQ + self.NK, 128]) for i in range(nb)]
+        return ttnn.to_layout(ttnn.reshape(ttnn.concat(bl, 0), (nb, self.NK, 128)), ttnn.TILE_LAYOUT)
+
+    def _token_dit(self, a_h, s_h, z_h, NT):
+        import torch.nn.functional as F
+        nbk, hd, nh = self.DIT_BLOCKS, self.DIT_HEAD_DIM, self.DIT_N_HEADS
+        gP = lambda k: self.w["diffusion_transformer." + k].float()
+        def adaln(a, s, pre):
+            an = F.layer_norm(a, (a.shape[-1],)); sn = F.layer_norm(s, (s.shape[-1],)) * gP(pre + "layernorm_s.weight")
+            return torch.sigmoid(F.linear(sn, gP(pre + "linear_s.weight"), gP(pre + "linear_s.bias"))) * an + F.linear(sn, gP(pre + "linear_nobias_s.weight"))
+        for b in range(nbk):
+            A = f"blocks.{b}.attention_pair_bias."; Cc = f"blocks.{b}.conditioned_transition_block."
+            an = adaln(a_h, s_h, A + "layernorm_a.")
+            zb = F.layer_norm(z_h, (256,)) * gP(A + "layernorm_z.weight"); bias = F.linear(zb, gP(A + "linear_nobias_z.weight")).permute(2, 0, 1)
+            Q = F.linear(an, gP(A + "attention.linear_q.weight"), gP(A + "attention.linear_q.bias")).reshape(NT, nh, hd).permute(1, 0, 2)
+            K = F.linear(an, gP(A + "attention.linear_k.weight")).reshape(NT, nh, hd).permute(1, 0, 2)
+            V = F.linear(an, gP(A + "attention.linear_v.weight")).reshape(NT, nh, hd).permute(1, 0, 2)
+            o = torch.einsum("hij,hjd->hid", torch.softmax(torch.einsum("hid,hjd->hij", Q, K) / (hd ** 0.5) + bias, -1), V).permute(1, 0, 2).reshape(NT, nh * hd)
+            o = o * torch.sigmoid(F.linear(an, gP(A + "attention.linear_g.weight"))); attn = F.linear(o, gP(A + "attention.linear_o.weight"))
+            attn = torch.sigmoid(F.linear(s_h, gP(A + "linear_a_last.weight"), gP(A + "linear_a_last.bias"))) * attn; ao = attn + a_h
+            an2 = adaln(ao, s_h, Cc + "adaln."); bb = F.silu(F.linear(an2, gP(Cc + "linear_nobias_a1.weight"))) * F.linear(an2, gP(Cc + "linear_nobias_a2.weight"))
+            a_h = torch.sigmoid(F.linear(s_h, gP(Cc + "linear_s.weight"), gP(Cc + "linear_s.bias"))) * F.linear(bb, gP(Cc + "linear_nobias_b.weight")) + ao
+        return a_h
+
+    @staticmethod
+    def _remap_transition(sd):
+        """Protenix Transition -> tt-bio Transition keys (silu folded into fc1)."""
+        return {
+            "norm.weight": sd["layernorm1.weight"],
+            "norm.bias": sd["layernorm1.bias"],
+            "fc1.weight": sd["linear_no_bias_a.weight"],
+            "fc2.weight": sd["linear_no_bias_b.weight"],
+            "fc3.weight": sd["linear_no_bias.weight"],
+        }
+
+
 class TrunkInput(Module):
     """Protenix trunk input construction: s_inputs -> s_init, z_init.
     s_init = linear_sinit(s_inputs); z_init = zinit1(s_init)[:,None] + zinit2(s_init)[None]
