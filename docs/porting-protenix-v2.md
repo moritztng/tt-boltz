@@ -883,3 +883,18 @@ compute pcc(my_update, golden_update) where update = out - a; this will show the
 (large) error and let the variant sweep actually discriminate. Then localize which
 sub-op (attn vs ff, pair-bias, etc.) produces the wrong update. This likely also
 explains the trunk pairformer z at 0.98 (same near-identity masking of update error).
+
+## DiT debug: BOTH APB (0.47) + CTB (0.19) sub-outputs wrong -> shared cause (AdaLN suspect)
+
+Captured block0 reference APB + CTB outputs (~/protenix_blk0_sub.pkl). My torch fp32:
+- APB out PCC 0.471 (mine absmean 0.284 vs gold 0.355)
+- CTB out PCC 0.196 (fed GOLDEN apb+a, so error is CTB's own; mine 0.338 vs gold 0.435)
+BOTH independently wrong => a SHARED component is the root cause. APB and CTB both use
+AdaptiveLayerNorm (layernorm_a / adaln). Prime suspect: my AdaLN math/weights.
+NEXT (fresh context, decisive): hook the reference block0 layernorm_a (and ctb.adaln)
+forward output; compare to my adaln(a,s). If AdaLN is the shared bug, fixing it lifts
+both APB and CTB -> the whole 24-block DiT. (Note: my AdaLN was validated PCC 0.9999 on
+the ATOM transformer via tt_bio AdaLN+remap_adaln; here I hand-coded adaln() in torch
+for the fp32 reimpl — verify the hand-coded version matches, or just use tt_bio AdaLN.)
+Also re-check: layernorm_a config (create_scale=False?), and whether s fed to AdaLN is
+correct (golden dit kwargs s = s_single).
