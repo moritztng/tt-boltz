@@ -77,6 +77,8 @@ reference harness → folding trunk (triangle-mult) → token diffusion transfor
 encoder/decoder + diffusion module → distogram + confidence heads → inputs
 embedder + relpos → MSA encoder (optional) → LM shim + diffusion sampler →
 end-to-end orchestration. Don't advance until the current module passes.
+Parallelize this across the machine's TT cards — one experiment per free device
+(see Hardware discipline) — so parity tests, seeds, and variants run at once.
 
 **Phase 3 — End-to-end on device.** Real weights, *entire* model on device (host
 = glue), validate Cα-RMSD vs ground truth. Only "working" when accuracy is good
@@ -208,9 +210,20 @@ separate.
 
 ## Hardware & process discipline
 
-- **Pin the device** (`TT_VISIBLE_DEVICES`/`--device_ids`); confirm it's **free**
-  before launching (a held device shows as a `CHIP_IN_USE` lock / hang).
-- **NEVER `SIGTERM` a running device job mid-op** — it can crash the driver. Wait.
+- **Use ALL the free devices to parallelize bring-up.** The machine usually has
+  several TT cards (e.g. 4 on a Quiet Box — `ls /dev/tenstorrent/`). Bring-up is
+  embarrassingly parallel: fan independent experiments across the cards instead
+  of serializing on one. Launch each in its **own process pinned to one card**
+  with `TT_VISIBLE_DEVICES=<id>` (run them in the background), so per-module
+  parity tests, optimization variants, accuracy/seed sweeps, and size sweeps all
+  run **concurrently → ~N× faster iteration** on an N-card box. One job per card.
+  The same multi-device machinery serves production — `--device_ids` /
+  `--num_devices` fans targets across cards via the shared worker.
+- **Pin the device** (`TT_VISIBLE_DEVICES`/`--device_ids`); confirm a card is
+  **free** before using it (a held card shows as a `CHIP_IN_USE` lock / hang —
+  check `tt-smi`). Respect any user constraint to a specific device.
+- **NEVER `SIGTERM` a running device job mid-op** — it can crash the driver. Wait
+  for it (and for someone else's job to finish) rather than killing it.
 - Account for the grid: Wormhole (8×8) has ~55% of Blackhole's L1, so memory
   budgets (chunk sizes, etc.) must be grid-aware (`_IS_SMALL_GRID`).
 
