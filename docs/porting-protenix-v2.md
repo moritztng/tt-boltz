@@ -1235,3 +1235,14 @@ small dynamic range (golden std 1.39) -> PCC especially sensitive. The head STRU
 correct (pae/pde 1.0). For release: keep s_single higher-precision into the plddt/resolved
 einsum (fp32 dest / keep s fp32 for these heads) if tighter confidence is needed; not a
 logic issue. Coordinates (the accuracy bar) are unaffected — confidence heads are metrics.
+
+## FULL ON-DEVICE SUITE: 12 tests green (14.55s)
+
+tests/test_protenix_{atomfeat,atomtx,ife,trunkin,trunk_pairformer,trunk_msa,
+trunk_template,diffusion,diffusion_cond,confidence}.py = 12 on-device parity tests,
+all green vs real v2 golden. Covers: atom featurization, windowed AtomTransformer, full
+atom encoder->s_inputs, trunk input, 48-block pairformer, MSA module, template embedder,
+diffusion atom encoder(coords)+decoder, DiffusionConditioning pair+single, confidence
+pae/pde. (DiT 24-block + plddt/resolved validated via scripts/, precision-documented.)
+This is the committed regression suite for the v2 compute graph. Remaining: end-to-end
+wiring (Ca-RMSD) + --fast/CLI/vendoring/README.
