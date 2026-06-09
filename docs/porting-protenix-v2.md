@@ -1002,3 +1002,20 @@ relu(linear_no_bias_q(q_l)) vs x_atom (PCC). If !=, inspect transformer.py 938-9
 what exactly feeds linear_no_bias_q (re-read: q_l reassigned by atom_transformer at 938,
 then x_atom=relu(linear_q(q_l)) at 944 — verify no intermediate reassignment/mask).
 NOTE: everything else in the atom encoder is validated (c 1.0, q_out 0.99999, formula 1.0).
+
+## atom-enc aggregation: clean handoff (next step + a diffusion f_forward clue)
+
+Instrumented same-run capture (hook linear_no_bias_q input + encoder out[1]) hit an
+UNRELATED reference error: diffusion.py f_forward line 458 `a_token += linear_no_bias_s(
+...)` size 128 vs 768 — surfaced only under my hooks (likely a mini-rollout / second
+path my first-call hooks forced). CLUE: f_forward adds a TOKEN-LEVEL linear_no_bias_s(
+s_single) to a_token AFTER the atom encoder — i.e., the diffusion token rep = atom-enc
+`a` (768) + token conditioning; verify whether golden atomenc out[0] is pre- or post-
+this add (the encoder hook is on atom_attention_encoder, so out[0] should be PRE-add =
+pure aggregation -> the 0.842 mismatch is still within the encoder).
+CLEAN NEXT STEP (fresh context, robust): in ONE simple venv run (NO extra hooks beyond
+one), capture diffusion_module.atom_attention_encoder's returned (a,q_l,c,p) AND
+relu(linear_no_bias_q(q_l)) via a single forward_pre_hook on linear_no_bias_q; compare
+relu(lq_input) to scatter-source of a. Keep instrumentation minimal to avoid the
+f_forward path error. Everything else in the atom encoder is validated (c 1.0, q_out
+0.99999, scatter-mean formula 1.0). This is the LAST atom-encoder detail.
