@@ -1441,3 +1441,25 @@ README. The hard compute + logic + precision question are all resolved.
 LESSON (skill): for stochastic/diffusion models, judge bf16 tolerance by comparing the
 precision-induced output delta to the model's inherent sample variance — not by per-tensor
 PCC. A "low" per-step PCC can still be within sample noise -> acceptable.
+
+## PRODUCTIONIZATION: reuse Boltz-2's AtomDiffusion sampler (no rebuild)
+
+tt_bio/boltz2.py already has the AF3 EDM sampler (same family as Protenix-v2):
+- sample_schedule (3998): sigma = (sigma_max^(1/rho) + i/(N-1)*(sigma_min^(1/rho)-
+  sigma_max^(1/rho)))^rho * sigma_data, pad 0 — IDENTICAL to Protenix InferenceNoiseScheduler.
+- sample (4017): center_random_augmentation + gammas (sigma>gamma_min ? gamma_0 : 0) +
+  per-step EDM update (4253: x_noisy + step_scale*(sigma_t - t_hat)*denoised_over_sigma).
+- center_random_augmentation (204), compute_random_augmentation (189).
+=> v2 sampler REUSES Boltz-2's sample()/sample_schedule with v2 params:
+  rho=7, sigma_max=160, sigma_min=4e-4, sigma_data=16, gamma_0=0.8, gamma_min=1.0,
+  step_scale(eta)=1.5, noise_scale_lambda=1.003. denoiser = v2 DiffusionModule.forward
+  (EDM-preconditioned, validated coords 0.9998 / tolerant in bf16).
+PRODUCTIONIZE the v2 model (tt_bio/protenix.py Protenix class):
+  forward(feats): AtomAttentionEncoder->s_inputs; TrunkInput; 10-cycle trunk(template+
+  msa+pairformer); DiffusionConditioning(once)+prepare_cache; then call the (reused/
+  v2-parameterized) AtomDiffusion.sample() with the v2 denoiser -> coords; ConfidenceHead.
+  Unify CLI: tt-bio predict --model protenix-v2 (worker wiring like Boltz-2/ESMFold2).
+This satisfies the skill's NO-REDUNDANCY/UNIFICATION req — the sampler + augmentation +
+schedule are shared with Boltz-2; only v2 params + the v2 denoiser/trunk differ.
+Remaining: build the Protenix class (compose validated modules + reused sampler),
+end-to-end Ca-RMSD (within ~2.7A sample variance), --fast block-fp8, vendoring, README.
