@@ -135,7 +135,18 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       norm<-layer_norm, proj_a/b<-linear_1/2, proj_o<-linear_out). 9/9 tests pass.
 - [x] MSAPairWeightedAveraging parity on device, PCC>0.98 (norm_m<-layernorm_m,
       proj_m<-linear_no_bias_mv, proj_g<-mg, proj_z<-z, proj_o<-out). 10/10 tests pass.
-- [ ] Next: full MSALayer/MSAModule (reconcile order vs
+- [!] **MSA module composition DIVERGES (finding).** Protenix MSABlock order:
+      (1) z += OuterProductMean(m)  [OPM on OLD m] -> (2) MSAStack updates m
+      (pwa + transition) -> (3) pair_stack (PairformerBlock c_s=0) updates z.
+      tt-bio MSALayer order: update m FIRST (pwa+transition) -> THEN OPM(new m)
+      -> pairformer_layer. The OPM input differs (old vs new m), so tt-bio's
+      MSALayer is NOT a drop-in. ALL MSA sub-modules are verified/reusable
+      (OPM, PairWeightedAveraging, Transition, PairformerLayer-on-pair); the MSA
+      module port = a small Protenix-ordered assembly reusing those verified
+      ttnn primitives. (Pattern: composition layers may diverge from Boltz-2
+      even when every primitive matches — check each module's forward order.)
+- [ ] Next: build the Protenix-ordered MSA layer (reuse verified primitives) ->
+      MSAModule (N blocks + input proj). Reconcile order vs
       Protenix MSABlock) + PairformerStack (N-block) + s/z init linears →
       MSA block/module → diffusion transformer + atom encoder/decoder +
       DiffusionModule → input/relpos/template/constraint embedders →
