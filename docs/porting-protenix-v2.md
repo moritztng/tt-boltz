@@ -357,3 +357,21 @@ protenix_ref_build.py):
 4. Protenix(cfg).eval(); load_state_dict(strip 'module.' prefix, strict).
 Next: feats via the data pipeline (download CCD components.cif) for a tiny
 protein -> model.forward -> reference structure -> validate tt-bio end-to-end.
+
+## MILESTONE: full Protenix-v2 reference forward runs end-to-end (real weights, real feats)
+
+scripts/protenix_ref_forward.py runs the complete v2 reference on CPU:
+- tiny single-chain protein (38 res) -> SampleDictToFeatures builds feats offline
+  (use_msa=False, use_template=False, esm.enable=False; N_msa=1 dummy MSA row).
+- N_token=38, N_atom=275; forward emits coordinate (1,275,3), plddt (1,275,50),
+  pae (1,38,38,64), pde, contact_probs (38,38), resolved (1,275,2).
+- saved to ~/protenix_ref_out.pkl (pred + input_feature_dict) for tt-bio compare.
+
+### Reference env (robust against the shared ~/.local being mutated by other agents)
+Isolated venv at ~/protenix_ref_venv on **Python 3.11** (uv-installed; the v2 repo
+needs biotite==1.4.0 which requires py>=3.11). Deps: torch==2.7.1+cpu, biotite==1.4.0,
+modelcif==1.4, numpy 2.2.6, ml_collections, einops, optree, rdkit, gemmi, biopython,
+scikit-learn, tqdm, dm-tree, plus protenix+fair-esm (--no-deps). CCD files in
+~/common/ (components.cif 468MB, components.cif.rdkit_mol.pkl 135MB from public TOS).
+Force base['triangle_multiplicative']='torch' and ['triangle_attention']='torch' (the
+v2 default is 'cuequivariance', a CUDA-only fused kernel).

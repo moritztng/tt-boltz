@@ -1,0 +1,7 @@
+[{
+  "sequences": [
+    {"proteinChain": {"sequence": "GSSGSSGQITLWQRPLVTIKIGGQLKEALLDTGADDTV", "count": 1}}
+  ],
+  "modelSeeds": [42],
+  "name": "tiny_test"
+}]
