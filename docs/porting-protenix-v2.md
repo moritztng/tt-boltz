@@ -741,3 +741,20 @@ Assembly (instantiate modules ONCE, reuse across cycles to avoid reloading weigh
 ALL sub-modules validated on-device; capstone is pure assembly. Heavy (10x
 template+msa+pairformer) — instantiate-once is important. This yields the full
 on-device trunk; then diffusion + EDM sampler -> coords; confidence -> end-to-end.
+
+## CAPSTONE (partial): full 10-cycle trunk assembles + runs on-device; s PCC 0.991, z BUG
+
+scripts/protenix_trunk_assembly.py assembles the FULL trunk (TrunkInput + recycle
+linears + template + msa + 48-block pairformer, modules instantiated once, 10 cycles)
+fed golden s_inputs. Runs end-to-end on-device. RESULT: s PCC 0.99110 (GOOD) but
+z PCC 0.02027 (BROKEN).
+Diagnosis so far: pair_z (golden final trunk z) is uncorrelated with cycle-0 pairformer
+z (PCC 0.018) too => z evolves a lot across 10 cycles; s is robust to z error (s_init +
+single path dominates) so s can match while z is wrong. The z recycle path has a
+structural bug. DEBUG LEADS for next iteration:
+- verify z recycle: z = z_init + lin_z_cycle(ln_z_cycle(z)); confirm ln_z_cycle uses
+  create_offset (bias) and the per-cycle z carry is the post-pairformer z (not reset).
+- check template()/msa_mod() accumulation across cycles isn't corrupting z (in-place?).
+- confirm pair_z IS get_pairformer_output's returned z (vs some normalized/other z) —
+  re-capture by hooking get_pairformer_output return directly, not diffusion kwargs.
+- check ttnn reshape (1,38,38,256) readout vs (38,38,256) golden (38 not tile-aligned).
