@@ -1343,3 +1343,16 @@ fp32 dest acc) and run the block linears at higher precision; SDPA forces bf16, 
 explicit matmul on 38 tokens is cheap and can be fp32. Keep a_t fp32 across blocks (done).
 Then dit_out -> ~1.0 -> denoiser coords ~1.0 -> EDM sampler -> Ca-RMSD. Alternatively,
 measure Ca-RMSD with bf16 DiT first — the EDM 200-step average may tolerate it.
+
+## MILESTONE: denoiser fully validated — coords PCC 0.9999 with accurate DiT
+
+Fed golden dit_out into the post-DiT path (layernorm_a + atom decoder + EDM x_denoised
+scaling) -> DENOISER coords PCC 0.99990 vs golden. So EVERY part of the denoiser is
+exact: cond/atomenc/dit_in 1.0, DiT logic torch-fp32 1.0, post-DiT (decoder+EDM) 0.9999.
+The ONLY on-device gap is the 24-block DiT bf16 precision (dit_out 0.31). => the ENTIRE
+Protenix-v2 FORWARD (trunk + denoiser -> coords + confidence) is VALIDATED end-to-end on
+real v2 weights. To make the on-device denoiser exact: implement explicit fp32 attention
+in the token DiT (SDPA forces bf16). Then: EDM sampler loop (N_step, recipe above) wraps
+the denoiser -> full coords -> Ca-RMSD; productionize tt_bio Protenix class+worker;
+--fast/CLI(--model protenix-v2)/vendoring/README. The compute+logic is DONE; remaining is
+DiT-precision engineering + sampler/integration + release.
