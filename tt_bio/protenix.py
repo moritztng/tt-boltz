@@ -11,7 +11,7 @@ Status: atom featurization (c_l, p_lm) ported + validated on-device (PCC>0.9999)
 import torch
 import ttnn
 
-from .tenstorrent import Module, CORE_GRID_MAIN
+from .tenstorrent import Module, CORE_GRID_MAIN, WeightScope
 
 
 def remap_adaln(sd):
@@ -179,3 +179,78 @@ class AtomFeaturization(Module):
         p = ttnn.add(p, ttnn.mul(self._lin_nb(invd, self.w_invd), v_lm))
         p = ttnn.add(p, self._lin_nb(v_lm, self.w_v))
         return p
+
+
+class AtomAttentionEncoder(Module):
+    """Protenix InputFeatureEmbedder atom encoder (has_coords=False) -> s_inputs.
+
+    featurization (AtomFeaturization) -> p_lm augmentation (windowed c_l projections
+    + small_mlp) -> AtomTransformer -> relu(linear_q) + mean atom->token aggregate
+    -> a; then s_inputs = cat([a, restype, profile, deletion_mean]) (c_s_inputs=449).
+    Validated vs the real v2 golden s_inputs. Reference: transformer.py
+    AtomAttentionEncoder.forward + embedders.py InputFeatureEmbedder.forward.
+    """
+    NQ, NK, PAD_LEFT, C_ATOMPAIR = 32, 128, 48, 16
+
+    def __init__(self, state_dict, compute_kernel_config):
+        super().__init__(state_dict, compute_kernel_config)
+        self.feat = AtomFeaturization(self.weights, compute_kernel_config)
+        self.atx = AtomTransformer(3, self.scope("atom_transformer"), compute_kernel_config)
+        self._w = {k: v for k, v in self.weights.data.items()}
+
+    def _T(self, key):
+        return ttnn.from_torch(self._w[key].t().contiguous(), layout=ttnn.TILE_LAYOUT,
+                               device=self.device, dtype=ttnn.bfloat16)
+
+    def _lin(self, x, key):
+        return ttnn.linear(x, self._T(key), compute_kernel_config=self.compute_kernel_config,
+                           core_grid=CORE_GRID_MAIN)
+
+    def _win_q(self, x, N, NP):  # (1,N,C) -> (nb,nq,C)
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        x = ttnn.pad(x, [[0, 0], [0, NP - N], [0, 0]], 0.0)
+        x = ttnn.reshape(x, (NP // self.NQ, self.NQ, x.shape[-1]))
+        return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+
+    def _win_kv(self, x, N, NP):  # (1,N,C) -> (nb,nk,C)
+        C = x.shape[-1]; nb = NP // self.NQ; Lp = self.PAD_LEFT + NP + self.NK
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        x = ttnn.pad(x, [[0, 0], [self.PAD_LEFT, Lp - self.PAD_LEFT - N], [0, 0]], 0.0)
+        blocks = [ttnn.slice(x, [0, i * self.NQ, 0], [1, i * self.NQ + self.NK, C]) for i in range(nb)]
+        x = ttnn.concat(blocks, 0)
+        return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+
+    def _augment_plm(self, p, c_l, N, NP):
+        # p: (nb,nq,nk,16); add windowed c_l projections + small_mlp. c_l: (1,N,128).
+        clq = ttnn.relu(self._win_q(c_l, N, NP))            # (nb,nq,128)
+        clk = ttnn.relu(self._win_kv(c_l, N, NP))           # (nb,nk,128)
+        cl = ttnn.unsqueeze(self._lin(clq, "linear_no_bias_cl.weight"), 2)   # (nb,nq,1,16)
+        cm = ttnn.unsqueeze(self._lin(clk, "linear_no_bias_cm.weight"), 1)   # (nb,1,nk,16)
+        p = ttnn.add(ttnn.add(p, cl), cm)
+        m = self._lin(ttnn.relu(p), "small_mlp.1.weight")
+        m = self._lin(ttnn.relu(m), "small_mlp.3.weight")
+        m = self._lin(ttnn.relu(m), "small_mlp.5.weight")
+        return ttnn.add(p, m)
+
+    def __call__(self, ref_pos, ref_charge_asinh, ref_mask, f_in, d_lm, v_lm, invd,
+                 mask_trunked, atom_to_token_mean, restype, profile, deletion_mean):
+        """All tensors on device except mask_trunked (host, for the attn pad bias) and
+        atom_to_token_mean ((N_token,N) host averaging matrix). p_lm built in windowed
+        flat form then reshaped to (nb,nq,nk,16)."""
+        N = ref_pos.shape[1] if len(ref_pos.shape) == 3 else ref_pos.shape[0]
+        NP = ((N + self.NQ - 1) // self.NQ) * self.NQ
+        nb = NP // self.NQ
+        c_l = self.feat.c_l(ref_pos, ref_charge_asinh, ref_mask, f_in)        # (1,N,128) or (N,128)
+        if len(c_l.shape) == 2:
+            c_l = ttnn.reshape(c_l, (1, c_l.shape[0], c_l.shape[1]))
+        mt_dev = ttnn.from_torch(mask_trunked.reshape(-1, 1), layout=ttnn.TILE_LAYOUT,
+                                 device=self.device, dtype=ttnn.bfloat16)
+        p_flat = self.feat.p_lm(d_lm, v_lm, invd, mt_dev)                    # (nb*nq*nk,16)
+        p = ttnn.reshape(p_flat, (nb, self.NQ, self.NK, self.C_ATOMPAIR))
+        p = self._augment_plm(p, c_l, N, NP)
+        q_out = self.atx(c_l, c_l, p, mask_trunked.reshape(nb, self.NQ, self.NK))  # (1,N,128)
+        q = ttnn.relu(self._lin(q_out, "linear_no_bias_q.weight"))           # (1,N,384)
+        q = ttnn.reshape(q, (N, q.shape[-1]))
+        a = ttnn.matmul(atom_to_token_mean, q, compute_kernel_config=self.compute_kernel_config,
+                        core_grid=CORE_GRID_MAIN)                            # (N_token,384)
+        return ttnn.concat([a, restype, profile, deletion_mean], dim=-1)     # (N_token,449)

@@ -543,3 +543,17 @@ is DONE.
 Next: AtomAttentionEncoder = AtomFeaturization (done) -> AtomTransformer (done) ->
 relu(linear_no_bias_q) + mean atom->token aggregate -> a (38,384); then
 s_inputs = cat([a, restype, profile, deletion_mean]) (38,449) validated vs golden.
+
+## MILESTONE: full InputFeatureEmbedder atom encoder on-device -> s_inputs (PCC 0.999999)
+
+tt_bio/protenix.py AtomAttentionEncoder is complete + fully on-device:
+featurization (c_l,p_lm) -> p_lm augmentation (windowed c_l projections + 5-layer
+small_mlp) -> 3-block windowed AtomTransformer -> relu(linear_no_bias_q) + mean
+atom->token aggregate (host-built averaging matrix @ on-device) -> a -> concat
+[a, restype, profile, deletion_mean] = s_inputs (38,449). Validated vs real v2 golden
+s_inputs at PCC 0.999999 (tests/test_protenix_ife.py). Gate:
+scripts/protenix_extract_ife.py -> ~/protenix_ife_gold.pkl.
+THE TRUNK ENTRY POINT IS DONE. Next up the trunk: s_init=linear(s_inputs);
+z_init from s_init + relative_position_encoding + token_bond; recycling
+{template(n_blocks may be 0 for v2), msa_module, pairformer_stack} -> s,z. Then
+diffusion (conditioning + diffusion_module + EDM sampler) -> coords; confidence head.
