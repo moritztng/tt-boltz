@@ -250,3 +250,20 @@ What's left, by type:
 
 Net: the autonomous loop has cleared the high-value device parity work. The
 single biggest unblock now is the **gated checkpoint** (user) for end-to-end.
+
+## Real-weight validation finding: diffusion DiT block residual is bf16-sensitive
+
+Real-weight validation (the public base checkpoint) PASSES for: PairformerBlock
+(PCC s=1.0 z=0.998), MSABlock, DistogramHead, and — in isolation — the diffusion
+APB (0.99979) and ConditionedTransitionBlock (0.99998).
+
+But the FULL diffusion token-transformer block (`out = attn + CTB(attn,s)`) scored
+only ~0.81 on real weights with RANDOM test inputs. Root cause (diagnosed, NOT a
+port bug): with real trained weights the CTB has ~30x gain on random inputs
+(ff std ~18.8 vs attn std ~0.6), so the block output is dominated by ff and a tiny
+bf16 error in attn is amplified. This is a pathological random-inputs-into-real-
+weights combo the trained model never sees; the sub-parts are individually
+correct on real weights. Flag for end-to-end: watch CTB intermediate precision
+(bf16 storage of large activations) when validating real-input end-to-end RMSD;
+HiFi4 fp32 accumulation is already on. A meaningful full-block real-weight check
+needs realistic (in-distribution) inputs, not random.

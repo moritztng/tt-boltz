@@ -415,3 +415,4 @@ def test_real_weight_msa_block():
     zz = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(ref_z.shape)
     pm_, pz_ = pcc(mm, ref_m), pcc(zz, ref_z)
     assert pm_ > 0.98 and pz_ > 0.98, f"real-weight MSA m={pm_:.5f} z={pz_:.5f}"
+
