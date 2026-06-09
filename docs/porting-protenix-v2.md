@@ -532,3 +532,14 @@ on-device — reuse tt-bio AttentionPairBias(atom_level) windowing (keys_indexin
 batched SDPA) or ttnn slice/concat + batched matmul. The rest is fully on-device.
 With the atom transformer done, AtomAttentionEncoder = featurization (done) + this
 + relu(linear_q) mean-aggregate atom->token -> a, then s_inputs concat.
+
+## MILESTONE: AtomTransformer fully ON-DEVICE (PCC 0.999998, releasable)
+
+tt_bio/protenix.py AtomTransformer is now fully on-device — windowed attention via
+ttnn pad+slice+concat (32-multiple offsets are tile-aligned) + batched 4D matmul +
+softmax, no host gather. 3 blocks, double AdaLN, both gates, CTB. Validated vs real
+v2 golden_qout: PCC 0.999998 (tests/test_protenix_atomtx.py). The hardest v2 module
+is DONE.
+Next: AtomAttentionEncoder = AtomFeaturization (done) -> AtomTransformer (done) ->
+relu(linear_no_bias_q) + mean atom->token aggregate -> a (38,384); then
+s_inputs = cat([a, restype, profile, deletion_mean]) (38,449) validated vs golden.
