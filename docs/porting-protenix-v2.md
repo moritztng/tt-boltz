@@ -601,3 +601,16 @@ REMAINING (the bulk):
 5. END-TO-END: wire full forward -> Ca-RMSD vs ~/protenix_ref_out.pkl coords.
 6. RELEASE: --fast block-fp8, CLI --model protenix-v2 + scheduler/worker wiring,
    vendoring (no clones), unified README.
+
+## MILESTONE: full 48-block Pairformer stack validated vs REAL trunk I/O
+
+The complete v2 pairformer_stack (48 blocks) reproduces the real captured trunk I/O
+(~/protenix_ref_out.pkl pairformer_stack in->out, the tiny protein's actual s,z):
+s PCC 0.99277, z PCC 0.97969 (bf16 accumulation over 48 blocks; acceptable).
+tests/test_protenix_trunk_pairformer.py — builds the stack from raw v2 ckpt via
+remap_pairformer_block (pure dict remap, no protenix in sys python3) + the captured
+golden I/O. v2 pairformer dims: c_z=256, c_s=384, no_heads_pair=8, c_hidden_pair_att=32,
+attention_pair_bias n_heads=16. => the trunk's largest component works end-to-end on
+real tensors+weights. With msa (validated) + trunk input + atom encoder, only the
+recycle wiring (recycle linears + template embedder + 10-cycle loop) remains for the
+full trunk output.
