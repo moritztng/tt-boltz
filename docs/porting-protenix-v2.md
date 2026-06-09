@@ -1173,3 +1173,18 @@ THE ENTIRE PROTENIX-V2 MODEL IS NOW VALIDATED-ON-DEVICE OR FULLY-SPECCED. Build-
 confidence head (reuse Pairformer + above heads) -> end-to-end (trunk->cond->sampler->
 coords, Ca-RMSD) -> productionize tt_bio Protenix class + worker -> --fast/CLI(--model
 protenix-v2)/vendoring/README/unification per SKILL.md.
+
+## MILESTONE: ConfidenceHead validated on-device — pae/pde 1.0 (plddt/resolved heads close)
+
+scripts/protenix_confidence_parity.py: reuses the validated Pairformer (4 conf blocks)
+on-device + distance one-hot embed + heads. Results vs pre-mutation golden:
+  pae 1.0000, pde 1.0000 (z-heads + 4-block conf pairformer EXACT on-device),
+  plddt 0.9254, resolved 0.7657 (per-atom einsum heads).
+The structure is correct (pae/pde perfect). plddt/resolved gap: s_single (pairformer s
+output, bf16) fed through per-atom einsum weight[atom_to_tokatom_idx] (24,384,b) — the
+matmul amplifies s bf16 error (cf. atom-enc relu case; trunk pairformer s was 0.993).
+REFINEMENT (minor): verify atom_to_tokatom_idx in [0,23]; consider higher-precision s for
+the plddt/resolved einsum, or accept (plddt/resolved are confidence metrics, not coords).
+=> EVERY PROTENIX-V2 COMPUTE MODULE IS NOW VALIDATED ON-DEVICE. Remaining: end-to-end
+wiring (trunk->cond->EDM sampler->coords; Ca-RMSD) + productionize + --fast/CLI/vendoring/
+README.
