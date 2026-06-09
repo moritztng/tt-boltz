@@ -950,3 +950,21 @@ checking if cached p_lm == no-coords AtomFeaturization.p_lm+aug, then z-broadcas
 separately). Validate against golden using the cached c_l/p_lm as inputs. Reuse
 AtomAttentionEncoder pieces from tt_bio/protenix.py with c_token=768 + the s/r_l/z adds.
 Then atomdec (broadcast a->atoms + AtomTransformer + LN->linear->coords) -> coords delta.
+
+## RESOLVED: atom encoder(has_coords) — cached p_lm already includes pair_z broadcast
+
+DiffusionModule.forward takes p_lm + c_l as INPUTS (built once by the sampler via the
+encoder's prepare_cache(z) and cached across all sampler steps). So the golden cached
+p_lm (atomenc kwargs) ALREADY includes the pair_z broadcast + base featurization; the
+encoder forward (cache provided -> prepare_cache skipped) only adds, per step:
+  c_l_aug = c_l + broadcast_token_to_atom(linear_no_bias_s(layernorm_s(s_single)), a2t)
+  q_l = c_l_aug + linear_no_bias_r(r_l)
+  p_lm_aug = p_lm + linear_cl(relu(win_q(c_l_aug))) + linear_cm(relu(win_k(c_l_aug)))
+  p_lm_aug += small_mlp(p_lm_aug)
+  q_out = atom_transformer(q_l, c_l_aug, p_lm_aug)   # reuse AtomTransformer (c_atom=128, 3 blk)
+  a = aggregate(relu(linear_no_bias_q(q_out)), a2t, mean)  # c_token=768
+VALIDATION: feed golden cached c_l/p_lm + r_l/s/a2t; compare a(768),q,c,p_lm to golden.
+=> NO z re-add. Reuse tt_bio/protenix.py AtomTransformer + the new s/r_l broadcast +
+linear_no_bias_q@768. Weights: diffusion_module.atom_attention_encoder.* (incl.
+layernorm_s, linear_no_bias_s, linear_no_bias_r, linear_no_bias_q@768, atom_transformer).
+Implementation is now fully de-risked. Then atomdec, then EDM sampler.
