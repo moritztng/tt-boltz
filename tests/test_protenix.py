@@ -384,3 +384,34 @@ def test_real_weight_distogram_head():
     out = torch.Tensor(ttnn.to_torch(dh(ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)))).float().reshape(ref.shape)
     p = pcc(out, ref)
     assert p > 0.98, f"real-weight distogram PCC {p:.5f}"
+
+
+@pytest.mark.skipif(not os.path.exists(_CKPT), reason="protenix base checkpoint not downloaded")
+def test_real_weight_msa_block():
+    from protenix.model.modules.pairformer import MSABlock
+    ck = torch.load(_CKPT, map_location="cpu", weights_only=False)["model"]
+    p = "module.msa_module.blocks.0."
+    sd = {k[len(p):]: v for k, v in ck.items() if k.startswith(p)}
+    mod = MSABlock(c_m=64, c_z=128, c_hidden=32, is_last_block=False).eval()
+    mod.load_state_dict(sd, strict=True)  # real weights, exact load
+    S, L = 8, 32
+    m = torch.randn(1, S, L, 64); z = torch.randn(1, L, L, 128)
+    ref_m, ref_z = run_reference_msa_block(mod, m.clone(), z.clone())
+    ref_m, ref_z = ref_m.float(), ref_z.float()
+    rsd = mod.state_dict()
+    def sub(d, q): return {k[len(q)+1:]: v for k, v in d.items() if k.startswith(q + ".")}
+    dev = get_device(); ck_ = _ck(dev)
+    opm = OuterProductMean(remap_outer_product_mean(sub(rsd, "outer_product_mean_msa")), ck_)
+    pwa = PairWeightedAveraging(8, 8, remap_pair_weighted_averaging(sub(rsd, "msa_stack.msa_pair_weighted_averaging")), ck_)
+    tm = Transition(remap_transition(sub(rsd, "msa_stack.transition_m")), ck_)
+    pl = PairformerLayer(32, 4, None, None, False, remap_msa_pair_stack(sub(rsd, "pair_stack")), ck_)
+    ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    m_t = ft(m)
+    z1 = ttnn.add(ft(z), opm(m_t, None, None))
+    m_t = ttnn.add(m_t, ttnn.reshape(pwa(m_t, ttnn.clone(z1)), tuple(m_t.shape)))
+    m_t = ttnn.add(m_t, ttnn.reshape(tm(m_t), tuple(m_t.shape)))
+    z_out = pl(None, z1)[1]
+    mm = torch.Tensor(ttnn.to_torch(m_t)).float().reshape(ref_m.shape)
+    zz = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(ref_z.shape)
+    pm_, pz_ = pcc(mm, ref_m), pcc(zz, ref_z)
+    assert pm_ > 0.98 and pz_ > 0.98, f"real-weight MSA m={pm_:.5f} z={pz_:.5f}"
