@@ -1313,3 +1313,18 @@ a_t as ttnn.float32 / use fp32 dest acc + avoid bf16 round-trip of the residual 
 block; or accumulate the per-block update in fp32. This is the documented DiT-precision
 item; once a_t holds fp32 the 24-block PCC should recover (cf. trunk pairformer s0.993).
 Then denoiser coords -> ~0.99 -> EDM sampler loop -> Ca-RMSD. Everything else validated.
+
+## DiT precision: bf16 block-COMPUTE limit on near-identity updates (fp32 residual insufficient)
+
+Tried fp32 DiT residual stream (a_t fp32, AdaLN inputs cast bf16) -> dit_out still 0.31.
+So the limit is NOT residual storage; it's bf16 COMPUTE within each block (attn/linears).
+The DiT blocks are near-IDENTITY (tiny update vs a_t), so per-block bf16 compute noise is
+large RELATIVE to the update -> the update direction is noisy -> 24-block accumulation ~0.3.
+(Trunk pairformer survives bf16 at 0.99 because its per-block updates are much larger.)
+NEXT DIAGNOSTIC (confirm bf16 vs structural): torch fp32 24-block DiT vs golden dit_out
+(scripts/protenix_dit_consistent torch path) — block0 fp32 was 1.0; if 24-block fp32 ~1.0
+then it's purely bf16 and needs higher-precision DiT compute (bfloat8b/fp32 matmul accum
+in the token DiT, or run the 24-block DiT path in fp32). If <1.0, a residual structural
+diff remains. THEN check end-to-end Ca-RMSD tolerance: coords = c_skip*x_noisy +
+c_out*r_update; over 200 sampler steps the DiT error may partially average — measure actual
+Ca-RMSD before over-investing in DiT precision. Everything else in the denoiser is exact (1.0).
