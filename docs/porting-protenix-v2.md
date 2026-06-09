@@ -927,3 +927,26 @@ noise-dependent atomenc/dit/atomdec). NOTE: DiffusionConditioning is noise-INDEP
 Next: validate atomenc (has_coords=True: AtomAttentionEncoder + r_l noisy coords + s/z
 trunk broadcast; reuse the windowed AtomTransformer) and atomdec (broadcast token->atom
 + AtomTransformer + linear->coords) against this golden. Then EDM sampler -> coords.
+
+## SPEC: diffusion atom encoder (has_coords=True) — inputs + recipe
+
+atomenc consistent golden (~/protenix_diffusion_consistent.pkl['atomenc']):
+- positional: atom_to_token_idx(275), ref_pos(275,3), ref_charge(275), ref_mask(275),
+  ref_atom_name_chars(275,4,64), ref_element(275,128), d_lm(9,32,128,3), v_lm(...1), pad_info.
+- kwargs: r_l(1,275,3) NOISY coords, s(1,38,384)=s_single, z(1,38,38,256)=pair_z,
+  p_lm(1,9,32,128,16) CACHED, c_l(275,128) CACHED.
+- out: (a(1,38,768), q(1,275,128), c(1,275,128), p_lm(1,9,32,128,16)).
+c_l & p_lm are PASSED IN (cached from a no-coords prepare_cache = my AtomFeaturization,
+already validated). has_coords forward (transformer.py 899-948):
+  c_l = c_l + broadcast_token_to_atom(linear_no_bias_s(layernorm_s(s)), atom_to_token_idx)
+  q_l = c_l + linear_no_bias_r(r_l)
+  p_lm += linear_cl(relu(win_q(c_l))) + linear_cm(relu(win_k(c_l))); p_lm += small_mlp(p_lm)
+  q_l = atom_transformer(q_l, c_l, p_lm)            # reuse validated AtomTransformer (768? NO: c_atom=128)
+  a = aggregate(relu(linear_no_bias_q(q_l)), atom_to_token, mean)  # c_token=768 here
+OPEN Q (read prepare_cache caching): where does the pair_z (z) broadcast enter p_lm?
+prepare_cache's r_l-branch does p_lm += broadcast_token_to_local_atom_pair(linear_z(
+layernorm_z(z))). If the CACHED p_lm excludes it, the forward must add it (verify by
+checking if cached p_lm == no-coords AtomFeaturization.p_lm+aug, then z-broadcast added
+separately). Validate against golden using the cached c_l/p_lm as inputs. Reuse
+AtomAttentionEncoder pieces from tt_bio/protenix.py with c_token=768 + the s/r_l/z adds.
+Then atomdec (broadcast a->atoms + AtomTransformer + LN->linear->coords) -> coords delta.
