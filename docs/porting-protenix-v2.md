@@ -512,3 +512,23 @@ ATOM_DIM=128). Reconcile deltas for Protenix v2 atom transformer:
 Golden gate: ~/protenix_atomtx_gold.pkl (q,c,p->qout). Next: wire the 3-block atom
 transformer (reuse AttentionPairBias atom_level + AdaLN + CTB, add the 2nd kv AdaLN)
 and validate vs golden_qout.
+
+## MILESTONE: full atom transformer validated end-to-end (PCC 0.999998 vs golden)
+
+The complete 3-block Protenix-v2 atom transformer is validated against real v2
+golden_qout:
+- scripts/protenix_atomtx_torch_ref.py: pure-torch reimpl (only extracted weights,
+  no protenix) reproduces golden_qout EXACTLY (PCC 1.0, maxerr 1.5e-8) — confirms the
+  algorithm: double AdaLN (layernorm_a then layernorm_kv on q_norm), windowing
+  (left-pad 48, stride-32/width-128 sliding, mask_trunked validity -inf), two gates
+  (per-head linear_g + output sigmoid(linear_a_last(s))), ConditionedTransitionBlock,
+  residuals.
+- scripts/protenix_atomtx_ttnn_parity.py: ttnn impl reuses tt-bio AdaLN (remap_adaln)
+  + ttnn linears/CTB/gates -> PCC 0.999998 (maxerr 0.016 bf16) vs golden_qout.
+
+REMAINING for release: the windowed-attention core (Q.K^T/softmax/.V over the 9x
+[32,128] windows) currently uses a host gather in the parity script. Move it
+on-device — reuse tt-bio AttentionPairBias(atom_level) windowing (keys_indexing +
+batched SDPA) or ttnn slice/concat + batched matmul. The rest is fully on-device.
+With the atom transformer done, AtomAttentionEncoder = featurization (done) + this
++ relu(linear_q) mean-aggregate atom->token -> a, then s_inputs concat.
