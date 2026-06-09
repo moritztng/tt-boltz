@@ -149,7 +149,14 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       to z); but PairWeightedAveraging hits a ttnn slice/layout snag on the
       *composed* z (it passes in isolation — a plumbing detail, not architectural).
       Next debug: normalize z's memory_config after the OPM add, or inspect pwa's
-      per-head z slicing at L=32. Then assemble MSAModule (N blocks + input proj).
+      per-head z slicing at L=32. [UPDATE] Root cause was a dims mismatch, not
+      plumbing: the MSA-block pwa uses c=8,n_heads=8 (not standalone default c=32) ->
+      build PairWeightedAveraging(head_dim=8,n_heads=8). With that, the block RUNS in
+      Protenix order (z+=OPM(m); m+=pwa(m,z); m+=transition(m); z=pair_stack(z)) but
+      PCC m=0.919 z=0.503 (<0.98). Two isolated correctness gaps to diagnose next:
+      (a) head_dim=8 pwa (m~0.92 — likely sub-tile head padding); (b) the c_s=0
+      PairformerLayer/transform_s=False path or the OPM-add (z~0.50 — verify the
+      c_s=0 pair stack in isolation vs PairformerBlock(c_s=0)). Then MSAModule.
 - [ ] Next: build the Protenix-ordered MSA layer (reuse verified primitives) ->
       MSAModule (N blocks + input proj). Reconcile order vs
       Protenix MSABlock) + PairformerStack (N-block) + s/z init linears →
