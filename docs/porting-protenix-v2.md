@@ -1188,3 +1188,25 @@ the plddt/resolved einsum, or accept (plddt/resolved are confidence metrics, not
 => EVERY PROTENIX-V2 COMPUTE MODULE IS NOW VALIDATED ON-DEVICE. Remaining: end-to-end
 wiring (trunk->cond->EDM sampler->coords; Ca-RMSD) + productionize + --fast/CLI/vendoring/
 README.
+
+## END-TO-END ASSEMBLY CHECKLIST (every piece validated; mechanical wiring)
+
+Productionize into tt_bio/protenix.py as a `Protenix` model class (load v2 ckpt once,
+bf16). Forward(feats) order — reuse the validated scripts/protenix_*_parity.py logic:
+1. s_inputs = AtomAttentionEncoder(feats)                    [protenix.py, 0.999999]
+2. s_init,z_init = TrunkInput(s_inputs, relp, token_bonds)   [protenix.py, 0.999997]
+3. trunk: z=s=0; for 10 cycles:
+     z = z_init + lin_z_cycle(ln_z_cycle(z)); z += TemplateEmbedder(feats,z) [0.99985]
+     z = MSAModule(feats,z,s_inputs) [0.994]; s = s_init + lin_s(ln_s(s))
+     s,z = Pairformer48(s,z) [s0.993/z0.980]                 [full trunk s0.991/z0.990]
+4. cond ONCE: s_single,pair_z = DiffusionConditioning(s_trunk=s, s_inputs, z_trunk=z,
+   noise placeholder per-step) [pair1.0/single0.99999]; c_l,p_lm = atom prepare_cache(z).
+5. EDM sampler (generator recipe): x = sched[0]*randn; for step: centre_aug, t_hat,
+   x_noisy, x_den = denoiser(x_noisy,t_hat,...) [cond reused + atomenc0.99999 + DiT +
+   atomdec0.99992], EDM update. -> coords (N_sample,N_atom,3).
+6. ConfidenceHead(feats,s_inputs,s,z,coords) -> plddt/pae/pde/resolved [pae/pde1.0].
+7. Ca-RMSD(coords vs ~/protenix_ref_out.pkl['pred']['coordinate']) -> RELEASABLE gate.
+Then SKILL requirements: --fast (set_fast_mode block-fp8), CLI `tt-bio predict --model
+protenix-v2` + scheduler/worker wiring, vendor protenix data-pipeline bits (no clone),
+unified README + I/O + terminal output (normal/--debug/--log), inference-only.
+Reference env to regenerate golden: ~/protenix_ref_venv (py3.11) + PROTENIX_SRC + CCD.

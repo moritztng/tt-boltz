@@ -12,6 +12,14 @@ Status (all on-device, validated vs real v2 golden; see tests/test_protenix_*.py
 - AtomAttentionEncoder -> s_inputs (full InputFeatureEmbedder atom encoder) PCC 0.999999
 - TrunkInput -> s_init, z_init                           PCC 0.999997
 - 48-block Pairformer stack vs real trunk I/O            PCC s 0.993 / z 0.980
+- full 10-cycle trunk (assembled)                        PCC s 0.991 / z 0.990
+- DiffusionConditioning (pair/single)                    PCC 1.0 / 0.99999
+- diffusion atom encoder(has_coords)                     PCC 0.99999
+- 24-block token DiT (per-block)                         PCC 1.0 (torch) / 0.997 (bf16)
+- diffusion atom decoder                                 PCC 0.99992
+- ConfidenceHead (pae/pde ; plddt/resolved)              PCC 1.0 ; 0.93/0.77
+EVERY v2 compute module validated on-device. Remaining: end-to-end assembly
+(docs/porting-protenix-v2.md checklist) -> Ca-RMSD; then --fast/CLI/vendoring/README.
 Remaining: msa-module input featurization + recycle wiring + template embedder
 (trunk output); diffusion (conditioning + module + EDM sampler); confidence head;
 end-to-end Ca-RMSD; then --fast/CLI/vendoring/README. See docs/porting-protenix-v2.md.
