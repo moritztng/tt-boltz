@@ -503,21 +503,55 @@ class Protenix:
         h = torch.Tensor(ttnn.to_torch(t)).float()
         return h.reshape(shape) if shape is not None else h
 
+    @staticmethod
+    def _atom_pair_feats(ref_pos, ref_space_uid):
+        """Algorithm 5 lines 1-3 (reference update_input_feature_dict): windowed atom-pair
+        feats from ref_pos + ref_space_uid (NQ=32, NK=128, pad_left=48). Validated vs the
+        reference (d_lm exact, v_lm/mask exact). Returns d_lm (nb,NQ,NK,3), v_lm (nb,NQ,NK,1),
+        mask_trunked (nb,NQ,NK)."""
+        import torch
+        import torch.nn.functional as F
+        N = ref_pos.shape[0]; NQ, NK, PADL = 32, 128, 48
+        nb = (N + NQ - 1) // NQ; NP = nb * NQ; qpad = NP - N
+        ruid = ref_space_uid.long()
+        qpos = F.pad(ref_pos.float(), (0, 0, 0, qpad)).reshape(nb, NQ, 3)
+        quid = F.pad(ruid, (0, qpad), value=0).reshape(nb, NQ)              # pad value 0 (reference)
+        pad_right = int((nb - 0.5) * NQ + NK / 2 - N + 0.5)
+        kpos_p = F.pad(ref_pos.float(), (0, 0, PADL, pad_right))
+        kuid_p = F.pad(ruid, (PADL, pad_right), value=0)
+        kpos = torch.stack([kpos_p[b * NQ:b * NQ + NK] for b in range(nb)], 0)   # (nb,NK,3)
+        kuid = torch.stack([kuid_p[b * NQ:b * NQ + NK] for b in range(nb)], 0)   # (nb,NK)
+        d_lm = qpos[:, :, None, :] - kpos[:, None, :, :]                         # (nb,NQ,NK,3)
+        v_lm = (quid[:, :, None] == kuid[:, None, :]).float().unsqueeze(-1)      # (nb,NQ,NK,1)
+        qidx = torch.arange(NP).reshape(nb, NQ); qval = (qidx < N).float()
+        kglob = torch.stack([torch.arange(b * NQ - PADL, b * NQ - PADL + NK) for b in range(nb)], 0)
+        kval = ((kglob >= 0) & (kglob < N)).float()
+        mask_trunked = qval[:, :, None] * kval[:, None, :]                      # (nb,NQ,NK)
+        return d_lm, v_lm, mask_trunked
+
     def _atom_feat_inputs(self, feats):
-        """Build the per-atom feature tensors shared by both atom encoders."""
+        """Build the per-atom feature tensors shared by both atom encoders. Accepts the
+        canonical protenix input_feature_dict: d_lm/v_lm/mask_trunked are computed from
+        ref_pos + ref_space_uid (model-side, Algorithm 5) when not already provided."""
         import torch
         N = feats["ref_pos"].shape[0]
         f_in = torch.cat([feats["ref_mask"].reshape(N, 1), feats["ref_element"].reshape(N, 128),
                           feats["ref_atom_name_chars"].reshape(N, 256)], dim=-1)
-        nb, nq, nk, _ = feats["d_lm"].shape
+        if "d_lm" in feats and "v_lm" in feats:
+            d_lm, v_lm = feats["d_lm"], feats["v_lm"]
+            mt = feats.get("mask_trunked")
+            if mt is None:
+                mt = feats["pad_info"]["mask_trunked"]
+        else:
+            d_lm, v_lm, mt = self._atom_pair_feats(feats["ref_pos"], feats["ref_space_uid"])
+        nb, nq, nk, _ = d_lm.shape
         M = nb * nq * nk
-        d = feats["d_lm"].reshape(M, 3); v = feats["v_lm"].reshape(M, 1)
-        invd = (1.0 / (1.0 + (feats["d_lm"] ** 2).sum(-1, keepdim=True))).reshape(M, 1)
-        mt = feats["mask_trunked"]
+        d = d_lm.reshape(M, 3); v = v_lm.reshape(M, 1)
+        invd = (1.0 / (1.0 + (d_lm ** 2).sum(-1, keepdim=True))).reshape(M, 1)
         a2t = feats["atom_to_token_idx"].long(); NT = int(a2t.max()) + 1
         S = torch.zeros(N, NT); S[torch.arange(N), a2t] = 1.0
         return dict(N=N, NT=NT, nb=nb, nq=nq, nk=nk, f_in=f_in, d=d, v=v, invd=invd,
-                    mt=mt, a2t=a2t, S=S, ref_charge_asinh=torch.arcsinh(feats["ref_charge"]).reshape(N, 1))
+                    mt=mt.float(), a2t=a2t, S=S, ref_charge_asinh=torch.arcsinh(feats["ref_charge"]).reshape(N, 1))
 
     def _diffusion_pair_cond(self, z_trunk_tt, relp):
         """DiffusionConditioning pair branch (computed once; t-independent):

@@ -1520,3 +1520,15 @@ Rg 5.6A; conditioned -> Rg 16.3A). Both now in Protenix.fold.
 
 REMAINING (pure packaging): data-pipeline vendoring (sequence/CCD -> feats dict, no clones),
 worker/CLI --model protenix-v2, --fast block-fp8, unified README + I/O.
+
+## fold() CONSUMES CANONICAL protenix input_feature_dict (Algorithm 5 moved into model)
+
+Protenix.fold now accepts the canonical protenix input_feature_dict directly: the windowed
+atom-pair features d_lm/v_lm/mask_trunked are computed INSIDE the model (Protenix._atom_pair_feats,
+porting update_input_feature_dict / Algorithm 5 lines 1-3) from ref_pos + ref_space_uid
+(NQ=32,NK=128,pad_left=48; ref_space_uid padded with 0 like the reference). Validated exact vs
+the reference (d_lm PCC 1.0 maxerr 0, v_lm/mask exact). fold on the raw feat dict (d_lm/v_lm
+dropped, model recomputes) -> Rg 16.05A, vs-ref 8.61A within variance. This shrinks the data
+pipeline's required outputs to BASE features only (no d_lm/v_lm/mask_trunked):
+  ref_pos, ref_space_uid, ref_charge, ref_element, ref_atom_name_chars, ref_mask,
+  atom_to_token_idx, relp, token_bonds, restype, profile, deletion_mean, msa, template_*, asym_id.
