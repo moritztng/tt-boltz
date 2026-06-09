@@ -822,3 +822,22 @@ pair_z (38,38,256)).
 Remaining diffusion: atomenc(has_coords=True) -> (a 768,q,c,p_lm); 24-block token DiT
 (non-windowed AttentionPairBias, c_a=768) -> a; atomdec -> coords delta. Golden for
 each in ~/protenix_diffusion_gold.pkl. Then EDM sampler loop -> coords; confidence.
+
+## DIFFUSION DiT (partial): 24-block token DiT assembled; PCC 0.62 (per-block bug to localize)
+
+scripts/protenix_dit_parity.py wires the 24-block token DiT (per block: adaln_a ->
+AttentionPairBias(48,16,compute_pair_bias,non-atom) -> sigmoid(linear_a_last(s)) gate ->
++a input residual -> ctb_adaln -> SiLU-gated FF -> +attn_out). z fed as cond pair_z
+permuted (1,256,38,38)->(1,38,38,256); z pre-normalized (mean0/std1) so efficient_fusion
+== standard. Input residual CONFIRMED needed (with: 0.62, without: 0.005). But final
+PCC 0.62 => small per-block error compounding over 24 blocks. DEBUG (fresh context):
+- capture per-block golden (hook each diffusion_transformer.blocks.i) to find where
+  divergence starts.
+- verify remap_adaptive_layernorm == the AdaLN math used elsewhere (remap_adaln);
+  check layernorm_a create_offset.
+- verify AttentionPairBias(atom_level=False) pair-bias scale (z_weight *= head_dim**0.5
+  vs SDPA scale head_dim**-0.5) for c_a=768/16-head config.
+- check z: does the DiT re-use the SAME z across all 24 blocks, or is z updated? (here
+  z is constant; confirm reference doesn't evolve z).
+Single-block parity (random) passes >0.98, so the wiring is close; the gap is a
+real-weight per-block detail amplified x24.
