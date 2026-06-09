@@ -7,7 +7,7 @@ from tt_bio.protenix import AtomTransformer
 ck=torch.load('/home/ttuser/protenix_ckpt/protenix-v2.pt',map_location='cpu',weights_only=True); ck=ck.get('model',ck)
 P='module.diffusion_module.atom_attention_encoder.'
 g=lambda k: ck[P+k]
-dg=pickle.load(open('/home/ttuser/protenix_diffusion_consistent.pkl','rb'))['atomenc']
+dg=pickle.load(open('/home/ttuser/protenix_atomenc_pre.pkl','rb'))
 pin=dg['in']; kw=dg['kwargs']
 a2t=pin[0].long()            # (275,)
 mask_trunked=pin[8]['mask_trunked'].float()   # (9,32,128)

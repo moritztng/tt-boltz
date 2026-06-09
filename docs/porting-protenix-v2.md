@@ -1039,3 +1039,19 @@ template embedder 0.99985, MSA module 0.994, 48-blk pairformer s0.993/z0.980, fu
 10-cycle trunk s0.991/z0.990, DiffusionConditioning pair1.0/single0.99999, DiT block
 torch-fp32 1.0 (bf16 0.997/block). Remaining: atom-enc agg detail, atom decoder, EDM
 sampler, confidence, end-to-end Ca-RMSD, --fast/CLI/vendoring/README.
+
+## RESOLVED + VALIDATED: diffusion atom encoder(has_coords) PCC 0.99999
+
+ROOT CAUSE of the 0.842 saga: the Protenix reference encoder MUTATES its inputs
+in-place (inplace_safe=True). My forward_hook captured inputs AFTER mutation, so
+feeding the captured c_l/p_lm back gave wrong results. FIX: capture with
+forward_PRE_hook + clone (scripts/protenix_extract_atomenc_pre.py ->
+~/protenix_atomenc_pre.pkl). Proof: standalone reference encoder fed pre-mutation
+inputs reproduces golden a at PCC 1.0; ttnn atom encoder(has_coords) validates at
+PCC 0.99999 on-device. The atom encoder was correct all along.
+CRITICAL LESSON (applies to atomdec + any inplace_safe module): capture golden INPUTS
+with forward_pre_hook(with_kwargs=True)+clone, NOT forward_hook. (DiT was fine — its
+din was captured via a pre_hook. Outputs are always safe.)
+DIFFUSION STATUS: cond pair1.0/single0.99999, atomenc(has_coords) 0.99999, DiT block
+torch1.0/ttnn0.997. Remaining: atomdec (re-capture inputs via pre-hook), then EDM
+sampler -> coords; confidence; end-to-end Ca-RMSD.
