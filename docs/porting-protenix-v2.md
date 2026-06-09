@@ -916,3 +916,14 @@ PRECISION OPTIONS for the DiT (and possibly trunk): keep residual stream a_t in 
 end-to-end Ca-RMSD needs it. The DiT is logically done.
 ACTION ITEM: redo the diffusion submodule golden (cond/atomenc/dit/atomdec) as ONE
 consistent capture before validating atomenc/atomdec.
+
+## Consistent diffusion golden ready (~/protenix_diffusion_consistent.pkl)
+
+scripts/protenix_extract_diffusion_consistent.py captures cond/atomenc/dit/atomdec I/O
+in ONE venv forward (all from sampler step 0 -> mutually consistent for the
+noise-dependent atomenc/dit/atomdec). NOTE: DiffusionConditioning is noise-INDEPENDENT
+(inputs are trunk s/z + relp + scalar noise-level), so the earlier pair(1.0)/single
+(0.99999) validations remain valid. Only atomenc/dit/atomdec need this consistent pkl.
+Next: validate atomenc (has_coords=True: AtomAttentionEncoder + r_l noisy coords + s/z
+trunk broadcast; reuse the windowed AtomTransformer) and atomdec (broadcast token->atom
++ AtomTransformer + linear->coords) against this golden. Then EDM sampler -> coords.
