@@ -639,3 +639,14 @@ remap_pair_weighted_averaging, remap_transition, remap_msa_pair_stack). Validate
 4-block stack vs golden msa_module I/O (like test_protenix_trunk_pairformer.py).
 Then recycle wiring: recycle linears (layernorm_z_cycle/linear_no_bias_z_cycle/
 layernorm_s/linear_no_bias_s) + template embedder + 10-cycle loop -> trunk output.
+
+## MILESTONE: full 4-block MSA module validated vs REAL trunk I/O (z PCC 0.994)
+
+The v2 msa_module (input featurization + 4 MSABlocks) reproduces the real captured
+msa_module output z (PCC 0.99407). tests/test_protenix_trunk_msa.py — built from raw
+ckpt via pure-dict remaps + golden I/O (no protenix in sys python3). KEY: the LAST
+MSA block (block 3) drops msa_stack — only OPM + pair_stack (standard AF3; the MSA
+rep isn't needed after the final block). pwa head_dim=8/heads=8; pair_stack tri_att
+head_dim=32/heads=8; c_m=128. Both big trunk components (msa + pairformer) now
+validated end-to-end on real tensors+weights. Remaining trunk: recycle linears +
+template embedder (2 blk) + 10-cycle loop -> trunk output s,z.
