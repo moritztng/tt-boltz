@@ -435,3 +435,20 @@ Genuinely-new ttnn work (rest is remap/reconcile of validated primitives):
 Build order: InputFeatureEmbedder (AtomAttnEncoder has_coords=False -> s_inputs 449)
 -> trunk linears/recycle -> DiffusionConditioning -> DiffusionModule(+AtomAttn
 has_coords=True + Decoder)+sampler -> ConfidenceHead -> end-to-end Ca-RMSD.
+
+## MILESTONE: standalone InputFeatureEmbedder parity gate (PCC 1.0)
+
+scripts/protenix_ife_parity_gate.py drives JUST the Protenix InputFeatureEmbedder
+(input_embedder.* real v2 weights) on the golden feat from ~/protenix_ref_out.pkl
+and reproduces the captured golden s_inputs (38,449) exactly: maxabs_err 0, PCC 1.0.
+=> the atom encoder can be driven in isolation; golden inputs (incl. windowed
+d_lm(9,32,128,3)/v_lm(9,32,128,1)/pad_info) + output are the gate for the tt-bio port.
+
+AtomAttentionEncoder(has_coords=False) flow to port (transformer.py:820-949):
+- prepare_cache -> c_l (atom single [275,128]) + p_lm (windowed atom-pair
+  [n_blocks=9, n_queries=32, n_keys=128, c_atompair=16]) from ref feats + d_lm/v_lm.
+- q_l = c_l.clone(); p_lm += linear_cl(relu(c_l_q)) + linear_cm(relu(c_l_k)); p_lm += small_mlp(p_lm).
+- atom_transformer(q_l, c_l, p_lm): DiffusionTransformer cross_attention_mode with
+  LOCAL WINDOWED attention (32 queries x 128 keys per block) — the new ttnn primitive.
+- a = mean-aggregate(relu(linear_q(q_l)) atom->token) -> [38, c_token=384].
+- s_inputs = cat([a, restype(32), profile(32), deletion_mean(1)]) = 449.
