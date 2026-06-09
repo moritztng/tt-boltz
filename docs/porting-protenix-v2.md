@@ -1119,3 +1119,21 @@ release, all recipes in this doc):
    document the dep), unified README, remove redundancy.
 Skill requirements still to satisfy: unified I/O, consistent terminal output (normal +
 --debug/--log), inference-only, fast weight load. See SKILL.md.
+
+## SPEC: ConfidenceHead (golden captured pre-mutation; reuses validated Pairformer)
+
+scripts/protenix_extract_confidence_pre.py -> ~/protenix_confidence_pre.pkl (pre-hook
+clone): kwargs (input_feature_dict, s_inputs, s_trunk, z_trunk, pair_mask, x_pred_coords)
+-> out (plddt(1,275,50), pae(1,38,38,64), pde(1,38,38,64), resolved(1,275,2)).
+Structure (confidence.py): n_blocks=4, c_s=384, c_z=256(v2), b_pae/pde=64, b_plddt=50,
+b_resolved=2; distance bins 3.25..52.0 step 1.25 (lower/upper_bins).
+forward: z = z_trunk + linear_no_bias_s1(s_inputs)[:,None] + linear_no_bias_s2(s_inputs)[None]
+  ; d = cdist(x_pred_coords token-rep atoms); onehot d in [lower,upper) bins ->
+  linear_no_bias_d + linear_no_bias_d_wo_onehot(1/(1+d^2)?) ; z += d-embed
+  ; s,z = pairformer_stack(s_trunk-ish or s_inputs-proj, z)  # 4 blocks [reuse Pairformer]
+  ; heads: pae=linear(z), pde=linear(z+z^T?), plddt/resolved = per-atom via einsum with
+    linear_no_bias_s1/s2 weights (b_plddt=50, b_resolved=2). (READ confidence.py tail for
+    exact head projections + the token->atom expansion using max_atoms_per_token=20.)
+Reuse tt_bio.tenstorrent Pairformer (validated) + the distance embed + head linears.
+Validate vs golden (pre-mutation). This is the LAST compute component; then end-to-end
+wiring + release (--fast/CLI/vendoring/README).
