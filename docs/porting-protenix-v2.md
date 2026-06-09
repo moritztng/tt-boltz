@@ -1137,3 +1137,24 @@ forward: z = z_trunk + linear_no_bias_s1(s_inputs)[:,None] + linear_no_bias_s2(s
 Reuse tt_bio.tenstorrent Pairformer (validated) + the distance embed + head linears.
 Validate vs golden (pre-mutation). This is the LAST compute component; then end-to-end
 wiring + release (--fast/CLI/vendoring/README).
+
+## SPEC (complete): ConfidenceHead forward — ready to implement
+
+forward(feat, s_inputs, s_trunk, z_trunk, pair_mask, x_pred_coords):
+  s_trunk = input_strunk_ln(clamp(s_trunk, -512, 512))
+  x_pred_rep = x_pred_coords[:, distogram_rep_atom_mask]  # token-rep atoms (N_token)
+  z = z_trunk + linear_no_bias_s1(s_inputs)[:,None] + linear_no_bias_s2(s_inputs)[None]
+  per sample (memory_efficient_forward):
+    d = cdist(x_pred_rep, x_pred_rep)                      # (N_token,N_token)
+    z += linear_no_bias_d(one_hot(d, lower_bins, upper_bins)) + linear_no_bias_d_wo_onehot(d[...,None])
+    s_single, z = pairformer_stack(s_trunk, z, pair_mask)  # 4 blocks [reuse validated Pairformer]
+    heads (READ confidence.py tail ~line +58 for exact):
+      pae = linear_no_bias_pae(z)            # (N_token,N_token,64), zeros-init
+      pde = linear_no_bias_pde(z + z^T)      # (N_token,N_token,64), zeros-init (verify symmetrization)
+      plddt, resolved = per-ATOM via atom_to_token_idx + atom_to_tokatom_idx expansion
+        (max_atoms_per_token=20): project s_single -> per-token-per-atom logits
+        (b_plddt=50, b_resolved=2) then gather to N_atom. (read tail for the exact einsum.)
+Golden: ~/protenix_confidence_pre.pkl (pre-mutation). Validate plddt/pae/pde/resolved vs
+golden. Reuse tt_bio Pairformer + one_hot distance binning + head linears.
+ALL v2 COMPONENTS now validated-or-fully-specced. Implementation order to finish:
+confidence head -> end-to-end wiring (Ca-RMSD) -> --fast/CLI/vendoring/README.
