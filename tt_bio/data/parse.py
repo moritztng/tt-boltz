@@ -141,7 +141,9 @@ def _parse_a3m(  # noqa: C901
             if c != "-" and c.islower():
                 count += 1
                 continue
-            token = const.prot_letter_to_token[c]
+            # Unknown / non-residue characters (a malformed MSA, stray
+            # whitespace, etc.) map to UNK instead of crashing with a KeyError.
+            token = const.prot_letter_to_token.get(c, const.unk_token["PROTEIN"])
             token = const.token_ids[token]
             residue.append(token)
             if count > 0:
@@ -273,7 +275,9 @@ def parse_csv(
             if c != "-" and c.islower():
                 count += 1
                 continue
-            token = const.prot_letter_to_token[c]
+            # Unknown / non-residue characters (a malformed MSA, stray
+            # whitespace, etc.) map to UNK instead of crashing with a KeyError.
+            token = const.prot_letter_to_token.get(c, const.unk_token["PROTEIN"])
             token = const.token_ids[token]
             residue.append(token)
             if count > 0:
