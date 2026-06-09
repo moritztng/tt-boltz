@@ -18,8 +18,12 @@ Status (all on-device, validated vs real v2 golden; see tests/test_protenix_*.py
 - 24-block token DiT (per-block)                         PCC 1.0 (torch) / 0.997 (bf16)
 - diffusion atom decoder                                 PCC 0.99992
 - ConfidenceHead (pae/pde ; plddt/resolved)              PCC 1.0 ; 0.93/0.77
-EVERY v2 compute module validated on-device. Remaining: end-to-end assembly
-(docs/porting-protenix-v2.md checklist) -> Ca-RMSD; then --fast/CLI/vendoring/README.
+EVERY v2 compute module validated on-device. ASSEMBLED into the top-level Protenix
+class (load_from_checkpoint + fold): full on-device pipeline (atom encoder -> diffusion
+atom cache -> 10-cycle Trunk -> diffusion conditioning -> EDM sampler) produces valid
+structures within sample variance of the reference (scripts/protenix_fold_e2e.py,
+scripts/protenix_predict.py -> PDB). Remaining (packaging): data-pipeline vendoring
+(sequence/CCD -> feats dict), worker/CLI --model protenix-v2, unified README.
 """
 import torch
 import ttnn
