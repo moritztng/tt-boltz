@@ -303,14 +303,14 @@ class _WorkerState:
         def _pfn(stage, step, total):
             report_progress("diffusion" if stage == "trunk" else stage)
 
-        coords = self.model.fold(
+        coords, plddt = self.model.fold(
             feats, n_step=cfg["sampling_steps"], n_sample=cfg["diffusion_samples"],
-            seed=cfg.get("seed") or 0, progress_fn=_pfn,
+            seed=cfg.get("seed") or 0, progress_fn=_pfn, return_confidence=True,
         )
         out = Path(cfg["struct_dir"]) / f"{path.stem}.{cfg['output_format']}"
         _write_protenix_structure(coords[0], feats, aatype_from_sequence(seq), out, cfg["output_format"])
         metrics = {
-            "n_residues": len(seq), "n_chains": len(chains),
+            "plddt": round(float(plddt), 4), "n_residues": len(seq), "n_chains": len(chains),
             "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
         }
         return metrics, None, {"record": types.SimpleNamespace(affinity=False)}

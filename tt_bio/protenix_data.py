@@ -75,10 +75,11 @@ def protein_atom_features(aatype: torch.Tensor, conformers: dict) -> dict:
     z_of = const.element_to_atomic_num  # symbol -> atomic number
     n_tok = aatype.shape[0]
     ref_pos, ref_charge, ref_mask, a2t, ruid = [], [], [], [], []
-    elem_idx, name_chars = [], []
+    elem_idx, name_chars, tokatom, disto_rep = [], [], [], []
     for t, aa in enumerate(aatype.tolist()):
         res = letter_to_res[RESTYPE_ORDER[aa]] if aa < len(RESTYPE_ORDER) else "UNK"
         atoms = list(const.ref_atoms[res])
+        disto_atom = const.res_to_disto_atom.get(res, "CA")  # distogram rep atom (CB, or CA for GLY)
         conf = torch.as_tensor(conformers[res], dtype=torch.float32)
         if t == n_tok - 1:  # C-terminal residue carries the extra OXT (carboxylate) oxygen
             atoms = atoms + ["OXT"]
@@ -90,6 +91,8 @@ def protein_atom_features(aatype: torch.Tensor, conformers: dict) -> dict:
             ref_charge.append(_FORMAL_CHARGE.get((res, nm), 0.0))
             ref_mask.append(1.0)
             a2t.append(t); ruid.append(t)
+            tokatom.append(k)                       # index of this atom within its token
+            disto_rep.append(1.0 if nm == disto_atom else 0.0)  # distogram rep atom (res_to_disto_atom)
             padded = (nm + "    ")[:4]
             name_chars.append([ord(c) - 32 for c in padded])
         ref_pos.append(conf)
@@ -103,6 +106,8 @@ def protein_atom_features(aatype: torch.Tensor, conformers: dict) -> dict:
         "ref_mask": torch.tensor(ref_mask),
         "atom_to_token_idx": torch.tensor(a2t, dtype=torch.long),
         "ref_space_uid": torch.tensor(ruid, dtype=torch.long),
+        "atom_to_tokatom_idx": torch.tensor(tokatom, dtype=torch.long),
+        "distogram_rep_atom_mask": torch.tensor(disto_rep),
     }
 
 
