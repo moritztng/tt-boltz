@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
     make_attention_pair_bias,
     make_outer_product_mean,
+    make_adaptive_layernorm,
     make_msa_block,
     make_pair_weighted_averaging,
     make_pairformer_block,
@@ -26,6 +27,7 @@ from protenix_reference import (  # noqa: E402
     pcc,
     remap_attention_pair_bias,
     remap_outer_product_mean,
+    remap_adaptive_layernorm,
     remap_msa_pair_stack,
     remap_pair_weighted_averaging,
     remap_pairformer_block,
@@ -33,6 +35,7 @@ from protenix_reference import (  # noqa: E402
     remap_triangle_attention,
     remap_triangle_multiplication,
     run_reference_outer_product_mean,
+    run_reference_adaptive_layernorm,
     run_reference_msa_block,
     run_reference_pair_weighted_averaging,
     run_reference_pairformer_block,
@@ -43,6 +46,7 @@ from protenix_reference import (  # noqa: E402
 
 from tt_bio.tenstorrent import (  # noqa: E402
     AttentionPairBias,
+    AdaLN,
     OuterProductMean,
     PairWeightedAveraging,
     PairformerLayer,
@@ -229,3 +233,17 @@ def test_msa_block_parity():
     zz = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(ref_z.shape)
     pm_, pz_ = pcc(mm, ref_m), pcc(zz, ref_z)
     assert pm_ > 0.98 and pz_ > 0.98, f"m={pm_:.5f} z={pz_:.5f}"
+
+
+# AdaptiveLayerNorm (diffusion conditioning).
+def test_adaln_parity():
+    c_a, c_s, L = 768, 384, 32
+    mod, sd = make_adaptive_layernorm(c_a, c_s, seed=0)
+    a = torch.randn(1, L, c_a); s = torch.randn(1, L, c_s)
+    ref = run_reference_adaptive_layernorm(mod, a, s).float()
+    dev = get_device()
+    adaln = AdaLN(False, remap_adaptive_layernorm(sd), _ck(dev))
+    ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    out = torch.Tensor(ttnn.to_torch(adaln(ft(a), ft(s)))).float().reshape(ref.shape)
+    p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f}"

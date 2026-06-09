@@ -320,6 +320,33 @@ def run_reference_msa_block(mod, m, z):
         return mod(m, z, torch.ones(z.shape[:-1], dtype=z.dtype))  # (m, z)
 
 
+# --- AdaptiveLayerNorm (diffusion conditioning norm) --------------------------
+def make_adaptive_layernorm(c_a=768, c_s=384, seed=0):
+    from protenix.model.modules.primitives import AdaptiveLayerNorm
+
+    torch.manual_seed(seed)
+    mod = AdaptiveLayerNorm(c_a=c_a, c_s=c_s).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_adaptive_layernorm(ref_sd: dict) -> dict:
+    """Protenix AdaptiveLayerNorm -> tt-bio AdaLN. a = sigmoid(linear_s(LN_s(s)))*
+    LN_a(a) + linear_nobias_s(LN_s(s)); LN_a has no affine on both sides."""
+    return {
+        "s_norm.weight": ref_sd["layernorm_s.weight"],
+        "s_scale.weight": ref_sd["linear_s.weight"],
+        "s_scale.bias": ref_sd["linear_s.bias"],
+        "s_bias.weight": ref_sd["linear_nobias_s.weight"],
+    }
+
+
+def run_reference_adaptive_layernorm(mod, a, s):
+    with torch.no_grad():
+        return mod(a, s)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
