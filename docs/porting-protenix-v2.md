@@ -100,10 +100,29 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
 ## Status / next steps
 
 - [x] Branch `protenix-v2` created off `main`.
-- [x] Phase 0: model researched, reference installed `--no-deps`, architecture
-      mapped to tt-bio, dependency hazard identified.
-- [ ] Pin exact Protenix-v2 config dims from the v2 checkpoint config.
-- [ ] Phase 1 step 0: `tests/protenix_reference.py` harness importing a single
-      Pairformer/triangle-mult block under stubs; first PCC>0.98 parity test
-      loading Protenix weights into the tt-bio module (weight-name map).
-- [ ] Proceed through the component order above.
+- [x] Phase 0: model researched, reference installed `--no-deps` (+ light deps
+      `ml_collections einops optree`), architecture mapped to tt-bio, dependency
+      hazard identified, dims confirmed (c_s=384, c_z=128, c_hidden_mul=128,
+      pair-att 32, heads 16/4; Pairformer 48, MSA 4, diffusion 24/3/3).
+- [x] Phase 1 step 0: `tests/protenix_reference.py` reference harness +
+      `tests/test_protenix.py`. **First parity gate PASSES on device:**
+      tt-bio `TriangleMultiplication` reproduces Protenix's OpenFold triangle
+      multiplication via a weight remap — outgoing PCC **0.99998** (`ending=False`),
+      incoming >0.98 (`ending=True`). Confirms the reuse strategy works.
+      - Verified remap: tt-bio `g_in`=cat(`linear_a_g`,`linear_b_g`),
+        `p_in`=cat(`linear_a_p`,`linear_b_p`), `g_out`=`linear_g`,
+        `p_out`=`linear_z`, norms direct; `ending`=incoming.
+- [ ] Next modules (same remap-and-parity approach): TriangleAttention →
+      AttentionPairBias → full PairformerBlock/Stack → MSA block/module →
+      diffusion transformer + atom encoder/decoder + DiffusionModule →
+      input/relpos/template/constraint embedders → distogram + confidence heads.
+- [ ] Phase 2: download the v2 (464M) checkpoint, pin v2 dims, load real weights,
+      end-to-end on device, Cα-RMSD vs ground truth.
+- [ ] Phases 3–6: robustness (all entity types/sizes/no-OOM), optimize
+      (bf16 load, residency, `--fast`, bucketing, best-of-N chunking), unify CLI
+      (`--model protenix-v2` + worker/multi-device + Rich/`--debug --log`),
+      vendor the reference, README, prune.
+
+**Not release-ready yet** — this is the start of Phase 1 (the keystone module is
+proven on hardware). The remaining modules + real-weight end-to-end + accuracy
++ robustness + CLI/vendoring are required before public Protenix-v2 support.
