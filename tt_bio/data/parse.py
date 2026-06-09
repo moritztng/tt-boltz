@@ -2782,8 +2782,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         if entity_type in {"protein", "dna", "rna"}:
             seq = str(item[entity_type]["sequence"])
         elif entity_type == "ligand":
-            assert "smiles" in item[entity_type] or "ccd" in item[entity_type]
-            assert "smiles" not in item[entity_type] or "ccd" not in item[entity_type]
+            has_smiles = "smiles" in item[entity_type]
+            has_ccd = "ccd" in item[entity_type]
+            if not (has_smiles or has_ccd):
+                raise ValueError("A ligand must specify either 'ccd' or 'smiles'.")
+            if has_smiles and has_ccd:
+                raise ValueError("A ligand cannot specify both 'ccd' and 'smiles' — choose one.")
             if "smiles" in item[entity_type]:
                 seq = str(item[entity_type]["smiles"])
             else:
