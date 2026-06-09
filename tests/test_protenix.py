@@ -15,13 +15,20 @@ import ttnn
 
 sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
+    make_triangle_attention,
     make_triangle_multiplication,
     pcc,
+    remap_triangle_attention,
     remap_triangle_multiplication,
+    run_reference_triangle_attention,
     run_reference_triangle_multiplication,
 )
 
-from tt_bio.tenstorrent import TriangleMultiplication, get_device  # noqa: E402
+from tt_bio.tenstorrent import (  # noqa: E402
+    TriangleAttention,
+    TriangleMultiplication,
+    get_device,
+)
 
 torch.set_grad_enabled(False)
 
@@ -53,3 +60,22 @@ def test_triangle_multiplication_parity(outgoing, ending):
     out = torch.Tensor(ttnn.to_torch(tm(x))).float()
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f} (outgoing={outgoing}, ending={ending})"
+
+
+# Protenix TriangleAttention starting/ending node -> tt-bio `ending` = not starting.
+@pytest.mark.parametrize("starting,ending", [(True, False), (False, True)])
+def test_triangle_attention_parity(starting, ending):
+    c_in, c_hidden, no_heads, L = 128, 32, 4, 64
+    mod, sd = make_triangle_attention(c_in, c_hidden, no_heads, starting=starting, seed=0)
+    x = torch.randn(1, L, L, c_in)
+    ref = run_reference_triangle_attention(mod, x).float()
+
+    dev = get_device()
+    ta = TriangleAttention(
+        head_dim=c_hidden, n_heads=no_heads, ending=ending,
+        state_dict=remap_triangle_attention(sd), compute_kernel_config=_ck(dev),
+    )
+    xt = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    out = torch.Tensor(ttnn.to_torch(ta(xt))).float()
+    p = pcc(out, ref)
+    assert p > 0.98, f"PCC {p:.5f} (starting={starting}, ending={ending})"

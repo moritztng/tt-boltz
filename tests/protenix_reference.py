@@ -83,6 +83,37 @@ def run_reference_triangle_multiplication(mod, z, mask=None):
         return mod(z, mask=mask)
 
 
+# --- TriangleAttention (second parity gate) -----------------------------------
+def make_triangle_attention(c_in=128, c_hidden=32, no_heads=4, starting=True, seed=0):
+    """OpenFold TriangleAttention (starting/ending node), random weights."""
+    from protenix.openfold_local.model.triangular_attention import TriangleAttention
+
+    torch.manual_seed(seed)
+    mod = TriangleAttention(c_in=c_in, c_hidden=c_hidden, no_heads=no_heads,
+                            starting=starting).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.5)
+    return mod, mod.state_dict()
+
+
+def remap_triangle_attention(ref_sd: dict) -> dict:
+    """OpenFold TriangleAttention -> tt-bio TriangleAttention: strip the `mha.`
+    prefix from the q/k/v/o/g projections; layer_norm + linear (pair bias) map
+    directly. tt-bio fuses q/k/v and folds the 1/sqrt(d) scale into `linear`."""
+    out = {}
+    for k, v in ref_sd.items():
+        out[k[len("mha."):] if k.startswith("mha.") else k] = v
+    return out
+
+
+def run_reference_triangle_attention(mod, x, mask=None):
+    """Forward OpenFold TriangleAttention. x: [B,L,L,c_in]."""
+    with torch.no_grad():
+        if mask is None:
+            mask = torch.ones(x.shape[:-1], dtype=x.dtype)
+        return mod(x, mask=mask)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()

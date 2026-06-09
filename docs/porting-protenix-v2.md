@@ -112,8 +112,10 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       - Verified remap: tt-bio `g_in`=cat(`linear_a_g`,`linear_b_g`),
         `p_in`=cat(`linear_a_p`,`linear_b_p`), `g_out`=`linear_g`,
         `p_out`=`linear_z`, norms direct; `ending`=incoming.
-- [ ] Next modules (same remap-and-parity approach): TriangleAttention →
-      AttentionPairBias → full PairformerBlock/Stack → MSA block/module →
+- [x] TriangleAttention parity on device (PCC>0.98, starting→ending=False,
+      ending→ending=True; remap = strip `mha.` prefix). 4/4 tests pass.
+- [ ] Next modules (same remap-and-parity approach): AttentionPairBias →
+      Transition → full PairformerBlock/Stack → MSA block/module →
       diffusion transformer + atom encoder/decoder + DiffusionModule →
       input/relpos/template/constraint embedders → distogram + confidence heads.
 - [ ] Phase 2: download the v2 (464M) checkpoint, pin v2 dims, load real weights,
