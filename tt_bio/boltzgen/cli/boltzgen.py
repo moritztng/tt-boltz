@@ -642,6 +642,14 @@ def run_command(args: argparse.Namespace) -> None:
     """
     from tt_bio.boltzgen import progress as P
 
+    # Guard degenerate sizing: num_designs must be >= 1, otherwise every shard
+    # gets zero designs, all devices are dropped, and the CPU split divides by
+    # zero (ZeroDivisionError) deep in the distributed path.
+    if args.num_designs is not None and args.num_designs < 1:
+        raise ValueError("--num_designs must be at least 1")
+    if getattr(args, "budget", None) is not None and args.budget < 1:
+        raise ValueError("--budget must be at least 1")
+
     # Default --output to ./<spec basename>/ (documented), so a bare
     # `tt-bio gen run spec.yaml` works.
     if not args.output:
