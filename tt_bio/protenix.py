@@ -14,6 +14,18 @@ import ttnn
 from .tenstorrent import Module, CORE_GRID_MAIN
 
 
+def remap_adaln(sd):
+    """Protenix AdaptiveLayerNorm -> tt-bio AdaLN weight names. Math is identical:
+    sigmoid(linear_s(LN(s)))*LN(a) + linear_nobias_s(LN(s)).  Validated on-device
+    (PCC 0.999996 vs the v2 reference, scripts/ check)."""
+    return {
+        "s_norm.weight": sd["layernorm_s.weight"],
+        "s_scale.weight": sd["linear_s.weight"],
+        "s_scale.bias": sd["linear_s.bias"],
+        "s_bias.weight": sd["linear_nobias_s.weight"],
+    }
+
+
 class AtomFeaturization(Module):
     """Protenix AtomAttentionEncoder.prepare_cache (has_coords=False path).
 

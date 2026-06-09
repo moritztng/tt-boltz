@@ -491,3 +491,24 @@ AttentionPairBias (cross_attention_mode, has_s=True), per block:
 ttnn plan: SDPA with batch=n_blocks(9), heads=4 + additive mask (pair+pad). Window
 gather via left-pad + 9 slices/concat (overlap => unfold, not reshape). Reuse
 tenstorrent.py AdaLN + ConditionedTransitionBlock (already Protenix-matched/validated).
+
+## MILESTONE: AdaLN remap validated; atom-transformer reuse map
+
+tt-bio AdaLN reproduces Protenix AdaptiveLayerNorm with remap (s_norm<-layernorm_s,
+s_scale<-linear_s, s_bias<-linear_nobias_s); on-device PCC 0.999996 vs v2 reference.
+=> tt_bio.protenix.remap_adaln().
+
+KEY REUSE: tt-bio AttentionPairBias ALREADY has atom_level=True windowed attention
+(Boltz-2's local atom attention: keys_indexing gather + batched SDPA, ATOM_WINDOW=32,
+ATOM_DIM=128). Reconcile deltas for Protenix v2 atom transformer:
+- DOUBLE AdaLN: Protenix cross_attention_mode applies layernorm_kv (a 2nd AdaLN) to
+  q_norm before deriving kv; tt-bio's atom_level derives kv from a windowed gather of
+  the single normed s (no 2nd AdaLN). Must apply AdaLN_kv to q_norm pre-gather.
+- weight remap (per block): attention_pair_bias.attention.linear_q/k/v/g/o ->
+  proj_q/k/v/g/o; layernorm_z->proj_z.0, linear_nobias_z->proj_z.1; layernorm_a->the
+  layer's AdaLN; conditioned_transition_block.{adaln, linear_nobias_a1/a2/b, linear_s}.
+- Protenix ConditionedTransitionBlock uses SiLU gate (b=silu(a1)*a2) + sigmoid(linear_s(s))
+  *linear_b(b) — matches tt-bio ConditionedTransitionBlock (verify a1/a2/b names).
+Golden gate: ~/protenix_atomtx_gold.pkl (q,c,p->qout). Next: wire the 3-block atom
+transformer (reuse AttentionPairBias atom_level + AdaLN + CTB, add the 2nd kv AdaLN)
+and validate vs golden_qout.
