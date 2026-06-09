@@ -167,7 +167,9 @@ def remap_attention_pair_bias(ref_sd: dict) -> dict:
         "proj_g.weight": ref_sd["attention.linear_g.weight"],
         "proj_o.weight": ref_sd["attention.linear_o.weight"],
         "proj_z.0.weight": ref_sd["layernorm_z.weight"],
-        "proj_z.0.bias": ref_sd["layernorm_z.bias"],
+        # layernorm_z has no bias when create_offset_ln_z=False (diffusion APB);
+        # tt-bio's z-norm always has a bias slot, so default to zeros.
+        "proj_z.0.bias": ref_sd.get("layernorm_z.bias", torch.zeros_like(ref_sd["layernorm_z.weight"])),
         "proj_z.1.weight": ref_sd["linear_nobias_z.weight"],
     }
 
@@ -364,6 +366,22 @@ def make_conditioned_transition_block(c_a=768, c_s=384, n=2, seed=0):
 def run_reference_conditioned_transition_block(mod, a, s):
     with torch.no_grad():
         return mod(a, s)
+
+
+# --- DiffusionTransformerBlock (token DiT: AdaLN-attn + CTB) -------------------
+def make_diffusion_transformer_block(c_a=768, c_s=384, c_z=128, n_heads=16, seed=0):
+    from protenix.model.modules.transformer import DiffusionTransformerBlock
+
+    torch.manual_seed(seed)
+    mod = DiffusionTransformerBlock(c_a=c_a, c_s=c_s, c_z=c_z, n_heads=n_heads).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def run_reference_diffusion_transformer_block(mod, a, s, z):
+    with torch.no_grad():
+        return mod(a, s, z)[0]  # out_a
 
 
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
