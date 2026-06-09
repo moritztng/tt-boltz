@@ -1158,3 +1158,18 @@ Golden: ~/protenix_confidence_pre.pkl (pre-mutation). Validate plddt/pae/pde/res
 golden. Reuse tt_bio Pairformer + one_hot distance binning + head linears.
 ALL v2 COMPONENTS now validated-or-fully-specced. Implementation order to finish:
 confidence head -> end-to-end wiring (Ca-RMSD) -> --fast/CLI/vendoring/README.
+
+## ConfidenceHead heads (COMPLETE recipe):
+  pae  = linear_no_bias_pae(pae_ln(z))                       # (N_tok,N_tok,64), pae_ln=LayerNorm
+  pde  = linear_no_bias_pde(pde_ln(z + z.transpose(-2,-3)))  # symmetrized, (N_tok,N_tok,64)
+  a    = broadcast_token_to_atom(s_single, atom_to_token_idx) # (N_atom, c_s)
+  plddt    = einsum('nc,ncb->nb', plddt_ln(a),  plddt_weight[atom_to_tokatom_idx])   # (N_atom,50)
+  resolved = einsum('nc,ncb->nb', resolved_ln(a), resolved_weight[atom_to_tokatom_idx]) # (N_atom,2)
+where plddt_weight/resolved_weight are Parameters (max_atoms_per_token=20, c_s=384, b);
+atom_to_tokatom_idx in [0,19] selects per-within-token-atom weight matrix. ttnn: pae/pde
+= layer_norm+linear(+transpose-add); plddt/resolved = broadcast s_single->atoms (S matrix)
++ layer_norm + per-atom matvec (gather weight[idx] via 20-way select or index-matmul).
+THE ENTIRE PROTENIX-V2 MODEL IS NOW VALIDATED-ON-DEVICE OR FULLY-SPECCED. Build-to-finish:
+confidence head (reuse Pairformer + above heads) -> end-to-end (trunk->cond->sampler->
+coords, Ca-RMSD) -> productionize tt_bio Protenix class + worker -> --fast/CLI(--model
+protenix-v2)/vendoring/README/unification per SKILL.md.
