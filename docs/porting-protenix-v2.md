@@ -291,3 +291,18 @@ The remaining work is NO LONGER module parity — it's INTEGRATION:
 To resume: re-run `/loop ...` and I'll undertake the atom-featurization
 integration; or provide the v2 checkpoint and I'll wire end-to-end. The verified
 modules + remaps + reconciliation catalog + real-weight tests are all committed.
+
+## Verified v2 config (from the real 464M checkpoint — for the full-model build)
+
+Inferred from protenix-v2.pt shapes (use these to construct the reference modules
+so weights load strict; v2 differs from base/v0.5.0 dims):
+- Pairformer: c_z=256 (base 128), c_s=384, c_hidden_mul=256, no_heads_pair=8
+  (base 4), c_hidden_pair_att=32, AttentionPairBias n_heads=16. 48 blocks.
+- MSA: c_m=128 (base 64), c_z=256, OPM c_hidden=32, pwa c=8/n_heads=8; the MSA
+  block's pair_stack uses no_heads_pair=8 (NOT the PairformerBlock default 4 — must
+  be constructed explicitly or strict load mismatches). 4 blocks.
+- Diffusion token transformer: c_a=768, c_s=384, c_z=256, n_heads=16. 24 blocks.
+- Distogram: c_z input 256, no_bins=64.
+Validated on real v2 weights (PCC>0.98, strict load): Pairformer block (s=0.99998
+z=0.99482) and DistogramHead. Modules are dim-parametric so they accept v2; the
+only gotcha is passing the non-default block sub-config (e.g. MSA pair_stack heads).
