@@ -810,3 +810,15 @@ scripts/protenix_extract_diffusion_gold.py -> ~/protenix_diffusion_gold.pkl hook
 - atomdec (AtomAttentionDecoder): a -> broadcast to atoms + skip + AtomTransformer ->
   LayerNorm -> linear -> coords delta (1,275,3).
 All targets in the pkl. Then EDM sampler loop wraps diffusion_module(x_noisy,t)->coords.
+
+## MILESTONE: DiffusionConditioning COMPLETE (pair 1.0 + single 0.99999)
+
+Single path validated: single_s = linear_s(layernorm_s(cat[s_trunk,s_inputs])) +
+linear_n(layernorm_n(fourier(log(t/sigma)/4))) then +transition_s1 +transition_s2.
+FourierEmbedding = cos(2*pi*(t'*w + b)), w/b loaded from ckpt (sigma_data=16).
+scripts/protenix_singlecond_parity.py -> PCC 0.99999 vs golden s_single. With the pair
+path (PCC 1.0), DiffusionConditioning is fully validated -> (s_single (1,38,384),
+pair_z (38,38,256)).
+Remaining diffusion: atomenc(has_coords=True) -> (a 768,q,c,p_lm); 24-block token DiT
+(non-windowed AttentionPairBias, c_a=768) -> a; atomdec -> coords delta. Golden for
+each in ~/protenix_diffusion_gold.pkl. Then EDM sampler loop -> coords; confidence.
