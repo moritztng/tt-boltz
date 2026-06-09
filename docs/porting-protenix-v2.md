@@ -375,3 +375,27 @@ scikit-learn, tqdm, dm-tree, plus protenix+fair-esm (--no-deps). CCD files in
 ~/common/ (components.cif 468MB, components.cif.rdkit_mol.pkl 135MB from public TOS).
 Force base['triangle_multiplicative']='torch' and ['triangle_attention']='torch' (the
 v2 default is 'cuequivariance', a CUDA-only fused kernel).
+
+## MILESTONE: golden intermediate dataset captured (all 5 major modules)
+
+scripts/protenix_ref_forward.py with DUMP_INTERMEDIATES=1 registers forward hooks
+(with_kwargs=True) and saves the first-call I/O of every major module to
+~/protenix_ref_out.pkl['intermediates']. This is the per-stage validation harness
+for the tt-bio trunk. I/O contracts (tiny protein: 38 tokens, 275 atoms, c_s=384,
+c_z=256, c_s_inputs=449, c_l=128):
+
+- input_embedder(feat) -> s_inputs (38,449)
+- msa_module(feat, z(38,38,256), s_inputs(38,449)) -> z (38,38,256)
+- pairformer_stack(s(38,384), z(38,38,256)) -> (s, z)          [already ported+validated]
+- diffusion_module(x_noisy(1,275,3), t_hat_noise_level(1,), feat, s_inputs(38,449),
+    s_trunk(38,384), z_trunk=None, pair_z(38,38,256), p_lm(1,9,32,128,16),
+    c_l(275,128), chunk_size, inplace_safe, enable_efficient_fusion) -> x(1,275,3)
+- confidence_head(feat, s_inputs(38,449), s_trunk(38,384), z_trunk(38,38,256),
+    x_pred_coords(1,275,3), ...) -> plddt(1,275,50), pae(1,38,38,64),
+    pde(1,38,38,64), resolved(1,275,2)
+
+Remaining tt-bio build order (simplest first, validate each vs golden):
+1. InputFeatureEmbedder -> s_inputs (incl. atom-level AtomAttentionEncoder).
+2. trunk linears (s_init/z_init) + relative_position_encoding + recycling.
+3. DiffusionModule (DiffusionConditioning + AtomAttn enc/dec + DiT) + sampler.
+4. ConfidenceHead. 5. wire end-to-end -> Ca-RMSD vs ~/protenix_ref_out.pkl coords.

@@ -76,6 +76,26 @@ feat = data['input_feature_dict']
 print('N_token=%d N_atom=%d N_msa=%d'%(int(data['N_token']), int(data['N_atom']), int(data['N_msa'])), flush=True)
 print('feat keys (%d):'%len(feat), sorted(list(feat.keys()))[:30], flush=True)
 
+cap = {}
+if os.environ.get('DUMP_INTERMEDIATES'):
+    def _cpu(x):
+        import torch as _t
+        if _t.is_tensor(x): return x.detach().cpu()
+        if isinstance(x,(list,tuple)): return type(x)(_cpu(y) for y in x)
+        if isinstance(x,dict): return {k:_cpu(v) for k,v in x.items()}
+        return x
+    def _mk(name):
+        def hook(mod, args, kwargs, output):
+            if name not in cap:  # first call only (cycle 0 / first diffusion step)
+                cap[name] = {'in': _cpu(args), 'kwargs': _cpu(kwargs), 'out': _cpu(output)}
+        return hook
+    targets = {'input_embedder': m.input_embedder, 'msa_module': m.msa_module,
+               'pairformer_stack': m.pairformer_stack, 'diffusion_module': m.diffusion_module,
+               'confidence_head': m.confidence_head}
+    for nm, mod in targets.items():
+        mod.register_forward_hook(_mk(nm), with_kwargs=True)
+    print('intermediate capture armed:', list(targets), flush=True)
+
 print('running reference forward...', flush=True)
 pred, _, _ = m(input_feature_dict=feat, label_full_dict=None, label_dict=None,
                mode='inference', mc_dropout_apply_rate=0.0)
@@ -85,6 +105,9 @@ for k,v in pred.items():
 coord_key = 'coordinate' if 'coordinate' in pred else ('coords' if 'coords' in pred else None)
 out = {'pred': {k:(v.cpu() if torch.is_tensor(v) else v) for k,v in pred.items()},
        'feat': {k:(v.cpu() if torch.is_tensor(v) else v) for k,v in feat.items()}}
+if cap:
+    out['intermediates'] = cap
+    print('captured intermediates:', list(cap), flush=True)
 with open('/home/ttuser/protenix_ref_out.pkl','wb') as f:
     pickle.dump(out, f)
 print('REF_FORWARD_DONE saved /home/ttuser/protenix_ref_out.pkl', flush=True)
