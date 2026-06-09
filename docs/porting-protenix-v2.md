@@ -650,3 +650,14 @@ rep isn't needed after the final block). pwa head_dim=8/heads=8; pair_stack tri_
 head_dim=32/heads=8; c_m=128. Both big trunk components (msa + pairformer) now
 validated end-to-end on real tensors+weights. Remaining trunk: recycle linears +
 template embedder (2 blk) + 10-cycle loop -> trunk output s,z.
+
+## FINDING: template embedder is REQUIRED (not skippable) for plain folding
+
+Even with use_template=False (dummy template feats), the v2 template_embedder
+contributes ~0.55x the z magnitude (out absmean 2.9 vs z absmean 5.3) — it has
+learned biases, so plain folding MUST run it for parity. Golden I/O now captured in
+~/protenix_ref_out.pkl['intermediates']['template_embedder'] (out z-update (38,38,256)).
+=> implement the 2-block template embedder (triangle mult/attn + transitions over
+template feats; reuse tenstorrent.py Triangle*/Transition + PairformerLayer-like
+pair stack). Then recycle wiring assembles: z_cycle linear + template + msa + s_cycle
+linear + pairformer, x10 cycles, validated vs golden trunk s,z.

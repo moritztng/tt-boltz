@@ -91,7 +91,7 @@ if os.environ.get('DUMP_INTERMEDIATES'):
         return hook
     targets = {'input_embedder': m.input_embedder, 'msa_module': m.msa_module,
                'pairformer_stack': m.pairformer_stack, 'diffusion_module': m.diffusion_module,
-               'confidence_head': m.confidence_head}
+               'confidence_head': m.confidence_head, 'template_embedder': m.template_embedder}
     for nm, mod in targets.items():
         mod.register_forward_hook(_mk(nm), with_kwargs=True)
     print('intermediate capture armed:', list(targets), flush=True)
