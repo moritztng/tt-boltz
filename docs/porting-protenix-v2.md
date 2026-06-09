@@ -687,3 +687,21 @@ Reuse tenstorrent.py PairformerLayer (pair-only: transform_s=False, s=None) + re
 NOTE the pairformer here is pair-only (c_s=0) — needs the pair_stack remap variant.
 Build template pair feats on host from feat (dummy when use_template=False but present).
 Validate vs golden template_embedder out. Then recycle assembly -> trunk output.
+
+## TemplateEmbedder readiness (verified — implement directly next)
+
+All inputs verified present for direct implementation:
+- weights: template_embedder.{linear_no_bias_a(108->64), linear_no_bias_z(256->64),
+  linear_no_bias_u(64->256), layernorm_z(256), layernorm_v(64),
+  pairformer_stack.blocks.{0,1}} — the 2 blocks are PAIR-ONLY (tri_mul_in/out,
+  tri_att_start/end, pair_transition) => reuse PairformerLayer(...,transform_s=False)
+  + remap_msa_pair_stack (the same pair-only remap used for MSA pair_stack).
+- feats in captured input (num_templates=4 dummy slots): template_distogram (4,38,38,39),
+  template_aatype (4,38) int, template_unit_vector (4,38,38,3),
+  template_backbone_frame_mask (4,38,38), template_pseudo_beta_mask (4,38,38).
+  aatype one-hot num_classes=32 (STD_RESIDUES_WITH_GAP) -> restype_i/j each 32.
+- at(108) = cat[distogram*mc*pm (39), pseudo_beta_mask*mc*pm (1), aatype_i (32),
+  aatype_j (32), unit_vector*mc*pm (3), backbone_mask*mc*pm (1)]; mc=multichain mask
+  (asym_id eq), pm=ones. Loop 4 templates, average, linear_u(relu).
+- golden: ~/protenix_ref_out.pkl['intermediates']['template_embedder'] out (38,38,256).
+Everything needed is on hand; no further reference reads required to implement.
