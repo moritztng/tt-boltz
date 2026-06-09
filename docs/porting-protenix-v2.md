@@ -968,3 +968,21 @@ VALIDATION: feed golden cached c_l/p_lm + r_l/s/a2t; compare a(768),q,c,p_lm to 
 linear_no_bias_q@768. Weights: diffusion_module.atom_attention_encoder.* (incl.
 layernorm_s, linear_no_bias_s, linear_no_bias_r, linear_no_bias_q@768, atom_transformer).
 Implementation is now fully de-risked. Then atomdec, then EDM sampler.
+
+## atom encoder(has_coords): pre-aggregation PERFECT; final aggregation puzzle (0.842)
+
+Localized precisely (scripts/protenix_atomenc_coords_parity.py + diagnostics):
+- c_la vs golden c: PCC 1.00000 (s-broadcast + base correct)
+- q_out (atom_transformer) vs golden q (out[1]): PCC 0.99999 (transformer + q_l/r_l correct)
+- FINAL a: PCC 0.842 — WRONG, and reproduces in TORCH fp32 with GOLDEN q (out[1]):
+  scatter-mean(relu(linear_no_bias_q(out[1]))) over atom_to_token_idx = 0.842 vs golden
+  a (out[0]). atom_to_token_idx verified (0..37, 38 tokens, sane per-token counts);
+  formula verified == reference scatter(reduce=mean) via brute force; tried no-relu(0.67),
+  relu-after(0.83), sum(0.80) — none match.
+CONTRADICTION: per reference (transformer.py 943-949) a = aggregate(relu(linear_q(q_l)),
+mean) with q_l = out[1]. But computing exactly that from golden out[1] != golden out[0].
+=> out[1] is NOT the q_l fed to linear_q, OR a second projection/mask is involved, OR
+the hook captured a tuple in a different order. NEXT (fresh context): hook the reference
+aggregate_atom_to_token call inputs/output directly (or linear_no_bias_q I/O) inside the
+diffusion atom encoder to see the true x_atom -> a mapping. Everything ELSE in the atom
+encoder is validated (0.9999+).
