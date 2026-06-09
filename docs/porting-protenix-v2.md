@@ -791,3 +791,22 @@ Remaining diffusion:
   t_hat, ..., -> x(1,275,3)).
 - EDM sampler: N_step centered denoise loop (gamma0/gamma_min/noise_scale/step_scale)
   calling diffusion_module; sample-dim batch. -> final coords. Then confidence -> Ca-RMSD.
+
+## DIFFUSION submodule golden captured (validation targets ready)
+
+scripts/protenix_extract_diffusion_gold.py -> ~/protenix_diffusion_gold.pkl hooks the
+4 diffusion submodules (first sampler-step call). I/O contracts:
+- cond (DiffusionConditioning): -> (s_single (1,38,384), pair_z (38,38,256)).
+  pair path DONE (PCC 1.0). single path: s=cat[s_trunk,s_inputs]->LN_s->lin_s +
+  fourier(noise)->LN_n->lin_n + transition_s1/s2. kwargs has t_hat_noise_level.
+- atomenc (AtomAttentionEncoder has_coords=True): c_token=768. -> (a (1,38,768),
+  q (1,275,128), c (1,275,128), p_lm (1,9,32,128,16)). = the has_coords=False encoder
+  I built PLUS: c_l += linear_s(layernorm_s(s_single)) broadcast; q_l = c_l +
+  linear_r(r_l noisy coords); p_lm += broadcast_token_to_local_atom_pair(linear_z(
+  layernorm_z(pair_z))). Reuse AtomTransformer (windowed) — already validated.
+- dit (token DiffusionTransformer): 24 blocks, c_a=768, c_s=384(s_single), c_z=256
+  (pair_z), STANDARD (non-windowed) attn pair bias. Reuse tenstorrent AttentionPairBias
+  (atom_level=False) + AdaLN + ConditionedTransitionBlock. -> a (1,38,768).
+- atomdec (AtomAttentionDecoder): a -> broadcast to atoms + skip + AtomTransformer ->
+  LayerNorm -> linear -> coords delta (1,275,3).
+All targets in the pkl. Then EDM sampler loop wraps diffusion_module(x_noisy,t)->coords.
