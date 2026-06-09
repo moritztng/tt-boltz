@@ -449,6 +449,45 @@ class DiffusionModule:
         }
 
 
+def edm_sample(diffusion_module, cond, n_atoms, *, n_step=200, gamma0=0.8, gamma_min=1.0,
+               noise_scale=1.003, step_scale=1.5, sigma_data=16.0, s_max=160.0, s_min=4e-4,
+               rho=7.0, seed=None):
+    """AF3 EDM ancestral sampler for Protenix-v2 (same family as Boltz-2's
+    AtomDiffusion.sample; reuses tt_bio.boltz2.compute_random_augmentation). Produces
+    atom coords by iteratively denoising from noise with diffusion_module.denoise.
+
+    The v2 noise schedule uses denominator N_step (i/N), verified to reproduce the real
+    v2 reference t_hat sequence to 4 sig figs (4608, 2490, ... 0.1264 for N_step=10):
+        sigma[i] = sigma_data * (s_max^(1/rho) + (i/N_step)*(s_min^(1/rho)-s_max^(1/rho)))^rho
+    then a final sigma=0; gammas[i] = gamma0 if sigma[i] > gamma_min else 0; per step
+    (sigma_tm=sigmas[k], sigma_t=sigmas[k+1], gamma=gammas[k+1]); t_hat=sigma_tm*(1+gamma).
+    cond is the fixed trunk conditioning dict passed to DiffusionModule.denoise."""
+    import torch
+    from .boltz2 import compute_random_augmentation
+    if seed is not None:
+        torch.manual_seed(seed)
+    inv_rho = 1.0 / rho
+    i = torch.arange(n_step, dtype=torch.float64)
+    sig = sigma_data * (s_max ** inv_rho + (i / n_step) * (s_min ** inv_rho - s_max ** inv_rho)) ** rho
+    sigmas = torch.cat([sig, torch.zeros(1, dtype=torch.float64)]).float()      # (n_step+1,)
+    gammas = torch.where(sigmas > gamma_min, torch.tensor(gamma0), torch.tensor(0.0))
+    shape = (1, n_atoms, 3)
+    x = sigmas[0] * torch.randn(shape)
+    for k in range(n_step):
+        sigma_tm, sigma_t, gamma = sigmas[k].item(), sigmas[k + 1].item(), gammas[k + 1].item()
+        R, tr = compute_random_augmentation(1, device=x.device, dtype=x.dtype)
+        x = x - x.mean(dim=-2, keepdim=True)
+        x = torch.einsum("bmd,bds->bms", x, R) + tr
+        t_hat = sigma_tm * (1 + gamma)
+        noise_var = noise_scale ** 2 * (t_hat ** 2 - sigma_tm ** 2)
+        eps = (noise_var ** 0.5) * torch.randn(shape) if noise_var > 0 else torch.zeros(shape)
+        x_noisy = x + eps
+        denoised = diffusion_module.denoise(x_noisy, torch.tensor([t_hat], dtype=torch.float32), cond)
+        d = (x_noisy - denoised) / t_hat
+        x = x_noisy + step_scale * (sigma_t - t_hat) * d
+    return x
+
+
 class TrunkInput(Module):
     """Protenix trunk input construction: s_inputs -> s_init, z_init.
     s_init = linear_sinit(s_inputs); z_init = zinit1(s_init)[:,None] + zinit2(s_init)[None]

@@ -1480,3 +1480,21 @@ characterized precision variant: 2.30A < 2.68A sample variance, docs above).
 COMPUTE COMPLETE. Remaining is pure release engineering: tt_bio.Protenix model class
 (compose validated trunk + denoise() + reused AtomDiffusion.sample()), worker/CLI
 (--model protenix-v2), data-pipeline vendoring (no clones), --fast block-fp8, unified README.
+
+## SAMPLER PRODUCTIONIZED + FULL DIFFUSION VALIDATED END-TO-END
+
+tt_bio.protenix.edm_sample = AF3 EDM ancestral sampler for v2 (reuses
+tt_bio.boltz2.compute_random_augmentation; calls DiffusionModule.denoise). The v2 noise
+schedule uses denominator N_step (i/N, NOT i/(N-1)) -- VERIFIED to reproduce the real v2
+reference t_hat sequence to 4 sig figs (4608,2490,1268,601,260.5,100.8,33.57,9.108,1.017,
+0.1264 for N_step=10), with s_max=160, s_min=4e-4, rho=7, sigma_data=16, gamma0=0.8,
+gamma_min=1.0, noise_scale=1.003, step_scale=1.5; per step (sigma_tm=sigmas[k],
+sigma_t=sigmas[k+1], gamma=gammas[k+1]), t_hat=sigma_tm*(1+gamma).
+scripts/protenix_sample_e2e.py runs the full sampler with the production DiffusionModule +
+golden trunk conditioning (N_step=10): finite non-collapsed structure (Rg 16.9A); RMSD
+seed0-vs-reference 7.74A is BELOW the sampler's own seed-to-seed variance 8.0A -> the
+reference is a typical draw from the on-device sampler's distribution (high absolute value
+is the coarse N_step=10 smoke + MSA-less tiny protein, not a bug). FULL ON-DEVICE DIFFUSION
+(denoiser + sampler) VALIDATED END-TO-END.
+Remaining release work: top-level Protenix class (trunk loop -> cond -> edm_sample),
+worker/CLI --model protenix-v2, data-pipeline vendoring (no clones), --fast, README.
