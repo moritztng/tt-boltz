@@ -124,10 +124,17 @@ card; confirm free via `tt-smi`; never SIGTERM a running job.
       `linear_nobias_z`→`proj_z.1` (raw — tt-bio's internal ×√d is correct as-is).
       **7/7 parity tests pass.** Still TODO: the AdaLN/`has_s=True` variant used by
       the diffusion token transformer.
-- [ ] Then: full PairformerBlock/Stack (compose the 4 verified sub-modules +
-      pre-norms/residuals) → MSA block/module → diffusion transformer +
-      atom encoder/decoder + DiffusionModule → input/relpos/template/constraint
-      embedders → distogram + confidence heads.
+- [x] **Full PairformerBlock parity on device (both s and z, PCC>0.98).**
+      tt-bio's PairformerLayer consumes the block via scopes: tri_mul_out/in
+      (fused remap), tri_att_start/end DIRECT (scope strips `mha.`),
+      transition_z←pair_transition, attention←attention_pair_bias.attention,
+      pre_norm_s←attention_pair_bias.layernorm_a, transition_s←single_transition.
+      Residual order matches. **8/8 parity tests pass.** This is the bulk of the
+      trunk (×48).
+- [ ] Next: PairformerStack (N-block iteration) + the s/z init linears →
+      MSA block/module → diffusion transformer + atom encoder/decoder +
+      DiffusionModule → input/relpos/template/constraint embedders →
+      distogram + confidence heads. Then real-weight load + end-to-end.
 - [ ] Phase 2: download the v2 (464M) checkpoint, pin v2 dims, load real weights,
       end-to-end on device, Cα-RMSD vs ground truth.
 - [ ] Phases 3–6: robustness (all entity types/sizes/no-OOM), optimize

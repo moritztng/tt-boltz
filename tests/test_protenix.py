@@ -16,14 +16,17 @@ import ttnn
 sys.path.insert(0, os.path.dirname(__file__))
 from protenix_reference import (  # noqa: E402
     make_attention_pair_bias,
+    make_pairformer_block,
     make_transition,
     make_triangle_attention,
     make_triangle_multiplication,
     pcc,
     remap_attention_pair_bias,
+    remap_pairformer_block,
     remap_transition,
     remap_triangle_attention,
     remap_triangle_multiplication,
+    run_reference_pairformer_block,
     run_reference_transition,
     run_reference_triangle_attention,
     run_reference_triangle_multiplication,
@@ -31,6 +34,7 @@ from protenix_reference import (  # noqa: E402
 
 from tt_bio.tenstorrent import (  # noqa: E402
     AttentionPairBias,
+    PairformerLayer,
     Transition,
     TriangleAttention,
     TriangleMultiplication,
@@ -123,3 +127,27 @@ def test_attention_pair_bias_parity():
     out = torch.Tensor(ttnn.to_torch(apb(s_t, z_t))).float()
     p = pcc(out, ref)
     assert p > 0.98, f"PCC {p:.5f}"
+
+
+# Full PairformerBlock: compose the 4 verified sub-modules + pre-norms/residuals.
+def test_pairformer_block_parity():
+    c_z, c_s, L = 128, 384, 64
+    mod, sd = make_pairformer_block(c_z=c_z, c_s=c_s, seed=0)
+    s = torch.randn(1, L, c_s)
+    z = torch.randn(1, L, L, c_z)
+    s_ref, z_ref = run_reference_pairformer_block(mod, s, z)
+    s_ref, z_ref = s_ref.float(), z_ref.float()
+
+    dev = get_device()
+    layer = PairformerLayer(
+        tri_att_head_dim=32, tri_att_n_heads=4, att_head_dim=24, att_n_heads=16,
+        transform_s=True, state_dict=remap_pairformer_block(sd),
+        compute_kernel_config=_ck(dev),
+    )
+    s_t = ttnn.from_torch(s, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    z_t = ttnn.from_torch(z, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    s_out, z_out = layer(s_t, z_t)
+    s_o = torch.Tensor(ttnn.to_torch(s_out)).float()
+    z_o = torch.Tensor(ttnn.to_torch(z_out)).float()
+    ps, pz = pcc(s_o, s_ref), pcc(z_o, z_ref)
+    assert ps > 0.98 and pz > 0.98, f"PCC s={ps:.5f} z={pz:.5f}"

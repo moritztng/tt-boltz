@@ -172,6 +172,57 @@ def remap_attention_pair_bias(ref_sd: dict) -> dict:
     }
 
 
+# --- Full PairformerBlock (composition of the 4 verified sub-modules) ---------
+def make_pairformer_block(c_z=128, c_s=384, n_heads=16, c_hidden_mul=128,
+                          c_hidden_pair_att=32, no_heads_pair=4, seed=0):
+    from protenix.model.modules.pairformer import PairformerBlock
+
+    torch.manual_seed(seed)
+    mod = PairformerBlock(n_heads=n_heads, c_z=c_z, c_s=c_s,
+                          c_hidden_mul=c_hidden_mul,
+                          c_hidden_pair_att=c_hidden_pair_att,
+                          no_heads_pair=no_heads_pair).eval()
+    for p in mod.parameters():
+        p.data.normal_(0.0, 0.3)
+    return mod, mod.state_dict()
+
+
+def remap_pairformer_block(sd: dict) -> dict:
+    """Protenix PairformerBlock -> tt-bio PairformerLayer flat state_dict.
+    tt-bio scopes: tri_mul_out/in (fused remap), tri_att_start/end (DIRECT — the
+    `mha.` prefix is stripped by scope), transition_z<-pair_transition,
+    attention<-attention_pair_bias.attention, pre_norm_s<-attention_pair_bias.
+    layernorm_a, transition_s<-single_transition."""
+    def sub(p):
+        return {k[len(p) + 1:]: v for k, v in sd.items() if k.startswith(p + ".")}
+
+    out = {}
+    for k, v in remap_triangle_multiplication(sub("tri_mul_out")).items():
+        out[f"tri_mul_out.{k}"] = v
+    for k, v in remap_triangle_multiplication(sub("tri_mul_in")).items():
+        out[f"tri_mul_in.{k}"] = v
+    for k, v in sub("tri_att_start").items():   # direct (scope strips mha.)
+        out[f"tri_att_start.{k}"] = v
+    for k, v in sub("tri_att_end").items():
+        out[f"tri_att_end.{k}"] = v
+    for k, v in remap_transition(sub("pair_transition")).items():
+        out[f"transition_z.{k}"] = v
+    apb = sub("attention_pair_bias")
+    out["pre_norm_s.weight"] = apb["layernorm_a.weight"]
+    out["pre_norm_s.bias"] = apb["layernorm_a.bias"]
+    for k, v in remap_attention_pair_bias(apb).items():
+        out[f"attention.{k}"] = v
+    for k, v in remap_transition(sub("single_transition")).items():
+        out[f"transition_s.{k}"] = v
+    return out
+
+
+def run_reference_pairformer_block(mod, s, z):
+    with torch.no_grad():
+        pair_mask = torch.ones(z.shape[:-1], dtype=z.dtype)  # [B,L,L]; ones == no mask
+        return mod(s, z, pair_mask)  # -> (s, z)
+
+
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.flatten().float(), b.flatten().float()
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
