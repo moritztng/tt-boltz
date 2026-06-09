@@ -5,6 +5,35 @@ Working branch: `protenix-v2`. Follows the
 "Phase 0 — understand + scope" artifact and the living plan; update it as phases
 complete.
 
+## Verified status & resume guide (read this first)
+
+**Done (on-device, PCC>0.98, 15 parity tests in tests/test_protenix.py):** the
+entire TOKEN-LEVEL compute core of Protenix, reproduced by reusing tt-bio
+primitives + Protenix-specific assembly:
+- TriangleMultiplication (out/in), TriangleAttention (start/end), Transition,
+  AttentionPairBias (Pairformer has_s=False) — and the FULL PairformerBlock.
+- OuterProductMean, MSAPairWeightedAveraging — and the FULL MSABlock (assembled).
+- AdaLN, ConditionedTransitionBlock (assembled), and the FULL diffusion
+  token-transformer block (AdaLN-attn + output gate + CTB).
+- DistogramHead.
+
+**Reconciliation catalog (the subtle fixes that recur):** weight remaps per
+module (see protenix_reference.py); MSA-block pwa uses c=8 (head_dim=8); diffusion
+APB layernorm_z has no bias (default zeros); DistogramHead bias x2 (symmetrize
+order); reference forwards MUTATE inputs in place -> clone before the reference
+call; OPM/pwa composition order differs from Boltz-2 (assemble in Protenix order).
+
+**Remaining (Phase 1 parity, no checkpoint needed):** atom encoder/decoder (map
+to Boltz-2 AtomAttentionEncoder/Decoder — biggest, needs atom featurization),
+DiffusionConditioning (assemble: relpos + Fourier + transitions), the diffusion
+sampler, input/relpos/template/constraint embedders, ConfidenceHead.
+
+**Release gate (Phase 2+, NEEDS USER):** the **gated 464M Protenix-v2 checkpoint**
+must be downloaded (user credentials) to load real weights and run end-to-end;
+then Cα-RMSD validation, robustness, --fast, CLI --model protenix-v2, vendoring,
+README. The compute core being verified does NOT mean releasable — end-to-end
+accuracy on real weights is the gate, and it requires the checkpoint.
+
 ## What Protenix-v2 is (Phase 0 findings)
 
 - ByteDance's open-source **AlphaFold3 reproduction** (Apache-2.0). Protenix-v2
