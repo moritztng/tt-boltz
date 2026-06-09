@@ -1346,6 +1346,16 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             structures/     # one CIF per complex (pLDDT in B-factors)
             results.json    # confidence metrics + affinity
     """
+    # These are counts of things to generate; <1 crashes deep in the model
+    # (e.g. "reshape tensor of 0 elements" / "Dimension size must be
+    # non-negative"). Reject up front with a clear message.
+    if diffusion_samples < 1:
+        raise click.BadParameter("--diffusion_samples must be at least 1")
+    if diffusion_samples_affinity < 1:
+        raise click.BadParameter("--diffusion_samples_affinity must be at least 1")
+    if max_parallel_samples < 1:
+        raise click.BadParameter("--max_parallel_samples must be at least 1")
+
     use_tt = accelerator == "tenstorrent"
     if fast and not use_tt:
         click.echo("Note: --fast is only used with --accelerator tenstorrent; ignoring.")
