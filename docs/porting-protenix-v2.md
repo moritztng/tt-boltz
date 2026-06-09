@@ -1019,3 +1019,23 @@ relu(linear_no_bias_q(q_l)) via a single forward_pre_hook on linear_no_bias_q; c
 relu(lq_input) to scatter-source of a. Keep instrumentation minimal to avoid the
 f_forward path error. Everything else in the atom encoder is validated (c 1.0, q_out
 0.99999, scatter-mean formula 1.0). This is the LAST atom-encoder detail.
+
+## HANDOFF NOTE: write a STANDALONE x_atom capture (don't extend cap_diff)
+
+Extending /tmp/cap_diff.py with extra hooks repeatedly broke (f_forward 458 mismatch;
+4-tuple unpack ValueError) — its multi-submodule hooks + assumptions are fragile. For
+the x_atom resolution, write a FRESH minimal venv script: build v2 model + dataloader
+(reuse scripts/protenix_ref_forward.py scaffold), monkeypatch ONLY
+protenix.model.utils.aggregate_atom_to_token to record (x_atom, out, idx) for the
+768-dim call, AND monkeypatch the diffusion atom encoder's linear_no_bias_q.forward
+(save its input q_l) — both via simple function-wrapping, no register_forward_hook on
+the encoder tuple. Run the full forward once. Then offline check (one run, consistent):
+  relu(linear_no_bias_q(saved q_l)) vs saved x_atom  (== ? -> if yes, x_atom source is
+  exactly relu(linear_q(q_l)) and golden a = scatter-mean of it; the prior 0.842 was a
+  cross-run artifact). This is the LAST atom-encoder detail; everything else validated.
+STATUS RECAP (all on-device vs real v2 golden, PCC): atom featurization 0.9999+, windowed
+AtomTransformer 0.999998, full atom encoder->s_inputs 0.999999, trunk input 0.999997,
+template embedder 0.99985, MSA module 0.994, 48-blk pairformer s0.993/z0.980, full
+10-cycle trunk s0.991/z0.990, DiffusionConditioning pair1.0/single0.99999, DiT block
+torch-fp32 1.0 (bf16 0.997/block). Remaining: atom-enc agg detail, atom decoder, EDM
+sampler, confidence, end-to-end Ca-RMSD, --fast/CLI/vendoring/README.
