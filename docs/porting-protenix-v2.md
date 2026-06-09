@@ -1210,3 +1210,18 @@ Then SKILL requirements: --fast (set_fast_mode block-fp8), CLI `tt-bio predict -
 protenix-v2` + scheduler/worker wiring, vendor protenix data-pipeline bits (no clone),
 unified README + I/O + terminal output (normal/--debug/--log), inference-only.
 Reference env to regenerate golden: ~/protenix_ref_venv (py3.11) + PROTENIX_SRC + CCD.
+
+## HANDOFF INVENTORY (self-sufficient for fresh-context continuation)
+
+- 29 committed scripts/protenix_*.py: golden-extract (per module, py3.11 venv) + ttnn
+  parity (per module). Every golden pkl is regenerable from these.
+- 8 tests/test_protenix*.py: 7 on-device trunk-component tests (gated on ~/ golden pkls,
+  skip if absent) + test_protenix.py (random + real-weight gates).
+- 16 ~/protenix_*.pkl golden (ephemeral; regenerate via scripts/protenix_extract_*.py in
+  the py3.11 reference venv).
+- Env: ~/protenix_ref_venv (py3.11), PROTENIX_SRC=/tmp/protenix-src, ~/common CCD,
+  ~/protenix_ckpt/protenix-v2.pt. See [[protenix-v2-port]] memory.
+TEST-SUITE TODO (bounded, valuable): promote the diffusion-submodule parity scripts
+(atomenc_coords, atomdec, dit_consistent, diffcond, singlecond, confidence) to pytest
+tests (skipif on their golden pkls), mirroring the trunk-component tests, for a complete
+committed validation suite.
