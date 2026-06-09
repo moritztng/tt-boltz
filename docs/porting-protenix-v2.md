@@ -718,3 +718,26 @@ linear_no_bias_z_cycle/layernorm_s/linear_no_bias_s) + the 10-cycle loop assembl
   z = z_init + lin_z_cycle(ln_z_cycle(z)); z += template; z = msa(z); 
   s = s_init + lin_s(ln_s(s)); s,z = pairformer(s,z)   x N_cycle=10
 -> trunk output s,z (golden captured). Then diffusion + sampler -> coords; confidence.
+
+## TRUNK CAPSTONE readiness: full 10-cycle assembly (all parts validated)
+
+Final trunk golden TARGET identified: s_trunk (38,384) + pair_z (38,38,256) live in
+~/protenix_ref_out.pkl['intermediates']['diffusion_module']['kwargs'] (s_trunk, pair_z)
+— these ARE get_pairformer_output's final s,z after N_cycle=10.
+Recycle linears confirmed in ckpt (top-level): layernorm_z_cycle.{weight,bias},
+linear_no_bias_z_cycle.weight, layernorm_s.{weight,bias}, linear_no_bias_s.weight
+(+ TrunkInput's sinit/zinit1/zinit2 already done).
+Assembly (instantiate modules ONCE, reuse across cycles to avoid reloading weights):
+  s_inputs = AtomAttentionEncoder(feat)            # done, PCC 0.999999
+  s_init, z_init = TrunkInput(s_inputs, relp, token_bonds)   # done, PCC 0.999997
+  z = s = 0
+  for cycle in range(10):
+    z = z_init + lin_z_cycle(ln_z_cycle(z))        # ln_z_cycle has bias
+    z = z + template_embedder(feat, z)             # done, PCC 0.99985
+    z = msa_module(feat, z, s_inputs)              # done, PCC 0.994
+    s = s_init + lin_s(ln_s(s))                    # ln_s has bias
+    s, z = pairformer_stack(s, z)                  # done, PCC 0.993/0.980
+  validate (s,z) vs (s_trunk, pair_z) golden.  # bf16 drift over 10 cycles TBD.
+ALL sub-modules validated on-device; capstone is pure assembly. Heavy (10x
+template+msa+pairformer) — instantiate-once is important. This yields the full
+on-device trunk; then diffusion + EDM sampler -> coords; confidence -> end-to-end.
