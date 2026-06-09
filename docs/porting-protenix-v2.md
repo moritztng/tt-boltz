@@ -1297,3 +1297,19 @@ wiring error: re-verify (a) encoder a_token vs standalone-validated atomenc a (b
 s=s_trunk), (b) the +linear_no_bias_s(layernorm_s(s_single)) add, (c) DiT s=s_single,
 (d) layernorm_a, (e) decoder skips q/c/p ordering). The corrected f_forward recipe is in
 the section above. Per-module PCCs are all 0.99+, so the bug is in the CHAINING, not a module.
+
+## DENOISER LOCALIZED: logic correct; limit is 24-block DiT bf16 accumulation
+
+Per-stage vs standalone dm.forward golden (~/protenix_dm_stages.pkl, coords PCC 1.0):
+  s_single 1.0, enc_a 1.0, dit_in 1.0  (encoder w/ r_noisy+s_trunk, +linear_no_bias_s(
+  layernorm_s(s_single)), all EXACT). EDM preconditioning correct (r_noisy = x/sqrt(
+  sigma^2+t^2); x_denoised = x/(1+sr^2) + t/sqrt(1+sr^2)*r_update, sr=t/sigma).
+  dit_out 0.33  <- the only gap. coords 0.12.
+=> the denoiser CHAINING IS LOGICALLY CORRECT; the gap is purely bf16 accumulation in
+the 24-block token DiT (near-identity residual stream; block0 is torch1.0/ttnn0.997,
+compounding). Pre-normalizing pair_z didn't change it (not a z issue).
+FIX (precision): run the DiT residual stream (a_t) in fp32 across the 24 blocks — keep
+a_t as ttnn.float32 / use fp32 dest acc + avoid bf16 round-trip of the residual each
+block; or accumulate the per-block update in fp32. This is the documented DiT-precision
+item; once a_t holds fp32 the 24-block PCC should recover (cf. trunk pairformer s0.993).
+Then denoiser coords -> ~0.99 -> EDM sampler loop -> Ca-RMSD. Everything else validated.
