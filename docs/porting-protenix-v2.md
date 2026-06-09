@@ -1548,3 +1548,15 @@ Rg 16.05A, vs-ref 8.61A within variance. The data pipeline now needs only:
   template_*    : (empty when no templates)
 The CCD-sourced atom features (residue->atom expansion) are the remaining delicate part;
 all index/relpos/atom-pair derived features are now computed inside the model.
+
+## DATA PIPELINE COMPLETE: sequence -> structure on-device
+
+tt_bio/protenix_data.py build_protein_features(sequence) produces the full model-ready
+feats from a one-letter protein sequence (offline / no-MSA / no-template), combining the
+exactly-validated token + atom featurizers with a bundled 20-amino-acid reference conformer
+table (tt_bio/data/protein_ref_conformers.json, CCD ideal coords in const.ref_atoms order).
+Trunk skips the template embedder when no templates are given (nt=0). Full on-device run
+from a SEQUENCE STRING -> Protenix.fold -> structure: e.g. the HIV-protease fragment
+GSSGSSGQITLWQRPLVTIKIGGQLKEALLDTGADDTV folds to a finite 275-atom structure (Rg 14.93A).
+No protenix dependency. The model regenerates relp/d_lm/v_lm/mask_trunked internally;
+ref_pos uses the bundled reference conformer (stochastic reference -> any valid one folds).

@@ -753,9 +753,11 @@ class Trunk:
         import torch.nn.functional as F
         N = s_inputs.shape[0]
         s_init, z_init = self.trunk_input(self._T(s_inputs), self._T(relp), self._T(token_bonds.unsqueeze(-1)))
-        # template feature concat (per template)
+        # template feature concat (per template). Offline (no-template) inference omits
+        # template_* entirely -> nt=0, template embedder skipped (the reference's
+        # use_template=False path carries all-zero template geometry, a negligible update).
         asym = feat["asym_id"]; mc = (asym[:, None] == asym[None, :]).float(); pm = torch.ones(N, N)
-        nt = feat["template_aatype"].shape[0]
+        nt = feat["template_aatype"].shape[0] if "template_aatype" in feat else 0
         te_at = []
         for t in range(nt):
             dg = feat["template_distogram"][t] * mc[..., None] * pm[..., None]
@@ -777,7 +779,8 @@ class Trunk:
                 progress_fn("trunk", step=cyc, total=self.N_CYCLES)
             zc = self._lin(self._ln(z3, "layernorm_z_cycle.weight", "layernorm_z_cycle.bias"), "linear_no_bias_z_cycle.weight")
             z3 = ttnn.add(ttnn.reshape(z_init, (1, N, N, self.C_Z)), zc)
-            z3 = ttnn.add(z3, self._template(z3, te_at, N, nt))
+            if nt > 0:
+                z3 = ttnn.add(z3, self._template(z3, te_at, N, nt))
             z3 = self._msa(z3, m_feat)
             sc = self._lin(self._ln(s, "layernorm_s.weight", "layernorm_s.bias"), "linear_no_bias_s.weight")
             s = ttnn.add(s_init, sc)

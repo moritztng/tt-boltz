@@ -36,6 +36,26 @@ def aatype_from_sequence(seq: str) -> torch.Tensor:
     return torch.tensor([_AA1_TO_IDX.get(c.upper(), 20) for c in seq], dtype=torch.long)
 
 
+def load_ref_conformers() -> dict:
+    """Bundled standard-residue reference conformers (CCD ideal coordinates, in
+    const.ref_atoms order). {3-letter resname: (n_atom, 3) tensor}."""
+    import json
+    import os
+    path = os.path.join(os.path.dirname(__file__), "data", "protein_ref_conformers.json")
+    return {k: torch.tensor(v, dtype=torch.float32) for k, v in json.load(open(path)).items()}
+
+
+def build_protein_features(sequence: str) -> dict:
+    """Full model-ready input_feature_dict for a single offline protein chain from a
+    one-letter sequence. Combines token + atom features (bundled reference conformers).
+    The model (tt_bio.protenix.Protenix.fold) regenerates relp / d_lm / v_lm / mask_trunked
+    internally, so this is everything fold needs."""
+    aatype = aatype_from_sequence(sequence)
+    feats = protein_token_features(aatype)
+    feats.update(protein_atom_features(aatype, load_ref_conformers()))
+    return feats
+
+
 def protein_atom_features(aatype: torch.Tensor, conformers: dict) -> dict:
     """Atom-level features for a single offline protein chain.
 
