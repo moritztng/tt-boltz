@@ -416,3 +416,39 @@ def test_real_weight_msa_block():
     pm_, pz_ = pcc(mm, ref_m), pcc(zz, ref_z)
     assert pm_ > 0.98 and pz_ > 0.98, f"real-weight MSA m={pm_:.5f} z={pz_:.5f}"
 
+
+
+# Real Protenix-v2 (464M) checkpoint validation. v2 = same architecture, larger
+# dims (c_z=256, c_hidden_mul=256, no_heads_pair=8). Modules are dim-parametric.
+_CKPT_V2 = "/home/ttuser/protenix_ckpt/protenix-v2.pt"
+
+
+@pytest.mark.skipif(not os.path.exists(_CKPT_V2), reason="protenix-v2 checkpoint not present")
+def test_real_weight_v2_pairformer_block():
+    from protenix.model.modules.pairformer import PairformerBlock
+    sd_all = torch.load(_CKPT_V2, map_location="cpu", weights_only=True)
+    sd_all = sd_all.get("model", sd_all)
+    pfx = "module.pairformer_stack.blocks.0."
+    sd = {k[len(pfx):]: v for k, v in sd_all.items() if k.startswith(pfx)}
+    c_z = sd["tri_mul_in.layer_norm_in.weight"].shape[0]
+    c_s = sd["single_transition.layernorm1.weight"].shape[0]
+    c_hidden_mul = sd["tri_mul_out.linear_z.weight"].shape[1]
+    no_heads_pair = sd["tri_att_start.linear.weight"].shape[0]
+    c_hidden_pair_att = sd["tri_att_start.mha.linear_q.weight"].shape[0] // no_heads_pair
+    apb_nh = sd["attention_pair_bias.linear_nobias_z.weight"].shape[0]
+    mod = PairformerBlock(n_heads=apb_nh, c_z=c_z, c_s=c_s, c_hidden_mul=c_hidden_mul,
+                          c_hidden_pair_att=c_hidden_pair_att, no_heads_pair=no_heads_pair).eval()
+    mod.load_state_dict(sd, strict=True)
+    L = 64
+    s = torch.randn(1, L, c_s); z = torch.randn(1, L, L, c_z)
+    s_ref, z_ref = run_reference_pairformer_block(mod, s.clone(), z.clone())
+    s_ref, z_ref = s_ref.float(), z_ref.float()
+    dev = get_device()
+    layer = PairformerLayer(c_hidden_pair_att, no_heads_pair, c_s // apb_nh, apb_nh, True,
+                            remap_pairformer_block(mod.state_dict()), _ck(dev))
+    ft = lambda x: ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=dev, dtype=ttnn.bfloat16)
+    s_out, z_out = layer(ft(s), ft(z))
+    so = torch.Tensor(ttnn.to_torch(s_out)).float().reshape(s_ref.shape)
+    zo = torch.Tensor(ttnn.to_torch(z_out)).float().reshape(z_ref.shape)
+    ps, pz = pcc(so, s_ref), pcc(zo, z_ref)
+    assert ps > 0.98 and pz > 0.98, f"v2 real-weight PCC s={ps:.5f} z={pz:.5f}"
