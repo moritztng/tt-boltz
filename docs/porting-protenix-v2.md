@@ -661,3 +661,29 @@ learned biases, so plain folding MUST run it for parity. Golden I/O now captured
 template feats; reuse tenstorrent.py Triangle*/Transition + PairformerLayer-like
 pair stack). Then recycle wiring assembles: z_cycle linear + template + msa + s_cycle
 linear + pairformer, x10 cycles, validated vs golden trunk s,z.
+
+## SPEC: TemplateEmbedder (2 blocks) — ready to implement
+
+Reference: pairformer.py TemplateEmbedder. n_blocks=2, c=64, c_z=256. Weights under
+ckpt 'module.template_embedder.*': linear_no_bias_z (c_z->c), layernorm_z (c_z),
+linear_no_bias_a (108->c), pairformer_stack.blocks.{0,1} (pair-only, c_z=c=64),
+layernorm_v (c), linear_no_bias_u (c->c_z). Golden I/O captured (feat,z(38,38,256)->
+z-update(38,38,256)).
+forward(feat, z):
+  z_n = layernorm_z(z)
+  multichain = (asym_id[:,None]==asym_id[None,:]); pair_mask = ones
+  for t in range(num_templates):   # =1 for dummy/plain-folding
+    at = cat([ template_distogram[t](39)*multichain*pair_mask,
+               template_pseudo_beta_mask[t](1)*masks,
+               onehot(template_aatype[t])(32) broadcast i, broadcast j,   # restype_i, restype_j
+               template_unit_vector[t](3)*masks,
+               template_backbone_frame_mask[t](1)*masks ], -1)  # 39+1+32+32+3+1 = 108
+    v = linear_no_bias_z(z_n) + linear_no_bias_a(at)        # c=64
+    _, v = pairformer_stack(None, v)                        # 2 pair-only blocks (c_z=64)
+    v = layernorm_v(v); u += v
+  u = u/(1e-7+num_templates); u = linear_no_bias_u(relu(u)) # -> c_z=256
+  return u   # added to z in the recycle loop
+Reuse tenstorrent.py PairformerLayer (pair-only: transform_s=False, s=None) + remaps.
+NOTE the pairformer here is pair-only (c_s=0) — needs the pair_stack remap variant.
+Build template pair feats on host from feat (dummy when use_template=False but present).
+Validate vs golden template_embedder out. Then recycle assembly -> trunk output.
