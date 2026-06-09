@@ -1175,7 +1175,7 @@ class BinderDesignPipeline:
         diffusion_batch_size = args.diffusion_batch_size
         if diffusion_batch_size is None:
             diffusion_batch_size = 1 if args.num_designs < 100 else 10
-        num_batches = math.ceil(args.num_designs / diffusion_batch_size)
+        num_batches = math.ceil(args.num_designs / max(1, diffusion_batch_size))
         print(f"Using diffusion batch size: {diffusion_batch_size}")
         print(f"Number of diffusion batches: {num_batches}")
 
