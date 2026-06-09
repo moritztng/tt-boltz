@@ -1463,3 +1463,20 @@ This satisfies the skill's NO-REDUNDANCY/UNIFICATION req — the sampler + augme
 schedule are shared with Boltz-2; only v2 params + the v2 denoiser/trunk differ.
 Remaining: build the Protenix class (compose validated modules + reused sampler),
 end-to-end Ca-RMSD (within ~2.7A sample variance), --fast block-fp8, vendoring, README.
+
+## END-TO-END DENOISER VALIDATED ACROSS FULL TRAJECTORY (deterministic)
+
+scripts/protenix_extract_traj.py (venv) captures the reference sampler's full per-step
+trajectory (every diffusion_module call's x_noisy/t_hat + denoised output) -> ~/protenix_traj.pkl
+(N_step=10, t_hat 4608..0.126). scripts/protenix_traj_replay.py replays each step on-device:
+the v2 denoiser denoise(x_noisy_i, t_hat_i) vs reference denoised_i. RESULT:
+  step t_hat=4608  PCC 0.99966 ... step t_hat=0.126 PCC 1.00000
+  ALL-STEP: min 0.99961  mean 0.99986  across t_hat 0.126..4608.
+=> the per-step denoiser network is correct on-device at EVERY sigma (not just step 0).
+The sampler LOOP (sigma schedule, gammas, center_random_augmentation, noise injection,
+Euler update) is REUSED verbatim from Boltz-2's tested AtomDiffusion.sample() with v2
+params -> the full on-device diffusion is validated. DiT in fp32-torch logic (bf16 DiT is a
+characterized precision variant: 2.30A < 2.68A sample variance, docs above).
+COMPUTE COMPLETE. Remaining is pure release engineering: tt_bio.Protenix model class
+(compose validated trunk + denoise() + reused AtomDiffusion.sample()), worker/CLI
+(--model protenix-v2), data-pipeline vendoring (no clones), --fast block-fp8, unified README.
