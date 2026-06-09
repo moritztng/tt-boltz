@@ -212,3 +212,25 @@ bias), NOT 3D-RoPE. So map them onto tt-bio's **Boltz-2** atom modules
 `AtomTransformer`@1904) — also AF3 — **not** the esmfold2 SWA (3D-RoPE, wrong
 formulation). The parity harness needs full atom featurization (ref_pos / charge
 / element / atom_name_chars / atom_to_token + atompair features); multi-step.
+
+## Remaining-work breakdown (after the compute core is verified)
+
+The tractable device parity gates are done (15/15 = the whole token-level core).
+What's left, by type:
+- **Atom encoder/decoder** — the one big *device* sub-effort left: windowed
+  attention (`AtomTransformer`, n_queries=32/n_keys=128) + atom feature/bias
+  setup. tt-bio's Boltz-2 `AtomAttentionEncoder` takes q/c/atom_enc_bias
+  precomputed (caller's job); Protenix computes them inside. Multi-iteration:
+  build the atom featurization, map onto tt-bio's `AtomTransformer`, parity-test.
+- **Cheap host code, reused as-is (not device gates):** FourierEmbedding
+  (fixed seed-42 buffers, just cos), RelativePositionEncoding featurization,
+  input/template/constraint feature prep.
+- **Assembly of verified pieces:** DiffusionConditioning (relpos + Fourier +
+  transitions), the diffusion sampler loop (reverse diffusion over the verified
+  DiT block).
+- **Complex:** ConfidenceHead (multiple heads + a folding trunk).
+- **Release gate (needs USER):** gated 464M checkpoint -> real-weight end-to-end
+  + Cα-RMSD; then robustness, --fast, CLI --model protenix-v2, vendoring, README.
+
+Net: the autonomous loop has cleared the high-value device parity work. The
+single biggest unblock now is the **gated checkpoint** (user) for end-to-end.
