@@ -306,3 +306,20 @@ so weights load strict; v2 differs from base/v0.5.0 dims):
 Validated on real v2 weights (PCC>0.98, strict load): Pairformer block (s=0.99998
 z=0.99482) and DistogramHead. Modules are dim-parametric so they accept v2; the
 only gotcha is passing the non-default block sub-config (e.g. MSA pair_stack heads).
+
+## End-to-end path: concrete requirements (probed)
+
+Running the Protenix REFERENCE inference (to get real feats + a reference
+structure for tt-bio end-to-end validation) needs a dependency + data stack the
+parity work didn't (we installed protenix --no-deps + only torch/ml_collections/
+einops/optree):
+- deps: absl-py (config/model), biotite + biopython + rdkit (data/CCD/parsing),
+  modelcif, etc. (the protenix.runner subpackage may also need installing from
+  the repo, not just the PyPI wheel).
+- data: CCD components file (components.v20240608.cif[.rdkit_mol.pkl]) +
+  cluster/release files; MSA inputs.
+- the reference targets GPU; CPU-only viability for the full pipeline is unknown
+  (some ops/deepspeed may assume CUDA).
+This is the featurization-pipeline INTEGRATION — a focused multi-session effort,
+not a per-iteration parity gate. The verified, dim-parametric tt-bio modules
+(real-weight-validated on base + v2) are ready to receive its feats.
