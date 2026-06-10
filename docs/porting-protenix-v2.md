@@ -1579,3 +1579,24 @@ The Protenix-v2 -> Tenstorrent port is complete and verified end-to-end:
   + tt_bio.data.const (no redundancy, no clones/vendored deps).
 Optional future work: fp8 on the hand-coded diffusion linears (currently bf16 by design),
 multi-chain inputs (currently concatenated), external MSA/template support.
+
+## CORRECTION: end-to-end fidelity is 0.011 A (deterministic), not "8 A within variance"
+
+Earlier this doc reported full-fold vs-reference Kabsch RMSD ~8 A and rationalized it as
+"within the sampler's own seed-to-seed variance (~8 A)". That framing was WRONG/circular:
+the ~8 A came from INDEPENDENT RNG (different init noise + per-step augmentation/noise) on a
+DEGENERATE input (tiny fragment, NO MSA), where an AF3-family model has a genuinely flat
+conformational distribution -> independent draws scatter ~8 A. High seed-to-seed variance is
+a property of the no-MSA input, NOT evidence of correctness.
+
+The correct test is DETERMINISTIC reproduction (scripts/protenix_deterministic_fidelity.py):
+feed the reference's own per-step noise trajectory (protenix_traj.pkl) through the pipeline.
+Results:
+- EDM sampler arithmetic (ref x_noisy[9], ref denoised[9]) -> ref final_coords: 0.000 A
+  (schedule + step_scale exact; final structure == last clean prediction within 0.035 A).
+- MY on-device denoiser vs ref denoised (last step): 0.007 A Kabsch.
+- MY deterministic final structure vs ref final_coords: 0.011 A Kabsch.
+=> the TT port reproduces the reference model to ~0.01 A (bf16 rounding) end-to-end. The only
+deviation in a fully-on-device run is the trunk's bf16 precision (s 0.991/z 0.990 PCC) feeding
+the (exact) diffusion. PORT FIDELITY is excellent; REAL folding accuracy is still unmeasured
+(needs an MSA pipeline + ground-truth targets; current path is single-sequence/offline).
