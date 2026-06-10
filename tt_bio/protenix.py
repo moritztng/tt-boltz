@@ -33,6 +33,26 @@ from .protenix_weights import remap_adaln  # single source of all v2->tt-bio wei
 from .tenstorrent import Module, CORE_GRID_MAIN, WeightScope
 
 
+def _window_q(x, N, NP, nq=32):
+    """Window the query axis into local blocks: (N,C)|(1,N,C) -> (NP//nq, nq, C), right-padded
+    to NP. Shared by the atom-encoder and diffusion atom-cache windowing."""
+    x = ttnn.reshape(x, (1, N, x.shape[-1])) if len(x.shape) == 2 else x
+    x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+    x = ttnn.pad(x, [[0, 0], [0, NP - N], [0, 0]], 0.0)
+    return ttnn.to_layout(ttnn.reshape(x, (NP // nq, nq, x.shape[-1])), ttnn.TILE_LAYOUT)
+
+
+def _window_kv(x, N, NP, nq=32, nk=128, pad_left=48):
+    """Window the key/value axis into overlapping local blocks: (N,C)|(1,N,C) -> (NP//nq, nk, C)
+    with a left pad of (nk-nq)/2. Shared windowing for the local atom-pair attention."""
+    x = ttnn.reshape(x, (1, N, x.shape[-1])) if len(x.shape) == 2 else x
+    C = x.shape[-1]; nb = NP // nq; Lp = pad_left + NP + nk
+    x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+    x = ttnn.pad(x, [[0, 0], [pad_left, Lp - pad_left - N], [0, 0]], 0.0)
+    bl = [ttnn.slice(x, [0, i * nq, 0], [1, i * nq + nk, C]) for i in range(nb)]
+    return ttnn.to_layout(ttnn.reshape(ttnn.concat(bl, 0), (nb, nk, C)), ttnn.TILE_LAYOUT)
+
+
 class AtomTransformer(Module):
     """Protenix AtomTransformer = DiffusionTransformer(cross_attention_mode=True),
     3 blocks, local windowed attention (n_queries=32, n_keys=128). Fully on-device.
@@ -219,19 +239,11 @@ class AtomAttentionEncoder(Module):
         return ttnn.linear(x, self._T(key), compute_kernel_config=self.compute_kernel_config,
                            core_grid=CORE_GRID_MAIN)
 
-    def _win_q(self, x, N, NP):  # (1,N,C) -> (nb,nq,C)
-        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        x = ttnn.pad(x, [[0, 0], [0, NP - N], [0, 0]], 0.0)
-        x = ttnn.reshape(x, (NP // self.NQ, self.NQ, x.shape[-1]))
-        return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+    def _win_q(self, x, N, NP):
+        return _window_q(x, N, NP, self.NQ)
 
-    def _win_kv(self, x, N, NP):  # (1,N,C) -> (nb,nk,C)
-        C = x.shape[-1]; nb = NP // self.NQ; Lp = self.PAD_LEFT + NP + self.NK
-        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        x = ttnn.pad(x, [[0, 0], [self.PAD_LEFT, Lp - self.PAD_LEFT - N], [0, 0]], 0.0)
-        blocks = [ttnn.slice(x, [0, i * self.NQ, 0], [1, i * self.NQ + self.NK, C]) for i in range(nb)]
-        x = ttnn.concat(blocks, 0)
-        return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+    def _win_kv(self, x, N, NP):
+        return _window_kv(x, N, NP, self.NQ, self.NK, self.PAD_LEFT)
 
     def _augment_plm(self, p, c_l, N, NP):
         # p: (nb,nq,nk,16); add windowed c_l projections + small_mlp. c_l: (1,N,128).
@@ -434,17 +446,10 @@ class DiffusionModule:
 
     # --- windowing helpers (atom encoder p augmentation) ---
     def _winq(self, x, N, NP):
-        nb = NP // self.NQ
-        x = ttnn.to_layout(ttnn.reshape(x, (1, N, 128)), ttnn.ROW_MAJOR_LAYOUT)
-        x = ttnn.pad(x, [[0, 0], [0, NP - N], [0, 0]], 0.0)
-        return ttnn.to_layout(ttnn.reshape(x, (nb, self.NQ, 128)), ttnn.TILE_LAYOUT)
+        return _window_q(x, N, NP, self.NQ)
 
     def _winkv(self, x, N, NP):
-        nb = NP // self.NQ; Lp = self.PAD_LEFT + NP + self.NK
-        x = ttnn.to_layout(ttnn.reshape(x, (1, N, 128)), ttnn.ROW_MAJOR_LAYOUT)
-        x = ttnn.pad(x, [[0, 0], [self.PAD_LEFT, Lp - self.PAD_LEFT - N], [0, 0]], 0.0)
-        bl = [ttnn.slice(x, [0, i * self.NQ, 0], [1, i * self.NQ + self.NK, 128]) for i in range(nb)]
-        return ttnn.to_layout(ttnn.reshape(ttnn.concat(bl, 0), (nb, self.NK, 128)), ttnn.TILE_LAYOUT)
+        return _window_kv(x, N, NP, self.NQ, self.NK, self.PAD_LEFT)
 
     def _dit_pair_biases(self, pair_z):
         """Per-block DiT attention pair bias linear_z(LN(LN(pair_z))). Depends only on the
