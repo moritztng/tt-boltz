@@ -15,6 +15,14 @@ from __future__ import annotations
 
 import torch
 
+# weight remaps live in the package (single source); re-exported here for the
+# reference-parity tests. remap_adaptive_layernorm is the AdaLN remap.
+from tt_bio.protenix_weights import (  # noqa: E402
+    remap_triangle_multiplication, remap_transition, remap_attention_pair_bias,
+    remap_pairformer_block, remap_outer_product_mean, remap_pair_weighted_averaging,
+    remap_msa_pair_stack, remap_adaln as remap_adaptive_layernorm,
+)
+
 # --- Confirmed Protenix-v2 architecture (from protenix.model + config) --------
 # AF3-standard, identical block graph to Boltz-2 (already ported in tt-bio).
 PROTENIX_ARCH = {
@@ -51,28 +59,6 @@ def make_triangle_multiplication(c_z=128, c_hidden=128, outgoing=True, seed=0):
     for p in mod.parameters():
         p.data.normal_(0.0, 0.5)
     return mod, mod.state_dict()
-
-
-def remap_triangle_multiplication(ref_sd: dict) -> dict:
-    """Map OpenFold TriangleMultiplication weights -> tt-bio's fused
-    TriangleMultiplication layout (tt_bio.tenstorrent.TriangleMultiplication).
-
-    tt-bio packs the per-side gate/value projections into fused g_in / p_in
-    (rows = [a-side (c_hidden), b-side (c_hidden)]) and computes
-    a = linear_a_p(z) * sigmoid(linear_a_g(z)) — identical to OpenFold's
-    a = a * sigmoid(linear_a_g(z)) * linear_a_p(z).
-    """
-    return {
-        "norm_in.weight": ref_sd["layer_norm_in.weight"],
-        "norm_in.bias": ref_sd["layer_norm_in.bias"],
-        "norm_out.weight": ref_sd["layer_norm_out.weight"],
-        "norm_out.bias": ref_sd["layer_norm_out.bias"],
-        # fused: rows [a-gate ; b-gate] and [a-proj ; b-proj]
-        "g_in.weight": torch.cat([ref_sd["linear_a_g.weight"], ref_sd["linear_b_g.weight"]], dim=0),
-        "p_in.weight": torch.cat([ref_sd["linear_a_p.weight"], ref_sd["linear_b_p.weight"]], dim=0),
-        "g_out.weight": ref_sd["linear_g.weight"],   # output gate
-        "p_out.weight": ref_sd["linear_z.weight"],   # output projection
-    }
 
 
 def run_reference_triangle_multiplication(mod, z, mask=None):
@@ -125,18 +111,6 @@ def make_transition(c_in=128, n=4, seed=0):
     return mod, mod.state_dict()
 
 
-def remap_transition(ref_sd: dict) -> dict:
-    """Protenix Transition -> tt-bio Transition. Both: out = linear(silu(a)*b),
-    a/b = linear_{a,b}(LN(x)). tt-bio folds silu into fc1."""
-    return {
-        "norm.weight": ref_sd["layernorm1.weight"],
-        "norm.bias": ref_sd["layernorm1.bias"],
-        "fc1.weight": ref_sd["linear_no_bias_a.weight"],  # gets silu in tt-bio
-        "fc2.weight": ref_sd["linear_no_bias_b.weight"],
-        "fc3.weight": ref_sd["linear_no_bias.weight"],
-    }
-
-
 def run_reference_transition(mod, x):
     with torch.no_grad():
         return mod(x)
@@ -154,27 +128,6 @@ def make_attention_pair_bias(c_a=384, c_z=128, n_heads=16, seed=0):
     return mod, mod.state_dict()
 
 
-def remap_attention_pair_bias(ref_sd: dict) -> dict:
-    """Protenix AttentionPairBias -> tt-bio AttentionPairBias (atom_level=False,
-    compute_pair_bias=True). The input-`a` LayerNorm is applied externally by the
-    caller (tt-bio does it via PairformerLayer.pre_norm_s); here the test feeds
-    layernorm_a(a). Verified raw mapping (PCC 0.99986) — q has a bias."""
-    return {
-        "proj_q.weight": ref_sd["attention.linear_q.weight"],
-        "proj_q.bias": ref_sd["attention.linear_q.bias"],
-        "proj_k.weight": ref_sd["attention.linear_k.weight"],
-        "proj_v.weight": ref_sd["attention.linear_v.weight"],
-        "proj_g.weight": ref_sd["attention.linear_g.weight"],
-        "proj_o.weight": ref_sd["attention.linear_o.weight"],
-        "proj_z.0.weight": ref_sd["layernorm_z.weight"],
-        # layernorm_z has no bias when create_offset_ln_z=False (diffusion APB);
-        # tt-bio's z-norm always has a bias slot, so default to zeros.
-        "proj_z.0.bias": ref_sd.get("layernorm_z.bias", torch.zeros_like(ref_sd["layernorm_z.weight"])),
-        "proj_z.1.weight": ref_sd["linear_nobias_z.weight"],
-    }
-
-
-# --- Full PairformerBlock (composition of the 4 verified sub-modules) ---------
 def make_pairformer_block(c_z=128, c_s=384, n_heads=16, c_hidden_mul=128,
                           c_hidden_pair_att=32, no_heads_pair=4, seed=0):
     from protenix.model.modules.pairformer import PairformerBlock
@@ -187,36 +140,6 @@ def make_pairformer_block(c_z=128, c_s=384, n_heads=16, c_hidden_mul=128,
     for p in mod.parameters():
         p.data.normal_(0.0, 0.3)
     return mod, mod.state_dict()
-
-
-def remap_pairformer_block(sd: dict) -> dict:
-    """Protenix PairformerBlock -> tt-bio PairformerLayer flat state_dict.
-    tt-bio scopes: tri_mul_out/in (fused remap), tri_att_start/end (DIRECT — the
-    `mha.` prefix is stripped by scope), transition_z<-pair_transition,
-    attention<-attention_pair_bias.attention, pre_norm_s<-attention_pair_bias.
-    layernorm_a, transition_s<-single_transition."""
-    def sub(p):
-        return {k[len(p) + 1:]: v for k, v in sd.items() if k.startswith(p + ".")}
-
-    out = {}
-    for k, v in remap_triangle_multiplication(sub("tri_mul_out")).items():
-        out[f"tri_mul_out.{k}"] = v
-    for k, v in remap_triangle_multiplication(sub("tri_mul_in")).items():
-        out[f"tri_mul_in.{k}"] = v
-    for k, v in sub("tri_att_start").items():   # direct (scope strips mha.)
-        out[f"tri_att_start.{k}"] = v
-    for k, v in sub("tri_att_end").items():
-        out[f"tri_att_end.{k}"] = v
-    for k, v in remap_transition(sub("pair_transition")).items():
-        out[f"transition_z.{k}"] = v
-    apb = sub("attention_pair_bias")
-    out["pre_norm_s.weight"] = apb["layernorm_a.weight"]
-    out["pre_norm_s.bias"] = apb["layernorm_a.bias"]
-    for k, v in remap_attention_pair_bias(apb).items():
-        out[f"attention.{k}"] = v
-    for k, v in remap_transition(sub("single_transition")).items():
-        out[f"transition_s.{k}"] = v
-    return out
 
 
 def run_reference_pairformer_block(mod, s, z):
@@ -236,19 +159,6 @@ def make_outer_product_mean(c_m=128, c_z=128, c_hidden=32, seed=0):
     return mod, mod.state_dict()
 
 
-def remap_outer_product_mean(ref_sd: dict) -> dict:
-    """OpenFold OuterProductMean -> tt-bio OuterProductMean. Direct (verified
-    PCC 0.99962; the c_hidden^2 flatten order matches, no permute needed)."""
-    return {
-        "norm.weight": ref_sd["layer_norm.weight"],
-        "norm.bias": ref_sd["layer_norm.bias"],
-        "proj_a.weight": ref_sd["linear_1.weight"],
-        "proj_b.weight": ref_sd["linear_2.weight"],
-        "proj_o.weight": ref_sd["linear_out.weight"],
-        "proj_o.bias": ref_sd["linear_out.bias"],
-    }
-
-
 def run_reference_outer_product_mean(mod, m):
     with torch.no_grad():
         return mod(m, mask=torch.ones(m.shape[:-1], dtype=m.dtype))  # [B,L,L,c_z]
@@ -263,20 +173,6 @@ def make_pair_weighted_averaging(c_m=64, c=32, c_z=128, n_heads=8, seed=0):
     for p in mod.parameters():
         p.data.normal_(0.0, 0.3)
     return mod, mod.state_dict()
-
-
-def remap_pair_weighted_averaging(ref_sd: dict) -> dict:
-    """Protenix MSAPairWeightedAveraging -> tt-bio PairWeightedAveraging."""
-    return {
-        "norm_m.weight": ref_sd["layernorm_m.weight"],
-        "norm_m.bias": ref_sd["layernorm_m.bias"],
-        "norm_z.weight": ref_sd["layernorm_z.weight"],
-        "norm_z.bias": ref_sd["layernorm_z.bias"],
-        "proj_m.weight": ref_sd["linear_no_bias_mv.weight"],  # value
-        "proj_g.weight": ref_sd["linear_no_bias_mg.weight"],  # gate
-        "proj_z.weight": ref_sd["linear_no_bias_z.weight"],   # z -> per-head bias
-        "proj_o.weight": ref_sd["linear_no_bias_out.weight"],
-    }
 
 
 def run_reference_pair_weighted_averaging(mod, m, z):
@@ -298,24 +194,6 @@ def make_msa_block(c_m=64, c_z=128, c_hidden=32, seed=0):
     return mod, mod.state_dict()
 
 
-def remap_msa_pair_stack(ps_sd: dict) -> dict:
-    """Pair-only remap for the MSA block's pair_stack (PairformerBlock c_s=0)."""
-    def s(p):
-        return {k[len(p) + 1:]: v for k, v in ps_sd.items() if k.startswith(p + ".")}
-    out = {}
-    for k, v in remap_triangle_multiplication(s("tri_mul_out")).items():
-        out[f"tri_mul_out.{k}"] = v
-    for k, v in remap_triangle_multiplication(s("tri_mul_in")).items():
-        out[f"tri_mul_in.{k}"] = v
-    for k, v in s("tri_att_start").items():
-        out[f"tri_att_start.{k}"] = v
-    for k, v in s("tri_att_end").items():
-        out[f"tri_att_end.{k}"] = v
-    for k, v in remap_transition(s("pair_transition")).items():
-        out[f"transition_z.{k}"] = v
-    return out
-
-
 def run_reference_msa_block(mod, m, z):
     """Reference MSABlock forward. MUTATES m,z in place — pass clones."""
     with torch.no_grad():
@@ -331,17 +209,6 @@ def make_adaptive_layernorm(c_a=768, c_s=384, seed=0):
     for p in mod.parameters():
         p.data.normal_(0.0, 0.3)
     return mod, mod.state_dict()
-
-
-def remap_adaptive_layernorm(ref_sd: dict) -> dict:
-    """Protenix AdaptiveLayerNorm -> tt-bio AdaLN. a = sigmoid(linear_s(LN_s(s)))*
-    LN_a(a) + linear_nobias_s(LN_s(s)); LN_a has no affine on both sides."""
-    return {
-        "s_norm.weight": ref_sd["layernorm_s.weight"],
-        "s_scale.weight": ref_sd["linear_s.weight"],
-        "s_scale.bias": ref_sd["linear_s.bias"],
-        "s_bias.weight": ref_sd["linear_nobias_s.weight"],
-    }
 
 
 def run_reference_adaptive_layernorm(mod, a, s):

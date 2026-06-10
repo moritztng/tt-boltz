@@ -29,6 +29,17 @@ def remap_triangle_multiplication(ref_sd: dict) -> dict:
     }
 
 
+def remap_adaln(ref_sd: dict) -> dict:
+    """Protenix AdaptiveLayerNorm -> tt-bio AdaLN. a = sigmoid(linear_s(LN_s(s)))*LN_a(a)
+    + linear_nobias_s(LN_s(s)); LN_a has no affine. Validated on-device (PCC 0.999996)."""
+    return {
+        "s_norm.weight": ref_sd["layernorm_s.weight"],
+        "s_scale.weight": ref_sd["linear_s.weight"],
+        "s_scale.bias": ref_sd["linear_s.bias"],
+        "s_bias.weight": ref_sd["linear_nobias_s.weight"],
+    }
+
+
 def remap_transition(ref_sd: dict) -> dict:
     """Protenix Transition -> tt-bio Transition (silu folded into fc1)."""
     return {

@@ -28,19 +28,9 @@ scripts/protenix_predict.py -> PDB). Remaining (packaging): data-pipeline vendor
 import torch
 import ttnn
 
+from . import protenix_weights as PW
+from .protenix_weights import remap_adaln  # single source of all v2->tt-bio weight remaps
 from .tenstorrent import Module, CORE_GRID_MAIN, WeightScope
-
-
-def remap_adaln(sd):
-    """Protenix AdaptiveLayerNorm -> tt-bio AdaLN weight names. Math is identical:
-    sigmoid(linear_s(LN(s)))*LN(a) + linear_nobias_s(LN(s)).  Validated on-device
-    (PCC 0.999996 vs the v2 reference, scripts/ check)."""
-    return {
-        "s_norm.weight": sd["layernorm_s.weight"],
-        "s_scale.weight": sd["linear_s.weight"],
-        "s_scale.bias": sd["linear_s.bias"],
-        "s_bias.weight": sd["linear_nobias_s.weight"],
-    }
 
 
 class AtomTransformer(Module):
@@ -326,10 +316,9 @@ class DiffusionModule:
                                     compute_kernel_config)
         self._wc = {}  # device-weight cache (upload once; reused across all sampling steps)
         from .tenstorrent import AdaLN, AttentionPairBias, Transition
-        from . import protenix_weights as PW
         C = "diffusion_conditioning."
         self._cond_transitions = [
-            Transition(self._remap_transition({k[len(C + nm + "."):]: v for k, v in self.w.items()
+            Transition(PW.remap_transition({k[len(C + nm + "."):]: v for k, v in self.w.items()
                                                 if k.startswith(C + nm + ".")}), compute_kernel_config)
             for nm in ("transition_s1", "transition_s2")]
         # On-device token DiT: per-block AdaLN + AttentionPairBias (compute_pair_bias=False,
@@ -521,17 +510,6 @@ class DiffusionModule:
             a_t = ttnn.add(ttnn.multiply(cs, linb(bb, Cc + "linear_nobias_b.weight")), ao)
         return a_t
 
-    @staticmethod
-    def _remap_transition(sd):
-        """Protenix Transition -> tt-bio Transition keys (silu folded into fc1)."""
-        return {
-            "norm.weight": sd["layernorm1.weight"],
-            "norm.bias": sd["layernorm1.bias"],
-            "fc1.weight": sd["linear_no_bias_a.weight"],
-            "fc2.weight": sd["linear_no_bias_b.weight"],
-            "fc3.weight": sd["linear_no_bias.weight"],
-        }
-
 
 class ConfidenceHead:
     """Protenix-v2 ConfidenceHead -> per-atom pLDDT (and pae/pde logits).
@@ -544,7 +522,6 @@ class ConfidenceHead:
     def __init__(self, conf_state_dict, device, compute_kernel_config):
         import re
         from .tenstorrent import Pairformer
-        from . import protenix_weights as PW
         self.w = dict(conf_state_dict)
         self.dev = device
         self.ckc = compute_kernel_config
@@ -733,7 +710,7 @@ class Protenix:
         pz = ttnn.reshape(pz, (1, N, N, pz.shape[-1]))
         for nm in ("transition_z1", "transition_z2"):
             sub = {k[len(C + nm + "."):]: v for k, v in self.sd.items() if k.startswith(C + nm + ".")}
-            t = Transition(DiffusionModule._remap_transition(sub), self.ckc)
+            t = Transition(PW.remap_transition(sub), self.ckc)
             pz = ttnn.add(pz, t(pz))
         return self._to_host(pz)
 
@@ -826,7 +803,6 @@ class Trunk:
         import re
         from .tenstorrent import (get_device, Pairformer, PairformerLayer,
                                    OuterProductMean, PairWeightedAveraging, Transition)
-        from . import protenix_weights as PW
         self.sd = model_state_dict
         self.ckc = compute_kernel_config
         self.dev = get_device()
