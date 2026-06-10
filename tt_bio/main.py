@@ -1257,6 +1257,8 @@ def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
         names.extend(atoms)
     arr = struc.AtomArray(coords.shape[0])
     arr.coord = coords.numpy().astype("float32")
+    arr.add_annotation("occupancy", float); arr.occupancy[:] = 1.0
+    arr.add_annotation("b_factor", float); arr.b_factor[:] = 0.0
     for i in range(coords.shape[0]):
         t = a2t[i]
         res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
