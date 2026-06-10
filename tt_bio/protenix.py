@@ -62,11 +62,17 @@ class AtomTransformer(Module):
         super().__init__(state_dict, compute_kernel_config)
         self.n_blocks = n_blocks
         self._w = {k: v for k, v in self.weights.data.items()}
+        self._wc = {}  # cache of device weights (upload once; reused every block/step)
 
     def _T(self, key, t=True):
-        w = self._w[key]
-        return ttnn.from_torch(w.t().contiguous() if t else w, layout=ttnn.TILE_LAYOUT,
-                               device=self.device, dtype=ttnn.bfloat16)
+        ck = (key, t)
+        v = self._wc.get(ck)
+        if v is None:
+            w = self._w[key]
+            v = ttnn.from_torch(w.t().contiguous() if t else w, layout=ttnn.TILE_LAYOUT,
+                                device=self.device, dtype=ttnn.bfloat16)
+            self._wc[ck] = v
+        return v
 
     def _lin(self, x, wkey, bkey=None, activation=None):
         return ttnn.linear(x, self._T(wkey), bias=(self._T(bkey, t=False) if bkey else None),
@@ -318,10 +324,21 @@ class DiffusionModule:
                                         for k, v in self.w.items()
                                         if k.startswith("atom_attention_decoder.atom_transformer.")},
                                     compute_kernel_config)
+        self._wc = {}  # device-weight cache (upload once; reused across all sampling steps)
+        from .tenstorrent import Transition
+        C = "diffusion_conditioning."
+        self._cond_transitions = [
+            Transition(self._remap_transition({k[len(C + nm + "."):]: v for k, v in self.w.items()
+                                                if k.startswith(C + nm + ".")}), compute_kernel_config)
+            for nm in ("transition_s1", "transition_s2")]
 
     def _T(self, key):
-        return ttnn.from_torch(self.w[key].t().contiguous(), layout=ttnn.TILE_LAYOUT,
-                               device=self.dev, dtype=ttnn.bfloat16)
+        v = self._wc.get(key)
+        if v is None:
+            v = ttnn.from_torch(self.w[key].t().contiguous(), layout=ttnn.TILE_LAYOUT,
+                                device=self.dev, dtype=ttnn.bfloat16)
+            self._wc[key] = v
+        return v
 
     def _dev(self, t):
         return ttnn.from_torch(t, layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
@@ -356,11 +373,7 @@ class DiffusionModule:
         nn_ = self._lin(self._ln(T(fou), "diffusion_conditioning.layernorm_n.weight"),
                         "diffusion_conditioning.linear_no_bias_n.weight")
         ss = ttnn.reshape(ttnn.add(ss, nn_), (1, NT, ss.shape[-1]))
-        for nm in ("transition_s1", "transition_s2"):
-            pre = f"diffusion_conditioning.{nm}."
-            sub = {k[len(pre):]: v for k, v in self.w.items() if k.startswith(pre)}
-            from .tenstorrent import Transition
-            t = Transition(self._remap_transition(sub), self.ckc)
+        for t in self._cond_transitions:   # prebuilt once (weights resident)
             ss = ttnn.add(ss, ttnn.reshape(t(ss), tuple(ss.shape)))
         s_single = ss
 
@@ -690,9 +703,11 @@ class Protenix:
         return torch.stack([ztok[aq[b][:, None].expand(NQ, NK), ak[b][None, :].expand(NQ, NK)]
                             for b in range(nb)], 0)                            # (nb,nq,nk,16)
 
-    def fold(self, feats, *, n_step=200, n_sample=1, seed=None, progress_fn=None, return_confidence=False):
-        """Run the full pipeline. feats: model-ready tensor dict. Returns coords
-        (n_sample, N, 3) host tensor; if return_confidence, returns (coords, mean_pLDDT)."""
+    def fold(self, feats, *, n_step=200, n_sample=1, seed=None, progress_fn=None,
+             return_confidence=False, n_cycles=None):
+        """Run the full pipeline. feats: model-ready tensor dict. n_cycles = trunk recycling
+        iterations (default 10, protenix-v2's spec; fewer trades accuracy for speed). Returns
+        coords (n_sample, N, 3) host tensor; if return_confidence, returns (coords, mean_pLDDT)."""
         import torch
         fi = self._atom_feat_inputs(feats)
         N, NT, nb, nq, nk = fi["N"], fi["NT"], fi["nb"], fi["nq"], fi["nk"]
@@ -713,7 +728,8 @@ class Protenix:
         p_lm = self._to_host(self.diff_feat.p_lm(tt(fi["d"]), tt(fi["v"]), tt(fi["invd"]), mt_dev), (nb, nq, nk, 16))
         # 3) trunk
         relp = feats["relp"] if "relp" in feats else self._generate_relp(feats)
-        s_trunk_tt, z_tt = self.trunk(feats, s_inputs, relp, feats["token_bonds"], progress_fn=progress_fn)
+        s_trunk_tt, z_tt = self.trunk(feats, s_inputs, relp, feats["token_bonds"],
+                                      progress_fn=progress_fn, n_cycles=n_cycles)
         s_trunk = self._to_host(s_trunk_tt, (NT, s_trunk_tt.shape[-1]))
         z_trunk = self._to_host(z_tt, (NT, NT, self.trunk.C_Z))   # raw trunk z (for confidence)
         # diffusion pair conditioning (once, t-independent): conditioned pair_z
@@ -758,6 +774,7 @@ class Trunk:
         self.sd = model_state_dict
         self.ckc = compute_kernel_config
         self.dev = get_device()
+        self._wc = {}  # cached device weights (upload once; reused every recycle cycle)
         ti_keys = ("linear_no_bias_sinit", "linear_no_bias_zinit1", "linear_no_bias_zinit2",
                    "linear_no_bias_token_bond", "relative_position_encoding")
         ti_sd = {k: v for k, v in self.sd.items() if any(k.startswith(p) for p in ti_keys)}
@@ -796,18 +813,24 @@ class Trunk:
                 tm = Transition(PW.remap_transition(sub(P + "msa_stack.transition_m.")), compute_kernel_config)
             self.MSA.append((opm, pwa, tm, pl))
 
-    def _T(self, x):
+    def _T(self, x):                       # activation uploader (per-call, not cached)
         return ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
 
-    def _g(self, k):
-        return self.sd[k]
+    def _W(self, key, transpose):          # cached device weight (upload once; reused every cycle)
+        ck = (key, transpose)
+        v = self._wc.get(ck)
+        if v is None:
+            w = self.sd[key]
+            v = self._T(w.t().contiguous() if transpose else w)
+            self._wc[ck] = v
+        return v
 
     def _lin(self, x, k):
-        return ttnn.linear(x, self._T(self.sd[k].t().contiguous()),
+        return ttnn.linear(x, self._W(k, True),
                            compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
 
     def _ln(self, x, wk, bk=None):
-        return ttnn.layer_norm(x, weight=self._T(self._g(wk)), bias=(self._T(self._g(bk)) if bk else None),
+        return ttnn.layer_norm(x, weight=self._W(wk, False), bias=(self._W(bk, False) if bk else None),
                                epsilon=1e-5, compute_kernel_config=self.ckc)
 
     def _template(self, z3, te_at, N, nt):
@@ -832,9 +855,10 @@ class Trunk:
             z3 = pl(None, z3)[1]
         return z3
 
-    def __call__(self, feat, s_inputs, relp, token_bonds, progress_fn=None):
+    def __call__(self, feat, s_inputs, relp, token_bonds, progress_fn=None, n_cycles=None):
         """feat: dict with template_* / msa / has_deletion / deletion_value / asym_id (host
-        tensors). s_inputs (N,449), relp (N,N,139), token_bonds (N,N) host. Returns
+        tensors). s_inputs (N,449), relp (N,N,139), token_bonds (N,N) host. n_cycles is the
+        number of recycling iterations (default N_CYCLES=10, protenix-v2's spec). Returns
         (s_trunk (N,384), z_trunk (1,N,N,256)) as ttnn tensors."""
         import torch
         import torch.nn.functional as F
@@ -861,9 +885,10 @@ class Trunk:
                           self._lin(self._T(s_inputs), "msa_module.linear_no_bias_s.weight"))
         z3 = ttnn.reshape(ttnn.mul(z_init, 0.0), (1, N, N, self.C_Z))
         s = ttnn.mul(s_init, 0.0)
-        for cyc in range(self.N_CYCLES):
+        n_cycles = self.N_CYCLES if n_cycles is None else n_cycles
+        for cyc in range(n_cycles):
             if progress_fn:
-                progress_fn("trunk", step=cyc, total=self.N_CYCLES)
+                progress_fn("trunk", step=cyc, total=n_cycles)
             zc = self._lin(self._ln(z3, "layernorm_z_cycle.weight", "layernorm_z_cycle.bias"), "linear_no_bias_z_cycle.weight")
             z3 = ttnn.add(ttnn.reshape(z_init, (1, N, N, self.C_Z)), zc)
             if nt > 0:

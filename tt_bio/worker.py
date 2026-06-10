@@ -329,6 +329,7 @@ class _WorkerState:
         coords, plddt = self.model.fold(
             feats, n_step=cfg["sampling_steps"], n_sample=cfg["diffusion_samples"],
             seed=cfg.get("seed") or 0, progress_fn=_pfn, return_confidence=True,
+            n_cycles=cfg.get("recycling_steps"),
         )
         out = Path(cfg["struct_dir"]) / f"{path.stem}.{cfg['output_format']}"
         _write_protenix_structure(coords[0], feats, aatype_from_sequence(seq), out, cfg["output_format"])
