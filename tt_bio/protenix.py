@@ -325,12 +325,30 @@ class DiffusionModule:
                                         if k.startswith("atom_attention_decoder.atom_transformer.")},
                                     compute_kernel_config)
         self._wc = {}  # device-weight cache (upload once; reused across all sampling steps)
-        from .tenstorrent import Transition
+        from .tenstorrent import AdaLN, AttentionPairBias, Transition
+        from . import protenix_weights as PW
         C = "diffusion_conditioning."
         self._cond_transitions = [
             Transition(self._remap_transition({k[len(C + nm + "."):]: v for k, v in self.w.items()
                                                 if k.startswith(C + nm + ".")}), compute_kernel_config)
             for nm in ("transition_s1", "transition_s2")]
+        # On-device token DiT: per-block AdaLN + AttentionPairBias (compute_pair_bias=False,
+        # fed the precomputed UNSCALED bias as the SDPA mask -> matches the host math exactly;
+        # these primitives handle the head_dim=48 tile padding). s-gate + conditioned-transition
+        # are raw ttnn (protenix's ctb differs from tt-bio's ConditionedTransitionBlock).
+        self.device_dit = True
+        DT = "diffusion_transformer."
+        sub = lambda pfx: {k[len(pfx):]: v for k, v in self.w.items() if k.startswith(pfx)}
+        self._dit = []
+        for b in range(self.DIT_BLOCKS):
+            A = DT + f"blocks.{b}.attention_pair_bias."
+            Cc = DT + f"blocks.{b}.conditioned_transition_block."
+            self._dit.append((
+                AdaLN(False, remap_adaln(sub(A + "layernorm_a.")), compute_kernel_config),
+                AttentionPairBias(self.DIT_HEAD_DIM, self.DIT_N_HEADS, True, False,
+                                  PW.remap_attention_pair_bias(sub(A)), compute_kernel_config),
+                AdaLN(False, remap_adaln(sub(Cc + "adaln.")), compute_kernel_config),
+                A, Cc))
 
     def _T(self, key):
         v = self._wc.get(key)
@@ -400,12 +418,17 @@ class DiffusionModule:
                       "linear_no_bias_s.weight"), (NT, 768)))
 
         # 3) token DiT (fp32 host; precision-limited on-device, see class docstring)
-        a_h = torch.Tensor(ttnn.to_torch(ttnn.reshape(a_tok, (1, NT, 768)))).float().reshape(NT, 768)
-        s_h = torch.Tensor(ttnn.to_torch(s_single)).float().reshape(NT, s_single.shape[-1])
-        # per-block pair bias depends only on pair_z (fixed across steps) -> precompute once
-        biases = cond.get("dit_biases") or self._dit_pair_biases(pair_z)
-        a_h = self._token_dit(a_h, s_h, biases, NT)
-        a_t = self._ln(T(a_h.reshape(1, NT, 768)), "layernorm_a.weight")
+        # per-block pair bias depends only on pair_z (fixed across steps) -> precomputed once
+        if self.device_dit and cond.get("dit_z") is not None:
+            a_t = self._token_dit_device(ttnn.reshape(a_tok, (1, NT, 768)), s_single,
+                                         cond["dit_z"], NT)
+            a_t = self._ln(a_t, "layernorm_a.weight")
+        else:  # host fp32 fallback (max fidelity / no precomputed device bias)
+            a_h = torch.Tensor(ttnn.to_torch(ttnn.reshape(a_tok, (1, NT, 768)))).float().reshape(NT, 768)
+            s_h = torch.Tensor(ttnn.to_torch(s_single)).float().reshape(NT, s_single.shape[-1])
+            biases = cond.get("dit_biases") or self._dit_pair_biases(pair_z)
+            a_h = self._token_dit(a_h, s_h, biases, NT)
+            a_t = self._ln(T(a_h.reshape(1, NT, 768)), "layernorm_a.weight")
 
         # 4) atom decoder
         DE = "atom_attention_decoder."
@@ -469,6 +492,34 @@ class DiffusionModule:
             an2 = adaln(ao, s_h, Cc + "adaln."); bb = F.silu(F.linear(an2, gP(Cc + "linear_nobias_a1.weight"))) * F.linear(an2, gP(Cc + "linear_nobias_a2.weight"))
             a_h = torch.sigmoid(F.linear(s_h, gP(Cc + "linear_s.weight"), gP(Cc + "linear_s.bias"))) * F.linear(bb, gP(Cc + "linear_nobias_b.weight")) + ao
         return a_h
+
+    def _dit_z_device(self, pair_z):
+        """Upload LN(pair_z) once per fold as (1,NT,NT,c_z) for the on-device DiT; each block's
+        AttentionPairBias (compute_pair_bias=True) derives its own pair bias from it (matching
+        the validated trunk-pairformer convention, incl. the head-dim scaling)."""
+        import torch.nn.functional as F
+        z_h = F.layer_norm(pair_z, (pair_z.shape[-1],)).unsqueeze(0).contiguous()
+        return ttnn.from_torch(z_h, layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
+
+    def _token_dit_device(self, a_t, s_t, z_dev, NT):
+        """On-device 24-block token DiT (ttnn). a_t (1,NT,768), s_t (1,NT,384); z_dev =
+        LN(pair_z) (1,NT,NT,c_z). Mirrors host _token_dit; reuses AdaLN + AttentionPairBias."""
+        ckc = self.ckc
+
+        def linb(x, wk, bk=None, act=None):
+            return ttnn.linear(x, self._T(wk), bias=(self._T(bk) if bk else None), activation=act,
+                               compute_kernel_config=ckc, core_grid=CORE_GRID_MAIN)
+        for (adaln_a, apb, ctb_adaln, A, Cc) in self._dit:
+            b = adaln_a(a_t, s_t)
+            attn = apb(b, z_dev)
+            sg = ttnn.sigmoid(linb(s_t, A + "linear_a_last.weight", A + "linear_a_last.bias"))
+            ao = ttnn.add(ttnn.multiply(attn, sg), a_t)
+            an2 = ctb_adaln(ao, s_t)
+            bb = ttnn.multiply(linb(an2, Cc + "linear_nobias_a1.weight", act="silu"),
+                               linb(an2, Cc + "linear_nobias_a2.weight"))
+            cs = ttnn.sigmoid(linb(s_t, Cc + "linear_s.weight", Cc + "linear_s.bias"))
+            a_t = ttnn.add(ttnn.multiply(cs, linb(bb, Cc + "linear_nobias_b.weight")), ao)
+        return a_t
 
     @staticmethod
     def _remap_transition(sd):
@@ -739,7 +790,12 @@ class Protenix:
         # 4) EDM sampler
         cond = {"s_trunk": s_trunk, "s_inputs": s_inputs, "pair_z": pair_z, "c_l": c_l,
                 "p_lm": p_lm, "S": S, "mask_trunked": mt.float()}
-        cond["dit_biases"] = self.diffusion._dit_pair_biases(pair_z)  # t-independent; once
+        # DiT pair input is t-independent -> upload LN(pair_z) once (on-device DiT derives the
+        # per-block bias), or precompute the host biases for the fp32 fallback.
+        if self.diffusion.device_dit:
+            cond["dit_z"] = self.diffusion._dit_z_device(pair_z)
+        else:
+            cond["dit_biases"] = self.diffusion._dit_pair_biases(pair_z)
         coords = []
         for k in range(n_sample):
             sd_seed = None if seed is None else seed + k
