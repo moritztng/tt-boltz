@@ -19,6 +19,8 @@ inference path. restype uses the standard AF order (A R N D C Q E G H I L K M F 
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 # standard AlphaFold restype order (index -> one-letter); index 7=G, 15=S (matches v2 golden)
@@ -45,14 +47,91 @@ def load_ref_conformers() -> dict:
     return {k: torch.tensor(v, dtype=torch.float32) for k, v in json.load(open(path)).items()}
 
 
-def build_protein_features(sequence: str) -> dict:
-    """Full model-ready input_feature_dict for a single offline protein chain from a
-    one-letter sequence. Combines token + atom features (bundled reference conformers).
-    The model (tt_bio.protenix.Protenix.fold) regenerates relp / d_lm / v_lm / mask_trunked
-    internally, so this is everything fold needs."""
+MSA_GAP_IDX = RESTYPE_DIM - 1  # protenix MSA vocab: gap '-' is the last class (31)
+
+
+def _msa_token(c: str) -> int:
+    """a3m residue char -> protenix MSA token: aa->0-19 (AF order), '-'->31, else->UNK(20)."""
+    if c == "-":
+        return MSA_GAP_IDX
+    i = _AA1_TO_IDX.get(c.upper(), -1)
+    return i if 0 <= i < 20 else 20
+
+
+def _parse_a3m(a3m: str) -> list[str]:
+    """a3m text -> list of aligned sequence strings (query first)."""
+    seqs, buf = [], []
+    for line in a3m.splitlines():
+        if line.startswith(">"):
+            if buf:
+                seqs.append("".join(buf)); buf = []
+        elif line:
+            buf.append(line.strip())
+    if buf:
+        seqs.append("".join(buf))
+    return seqs
+
+
+def protein_msa_features(a3m: str, query: str) -> dict | None:
+    """Build protenix MSA features from an a3m aligned to `query`.
+
+    a3m convention: query is row 0; uppercase = match columns, lowercase = insertions
+    (deletions relative to the query), '-' = gap. Per protenix
+    (data/msa/msa_featurizer.py): profile = per-column token frequency over 32 classes
+    (incl. gap), deletion_value = arctan(deletions/3)*2/pi, has_deletion = clip(deletions,0,1),
+    deletion_mean = raw column-mean deletions. Returns None if the a3m is not aligned to this
+    exact query (caller falls back to single-sequence)."""
+    rows = _parse_a3m(a3m)
+    if not rows:
+        return None
+
+    def featurize(seq: str):
+        toks, dels, d = [], [], 0
+        for ch in seq:
+            if ch.islower():          # insertion relative to query
+                d += 1
+            else:                      # match column (uppercase residue or '-')
+                toks.append(_msa_token(ch)); dels.append(d); d = 0
+        return toks, dels
+
+    n_tok = len(query)
+    if len(featurize(rows[0])[0]) != n_tok:
+        return None                    # a3m query not aligned to this exact sequence
+    msa, delmat, seen = [], [], set()
+    for seq in rows:
+        if seq in seen:                # dedup identical alignment rows (incl. insertions)
+            continue
+        seen.add(seq)
+        toks, dels = featurize(seq)
+        if len(toks) != n_tok:
+            continue
+        msa.append(toks); delmat.append(dels)
+    M = torch.tensor(msa, dtype=torch.long)
+    DM = torch.tensor(delmat, dtype=torch.float32)
+    profile = torch.stack([(M == k).float().mean(0) for k in range(RESTYPE_DIM)], dim=-1)
+    return {
+        "msa": M,
+        "has_deletion": DM.clamp(0.0, 1.0),
+        "deletion_value": torch.atan(DM / 3.0) * (2.0 / math.pi),
+        "profile": profile,
+        "deletion_mean": DM.mean(0),
+    }
+
+
+def build_protein_features(sequence: str, a3m: str | None = None) -> dict:
+    """Full model-ready input_feature_dict for a single protein chain from a one-letter
+    sequence. Combines token + atom features (bundled reference conformers). If `a3m` is
+    given (an alignment whose query matches `sequence`), the single-sequence MSA features
+    are replaced with the real MSA features; otherwise it folds single-sequence. The model
+    (tt_bio.protenix.Protenix.fold) regenerates relp / d_lm / v_lm / mask_trunked internally,
+    so this is everything fold needs."""
     aatype = aatype_from_sequence(sequence)
     feats = protein_token_features(aatype)
     feats.update(protein_atom_features(aatype, load_ref_conformers()))
+    if a3m:
+        msa_feats = protein_msa_features(a3m, sequence)
+        if msa_feats is not None:
+            feats.update(msa_feats)
     return feats
 
 

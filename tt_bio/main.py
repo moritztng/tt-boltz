@@ -1233,6 +1233,25 @@ def _read_protein_chains(path):
     return chains
 
 
+def _resolve_a3m_text(msa_spec, sequence, msa_dir):
+    """Return a3m text for a chain, or None for single-sequence folding. Tries an explicit
+    a3m path (``msa_spec``), then the shared ``{sha256(seq)[:16]}.a3m`` cache in ``msa_dir``
+    (written by the same MSA generation ESMFold2/Boltz-2 use). Mirrors resolve_msa's
+    candidate order but returns raw a3m text for the protenix featurizer."""
+    import hashlib
+
+    candidates = []
+    if msa_spec:
+        candidates.append(Path(msa_spec).expanduser())
+    if msa_dir:
+        h = hashlib.sha256(sequence.encode()).hexdigest()[:16]
+        candidates.append(Path(msa_dir) / f"{h}.a3m")
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0 and p.suffix != ".csv":
+            return p.read_text()
+    return None
+
+
 def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
     """Write a Protenix-v2 prediction (coords + atom metadata) as PDB/mmCIF via biotite.
     Reconstructs atom names/residues from tt_bio.data.const.ref_atoms (+ C-terminal OXT)."""

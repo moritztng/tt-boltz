@@ -55,14 +55,14 @@ Every command names its model with `--model`:
 
 - **`boltz2`** — folds complexes of proteins, DNA, RNA, and ligands and predicts binding affinity. Needs an MSA for each protein chain.
 - **`esmfold2`** / **`esmfold2-fast`** — fold a single protein sequence on-device, no MSA required (`esmfold2-fast` is the lighter, faster checkpoint):
-- **`protenix-v2`** — AlphaFold3-family folder (Pairformer trunk + atom diffusion, the [Protenix-v2](https://github.com/bytedance/Protenix) reproduction) for single-sequence protein folding on-device, no MSA or templates required:
+- **`protenix-v2`** — AlphaFold3-family folder (Pairformer trunk + atom diffusion, the [Protenix-v2](https://github.com/bytedance/Protenix) reproduction). Folds a protein on-device; an MSA is optional but strongly recommended (single-sequence ≈9 Å vs ≈2 Å CA-RMSD with an MSA on our test target):
 
 ```bash
 tt-bio predict seq.fasta --model esmfold2-fast --fast
-tt-bio predict seq.fasta --model protenix-v2
+tt-bio predict seq.fasta --model protenix-v2 --use_msa_server   # or fold single-sequence with no MSA flag
 ```
 
-ESMFold2 and Protenix-v2 are single-sequence and protein-only, so the MSA, ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only** (ESMFold2 still uses an MSA if you pass one). The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, and the multi-card / multi-machine flags — work for every model. Protenix-v2 loads its weights from the Hugging Face mirror on first use (override with `$PROTENIX_CKPT`).
+ESMFold2 and Protenix-v2 are protein-only, so the ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only**. Both can use an MSA: pass `--use_msa_server` (or a precomputed a3m via the input file / `--msa_db_path`); with no MSA source they fold single-sequence. The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, the MSA flags, and the multi-card / multi-machine flags — work for every model. Protenix-v2 loads its weights from the Hugging Face mirror on first use (override with `$PROTENIX_CKPT`).
 
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
