@@ -30,7 +30,7 @@ import ttnn
 
 from . import protenix_weights as PW
 from .protenix_weights import remap_adaln  # single source of all v2->tt-bio weight remaps
-from .tenstorrent import Module, CORE_GRID_MAIN, WeightScope
+from .tenstorrent import Module, CORE_GRID_MAIN
 
 
 def _window_q(x, N, NP, nq=32):
