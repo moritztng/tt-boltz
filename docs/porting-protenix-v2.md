@@ -1600,3 +1600,22 @@ Results:
 deviation in a fully-on-device run is the trunk's bf16 precision (s 0.991/z 0.990 PCC) feeding
 the (exact) diffusion. PORT FIDELITY is excellent; REAL folding accuracy is still unmeasured
 (needs an MSA pipeline + ground-truth targets; current path is single-sequence/offline).
+
+## LARGE-N: no OOM up to seq len 1024 + diffusion perf
+
+Two memory fixes (math-preserving) + one perf hoist let protenix-v2 fold up to 1024 residues:
+1. _diffusion_pair_cond keeps the pair tensor 4D (1,N,N,c) -> Transition chunked H/W path
+   (3D path doesn't chunk -> OOM at N>=512).
+2. Transition 4D row-chunk scales by 128/channel-width so c_z=256 fits L1 (was clashing at
+   N=1024); c=128 (Boltz-2) unchanged.
+3. DiT per-block pair bias linear_z(LN(pair_z)) is t-independent (pair_z fixed across steps)
+   -> precomputed ONCE per fold (_dit_pair_biases), reused every step.
+
+Verified (2048-seq MSA): 512 -> 4345 atoms, 1024 -> 8548 atoms, no OOM. Correctness held
+(prot CA-RMSD 2.26A unchanged). tests/test_protenix_largeN.py guards the 512 chunking path.
+
+Perf (single Blackhole card, full 200 diffusion steps, runtime_s excludes one-time model load):
+  N=512 : trunk ~104s + per-step 0.68s -> ~241s (~4 min)   [per-step was 3.03s before the hoist]
+  N=1024: trunk ~444s + per-step 2.24s -> ~892s (~15 min)
+Diffusion is host-DiT bound but now hoist-optimized; the trunk (10 recycling cycles over the
+N^2 pair) dominates at large N. Lever for faster runs (not wired): expose recycling cycles.
