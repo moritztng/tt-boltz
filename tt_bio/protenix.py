@@ -389,8 +389,9 @@ class DiffusionModule:
         # 3) token DiT (fp32 host; precision-limited on-device, see class docstring)
         a_h = torch.Tensor(ttnn.to_torch(ttnn.reshape(a_tok, (1, NT, 768)))).float().reshape(NT, 768)
         s_h = torch.Tensor(ttnn.to_torch(s_single)).float().reshape(NT, s_single.shape[-1])
-        z_h = F.layer_norm(pair_z, (pair_z.shape[-1],))
-        a_h = self._token_dit(a_h, s_h, z_h, NT)
+        # per-block pair bias depends only on pair_z (fixed across steps) -> precompute once
+        biases = cond.get("dit_biases") or self._dit_pair_biases(pair_z)
+        a_h = self._token_dit(a_h, s_h, biases, NT)
         a_t = self._ln(T(a_h.reshape(1, NT, 768)), "layernorm_a.weight")
 
         # 4) atom decoder
@@ -420,7 +421,22 @@ class DiffusionModule:
         bl = [ttnn.slice(x, [0, i * self.NQ, 0], [1, i * self.NQ + self.NK, 128]) for i in range(nb)]
         return ttnn.to_layout(ttnn.reshape(ttnn.concat(bl, 0), (nb, self.NK, 128)), ttnn.TILE_LAYOUT)
 
-    def _token_dit(self, a_h, s_h, z_h, NT):
+    def _dit_pair_biases(self, pair_z):
+        """Per-block DiT attention pair bias linear_z(LN(LN(pair_z))). Depends only on the
+        trunk pair_z (fixed across all sampling steps), so it is computed ONCE per fold and
+        reused every diffusion step -- the dominant host cost otherwise. Returns 24 tensors
+        of shape (n_heads, NT, NT)."""
+        import torch.nn.functional as F
+        gP = lambda k: self.w["diffusion_transformer." + k].float()
+        z_h = F.layer_norm(pair_z, (pair_z.shape[-1],))
+        biases = []
+        for b in range(self.DIT_BLOCKS):
+            A = f"blocks.{b}.attention_pair_bias."
+            zb = F.layer_norm(z_h, (256,)) * gP(A + "layernorm_z.weight")
+            biases.append(F.linear(zb, gP(A + "linear_nobias_z.weight")).permute(2, 0, 1))
+        return biases
+
+    def _token_dit(self, a_h, s_h, biases, NT):
         import torch.nn.functional as F
         nbk, hd, nh = self.DIT_BLOCKS, self.DIT_HEAD_DIM, self.DIT_N_HEADS
         gP = lambda k: self.w["diffusion_transformer." + k].float()
@@ -430,7 +446,7 @@ class DiffusionModule:
         for b in range(nbk):
             A = f"blocks.{b}.attention_pair_bias."; Cc = f"blocks.{b}.conditioned_transition_block."
             an = adaln(a_h, s_h, A + "layernorm_a.")
-            zb = F.layer_norm(z_h, (256,)) * gP(A + "layernorm_z.weight"); bias = F.linear(zb, gP(A + "linear_nobias_z.weight")).permute(2, 0, 1)
+            bias = biases[b]
             Q = F.linear(an, gP(A + "attention.linear_q.weight"), gP(A + "attention.linear_q.bias")).reshape(NT, nh, hd).permute(1, 0, 2)
             K = F.linear(an, gP(A + "attention.linear_k.weight")).reshape(NT, nh, hd).permute(1, 0, 2)
             V = F.linear(an, gP(A + "attention.linear_v.weight")).reshape(NT, nh, hd).permute(1, 0, 2)
@@ -707,6 +723,7 @@ class Protenix:
         # 4) EDM sampler
         cond = {"s_trunk": s_trunk, "s_inputs": s_inputs, "pair_z": pair_z, "c_l": c_l,
                 "p_lm": p_lm, "S": S, "mask_trunked": mt.float()}
+        cond["dit_biases"] = self.diffusion._dit_pair_biases(pair_z)  # t-independent; once
         coords = []
         for k in range(n_sample):
             sd_seed = None if seed is None else seed + k
