@@ -647,10 +647,14 @@ class Protenix:
                              compute_kernel_config=self.ckc)
         pz = ttnn.linear(zc, self._tt(self.sd[C + "linear_no_bias_z.weight"].t().contiguous()),
                          compute_kernel_config=self.ckc, core_grid=CORE_GRID_MAIN)
+        # keep the pair tensor 4D (1,N,N,c) so Transition uses its chunked H/W path
+        # (the 3D path doesn't chunk pair tensors -> OOM at large N).
+        N = relpe.shape[0]
+        pz = ttnn.reshape(pz, (1, N, N, pz.shape[-1]))
         for nm in ("transition_z1", "transition_z2"):
             sub = {k[len(C + nm + "."):]: v for k, v in self.sd.items() if k.startswith(C + nm + ".")}
             t = Transition(DiffusionModule._remap_transition(sub), self.ckc)
-            pz = ttnn.add(pz, ttnn.reshape(t(pz), tuple(pz.shape)))
+            pz = ttnn.add(pz, t(pz))
         return self._to_host(pz)
 
     def _plm_z_term(self, pair_z, a2t, nb, nq, nk):

@@ -844,6 +844,10 @@ class Transition(Module):
 
         H, W = x.shape[1], x.shape[2]
         transition_h_chunk_size = TRANSITION_H_CHUNK_SIZE_FAST if _FAST_MODE else TRANSITION_H_CHUNK_SIZE
+        # The chunk sizes are tuned for a 128-wide pair channel; the per-chunk swiglu memory
+        # scales with the channel width, so scale the row-chunk down for wider channels
+        # (e.g. Protenix-v2's c_z=256) to stay within L1. c=128 is unchanged (no regression).
+        transition_h_chunk_size = max(1, transition_h_chunk_size * 128 // x.shape[-1])
         transition_w_chunking_threshold = (
             SEQ_LEN_MORE_CHUNKING
             if COMPUTE_GRID_MAIN[0] == COMPUTE_GRID_X_13
