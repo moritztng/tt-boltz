@@ -967,6 +967,31 @@ def _dispatch_run(run_payload: dict, workers, *, total: int, results_path: Path,
     return failed
 
 
+def _dispatch_to_controller(controller_url: str, run_payload: dict, *, total: int,
+                            results_path: Path, struct_dir: Path, model: str,
+                            debug: bool, log: bool) -> int:
+    """Submit a run to an already-running controller and stream it to completion.
+
+    Unlike ``_dispatch_run`` this starts no scheduler and spawns no local
+    workers — the compute is provided by whatever workers are already connected
+    to ``controller_url`` (this host's pool and/or remote machines). Lets many
+    independent ``predict`` invocations share one persistent cluster, which is
+    how the web platform fans concurrent users across a fleet of machines.
+    """
+    client = ControllerClient(controller_url)
+    try:
+        n_workers = int(client.cluster().get("online_workers") or 0)
+    except Exception:
+        n_workers = 0
+    run_id = client.create_run(run_payload)["run_id"]
+    failed = _stream_run(client, run_id, total=total, n_workers=n_workers,
+                         debug=debug, log=log, results_path=results_path,
+                         struct_dir=struct_dir, model=model)
+    _persist_run_results(client, run_id, results_path)
+    click.echo(f"\nDone: {total - failed} ok, {failed} failed — {results_path}")
+    return failed
+
+
 def _write_job_outputs(client: ControllerClient, run_id: str, job_id: str,
                        struct_dir: Path) -> None:
     """Fetch a completed job's output files and write them under struct_dir."""
@@ -1084,6 +1109,75 @@ def worker_cmd(connect, accelerator, num_devices, device_ids, debug):
     except KeyboardInterrupt:
         click.echo("\nStopping workers...")
         _stop_worker_processes(procs)
+
+
+@cli.command("controller")
+@click.option("--listen", default="8765", help="Bind the controller HTTP server here: PORT or HOST:PORT (default 8765).")
+@click.option("--accelerator", type=click.Choice(["gpu", "cpu", "tenstorrent"]), default="tenstorrent")
+@click.option("--num_devices", default=0, type=int, help="Local devices to serve with (0=all). Ignored with --no-local-workers.")
+@click.option("--device_ids", default=None, type=str, help="Comma-separated TT device IDs to use locally")
+@click.option("--no-local-workers", "no_local_workers", is_flag=True,
+              help="Run only the coordinator; all compute comes from remote `tt-bio worker --connect` machines.")
+@click.option("--state-dir", default=None, type=click.Path(),
+              help="Where to keep the controller's SQLite state (default: a temp dir, discarded on exit).")
+@click.option("--debug", is_flag=True, help="Do not suppress local worker output")
+def controller_cmd(listen, accelerator, num_devices, device_ids, no_local_workers, state_dir, debug):
+    """Run a persistent prediction controller (cluster coordinator).
+
+    Starts the HTTP scheduler and — unless --no-local-workers — a worker per
+    local device, then stays up serving any number of
+    `tt-bio predict --controller URL` runs and accepting remote
+    `tt-bio worker --connect URL` machines. Ctrl-C to stop.
+
+    \b
+    Example — one coordinator, extra machines joining:
+        # on the master:
+        tt-bio controller --listen 0.0.0.0:8765
+        # on every other machine:
+        tt-bio worker --connect http://MASTER:8765
+        # submit work from anywhere that can reach the master:
+        tt-bio predict ./proteins --controller http://MASTER:8765 --use_msa_server
+    """
+    listen_host, listen_port = _parse_listen(listen)
+    if state_dir:
+        state_path = Path(state_dir).expanduser()
+        state_path.mkdir(parents=True, exist_ok=True)
+        db_path = state_path / "controller.sqlite3"
+        tmpdir = None
+    else:
+        tmpdir = Path(tempfile.mkdtemp(prefix="tt-bio-controller-"))
+        db_path = tmpdir / "controller.sqlite3"
+
+    server = ControllerServer(listen_host, listen_port, db_path)
+    server.serve_in_background()
+    url = f"http://127.0.0.1:{server.port}"
+    public_url = _public_join_url(listen_host, server.port)
+
+    workers, procs = [], []
+    if not no_local_workers:
+        try:
+            workers = _local_workers(accelerator, num_devices, device_ids, max_workers=10_000)
+        except RuntimeError as exc:
+            click.secho(f"No local workers ({exc}); coordinator-only.", fg="yellow")
+        if workers:
+            procs = _spawn_worker_processes(url, workers, debug)
+
+    click.echo(f"Controller listening on {public_url}")
+    click.echo(f"  local workers: {len(workers)}"
+               + (f" (devices {[int(w.device_id) for w in workers]})" if workers and accelerator == 'tenstorrent' else ""))
+    click.echo(f"  machines join: tt-bio worker --connect {public_url}")
+    click.echo(f"  submit work:   tt-bio predict <data> --controller {public_url}")
+    click.echo("Ctrl-C to stop.")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        click.echo("\nStopping controller...")
+    finally:
+        _stop_worker_processes(procs)
+        server.shutdown()
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 _MSA_DBS = {
@@ -1316,6 +1410,7 @@ def _generate_esmfold2_a3m(seqs, target_id, msa_dir, msa_db_path, use_envdb,
 @click.option("--energy-sample-hz", "energy_sample_hz", default=DEFAULT_ENERGY_SAMPLE_HZ, type=float, show_default=True, help="Sampling rate in Hz for power reporting")
 @click.option("--energy-metric", "energy_metric", default="both", type=click.Choice(["both", "tdp", "input"]), show_default=True, help="Which power channel(s) to measure")
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
+@click.option("--controller", default=None, help="Submit to an existing controller at URL (e.g. http://HOST:8765) instead of starting a local scheduler. Compute comes from that cluster's workers.")
 @click.option("--model", type=click.Choice(["boltz2", "esmfold2", "esmfold2-fast"]), default="boltz2", show_default=True,
               help="Structure model. boltz2: MSA + Pairformer. esmfold2: ESMC-6B + 48-block trunk + diffusion. "
                    "esmfold2-fast: the lighter 24-block ESMFold2-Fast checkpoint. Both esmfold2 variants run "
@@ -1329,7 +1424,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, debug, log,
-            report_energy, energy_sample_hz, energy_metric, listen, model):
+            report_energy, energy_sample_hz, energy_metric, listen, controller, model):
     """Run structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -1412,6 +1507,10 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
                        "jobs": job_payloads(jobs), "config": worker_cfg}
+        if controller:
+            _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
+                                    struct_dir=struct_dir, model=model, debug=debug, log=log)
+            return
         workers = _local_workers("tenstorrent", num_devices, device_ids, max_workers=max(len(jobs), 1))
         _dispatch_run(run_payload, workers, total=len(jobs), results_path=results_path,
                       struct_dir=struct_dir, model=model, listen=listen, debug=debug, log=log)
@@ -1422,22 +1521,26 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
 
     cache = Path(cache).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
-    download_all(cache)
-
-    if not msa_db_path and not use_msa_server:
-        default_msa_db = cache / "msa_db"
-        if (default_msa_db / "UNIREF30_READY").exists():
-            msa_db_path = str(default_msa_db)
+    # In --controller mode this process is a thin client: it never loads a model
+    # or touches a device, so skip downloading checkpoints and validating the
+    # local MSA DB — the connected workers resolve checkpoints and MSAs on their
+    # own hosts. msa_db_path (if given) is passed through for the workers to use.
+    if not controller:
+        download_all(cache)
+        if not msa_db_path and not use_msa_server:
+            default_msa_db = cache / "msa_db"
+            if (default_msa_db / "UNIREF30_READY").exists():
+                msa_db_path = str(default_msa_db)
+        if use_envdb and not use_msa_server and not msa_db_path:
+            raise RuntimeError(
+                "--use_envdb requires offline MSA DB setup.\n"
+                "Run: tt-bio msa --db all  (or use --use_msa_server)"
+            )
+        if msa_db_path and not use_msa_server:
+            _validate_offline_msa_db(Path(msa_db_path), require_envdb=use_envdb)
 
     if use_envdb and use_msa_server:
         click.echo("Note: --use_envdb is only used with offline MSA; ignored with --use_msa_server")
-    if use_envdb and not use_msa_server and not msa_db_path:
-        raise RuntimeError(
-            "--use_envdb requires offline MSA DB setup.\n"
-            "Run: tt-bio msa --db all  (or use --use_msa_server)"
-        )
-    if msa_db_path and not use_msa_server:
-        _validate_offline_msa_db(Path(msa_db_path), require_envdb=use_envdb)
 
     if use_msa_server:
         msa_server_username = msa_server_username or os.environ.get("BOLTZ_MSA_USERNAME")
@@ -1511,6 +1614,15 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         "jobs": job_payloads(jobs),
         "config": worker_cfg,
     }
+
+    if controller:
+        # Thin client: submit to the shared cluster and stream; no local workers,
+        # no devices, no energy profiling on this host.
+        if report_energy:
+            click.echo("Energy profiling is unavailable in --controller mode (no local device); skipping")
+        _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
+                                struct_dir=struct_dir, model=model, debug=debug, log=log)
+        return
 
     workers = _local_workers(
         "tenstorrent" if use_tt else accelerator,

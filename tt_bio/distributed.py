@@ -290,6 +290,50 @@ class ControllerStore:
         except Exception:
             return {}
 
+    def cluster(self, stale_after: float = 20.0) -> dict[str, Any]:
+        """Fleet snapshot: which workers are registered (grouped by host), how
+        many are live, and run/job counts. Used for operator + platform status.
+
+        A worker heartbeats on every lease poll (~1s when idle), so anything not
+        seen within ``stale_after`` seconds is treated as gone (machine left).
+        """
+        now = time.time()
+        with self._connect() as conn:
+            workers = [dict(row) for row in conn.execute(
+                "SELECT worker_id, host, accelerator, device_id, label, last_seen "
+                "FROM workers ORDER BY host, device_id"
+            )]
+            run_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM runs GROUP BY status"
+            ).fetchall()
+            job_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+            ).fetchall()
+        for w in workers:
+            w["idle_s"] = round(now - float(w["last_seen"]), 1)
+            w["online"] = w["idle_s"] <= stale_after
+        hosts: dict[str, dict[str, Any]] = {}
+        for w in workers:
+            if not w["online"]:
+                continue
+            h = hosts.setdefault(w["host"], {"host": w["host"], "devices": 0, "accelerators": set()})
+            h["devices"] += 1
+            h["accelerators"].add(w["accelerator"])
+        host_list = sorted(
+            ({"host": h["host"], "devices": h["devices"], "accelerators": sorted(h["accelerators"])}
+             for h in hosts.values()),
+            key=lambda h: h["host"],
+        )
+        return {
+            "now": now,
+            "workers": workers,
+            "online_workers": sum(1 for w in workers if w["online"]),
+            "total_workers": len(workers),
+            "hosts": host_list,
+            "runs": {row["status"]: row["n"] for row in run_rows},
+            "jobs": {row["status"]: row["n"] for row in job_rows},
+        }
+
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         with self._connect() as conn:
             events = [
@@ -346,7 +390,11 @@ class ControllerServer:
 
             def do_GET(self):  # noqa: N802
                 parsed = urllib.parse.urlparse(self.path)
-                if parsed.path.startswith("/runs/") and parsed.path.endswith("/events"):
+                if parsed.path == "/cluster":
+                    _json_response(self, 200, store.cluster())
+                elif parsed.path == "/healthz":
+                    _json_response(self, 200, {"ok": True})
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/events"):
                     run_id = parsed.path.split("/")[2]
                     query = urllib.parse.parse_qs(parsed.query)
                     after = int((query.get("after") or ["0"])[0])
@@ -418,6 +466,9 @@ class ControllerClient:
         if outputs:
             payload["outputs"] = outputs
         self._request("POST", "/complete", payload)
+
+    def cluster(self) -> dict[str, Any]:
+        return self._request("GET", "/cluster")
 
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         return self._request("GET", f"/runs/{run_id}/events?after={after}")
