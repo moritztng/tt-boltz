@@ -600,33 +600,15 @@ def _forward_design_progress(path: Path, pos: int, emit) -> int:
         return pos
 
 
-# ttnn prints a long nanobind teardown block at process exit that otherwise
-# buries the real error in a failed shard's log tail.
-_SHARD_NOISE = ("nanobind", "leaked instance", "leaked type", "leaked function",
-                "- leaked", "skipped remainder", "reference counting", "refleaks")
-
-
-def _tail_text(path: Path, nbytes: int = 20000) -> str:
-    """One-line error summary from a failed shard's log: drop the ttnn nanobind
-    teardown noise and surface the most specific exception line (so the
-    orchestrator reports e.g. the actual URLError, not a urllib stack frame)."""
+def _tail_text(path: Path, nbytes: int = 800) -> str:
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
             f.seek(max(0, size - nbytes))
-            raw = f.read().decode("utf-8", "replace").splitlines()
+            return f.read().decode("utf-8", "replace").strip()[-400:]
     except Exception:
         return "design shard failed (see worker log)."
-    lines = [ln.strip() for ln in raw
-             if ln.strip() and not any(n in ln for n in _SHARD_NOISE)]
-    if not lines:
-        return "design shard failed (see worker log)."
-    # Prefer the most recent concrete exception line ("SomeError: message").
-    for ln in reversed(lines):
-        if ("Error" in ln or "Exception" in ln) and ":" in ln:
-            return ln[:300]
-    return lines[-1][:300]
 
 
 def _read_outputs(output_dir: Path) -> dict[str, str]:
