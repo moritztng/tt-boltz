@@ -158,7 +158,7 @@ assert all(
 ### Model checkpoints and other artifacts ####
 # All BoltzGen weights + mols are mirrored on the same GCP bucket as the
 # tt-bio core artifacts and fetched directly over HTTPS.
-BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-bio-artifacts/boltzgen"
+BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen"
 ARTIFACTS: dict[str, tuple[str, str]] = {
     "design-diverse":   (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_diverse.ckpt",   "model"),
     "design-adherence": (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_adherence.ckpt", "model"),

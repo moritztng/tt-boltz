@@ -108,7 +108,7 @@ from tt_bio.runtime import (
 )
 from tt_bio.worker import run_worker_loop
 
-ARTIFACT_BASE_URL = "https://storage.googleapis.com/tt-bio-artifacts"
+ARTIFACT_BASE_URL = "https://storage.googleapis.com/tt-boltz-artifacts"
 URLS = {
     "mols": f"{ARTIFACT_BASE_URL}/mols.tar",
     "conf": f"{ARTIFACT_BASE_URL}/boltz2_conf.ckpt",

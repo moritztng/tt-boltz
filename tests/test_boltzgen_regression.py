@@ -18,7 +18,7 @@ that our slimmed Boltz drops, which perturbs trunk numerics out of bf16
 tolerance while leaving bond chemistry intact).
 
 The reference data is a 36 MB tarball at
-``https://storage.googleapis.com/tt-bio-artifacts/boltzgen_regression.tar.gz``,
+``https://storage.googleapis.com/tt-boltz-artifacts/boltzgen_regression.tar.gz``,
 downloaded once on first run to ``~/.cache/tt-bio/regression/``. The
 tarball's README documents how to regenerate it.
 """
@@ -35,7 +35,7 @@ import pytest
 
 
 REGRESSION_URL = (
-    "https://storage.googleapis.com/tt-bio-artifacts/boltzgen_regression.tar.gz"
+    "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen_regression.tar.gz"
 )
 _CACHE = Path.home() / ".cache/tt-bio/regression"
 _ROOT = _CACHE / "tt_bio_regression_v1"
