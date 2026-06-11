@@ -40,6 +40,9 @@ dependencies = [
     "msgpack-numpy",         # esm structure serialization (vendored)
     "brotli",                # esm (vendored)
     "cloudpathlib",          # esm (vendored)
+    # Protenix-v2 adds NO new dependencies: the on-device model + its data pipeline are
+    # pure torch/ttnn (canonical-CCD conformers bundled as JSON, no rdkit/gemmi at runtime),
+    # and weights come from the Hugging Face mirror via huggingface_hub (no clone).
     "ttnn==0.68.0",
 ]
 

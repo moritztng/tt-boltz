@@ -655,12 +655,29 @@ class AttentionPairBias(Module):
             )
         self.o_weight = self.torch_to_tt("proj_o.weight")
 
+    def compute_bias(self, z: ttnn.Tensor) -> ttnn.Tensor:
+        """Project the (LN'd) pair tensor z -> per-head additive attention bias
+        (1, n_heads, S, S). This is a pure function of z (no per-query dependence), so
+        for a fixed z (e.g. the diffusion trunk pair_z, constant across all sampling
+        steps) it can be computed ONCE and replayed via __call__(bias_precomputed=True),
+        instead of recomputing this NxNxc_z layer_norm+linear every call. Uses the same
+        (head_dim**0.5-scaled) z_weight as the inline path, so the result is identical."""
+        z = ttnn.layer_norm(
+            z, weight=self.z_norm_weight, bias=self.z_norm_bias, epsilon=1e-5,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        z = ttnn.linear(
+            z, self.z_weight, compute_kernel_config=self.compute_kernel_config, core_grid=CORE_GRID_MAIN,
+        )
+        return ttnn.permute(z, (0, 3, 1, 2))
+
     def __call__(
         self,
         s: ttnn.Tensor,
         z: ttnn.Tensor,
         keys_indexing: ttnn.Tensor | None = None,
         seq_mask: ttnn.Tensor | None = None,
+        bias_precomputed: bool = False,
     ) -> ttnn.Tensor:
         if not self.atom_level:
             qkv = ttnn.linear(
@@ -678,7 +695,8 @@ class AttentionPairBias(Module):
                 transpose_k_heads=False,
             )
             ttnn.deallocate(qkv)
-            if self.compute_pair_bias:
+            # bias_precomputed: z is ALREADY the (1,n_heads,S,S) bias from compute_bias() -> skip recompute
+            if self.compute_pair_bias and not bias_precomputed:
                 z = ttnn.layer_norm(
                     z,
                     weight=self.z_norm_weight,
