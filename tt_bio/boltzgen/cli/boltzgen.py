@@ -844,10 +844,14 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
             f"No workers connected to {controller_url}. Start the master's pool "
             f"and/or `tt-bio worker --connect {controller_url}` on other machines.")
 
-    # One shard per worker (each pays the model-load cost once); never more
-    # shards than designs. Spread designs evenly, remainder to the first shards.
+    # Spread across the fleet, but keep shards from getting pathologically thin:
+    # each shard reloads the models once (overhead) and a too-small shard is
+    # fragile (its few designs may all fail refolding). Aim for >= _MIN_PER_SHARD
+    # designs per shard, capped by the number of workers. Big production runs
+    # still use every worker; a small "quick look" uses just a few.
+    _MIN_PER_SHARD = 4
     total = args.num_designs
-    n = min(online, total)
+    n = max(1, min(online, math.ceil(total / _MIN_PER_SHARD)))
     counts = [total // n + (1 if i < total % n else 0) for i in range(n)]
 
     specs = [{"name": Path(s).name, "content": Path(s).read_text()} for s in args.design_spec]
@@ -875,6 +879,7 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
     shards_root = args.output / "shards"
     shards_root.mkdir(parents=True, exist_ok=True)
     shard_dirs: list[Path] = []
+    failures: dict[str, str] = {}
     after = 0
     seen_stage = None
     while True:
@@ -888,20 +893,30 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
                 print(f"stage: {seen_stage}", flush=True)
             elif etype == "done":
                 row = ev.get("row") or {}
+                sid = str(row.get("id"))
                 if row.get("status") == "ok":
-                    d = shards_root / str(row.get("id"))
-                    _write_job_outputs(client, run_id, str(row.get("id")), d)
+                    d = shards_root / sid
+                    _write_job_outputs(client, run_id, sid, d)
                     shard_dirs.append(d)
+                else:
+                    failures[sid] = (row.get("error") or "failed").strip()
         if snap.get("status") in ("ok", "failed"):
-            if snap.get("status") == "failed" or int(snap.get("failed") or 0) > 0:
-                raise RuntimeError(
-                    f"{snap.get('failed')} design shard(s) failed on the fleet — "
-                    f"check the worker logs on the relevant machine(s).")
             break
         time.sleep(0.5)
 
+    # A shard can legitimately yield nothing (e.g. a thin shard whose designs all
+    # fail refolding) — one bad shard must not throw away the others. Report what
+    # failed, then merge + filter over whatever succeeded; only abort if *no*
+    # shard produced designs.
+    if failures:
+        print(f"\n{len(failures)} of {len(jobs)} design shard(s) failed "
+              f"({len(shard_dirs)} succeeded):", flush=True)
+        for sid, err in failures.items():
+            print(f"  ✗ {sid}: {(err.splitlines() or ['failed'])[0]}", flush=True)
     if not shard_dirs:
-        raise RuntimeError("No design shards produced output.")
+        raise RuntimeError(
+            "Every design shard failed — no designs were produced. First error:\n"
+            + next(iter(failures.values()), "unknown (see worker logs)"))
     _merge_and_filter(args, shard_dirs, debug=debug)
 
 
