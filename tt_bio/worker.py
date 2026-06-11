@@ -475,12 +475,6 @@ def _execute_job(
         traceback.print_exc()
 
 
-# Shards run the pipeline up to (and including) analysis; the orchestrator does
-# the single global filter over the merged union, so per-shard filtering would
-# be wasted work. merge_command consumes the analysis-level outputs.
-_DESIGN_SHARD_STEPS = ["design", "inverse_folding", "folding", "analysis"]
-
-
 def _execute_design_job(
     client: ControllerClient,
     run_id: str,
@@ -536,11 +530,16 @@ def _execute_design_job(
         if mgd and not env.get("TT_MESH_GRAPH_DESC_PATH"):
             env["TT_MESH_GRAPH_DESC_PATH"] = str(mgd)
 
+        # Run the full pipeline on the shard (exactly like a local per-card
+        # shard in _run_distributed); the orchestrator then merges + filters the
+        # union. Restricting --steps here shifts the analysis step's expected
+        # folded-output path and yields zero metrics, so we don't.
         cmd = [sys.executable, "-m", "tt_bio.boltzgen.cli.boltzgen", "run", *spec_paths,
                "--output", str(out_dir), "--num_designs", str(num_designs),
                "--device_ids", device,
-               "--protocol", cfg.get("protocol", "protein-anything"),
-               "--steps", *cfg.get("steps", _DESIGN_SHARD_STEPS)]
+               "--protocol", cfg.get("protocol", "protein-anything")]
+        if cfg.get("steps"):
+            cmd += ["--steps", *cfg["steps"]]
         if cfg.get("fast"):
             cmd.append("--fast")
         if cfg.get("moldir"):

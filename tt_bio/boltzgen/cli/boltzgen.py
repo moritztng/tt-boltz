@@ -855,9 +855,12 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
         "kind": "design",
         "protocol": getattr(args, "protocol", "protein-anything"),
         "fast": bool(getattr(args, "fast", False)),
-        "steps": ["design", "inverse_folding", "folding", "analysis"],
         "specs": specs,
     }
+    # Honour an explicit --steps; otherwise each shard runs the full pipeline
+    # (the central filter below still re-ranks the merged union).
+    if getattr(args, "steps", None):
+        config["steps"] = list(args.steps)
     if getattr(args, "moldir", None):
         config["moldir"] = str(args.moldir)
     jobs = [{"id": f"shard_{i}", "name": f"shard_{i}",
