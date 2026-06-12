@@ -1626,7 +1626,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         if report_energy:
             click.echo("Energy profiling is unavailable in --controller mode (no local device); skipping")
         _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
-                                struct_dir=struct_dir, model=model, debug=debug, log=log)
+                                struct_dir=struct_dir, model=model, debug=debug, log=log, run_id=run_id)
         return
 
     workers = _local_workers(
