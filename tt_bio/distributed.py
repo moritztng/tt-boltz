@@ -39,6 +39,28 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+# Map the engine's fine-grained stage words (emitted by the worker and the
+# model's progress callback) to the coarse pipeline phase a biologist follows.
+_STAGE_MAP = {
+    "loading": "prepare", "featuriz": "prepare", "prep": "prepare",
+    "msa": "msa",
+    "trunk": "fold", "pairformer": "fold", "diffusion": "fold", "sampling": "fold",
+    "affinity": "score",
+    "saving": "save", "writing": "save",
+}
+
+
+def _coarse_stage(event: dict[str, Any]) -> str | None:
+    """The coarse phase an event implies, or None if it isn't a stage signal."""
+    if event.get("event") == "start":
+        return "prepare"
+    s = str(event.get("stage") or "").lower()
+    for key, phase in _STAGE_MAP.items():
+        if key in s:
+            return phase
+    return None
+
+
 class ControllerStore:
     """SQLite-backed controller state."""
 
@@ -65,6 +87,7 @@ class ControllerStore:
                     out_dir TEXT NOT NULL,
                     result_dir TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    owner TEXT,
                     config_json TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -75,6 +98,7 @@ class ControllerStore:
                     name TEXT NOT NULL DEFAULT '',
                     input_b64 TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
+                    stage TEXT,
                     worker_id TEXT,
                     lease_until REAL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +125,13 @@ class ControllerStore:
                 );
                 """
             )
+            # Migrate pre-existing tables that lack newer columns.
+            for stmt in ("ALTER TABLE jobs ADD COLUMN stage TEXT",
+                         "ALTER TABLE runs ADD COLUMN owner TEXT"):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already present
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload.get("run_id") or uuid.uuid4().hex[:12]
@@ -111,8 +142,8 @@ class ControllerStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO runs
-                    (run_id, data, out_dir, result_dir, status, config_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_id, data, out_dir, result_dir, status, owner, config_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -120,6 +151,7 @@ class ControllerStore:
                     payload["out_dir"],
                     payload["result_dir"],
                     "running",
+                    payload.get("owner"),  # opaque fairness key (hash of the user's session, never the secret)
                     json.dumps(config),
                     now,
                     now,
@@ -156,49 +188,43 @@ class ControllerStore:
         now = time.time()
         lease_until = now + LEASE_SECONDS
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO workers (worker_id, host, accelerator, device_id, label, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(worker_id) DO UPDATE SET
-                    host=excluded.host,
-                    accelerator=excluded.accelerator,
-                    device_id=excluded.device_id,
-                    label=excluded.label,
-                    last_seen=excluded.last_seen
-                """,
-                (
-                    worker_id,
-                    worker["host"],
-                    worker["accelerator"],
-                    str(worker["device_id"]),
-                    worker["label"],
-                    now,
-                ),
-            )
+            self._upsert_worker(conn, worker, now)
+            # Work-conserving max-min fair share across users (owners). Devices in
+            # use right now, per owner:
+            load: dict[str, int] = {}
+            for r in conn.execute(
+                "SELECT r.owner AS owner, COUNT(*) AS n "
+                "FROM jobs j JOIN runs r ON r.run_id = j.run_id "
+                "WHERE j.status='running' AND j.lease_until >= ? GROUP BY r.owner",
+                (now,),
+            ):
+                load[r["owner"]] = r["n"]
+            # Every job that could be handed out now (queued, or a lease that
+            # expired), oldest first.
             rows = conn.execute(
                 """
-                SELECT j.run_id, j.job_id, j.name, j.input_b64, r.config_json
+                SELECT j.run_id, j.job_id, j.name, j.input_b64, j.updated_at, r.owner, r.config_json
                 FROM jobs j
                 JOIN runs r ON r.run_id = j.run_id
                 WHERE r.status = 'running'
-                  AND (
-                    j.status = 'pending'
-                    OR (j.status = 'running' AND j.lease_until < ?)
-                  )
+                  AND (j.status = 'pending' OR (j.status = 'running' AND j.lease_until < ?))
                 ORDER BY j.updated_at, j.job_id
-                LIMIT ?
                 """,
-                (now, batch_size),
+                (now,),
             ).fetchall()
             if not rows:
                 return {"jobs": []}
+            # Give this freed device to the owner using the fewest devices right
+            # now (ties → oldest job). One user alone is the only owner, so they
+            # fill the whole cluster; the moment a second user has work, they're
+            # balanced in as devices turn over — no device ever sits idle while
+            # any job is waiting.
+            chosen = min(rows, key=lambda row: (load.get(row["owner"], 0), row["updated_at"], row["job_id"]))
+            run_id = chosen["run_id"]
+            config_json = chosen["config_json"]
+            picked = [row for row in rows if row["run_id"] == run_id][:batch_size]
             jobs = []
-            run_id = rows[0]["run_id"]
-            config_json = rows[0]["config_json"]
-            for row in rows:
-                if row["run_id"] != run_id:
-                    continue
+            for row in picked:
                 conn.execute(
                     """
                     UPDATE jobs
@@ -214,12 +240,75 @@ class ControllerStore:
                 })
             return {"run_id": run_id, "config": json.loads(config_json), "jobs": jobs}
 
+    def _upsert_worker(self, conn: sqlite3.Connection, worker: dict[str, Any], now: float) -> None:
+        """Register/refresh a worker's heartbeat (last_seen)."""
+        conn.execute(
+            """
+            INSERT INTO workers (worker_id, host, accelerator, device_id, label, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                host=excluded.host, accelerator=excluded.accelerator,
+                device_id=excluded.device_id, label=excluded.label,
+                last_seen=excluded.last_seen
+            """,
+            (worker["worker_id"], worker["host"], worker["accelerator"],
+             str(worker["device_id"]), worker["label"], now),
+        )
+
+    def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """A liveness ping a worker sends while it's busy computing (and so not
+        leasing), so the fleet never shows an active worker as offline."""
+        with self._lock, self._connect() as conn:
+            self._upsert_worker(conn, payload["worker"], time.time())
+        return {"ok": True}
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        """Cancel a run: stop new jobs being leased (run no longer 'running')
+        and mark its unfinished jobs canceled. Workers check this to abort the
+        work they're currently running for the run."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE runs SET status='canceled', updated_at=? WHERE run_id=?", (now, run_id))
+            conn.execute(
+                "UPDATE jobs SET status='canceled', lease_until=NULL, updated_at=? "
+                "WHERE run_id=? AND status IN ('pending','running')", (now, run_id))
+            self.add_event(conn, run_id, None, {"event": "run_done", "status": "canceled", "failed": 0})
+        return {"ok": True}
+
+    def run_status(self, run_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        return {"status": row["status"] if row else "missing"}
+
+    def run_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        """Per-input snapshot for a run: each job's id, status and live phase.
+        One cheap query regardless of event volume, so it scales to many inputs."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, status, stage FROM jobs WHERE run_id=? ORDER BY rowid",
+                (run_id,),
+            ).fetchall()
+        return [{"id": r["job_id"], "status": r["status"], "stage": r["stage"]} for r in rows]
+
     def record_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload["run_id"]
         worker_id = payload.get("worker_id")
         event = payload["event"]
         with self._lock, self._connect() as conn:
             self.add_event(conn, run_id, worker_id, event)
+            if worker_id:
+                now = time.time()
+                # An event is also a sign of life — keep the heartbeat fresh.
+                conn.execute("UPDATE workers SET last_seen=? WHERE worker_id=?", (now, worker_id))
+                # Attribute the stage to this worker's currently-running job, so
+                # each input's live phase is queryable. One job per worker at a
+                # time (batch_size=1), so worker_id + running pins it exactly.
+                phase = _coarse_stage(event)
+                if phase:
+                    conn.execute(
+                        "UPDATE jobs SET stage=?, updated_at=? "
+                        "WHERE run_id=? AND worker_id=? AND status='running'",
+                        (phase, now, run_id, worker_id))
         return {"ok": True}
 
     def complete_job(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -259,11 +348,14 @@ class ControllerStore:
                     (run_id,),
                 ).fetchone()["n"]
                 run_status = "failed" if failed else "ok"
-                conn.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                # Only conclude a run that's still running — never overwrite a
+                # 'canceled' status set by cancel_run with a late job completion.
+                changed = conn.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=? AND status='running'",
                     (run_status, now, run_id),
-                )
-                self.add_event(conn, run_id, None, {"event": "run_done", "status": run_status, "failed": failed})
+                ).rowcount
+                if changed:
+                    self.add_event(conn, run_id, None, {"event": "run_done", "status": run_status, "failed": failed})
         return {"ok": True}
 
     def results(self, run_id: str) -> list[dict[str, Any]]:
@@ -289,6 +381,50 @@ class ControllerStore:
             return json.loads(row["outputs_json"]) or {}
         except Exception:
             return {}
+
+    def cluster(self, stale_after: float = 20.0) -> dict[str, Any]:
+        """Fleet snapshot: which workers are registered (grouped by host), how
+        many are live, and run/job counts. Used for operator + platform status.
+
+        A worker heartbeats on every lease poll (~1s when idle), so anything not
+        seen within ``stale_after`` seconds is treated as gone (machine left).
+        """
+        now = time.time()
+        with self._connect() as conn:
+            workers = [dict(row) for row in conn.execute(
+                "SELECT worker_id, host, accelerator, device_id, label, last_seen "
+                "FROM workers ORDER BY host, device_id"
+            )]
+            run_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM runs GROUP BY status"
+            ).fetchall()
+            job_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+            ).fetchall()
+        for w in workers:
+            w["idle_s"] = round(now - float(w["last_seen"]), 1)
+            w["online"] = w["idle_s"] <= stale_after
+        hosts: dict[str, dict[str, Any]] = {}
+        for w in workers:
+            if not w["online"]:
+                continue
+            h = hosts.setdefault(w["host"], {"host": w["host"], "devices": 0, "accelerators": set()})
+            h["devices"] += 1
+            h["accelerators"].add(w["accelerator"])
+        host_list = sorted(
+            ({"host": h["host"], "devices": h["devices"], "accelerators": sorted(h["accelerators"])}
+             for h in hosts.values()),
+            key=lambda h: h["host"],
+        )
+        return {
+            "now": now,
+            "workers": workers,
+            "online_workers": sum(1 for w in workers if w["online"]),
+            "total_workers": len(workers),
+            "hosts": host_list,
+            "runs": {row["status"]: row["n"] for row in run_rows},
+            "jobs": {row["status"]: row["n"] for row in job_rows},
+        }
 
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         with self._connect() as conn:
@@ -339,6 +475,10 @@ class ControllerServer:
                         _json_response(self, 200, store.record_event(payload))
                     elif self.path == "/complete":
                         _json_response(self, 200, store.complete_job(payload))
+                    elif self.path == "/heartbeat":
+                        _json_response(self, 200, store.heartbeat(payload))
+                    elif self.path.startswith("/runs/") and self.path.endswith("/cancel"):
+                        _json_response(self, 200, store.cancel_run(self.path.split("/")[2]))
                     else:
                         _json_response(self, 404, {"error": "not found"})
                 except Exception as exc:
@@ -346,7 +486,11 @@ class ControllerServer:
 
             def do_GET(self):  # noqa: N802
                 parsed = urllib.parse.urlparse(self.path)
-                if parsed.path.startswith("/runs/") and parsed.path.endswith("/events"):
+                if parsed.path == "/cluster":
+                    _json_response(self, 200, store.cluster())
+                elif parsed.path == "/healthz":
+                    _json_response(self, 200, {"ok": True})
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/events"):
                     run_id = parsed.path.split("/")[2]
                     query = urllib.parse.parse_qs(parsed.query)
                     after = int((query.get("after") or ["0"])[0])
@@ -354,6 +498,10 @@ class ControllerServer:
                 elif parsed.path.startswith("/runs/") and parsed.path.endswith("/results"):
                     run_id = parsed.path.split("/")[2]
                     _json_response(self, 200, {"results": store.results(run_id)})
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/status"):
+                    _json_response(self, 200, store.run_status(parsed.path.split("/")[2]))
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/jobs"):
+                    _json_response(self, 200, {"jobs": store.run_jobs(parsed.path.split("/")[2])})
                 elif "/jobs/" in parsed.path and parsed.path.endswith("/outputs"):
                     parts = parsed.path.split("/")
                     # /runs/<run_id>/jobs/<job_id>/outputs
@@ -418,6 +566,24 @@ class ControllerClient:
         if outputs:
             payload["outputs"] = outputs
         self._request("POST", "/complete", payload)
+
+    def heartbeat(self, worker: dict[str, Any]) -> None:
+        self._request("POST", "/heartbeat", {"worker": worker})
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/runs/{run_id}/cancel", {})
+
+    def run_status(self, run_id: str) -> str:
+        try:
+            return self._request("GET", f"/runs/{run_id}/status").get("status", "missing")
+        except Exception:
+            return "missing"
+
+    def run_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        return self._request("GET", f"/runs/{run_id}/jobs").get("jobs", [])
+
+    def cluster(self) -> dict[str, Any]:
+        return self._request("GET", "/cluster")
 
     def events(self, run_id: str, after: int) -> dict[str, Any]:
         return self._request("GET", f"/runs/{run_id}/events?after={after}")

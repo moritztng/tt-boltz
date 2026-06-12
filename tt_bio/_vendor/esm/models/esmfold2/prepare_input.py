@@ -735,11 +735,8 @@ def build_chains_from_input(
             sym_id = entity_sym_count.get(entity_id, 0)
             entity_sym_count[entity_id] = sym_id + 1
             if isinstance(item, ProteinInput):
-                if item.msa is None:
-                    warnings.warn(
-                        f"No MSA provided for {item.id}, using single sequence mode"
-                    )
-
+                # Single-sequence (no MSA) is a normal, supported ESMFold-2 mode,
+                # so it isn't worth a warning on every chain.
                 new_tokens, new_atoms = tokenize_protein(
                     sequence=item.sequence,
                     modifications=item.modifications,

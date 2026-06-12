@@ -4655,8 +4655,18 @@ class AffinityModule(nn.Module):
         max_dist=22,
         groups: dict = {},
         use_tenstorrent: bool = False,
+        use_cross_transformer: bool = False,
     ):
         super().__init__()
+        # Newer affinity checkpoints carry this flag in their hparams. The public
+        # Boltz-2 affinity weights set it to False, and this Tenstorrent port
+        # implements only that path; accept the kwarg so load_from_checkpoint
+        # doesn't crash, and fail loudly if a checkpoint ever needs the
+        # cross-transformer variant.
+        if use_cross_transformer:
+            raise NotImplementedError(
+                "AffinityModule: use_cross_transformer=True is not supported by this implementation."
+            )
         self.use_tenstorrent = use_tenstorrent
         boundaries = torch.linspace(2, max_dist, num_dist_bins - 1)
         self.register_buffer("boundaries", boundaries)

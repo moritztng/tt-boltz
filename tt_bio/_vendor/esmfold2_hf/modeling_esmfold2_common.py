@@ -1337,7 +1337,7 @@ class DiffusionConditioning(nn.Module):
             z_rel = relative_position_encoding.to(dtype=torch.float32)
             z = torch.cat([z_trunk.to(dtype=torch.float32), z_rel], dim=-1)
             z = self.z_proj(self.z_input_norm(z))
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
                 for block in self.z_transitions:
                     z = z + block(z)
             if inference_cache is not None:

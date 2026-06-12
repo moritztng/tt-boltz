@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 import gemmi
 from rdkit import Chem, rdBase
-from rdkit.Chem import AllChem, HybridizationType
+from rdkit.Chem import AllChem, Descriptors, HybridizationType
 from sklearn.neighbors import KDTree
 from tt_bio.data.mol import load_molecules
 from tt_bio.data.types import (
@@ -141,7 +141,9 @@ def _parse_a3m(  # noqa: C901
             if c != "-" and c.islower():
                 count += 1
                 continue
-            token = const.prot_letter_to_token[c]
+            # Unknown / non-residue characters (a malformed MSA, stray
+            # whitespace, etc.) map to UNK instead of crashing with a KeyError.
+            token = const.prot_letter_to_token.get(c, const.unk_token["PROTEIN"])
             token = const.token_ids[token]
             residue.append(token)
             if count > 0:
@@ -273,7 +275,9 @@ def parse_csv(
             if c != "-" and c.islower():
                 count += 1
                 continue
-            token = const.prot_letter_to_token[c]
+            # Unknown / non-residue characters (a malformed MSA, stray
+            # whitespace, etc.) map to UNK instead of crashing with a KeyError.
+            token = const.prot_letter_to_token.get(c, const.unk_token["PROTEIN"])
             token = const.token_ids[token]
             residue.append(token)
             if count > 0:
@@ -2668,13 +2672,30 @@ def parse_polymer(
 def token_spec_to_ids(
     chain_name, residue_index_or_atom_name, chain_to_idx, atom_idx_map, chains
 ):
+    if chain_name not in chains:
+        raise ValueError(
+            f"Constraint references chain '{chain_name}', which is not in the input."
+        )
     if chains[chain_name].type == const.chain_type_ids["NONPOLYMER"]:
         # Non-polymer chains are indexed by atom name
-        _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
+        key = (chain_name, 0, residue_index_or_atom_name)
+        if key not in atom_idx_map:
+            raise ValueError(
+                f"Constraint references atom '{residue_index_or_atom_name}' on ligand "
+                f"'{chain_name}', which does not exist."
+            )
+        _, _, atom_idx = atom_idx_map[key]
         return (chain_to_idx[chain_name], atom_idx)
     else:
-        # Polymer chains are indexed by residue index
-        return chain_to_idx[chain_name], residue_index_or_atom_name - 1
+        # Polymer chains are indexed by residue index (1-indexed)
+        n_res = len(chains[chain_name].residues)
+        ridx = residue_index_or_atom_name
+        if not isinstance(ridx, int) or not (1 <= ridx <= n_res):
+            raise ValueError(
+                f"Constraint references residue {ridx} on chain '{chain_name}', "
+                f"which has {n_res} residues (1-indexed)."
+            )
+        return chain_to_idx[chain_name], ridx - 1
 
 
 def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
@@ -2765,8 +2786,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         if entity_type in {"protein", "dna", "rna"}:
             seq = str(item[entity_type]["sequence"])
         elif entity_type == "ligand":
-            assert "smiles" in item[entity_type] or "ccd" in item[entity_type]
-            assert "smiles" not in item[entity_type] or "ccd" not in item[entity_type]
+            has_smiles = "smiles" in item[entity_type]
+            has_ccd = "ccd" in item[entity_type]
+            if not (has_smiles or has_ccd):
+                raise ValueError("A ligand must specify either 'ccd' or 'smiles'.")
+            if has_smiles and has_ccd:
+                raise ValueError("A ligand cannot specify both 'ccd' and 'smiles' — choose one.")
             if "smiles" in item[entity_type]:
                 seq = str(item[entity_type]["smiles"])
             else:
@@ -2894,18 +2919,29 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             chain_type = const.chain_type_ids[entity_type.upper()]
             unk_token = const.unk_token[entity_type.upper()]
 
-            # Extract sequence
-            raw_seq = items[0][entity_type]["sequence"]
+            # Normalise the sequence: strip whitespace (sequences pasted from
+            # formatted sources carry spaces/newlines) and upper-case it.
+            # Otherwise those characters tokenize to UNK and silently fold
+            # garbage. (SMILES, which is case-sensitive, is a ligand and never
+            # reaches this polymer branch.)
+            raw_seq = "".join(items[0][entity_type]["sequence"].split()).upper()
             entity_to_seq[entity_id] = raw_seq
 
             # Convert sequence to tokens
             seq = [token_map.get(c, unk_token) for c in list(raw_seq)]
 
-            # Apply modifications
+            # Apply modifications (position is 1-indexed). Validate the range so
+            # an out-of-bounds position gives a clear error instead of an
+            # IndexError (or, for position 0, silently editing the last residue).
             for mod in items[0][entity_type].get("modifications", []):
-                code = mod["ccd"]
-                idx = mod["position"] - 1  # 1-indexed
-                seq[idx] = code
+                pos = mod["position"]
+                if not isinstance(pos, int) or not (1 <= pos <= len(seq)):
+                    raise ValueError(
+                        f"Modification position {pos} is out of range for chain "
+                        f"{items[0][entity_type].get('id')} (sequence length {len(seq)}); "
+                        "positions are 1-indexed."
+                    )
+                seq[pos - 1] = mod["ccd"]
 
             cyclic = items[0][entity_type].get("cyclic", False)
 
@@ -2938,7 +2974,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 ref_mol = get_mol(code, ccd, mol_dir)
 
                 if affinity:
-                    affinity_mw = AllChem.Descriptors.MolWt(ref_mol)
+                    affinity_mw = Descriptors.MolWt(ref_mol)
 
                     # Add error and warning messaging when computing affinity with ligands too large
                     if ref_mol.GetNumAtoms() > 128:
@@ -3010,7 +3046,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     print("WARNING: the ligand used for affinity calculation is larger than 56 heavy-atoms, "
                           "which was the maximum during training, therefore the affinity output might be inaccurate.")
 
-            affinity_mw = AllChem.Descriptors.MolWt(mol_no_h) if affinity else None
+            affinity_mw = Descriptors.MolWt(mol_no_h) if affinity else None
             extra_mols[f"LIG{ligand_id}"] = mol_no_h
             residue = parse_ccd_residue(
                 name=f"LIG{ligand_id}",
@@ -3281,6 +3317,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
 
             binder = constraint["pocket"]["binder"]
+            if binder not in chain_to_idx:
+                raise ValueError(f"Could not find binder with name {binder} in the input!")
             binder = chain_to_idx[binder]
 
             contacts = []

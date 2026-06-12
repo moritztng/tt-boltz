@@ -286,8 +286,16 @@ class DesignWriter:
                     )
                     global_idx = sample_idx * n_samples + n
 
-                    if total_files > 1:
-                        num_digits = len(str(total_files - 1))
+                    # A design run produces multiple designs in two ways: several
+                    # samples per spec (total_files = multiplicity * n_samples) OR
+                    # several enumerated design items (data_sample_idx increments
+                    # per item, growing global_idx). Either way, every design past
+                    # the first needs a unique, globally-indexed name. Keying only
+                    # on total_files missed the second case, so a single-spec
+                    # num_designs>1 run wrote every design to "{stem}.cif" and
+                    # overwrote it — silently capping output at one design.
+                    if total_files > 1 or global_idx > 0:
+                        num_digits = max(len(str(total_files - 1)), 1)
                         file_name = (
                             f"{stem}_{global_idx:0{num_digits}d}{self.file_suffix}"
                         )

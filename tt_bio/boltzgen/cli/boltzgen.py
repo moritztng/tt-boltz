@@ -158,7 +158,7 @@ assert all(
 ### Model checkpoints and other artifacts ####
 # All BoltzGen weights + mols are mirrored on the same GCP bucket as the
 # tt-bio core artifacts and fetched directly over HTTPS.
-BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-bio-artifacts/boltzgen"
+BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen"
 ARTIFACTS: dict[str, tuple[str, str]] = {
     "design-diverse":   (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_diverse.ckpt",   "model"),
     "design-adherence": (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_adherence.ckpt", "model"),
@@ -404,6 +404,26 @@ def add_device_arguments(p: argparse.ArgumentParser) -> None:
         help="Use block-fp8 for some operations (slightly lower precision, faster). "
         "Mirrors `tt-bio predict --fast`.",
     )
+    p.add_argument(
+        "--controller",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="Distribute this run across a fleet: dispatch design shards to the "
+        "controller at URL (e.g. http://HOST:8765) whose workers run them on "
+        "their own cards, then merge + filter here. Mirrors `tt-bio predict "
+        "--controller`. Other machines join with `tt-bio worker --connect URL`.",
+    )
+    p.add_argument(
+        "--run-id", dest="run_id", type=str, default=None, metavar="ID",
+        help="Use this run id on the controller (lets the submitter cancel the "
+        "run later). Requires --controller.",
+    )
+    p.add_argument(
+        "--owner", dest="owner", type=str, default=None, metavar="KEY",
+        help="Opaque fairness key (e.g. a hashed session id) the controller uses "
+        "to fair-share devices across users. Requires --controller.",
+    )
 
 
 def add_execute_core_arguments(p: argparse.ArgumentParser) -> None:
@@ -642,6 +662,18 @@ def run_command(args: argparse.Namespace) -> None:
     """
     from tt_bio.boltzgen import progress as P
 
+    # Guard degenerate sizing: num_designs must be >= 1, otherwise every shard
+    # gets zero designs, all devices are dropped, and the CPU split divides by
+    # zero (ZeroDivisionError) deep in the distributed path.
+    if args.num_designs is not None and args.num_designs < 1:
+        raise ValueError("--num_designs must be at least 1")
+    if getattr(args, "budget", None) is not None and args.budget < 1:
+        raise ValueError("--budget must be at least 1")
+    dbs = getattr(args, "diffusion_batch_size", None)
+    if dbs is not None and dbs < 1:
+        # ceil(num_designs / diffusion_batch_size) divides by zero otherwise.
+        raise ValueError("--diffusion_batch_size must be at least 1")
+
     # Default --output to ./<spec basename>/ (documented), so a bare
     # `tt-bio gen run spec.yaml` works.
     if not args.output:
@@ -667,7 +699,9 @@ def run_command(args: argparse.Namespace) -> None:
 
     t0, ok = time.time(), True
     try:
-        if len(devices) > 1:
+        if getattr(args, "controller", None):
+            _run_via_controller(args, args.controller)
+        elif len(devices) > 1:
             _run_distributed(args, devices)
         else:
             _configure(args)
@@ -774,19 +808,135 @@ def _run_distributed(args: argparse.Namespace, devices: list[int]) -> None:
             f"Shard(s) on device(s) {failed} failed — see "
             f"{args.output}/shards/device_<id>/run.log. Re-run with --reuse to resume.")
 
-    # Global reduce: combine all shards, then filter once over the union.
+    _merge_and_filter(args, [w["dir"] for w in workers], debug=debug)
+
+
+def _merge_and_filter(args: argparse.Namespace, shard_dirs: list[Path], *, debug: bool) -> None:
+    """Global reduce shared by every distributed path: combine all shard
+    directories, then filter once over the union so the kept set is ranked
+    against every design, not per shard. Output layout matches a single run."""
     with _quiet(not debug):
-        merge_command(argparse.Namespace(
-            sources=[w["dir"] for w in workers], output=args.output))
+        merge_command(argparse.Namespace(sources=list(shard_dirs), output=args.output))
     if args.steps and "filtering" not in args.steps:
         return
     filter_args = copy.copy(args)
     filter_args.steps, filter_args.reuse = ["filtering"], True
     with _quiet(not debug):
         configure_command(filter_args)
-    # Headless filter: the per-device view already covered the run; the summary
+    # Headless filter: the per-shard view already covered the run; the summary
     # panel reports the kept count.
     execute_command(filter_args, headless=not debug)
+
+
+def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
+    """Fan design shards across a fleet via the shared controller, then merge +
+    filter here — the multi-host twin of ``_run_distributed``.
+
+    Each shard is a job carrying a slice of num_designs; any connected worker
+    (this machine and/or remote galaxies) leases one, runs a single-device
+    ``gen run`` on it, and ships its output dir back. We collect those into
+    ``shards/`` and reuse the same global reduce as the local path.
+    """
+    import base64
+    import json as _json
+
+    from tt_bio.distributed import ControllerClient
+    from tt_bio.main import _write_job_outputs
+
+    debug = getattr(args, "debug", False)
+    client = ControllerClient(controller_url)
+    try:
+        online = int(client.cluster().get("online_workers") or 0)
+    except Exception as exc:
+        raise RuntimeError(f"Cannot reach controller at {controller_url}: {exc}") from exc
+    if online < 1:
+        raise RuntimeError(
+            f"No workers connected to {controller_url}. Start the master's pool "
+            f"and/or `tt-bio worker --connect {controller_url}` on other machines.")
+
+    # Spread across the fleet, but keep shards from getting pathologically thin:
+    # each shard reloads the models once (overhead) and a too-small shard is
+    # fragile (its few designs may all fail refolding). Aim for >= _MIN_PER_SHARD
+    # designs per shard, capped by the number of workers. Big production runs
+    # still use every worker; a small "quick look" uses just a few.
+    _MIN_PER_SHARD = 4
+    total = args.num_designs
+    n = max(1, min(online, math.ceil(total / _MIN_PER_SHARD)))
+    counts = [total // n + (1 if i < total % n else 0) for i in range(n)]
+
+    specs = [{"name": Path(s).name, "content": Path(s).read_text()} for s in args.design_spec]
+    config = {
+        "kind": "design",
+        "protocol": getattr(args, "protocol", "protein-anything"),
+        "fast": bool(getattr(args, "fast", False)),
+        "specs": specs,
+    }
+    # Honour an explicit --steps; otherwise each shard runs the full pipeline
+    # (the central filter below still re-ranks the merged union).
+    if getattr(args, "steps", None):
+        config["steps"] = list(args.steps)
+    if getattr(args, "moldir", None):
+        config["moldir"] = str(args.moldir)
+    jobs = [{"id": f"shard_{i}", "name": f"shard_{i}",
+             "input_b64": base64.b64encode(_json.dumps({"num_designs": c}).encode()).decode()}
+            for i, c in enumerate(counts)]
+    run_payload = {"data": str(args.design_spec[0]), "out_dir": str(args.output),
+                   "result_dir": str(args.output), "jobs": jobs, "config": config,
+                   "owner": getattr(args, "owner", None)}
+    # A caller-supplied run id (the platform passes its job id) lets the run be
+    # cancelled later via the controller; otherwise the controller assigns one.
+    if getattr(args, "run_id", None):
+        run_payload["run_id"] = args.run_id
+    run_id = client.create_run(run_payload)["run_id"]
+    print(f"Dispatched {len(jobs)} design shard(s) across {online} worker(s) "
+          f"on the fleet at {controller_url}", flush=True)
+
+    shards_root = args.output / "shards"
+    shards_root.mkdir(parents=True, exist_ok=True)
+    shard_dirs: list[Path] = []
+    failures: dict[str, str] = {}
+    after = 0
+    seen_stage = None
+    while True:
+        snap = client.events(run_id, after)
+        for ev in snap.get("events", []):
+            after = max(after, int(ev.get("seq", after)))
+            etype = ev.get("event")
+            if etype == "stage" and ev.get("stage") != seen_stage:
+                seen_stage = ev.get("stage")
+                # Echo stage words so log-tailing progress (e.g. the platform) advances.
+                print(f"stage: {seen_stage}", flush=True)
+            elif etype == "done":
+                row = ev.get("row") or {}
+                sid = str(row.get("id"))
+                if row.get("status") == "ok":
+                    d = shards_root / sid
+                    _write_job_outputs(client, run_id, sid, d)
+                    shard_dirs.append(d)
+                else:
+                    failures[sid] = (row.get("error") or "failed").strip()
+        st = snap.get("status")
+        if st == "canceled":
+            print("Run canceled — stopping without merge.", flush=True)
+            return
+        if st in ("ok", "failed"):
+            break
+        time.sleep(0.5)
+
+    # A shard can legitimately yield nothing (e.g. a thin shard whose designs all
+    # fail refolding) — one bad shard must not throw away the others. Report what
+    # failed, then merge + filter over whatever succeeded; only abort if *no*
+    # shard produced designs.
+    if failures:
+        print(f"\n{len(failures)} of {len(jobs)} design shard(s) failed "
+              f"({len(shard_dirs)} succeeded):", flush=True)
+        for sid, err in failures.items():
+            print(f"  ✗ {sid}: {(err.splitlines() or ['failed'])[0]}", flush=True)
+    if not shard_dirs:
+        raise RuntimeError(
+            "Every design shard failed — no designs were produced. First error:\n"
+            + next(iter(failures.values()), "unknown (see worker logs)"))
+    _merge_and_filter(args, shard_dirs, debug=debug)
 
 
 def download_command(args: argparse.Namespace) -> list[Path]:
@@ -1163,7 +1313,7 @@ class BinderDesignPipeline:
         diffusion_batch_size = args.diffusion_batch_size
         if diffusion_batch_size is None:
             diffusion_batch_size = 1 if args.num_designs < 100 else 10
-        num_batches = math.ceil(args.num_designs / diffusion_batch_size)
+        num_batches = math.ceil(args.num_designs / max(1, diffusion_batch_size))
         print(f"Using diffusion batch size: {diffusion_batch_size}")
         print(f"Number of diffusion batches: {num_batches}")
 
