@@ -39,6 +39,28 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+# Map the engine's fine-grained stage words (emitted by the worker and the
+# model's progress callback) to the coarse pipeline phase a biologist follows.
+_STAGE_MAP = {
+    "loading": "prepare", "featuriz": "prepare", "prep": "prepare",
+    "msa": "msa",
+    "trunk": "fold", "pairformer": "fold", "diffusion": "fold", "sampling": "fold",
+    "affinity": "score",
+    "saving": "save", "writing": "save",
+}
+
+
+def _coarse_stage(event: dict[str, Any]) -> str | None:
+    """The coarse phase an event implies, or None if it isn't a stage signal."""
+    if event.get("event") == "start":
+        return "prepare"
+    s = str(event.get("stage") or "").lower()
+    for key, phase in _STAGE_MAP.items():
+        if key in s:
+            return phase
+    return None
+
+
 class ControllerStore:
     """SQLite-backed controller state."""
 
@@ -75,6 +97,7 @@ class ControllerStore:
                     name TEXT NOT NULL DEFAULT '',
                     input_b64 TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
+                    stage TEXT,
                     worker_id TEXT,
                     lease_until REAL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +124,11 @@ class ControllerStore:
                 );
                 """
             )
+            # Migrate a pre-existing jobs table that lacks the stage column.
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already present
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload.get("run_id") or uuid.uuid4().hex[:12]
@@ -235,15 +263,35 @@ class ControllerStore:
             row = conn.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
         return {"status": row["status"] if row else "missing"}
 
+    def run_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        """Per-input snapshot for a run: each job's id, status and live phase.
+        One cheap query regardless of event volume, so it scales to many inputs."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, status, stage FROM jobs WHERE run_id=? ORDER BY rowid",
+                (run_id,),
+            ).fetchall()
+        return [{"id": r["job_id"], "status": r["status"], "stage": r["stage"]} for r in rows]
+
     def record_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload["run_id"]
         worker_id = payload.get("worker_id")
         event = payload["event"]
         with self._lock, self._connect() as conn:
             self.add_event(conn, run_id, worker_id, event)
-            # An event is also a sign of life — keep the worker's heartbeat fresh.
             if worker_id:
-                conn.execute("UPDATE workers SET last_seen=? WHERE worker_id=?", (time.time(), worker_id))
+                now = time.time()
+                # An event is also a sign of life — keep the heartbeat fresh.
+                conn.execute("UPDATE workers SET last_seen=? WHERE worker_id=?", (now, worker_id))
+                # Attribute the stage to this worker's currently-running job, so
+                # each input's live phase is queryable. One job per worker at a
+                # time (batch_size=1), so worker_id + running pins it exactly.
+                phase = _coarse_stage(event)
+                if phase:
+                    conn.execute(
+                        "UPDATE jobs SET stage=?, updated_at=? "
+                        "WHERE run_id=? AND worker_id=? AND status='running'",
+                        (phase, now, run_id, worker_id))
         return {"ok": True}
 
     def complete_job(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -435,6 +483,8 @@ class ControllerServer:
                     _json_response(self, 200, {"results": store.results(run_id)})
                 elif parsed.path.startswith("/runs/") and parsed.path.endswith("/status"):
                     _json_response(self, 200, store.run_status(parsed.path.split("/")[2]))
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/jobs"):
+                    _json_response(self, 200, {"jobs": store.run_jobs(parsed.path.split("/")[2])})
                 elif "/jobs/" in parsed.path and parsed.path.endswith("/outputs"):
                     parts = parsed.path.split("/")
                     # /runs/<run_id>/jobs/<job_id>/outputs
@@ -511,6 +561,9 @@ class ControllerClient:
             return self._request("GET", f"/runs/{run_id}/status").get("status", "missing")
         except Exception:
             return "missing"
+
+    def run_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        return self._request("GET", f"/runs/{run_id}/jobs").get("jobs", [])
 
     def cluster(self) -> dict[str, Any]:
         return self._request("GET", "/cluster")
