@@ -335,6 +335,22 @@ def run_worker_loop(
         "label": worker_info["label"],
     }
 
+    # Background heartbeat: while the main loop is blocked computing (MSA fetch,
+    # folding, a design-shard subprocess) it isn't leasing, so without this the
+    # controller would mark a perfectly healthy worker offline. A daemon thread
+    # pings the controller so a worker counts as online whenever its process is.
+    import threading
+    _stop_beat = threading.Event()
+
+    def _heartbeat_loop():
+        while not _stop_beat.wait(8.0):
+            try:
+                client.heartbeat(worker_info)
+            except Exception:
+                pass
+
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
     def emit(run_id: str, event: str, **kw):
         try:
             client.event(run_id, worker_id, {"event": event, **meta, **kw})
@@ -550,17 +566,43 @@ def _execute_design_job(
                                 stdout=logf, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         pos = 0
+        canceled = False
+        last_check = 0.0
         while proc.poll() is None:
             pos = _forward_design_progress(progress_file, pos, emit)
+            # If the run was canceled (user stopped the job), abort the shard so
+            # it stops hogging the device immediately instead of running to the
+            # end. Check at most every couple of seconds to stay cheap.
+            now = time.time()
+            if now - last_check > 2.0:
+                last_check = now
+                if client.run_status(run_id) == "canceled":
+                    canceled = True
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    break
             time.sleep(0.5)
-        pos = _forward_design_progress(progress_file, pos, emit)
-        logf.close()
-        if proc.returncode == 0:
-            outputs = _read_outputs(out_dir)
-            row.update({"status": "ok", "num_designs": num_designs,
-                        "runtime_s": round(time.time() - t0, 1)})
+        if canceled:
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            logf.close()
+            row.update({"status": "canceled", "error": "canceled by user"})
         else:
-            row["error"] = _tail_text(workdir / "run.log")
+            pos = _forward_design_progress(progress_file, pos, emit)
+            logf.close()
+            if proc.returncode == 0:
+                outputs = _read_outputs(out_dir)
+                row.update({"status": "ok", "num_designs": num_designs,
+                            "runtime_s": round(time.time() - t0, 1)})
+            else:
+                row["error"] = _tail_text(workdir / "run.log")
     except Exception as exc:
         traceback.print_exc()
         row["error"] = str(exc)[:200]

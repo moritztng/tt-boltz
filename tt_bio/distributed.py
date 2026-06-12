@@ -156,26 +156,7 @@ class ControllerStore:
         now = time.time()
         lease_until = now + LEASE_SECONDS
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO workers (worker_id, host, accelerator, device_id, label, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(worker_id) DO UPDATE SET
-                    host=excluded.host,
-                    accelerator=excluded.accelerator,
-                    device_id=excluded.device_id,
-                    label=excluded.label,
-                    last_seen=excluded.last_seen
-                """,
-                (
-                    worker_id,
-                    worker["host"],
-                    worker["accelerator"],
-                    str(worker["device_id"]),
-                    worker["label"],
-                    now,
-                ),
-            )
+            self._upsert_worker(conn, worker, now)
             rows = conn.execute(
                 """
                 SELECT j.run_id, j.job_id, j.name, j.input_b64, r.config_json
@@ -214,12 +195,55 @@ class ControllerStore:
                 })
             return {"run_id": run_id, "config": json.loads(config_json), "jobs": jobs}
 
+    def _upsert_worker(self, conn: sqlite3.Connection, worker: dict[str, Any], now: float) -> None:
+        """Register/refresh a worker's heartbeat (last_seen)."""
+        conn.execute(
+            """
+            INSERT INTO workers (worker_id, host, accelerator, device_id, label, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                host=excluded.host, accelerator=excluded.accelerator,
+                device_id=excluded.device_id, label=excluded.label,
+                last_seen=excluded.last_seen
+            """,
+            (worker["worker_id"], worker["host"], worker["accelerator"],
+             str(worker["device_id"]), worker["label"], now),
+        )
+
+    def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """A liveness ping a worker sends while it's busy computing (and so not
+        leasing), so the fleet never shows an active worker as offline."""
+        with self._lock, self._connect() as conn:
+            self._upsert_worker(conn, payload["worker"], time.time())
+        return {"ok": True}
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        """Cancel a run: stop new jobs being leased (run no longer 'running')
+        and mark its unfinished jobs canceled. Workers check this to abort the
+        work they're currently running for the run."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE runs SET status='canceled', updated_at=? WHERE run_id=?", (now, run_id))
+            conn.execute(
+                "UPDATE jobs SET status='canceled', lease_until=NULL, updated_at=? "
+                "WHERE run_id=? AND status IN ('pending','running')", (now, run_id))
+            self.add_event(conn, run_id, None, {"event": "run_done", "status": "canceled", "failed": 0})
+        return {"ok": True}
+
+    def run_status(self, run_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        return {"status": row["status"] if row else "missing"}
+
     def record_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload["run_id"]
         worker_id = payload.get("worker_id")
         event = payload["event"]
         with self._lock, self._connect() as conn:
             self.add_event(conn, run_id, worker_id, event)
+            # An event is also a sign of life — keep the worker's heartbeat fresh.
+            if worker_id:
+                conn.execute("UPDATE workers SET last_seen=? WHERE worker_id=?", (time.time(), worker_id))
         return {"ok": True}
 
     def complete_job(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -259,11 +283,14 @@ class ControllerStore:
                     (run_id,),
                 ).fetchone()["n"]
                 run_status = "failed" if failed else "ok"
-                conn.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                # Only conclude a run that's still running — never overwrite a
+                # 'canceled' status set by cancel_run with a late job completion.
+                changed = conn.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=? AND status='running'",
                     (run_status, now, run_id),
-                )
-                self.add_event(conn, run_id, None, {"event": "run_done", "status": run_status, "failed": failed})
+                ).rowcount
+                if changed:
+                    self.add_event(conn, run_id, None, {"event": "run_done", "status": run_status, "failed": failed})
         return {"ok": True}
 
     def results(self, run_id: str) -> list[dict[str, Any]]:
@@ -383,6 +410,10 @@ class ControllerServer:
                         _json_response(self, 200, store.record_event(payload))
                     elif self.path == "/complete":
                         _json_response(self, 200, store.complete_job(payload))
+                    elif self.path == "/heartbeat":
+                        _json_response(self, 200, store.heartbeat(payload))
+                    elif self.path.startswith("/runs/") and self.path.endswith("/cancel"):
+                        _json_response(self, 200, store.cancel_run(self.path.split("/")[2]))
                     else:
                         _json_response(self, 404, {"error": "not found"})
                 except Exception as exc:
@@ -402,6 +433,8 @@ class ControllerServer:
                 elif parsed.path.startswith("/runs/") and parsed.path.endswith("/results"):
                     run_id = parsed.path.split("/")[2]
                     _json_response(self, 200, {"results": store.results(run_id)})
+                elif parsed.path.startswith("/runs/") and parsed.path.endswith("/status"):
+                    _json_response(self, 200, store.run_status(parsed.path.split("/")[2]))
                 elif "/jobs/" in parsed.path and parsed.path.endswith("/outputs"):
                     parts = parsed.path.split("/")
                     # /runs/<run_id>/jobs/<job_id>/outputs
@@ -466,6 +499,18 @@ class ControllerClient:
         if outputs:
             payload["outputs"] = outputs
         self._request("POST", "/complete", payload)
+
+    def heartbeat(self, worker: dict[str, Any]) -> None:
+        self._request("POST", "/heartbeat", {"worker": worker})
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/runs/{run_id}/cancel", {})
+
+    def run_status(self, run_id: str) -> str:
+        try:
+            return self._request("GET", f"/runs/{run_id}/status").get("status", "missing")
+        except Exception:
+            return "missing"
 
     def cluster(self) -> dict[str, Any]:
         return self._request("GET", "/cluster")

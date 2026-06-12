@@ -414,6 +414,11 @@ def add_device_arguments(p: argparse.ArgumentParser) -> None:
         "their own cards, then merge + filter here. Mirrors `tt-bio predict "
         "--controller`. Other machines join with `tt-bio worker --connect URL`.",
     )
+    p.add_argument(
+        "--run-id", dest="run_id", type=str, default=None, metavar="ID",
+        help="Use this run id on the controller (lets the submitter cancel the "
+        "run later). Requires --controller.",
+    )
 
 
 def add_execute_core_arguments(p: argparse.ArgumentParser) -> None:
@@ -872,6 +877,10 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
             for i, c in enumerate(counts)]
     run_payload = {"data": str(args.design_spec[0]), "out_dir": str(args.output),
                    "result_dir": str(args.output), "jobs": jobs, "config": config}
+    # A caller-supplied run id (the platform passes its job id) lets the run be
+    # cancelled later via the controller; otherwise the controller assigns one.
+    if getattr(args, "run_id", None):
+        run_payload["run_id"] = args.run_id
     run_id = client.create_run(run_payload)["run_id"]
     print(f"Dispatched {len(jobs)} design shard(s) across {online} worker(s) "
           f"on the fleet at {controller_url}", flush=True)
