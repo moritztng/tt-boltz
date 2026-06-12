@@ -419,6 +419,11 @@ def add_device_arguments(p: argparse.ArgumentParser) -> None:
         help="Use this run id on the controller (lets the submitter cancel the "
         "run later). Requires --controller.",
     )
+    p.add_argument(
+        "--owner", dest="owner", type=str, default=None, metavar="KEY",
+        help="Opaque fairness key (e.g. a hashed session id) the controller uses "
+        "to fair-share devices across users. Requires --controller.",
+    )
 
 
 def add_execute_core_arguments(p: argparse.ArgumentParser) -> None:
@@ -876,7 +881,8 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
              "input_b64": base64.b64encode(_json.dumps({"num_designs": c}).encode()).decode()}
             for i, c in enumerate(counts)]
     run_payload = {"data": str(args.design_spec[0]), "out_dir": str(args.output),
-                   "result_dir": str(args.output), "jobs": jobs, "config": config}
+                   "result_dir": str(args.output), "jobs": jobs, "config": config,
+                   "owner": getattr(args, "owner", None)}
     # A caller-supplied run id (the platform passes its job id) lets the run be
     # cancelled later via the controller; otherwise the controller assigns one.
     if getattr(args, "run_id", None):

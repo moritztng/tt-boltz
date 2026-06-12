@@ -1416,6 +1416,7 @@ def _generate_esmfold2_a3m(seqs, target_id, msa_dir, msa_db_path, use_envdb,
 @click.option("--listen", default=None, help="Bind scheduler to HOST:PORT so remote workers can join (e.g. 8765 or 0.0.0.0:8765)")
 @click.option("--controller", default=None, help="Submit to an existing controller at URL (e.g. http://HOST:8765) instead of starting a local scheduler. Compute comes from that cluster's workers.")
 @click.option("--run-id", "run_id", default=None, help="Use this run id on the controller (lets the submitter cancel the run later). Requires --controller.")
+@click.option("--owner", "owner", default=None, help="Opaque fairness key (e.g. a hashed session id) the controller uses to fair-share devices across users. Requires --controller.")
 @click.option("--model", type=click.Choice(["boltz2", "esmfold2", "esmfold2-fast"]), default="boltz2", show_default=True,
               help="Structure model. boltz2: MSA + Pairformer. esmfold2: ESMC-6B + 48-block trunk + diffusion. "
                    "esmfold2-fast: the lighter 24-block ESMFold2-Fast checkpoint. Both esmfold2 variants run "
@@ -1429,7 +1430,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
             sampling_steps_affinity, diffusion_samples_affinity, affinity_checkpoint,
             num_devices, device_ids, fast, debug, log,
-            report_energy, energy_sample_hz, energy_metric, listen, controller, run_id, model):
+            report_energy, energy_sample_hz, energy_metric, listen, controller, run_id, owner, model):
     """Run structure prediction.
 
     DATA is a YAML/FASTA file or a directory of them.
@@ -1511,7 +1512,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         }
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
-                       "jobs": job_payloads(jobs), "config": worker_cfg}
+                       "jobs": job_payloads(jobs), "config": worker_cfg, "owner": owner}
         if controller:
             _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
                                     struct_dir=struct_dir, model=model, debug=debug, log=log, run_id=run_id)
@@ -1618,6 +1619,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         "result_dir": str(out),
         "jobs": job_payloads(jobs),
         "config": worker_cfg,
+        "owner": owner,
     }
 
     if controller:

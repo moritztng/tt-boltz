@@ -87,6 +87,7 @@ class ControllerStore:
                     out_dir TEXT NOT NULL,
                     result_dir TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    owner TEXT,
                     config_json TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -124,11 +125,13 @@ class ControllerStore:
                 );
                 """
             )
-            # Migrate a pre-existing jobs table that lacks the stage column.
-            try:
-                conn.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
-            except sqlite3.OperationalError:
-                pass  # column already present
+            # Migrate pre-existing tables that lack newer columns.
+            for stmt in ("ALTER TABLE jobs ADD COLUMN stage TEXT",
+                         "ALTER TABLE runs ADD COLUMN owner TEXT"):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already present
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_id = payload.get("run_id") or uuid.uuid4().hex[:12]
@@ -139,8 +142,8 @@ class ControllerStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO runs
-                    (run_id, data, out_dir, result_dir, status, config_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_id, data, out_dir, result_dir, status, owner, config_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -148,6 +151,7 @@ class ControllerStore:
                     payload["out_dir"],
                     payload["result_dir"],
                     "running",
+                    payload.get("owner"),  # opaque fairness key (hash of the user's session, never the secret)
                     json.dumps(config),
                     now,
                     now,
@@ -185,29 +189,42 @@ class ControllerStore:
         lease_until = now + LEASE_SECONDS
         with self._lock, self._connect() as conn:
             self._upsert_worker(conn, worker, now)
+            # Work-conserving max-min fair share across users (owners). Devices in
+            # use right now, per owner:
+            load: dict[str, int] = {}
+            for r in conn.execute(
+                "SELECT r.owner AS owner, COUNT(*) AS n "
+                "FROM jobs j JOIN runs r ON r.run_id = j.run_id "
+                "WHERE j.status='running' AND j.lease_until >= ? GROUP BY r.owner",
+                (now,),
+            ):
+                load[r["owner"]] = r["n"]
+            # Every job that could be handed out now (queued, or a lease that
+            # expired), oldest first.
             rows = conn.execute(
                 """
-                SELECT j.run_id, j.job_id, j.name, j.input_b64, r.config_json
+                SELECT j.run_id, j.job_id, j.name, j.input_b64, j.updated_at, r.owner, r.config_json
                 FROM jobs j
                 JOIN runs r ON r.run_id = j.run_id
                 WHERE r.status = 'running'
-                  AND (
-                    j.status = 'pending'
-                    OR (j.status = 'running' AND j.lease_until < ?)
-                  )
+                  AND (j.status = 'pending' OR (j.status = 'running' AND j.lease_until < ?))
                 ORDER BY j.updated_at, j.job_id
-                LIMIT ?
                 """,
-                (now, batch_size),
+                (now,),
             ).fetchall()
             if not rows:
                 return {"jobs": []}
+            # Give this freed device to the owner using the fewest devices right
+            # now (ties → oldest job). One user alone is the only owner, so they
+            # fill the whole cluster; the moment a second user has work, they're
+            # balanced in as devices turn over — no device ever sits idle while
+            # any job is waiting.
+            chosen = min(rows, key=lambda row: (load.get(row["owner"], 0), row["updated_at"], row["job_id"]))
+            run_id = chosen["run_id"]
+            config_json = chosen["config_json"]
+            picked = [row for row in rows if row["run_id"] == run_id][:batch_size]
             jobs = []
-            run_id = rows[0]["run_id"]
-            config_json = rows[0]["config_json"]
-            for row in rows:
-                if row["run_id"] != run_id:
-                    continue
+            for row in picked:
                 conn.execute(
                     """
                     UPDATE jobs
