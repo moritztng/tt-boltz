@@ -929,7 +929,7 @@ def _stream_run(client: ControllerClient, run_id: str, total: int, n_workers: in
                         if struct_dir is not None and row.get("status") == "ok":
                             _write_job_outputs(client, run_id, row["id"], struct_dir)
                 pq.put(ev)
-            if snapshot.get("status") in ("ok", "failed"):
+            if snapshot.get("status") in ("ok", "failed", "canceled"):
                 failed = int(snapshot.get("failed") or 0)
                 break
             time.sleep(0.5)

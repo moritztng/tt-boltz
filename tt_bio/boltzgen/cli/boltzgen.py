@@ -909,7 +909,11 @@ def _run_via_controller(args: argparse.Namespace, controller_url: str) -> None:
                     shard_dirs.append(d)
                 else:
                     failures[sid] = (row.get("error") or "failed").strip()
-        if snap.get("status") in ("ok", "failed"):
+        st = snap.get("status")
+        if st == "canceled":
+            print("Run canceled — stopping without merge.", flush=True)
+            return
+        if st in ("ok", "failed"):
             break
         time.sleep(0.5)
 

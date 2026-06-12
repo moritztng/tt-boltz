@@ -360,7 +360,15 @@ def run_worker_loop(
     state = _WorkerState(worker_info["accelerator"])
     try:
         while True:
-            lease = client.lease(worker_info, batch_size=1)
+            # Tolerate a controller that's briefly unreachable (restart, network
+            # blip): retry leasing instead of crashing the worker. This makes the
+            # fleet self-healing — a worker reconnects on its own when the
+            # controller comes back, with no manual restart.
+            try:
+                lease = client.lease(worker_info, batch_size=1)
+            except Exception:
+                time.sleep(idle_poll)
+                continue
             jobs = lease.get("jobs") or []
             if not jobs:
                 time.sleep(idle_poll)
