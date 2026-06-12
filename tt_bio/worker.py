@@ -578,16 +578,23 @@ def _execute_design_job(
                 last_check = now
                 if client.run_status(run_id) == "canceled":
                     canceled = True
+                    # SIGINT (not SIGTERM/SIGKILL): the boltzgen subprocess turns
+                    # it into KeyboardInterrupt, which lets its atexit handler
+                    # close the Tenstorrent device cleanly. SIGTERM/SIGKILL skip
+                    # atexit and leave the chip wedged for the next job.
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
                     except Exception:
-                        proc.terminate()
+                        proc.send_signal(signal.SIGINT)
                     break
             time.sleep(0.5)
         if canceled:
             try:
-                proc.wait(timeout=10)
+                # Give ttnn time to release the device (its teardown is slow).
+                proc.wait(timeout=60)
             except Exception:
+                # Last resort if it still won't exit: frees the slot but may
+                # leave the device needing a reset (rare).
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
