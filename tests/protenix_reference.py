@@ -13,6 +13,8 @@ and remaps; tests/test_protenix.py runs the on-device parity checks.
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 
 # weight remaps live in the package (single source); re-exported here for the
@@ -22,6 +24,18 @@ from tt_bio.protenix_weights import (  # noqa: E402
     remap_pairformer_block, remap_outer_product_mean, remap_pair_weighted_averaging,
     remap_msa_pair_stack, remap_adaln as remap_adaptive_layernorm,
 )
+
+# The reference-parity builders below import the upstream `protenix` package (installed
+# --no-deps in the reference venv). On a machine without it (e.g. clean CI / the system
+# python3 that runs the golden-pkl tests), SKIP those tests instead of erroring -- the
+# remaps above and the golden-pkl tests don't need it.
+_HAS_PROTENIX = importlib.util.find_spec("protenix") is not None
+
+
+def _need_protenix():
+    if not _HAS_PROTENIX:
+        import pytest
+        pytest.skip("protenix reference package required (run in the reference venv)")
 
 # --- Confirmed Protenix-v2 architecture (from protenix.model + config) --------
 # AF3-standard, identical block graph to Boltz-2 (already ported in tt-bio).
@@ -45,6 +59,7 @@ PROTENIX_ARCH = {
 def make_triangle_multiplication(c_z=128, c_hidden=128, outgoing=True, seed=0):
     """OpenFold-style TriangleMultiplication{Outgoing,Incoming} (what Protenix's
     PairformerBlock uses), random weights. Returns (module, state_dict)."""
+    _need_protenix()
     from protenix.openfold_local.model.triangular_multiplicative_update import (
         TriangleMultiplicationIncoming,
         TriangleMultiplicationOutgoing,
@@ -72,6 +87,7 @@ def run_reference_triangle_multiplication(mod, z, mask=None):
 # --- TriangleAttention (second parity gate) -----------------------------------
 def make_triangle_attention(c_in=128, c_hidden=32, no_heads=4, starting=True, seed=0):
     """OpenFold TriangleAttention (starting/ending node), random weights."""
+    _need_protenix()
     from protenix.openfold_local.model.triangular_attention import TriangleAttention
 
     torch.manual_seed(seed)
@@ -102,6 +118,7 @@ def run_reference_triangle_attention(mod, x, mask=None):
 
 # --- Transition (SwiGLU; used as pair_transition + single_transition) ---------
 def make_transition(c_in=128, n=4, seed=0):
+    _need_protenix()
     from protenix.model.modules.primitives import Transition
 
     torch.manual_seed(seed)
@@ -118,6 +135,7 @@ def run_reference_transition(mod, x):
 
 # --- AttentionPairBias (Pairformer single-attn-with-pair-bias, has_s=False) ---
 def make_attention_pair_bias(c_a=384, c_z=128, n_heads=16, seed=0):
+    _need_protenix()
     from protenix.model.modules.transformer import AttentionPairBias as RefAPB
 
     torch.manual_seed(seed)
@@ -130,6 +148,7 @@ def make_attention_pair_bias(c_a=384, c_z=128, n_heads=16, seed=0):
 
 def make_pairformer_block(c_z=128, c_s=384, n_heads=16, c_hidden_mul=128,
                           c_hidden_pair_att=32, no_heads_pair=4, seed=0):
+    _need_protenix()
     from protenix.model.modules.pairformer import PairformerBlock
 
     torch.manual_seed(seed)
@@ -150,6 +169,7 @@ def run_reference_pairformer_block(mod, s, z):
 
 # --- OuterProductMean (MSA -> pair) -------------------------------------------
 def make_outer_product_mean(c_m=128, c_z=128, c_hidden=32, seed=0):
+    _need_protenix()
     from protenix.openfold_local.model.outer_product_mean import OuterProductMean as RefOPM
 
     torch.manual_seed(seed)
@@ -166,6 +186,7 @@ def run_reference_outer_product_mean(mod, m):
 
 # --- MSAPairWeightedAveraging (pair-biased MSA averaging) ---------------------
 def make_pair_weighted_averaging(c_m=64, c=32, c_z=128, n_heads=8, seed=0):
+    _need_protenix()
     from protenix.model.modules.pairformer import MSAPairWeightedAveraging
 
     torch.manual_seed(seed)
@@ -185,6 +206,7 @@ def run_reference_pair_weighted_averaging(mod, m, z):
 # parity test must clone the inputs before calling the reference and feed the
 # pristine clones to the tt-bio side.
 def make_msa_block(c_m=64, c_z=128, c_hidden=32, seed=0):
+    _need_protenix()
     from protenix.model.modules.pairformer import MSABlock
 
     torch.manual_seed(seed)
@@ -202,6 +224,7 @@ def run_reference_msa_block(mod, m, z):
 
 # --- AdaptiveLayerNorm (diffusion conditioning norm) --------------------------
 def make_adaptive_layernorm(c_a=768, c_s=384, seed=0):
+    _need_protenix()
     from protenix.model.modules.primitives import AdaptiveLayerNorm
 
     torch.manual_seed(seed)
@@ -221,6 +244,7 @@ def run_reference_adaptive_layernorm(mod, a, s):
 # a_to_b (3 factors); Protenix's is b = silu(a1)*a2 (2 factors) — NOT a drop-in.
 # So assemble Protenix's from the verified AdaLN + raw ttnn linears (see test).
 def make_conditioned_transition_block(c_a=768, c_s=384, n=2, seed=0):
+    _need_protenix()
     from protenix.model.modules.transformer import ConditionedTransitionBlock
 
     torch.manual_seed(seed)
@@ -237,6 +261,7 @@ def run_reference_conditioned_transition_block(mod, a, s):
 
 # --- DiffusionTransformerBlock (token DiT: AdaLN-attn + CTB) -------------------
 def make_diffusion_transformer_block(c_a=768, c_s=384, c_z=128, n_heads=16, seed=0):
+    _need_protenix()
     from protenix.model.modules.transformer import DiffusionTransformerBlock
 
     torch.manual_seed(seed)
@@ -253,6 +278,7 @@ def run_reference_diffusion_transformer_block(mod, a, s, z):
 
 # --- DistogramHead -----------------------------------------------------------
 def make_distogram_head(c_z=128, no_bins=64, seed=0):
+    _need_protenix()
     from protenix.model.modules.head import DistogramHead
 
     torch.manual_seed(seed)

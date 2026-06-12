@@ -344,6 +344,7 @@ _CKPT = "/home/ttuser/protenix_ckpt/protenix_base_default_v0.5.0.pt"
 
 @pytest.mark.skipif(not os.path.exists(_CKPT), reason="protenix base checkpoint not downloaded")
 def test_real_weight_pairformer_block():
+    pytest.importorskip("protenix")
     from protenix.model.modules.pairformer import PairformerBlock
     ck = torch.load(_CKPT, map_location="cpu", weights_only=False)["model"]
     pfx = "module.pairformer_stack.blocks.0."
@@ -369,6 +370,7 @@ def test_real_weight_pairformer_block():
 @pytest.mark.skipif(not os.path.exists(_CKPT), reason="protenix base checkpoint not downloaded")
 def test_real_weight_distogram_head():
     from tt_bio.esmfold2 import DistogramHead
+    pytest.importorskip("protenix")
     from protenix.model.modules.head import DistogramHead as RefDH
     ck = torch.load(_CKPT, map_location="cpu", weights_only=False)["model"]
     sd = {k[len("module.distogram_head."):]: v for k, v in ck.items()
@@ -388,6 +390,7 @@ def test_real_weight_distogram_head():
 
 @pytest.mark.skipif(not os.path.exists(_CKPT), reason="protenix base checkpoint not downloaded")
 def test_real_weight_msa_block():
+    pytest.importorskip("protenix")
     from protenix.model.modules.pairformer import MSABlock
     ck = torch.load(_CKPT, map_location="cpu", weights_only=False)["model"]
     p = "module.msa_module.blocks.0."
@@ -425,6 +428,7 @@ _CKPT_V2 = "/home/ttuser/protenix_ckpt/protenix-v2.pt"
 
 @pytest.mark.skipif(not os.path.exists(_CKPT_V2), reason="protenix-v2 checkpoint not present")
 def test_real_weight_v2_pairformer_block():
+    pytest.importorskip("protenix")
     from protenix.model.modules.pairformer import PairformerBlock
     sd_all = torch.load(_CKPT_V2, map_location="cpu", weights_only=True)
     sd_all = sd_all.get("model", sd_all)
@@ -457,6 +461,7 @@ def test_real_weight_v2_pairformer_block():
 @pytest.mark.skipif(not os.path.exists(_CKPT_V2), reason="protenix-v2 checkpoint not present")
 def test_real_weight_v2_distogram_head():
     from tt_bio.esmfold2 import DistogramHead
+    pytest.importorskip("protenix")
     from protenix.model.modules.head import DistogramHead as RefDH
     sd_all = torch.load(_CKPT_V2, map_location="cpu", weights_only=True)
     sd_all = sd_all.get("model", sd_all)
