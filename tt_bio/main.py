@@ -1539,6 +1539,16 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                       ("--write_embeddings", write_embeddings), ("--checkpoint", bool(checkpoint))]:
             if on:
                 click.secho(f"Note: --model {model} is protein-only; ignoring {n}", fg="yellow")
+        # ESMFold2's ESMC-6B language model is ~12.8 GB resident in normal precision
+        # and does not fit a Wormhole chip's ~12 GB DRAM (OOM at every length). The
+        # --fast block-fp8 path halves it to ~6.4 GB and, with the grid-aware FFN
+        # tiling, folds the full L<=1024 range. So on Wormhole ESMFold2 runs fast-only.
+        if use_tt and model in ("esmfold2", "esmfold2-fast") and not fast:
+            from tt_bio.tenstorrent import is_wormhole
+            if is_wormhole():
+                fast = True
+                click.secho("Note: --model {} runs in --fast mode on Wormhole (normal "
+                            "precision needs >12 GB DRAM/chip); enabling --fast.".format(model), fg="yellow")
         if model == "esmfold2-fast" and (use_msa_server or msa_db_path):
             click.echo()
             click.secho("Note: --model esmfold2-fast has no MSA encoder; folding single-sequence "
@@ -1574,6 +1584,20 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
                        "jobs": job_payloads(jobs), "config": worker_cfg, "owner": owner}
+        # Pre-fetch the Protenix-v2 checkpoint ONCE in the parent before fanning
+        # out: otherwise N local workers all see it missing and race to download
+        # the same 1.9 GB file into one cache dir, corrupting/racing it (workers
+        # fail with FileNotFoundError). Mirrors Boltz-2's parent-side download_all.
+        # Skipped in --controller mode: remote workers fetch on their own hosts.
+        if model == "protenix-v2" and not controller:
+            ckpt_cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
+            ckpt_cache.mkdir(parents=True, exist_ok=True)
+            ckpt = os.environ.get("PROTENIX_CKPT") or str(ckpt_cache / "protenix-v2.pt")
+            if not Path(ckpt).exists():
+                click.echo("Downloading protenix-v2.pt")
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(repo_id="TMF001/protenix-v2-weights",
+                               filename="protenix-v2.pt", local_dir=str(ckpt_cache))
         if controller:
             _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
                                     struct_dir=struct_dir, model=model, debug=debug, log=log, run_id=run_id)

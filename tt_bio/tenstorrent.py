@@ -26,6 +26,17 @@ TRIANGLE_MULT_L1_MAX_SEQ = 352
 _IS_SMALL_GRID = False
 SDPA_CHUNK_TILE = 32
 SDPA_CHUNK_MAX = 256
+# Tiling for row-independent blocks so their activations fit the 12 GB/chip DRAM
+# on small grids (Wormhole) while the 6B weights stay resident (no reload — batch
+# throughput preserved). 0 = single pass (Blackhole — ample DRAM). Bit-exact
+# (independent rows over dim=1). Two regimes, set by _apply_grid_thresholds:
+#   SMALL_GRID_SEQ_TILE  — per-TOKEN blocks (ESMC FFN on [B,L,d]): transient ~ rows
+#     (no L factor), so a fixed row count bounds it.
+#   SMALL_GRID_PAIR_TILE_AREA — PAIR blocks (ESMFold2 transition / OPM on [B,L,L,c]):
+#     transient ~ rows*L, so bound rows*L by an area budget -> rows shrink as L
+#     grows, keeping the transient flat (else a fixed row count is GBs at L=1024).
+SMALL_GRID_SEQ_TILE = 0
+SMALL_GRID_PAIR_TILE_AREA = 0
 
 PAIRFORMER_PAD_MULTIPLE = 64  # Pad token dim to this multiple to avoid kernel recompilation
 MSA_PAD_MULTIPLE = 1024  # Pad MSA dim to this multiple to avoid kernel recompilation
@@ -119,7 +130,8 @@ def _apply_grid_thresholds(grid: tuple[int, int]) -> None:
     so chunking kicks in early enough to avoid L1/CB clashes."""
     global _IS_SMALL_GRID, SEQ_LEN_MORE_CHUNKING, TRANSITION_BATCH_CHUNKING_THRESHOLD
     global TRANSITION_W_CHUNKING_THRESHOLD, TRIANGLE_ATT_CHUNK_SIZE_FAST
-    global TRANSITION_W_CHUNK_SIZE, TRIANGLE_MULT_L1_MAX_SEQ_FAST
+    global TRANSITION_W_CHUNK_SIZE, TRIANGLE_MULT_L1_MAX_SEQ_FAST, SMALL_GRID_SEQ_TILE
+    global SMALL_GRID_PAIR_TILE_AREA
     _IS_SMALL_GRID = grid[0] * grid[1] < COMPUTE_GRID_X_11 * COMPUTE_GRID_Y
     if not _IS_SMALL_GRID:
         return  # Keep Blackhole baseline values
@@ -129,6 +141,11 @@ def _apply_grid_thresholds(grid: tuple[int, int]) -> None:
     TRIANGLE_ATT_CHUNK_SIZE_FAST = 512
     TRANSITION_W_CHUNK_SIZE = 512
     TRIANGLE_MULT_L1_MAX_SEQ_FAST = 320  # half of 640, snapped to TRIANGLE_MULT_CHUNK_SIZE
+    # Per-token block tile (rows); pair block tile by rows*L area budget. Both
+    # 32-tile-aligned. Sized so the wide activations fit alongside the resident 6B
+    # weights at L=1024 on Wormhole (--fast). area=65536 -> 64 rows at L=1024.
+    SMALL_GRID_SEQ_TILE = 256
+    SMALL_GRID_PAIR_TILE_AREA = 65536
 
 
 def _configure_active_compute_grid(device: ttnn.Device) -> None:
@@ -164,6 +181,35 @@ def set_fast_mode(enabled: bool) -> None:
     _FAST_MODE = bool(enabled)
 
 
+@lru_cache(maxsize=1)
+def arch_name() -> str:
+    """Tenstorrent architecture, e.g. 'wormhole_b0' or 'blackhole'. Cheap; no
+    device open required."""
+    return ttnn.get_arch_name()
+
+
+@lru_cache(maxsize=1)
+def num_chips() -> int:
+    """Physical Tenstorrent chips on this host (Galaxy = 32, QuietBox = 4, ...)."""
+    import glob as _glob
+    return len(_glob.glob("/dev/tenstorrent/[0-9]*"))
+
+
+def is_wormhole() -> bool:
+    return arch_name() == "wormhole_b0"
+
+
+def pair_row_tile(L: int) -> int:
+    """Rows per tile for a pair [B,L,L,*] row-independent op so the transient
+    (~rows*L*width) stays bounded as L grows. Returns 0 (single pass) on big
+    grids or when L is already small enough. 32-tile-aligned."""
+    area = SMALL_GRID_PAIR_TILE_AREA
+    if not area or L <= SMALL_GRID_SEQ_TILE:
+        return 0
+    rows = max(32, (area // L // 32) * 32)
+    return rows if rows < L else 0
+
+
 _device = None
 
 def get_device():
@@ -177,9 +223,19 @@ def get_device():
         device_id = int(os.environ.get("TT_BIO_LOGICAL_DEVICE_ID", "0"))
         # Wormhole: dispatch on Ethernet cores so the full 8x8 Tensix grid
         # (rather than 8x7 after worker-dispatch reservation) is available.
+        # BUT on a multi-chip system (Galaxy / multi-card mesh) the ETH cores are
+        # consumed by the inter-chip fabric, so ETH dispatch has no free cores
+        # ("No more available dispatch cores"). We must NOT attempt-then-reopen in
+        # the same process: the failed ETH open leaves the device mid-initialized
+        # ("dispatch kernels still running", "unexpected run_mailbox value") and a
+        # subsequent in-process open is unstable (later from_torch / close_device
+        # hang). So decide up front from the physical chip count and open cleanly
+        # once. Default (Tensix) dispatch yields an 8x7 grid that
+        # _configure_active_compute_grid picks up and tunes for.
+        eth_dispatch = is_wormhole() and num_chips() <= 1
         kwargs = (
             {"dispatch_core_config": ttnn.DispatchCoreConfig(ttnn.DispatchCoreType.ETH)}
-            if ttnn.get_arch_name() == "wormhole_b0" else {}
+            if eth_dispatch else {}
         )
         _device = ttnn.open_device(device_id=device_id, **kwargs)
         _configure_active_compute_grid(_device)

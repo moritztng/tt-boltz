@@ -204,7 +204,7 @@ class SwiGLUFFN(Module):
         self.fc1_weight = self.torch_to_tt("1.weight", dtype=_dtype())
         self.fc2_weight = self.torch_to_tt("3.weight", dtype=_dtype())
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def _ffn(self, x: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         x_norm = ttnn.layer_norm(
             x, weight=self.norm_weight, bias=self.norm_bias,
@@ -219,6 +219,25 @@ class SwiGLUFFN(Module):
         out = self._lin(gated, self.fc2_weight)
         ttnn.deallocate(gated)
         return out
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        # The fc1 activation (2*d_ff wide) is several GB at long L and, on top of
+        # the resident 6B weights, OOMs the 12 GB/chip Wormhole DRAM. The FFN is
+        # row-independent over dim=1, so tiling it is bit-exact. 4D pair input
+        # (ESMFold2 MSA-encoder pair_transition, [B,L,L,c]) has transient ~ rows*L
+        # -> area-bounded tile; 3D per-token (ESMC LM FFN, [B,L,d]) -> fixed row
+        # tile. Single pass on Blackhole. See tenstorrent._apply_grid_thresholds.
+        from tt_bio import tenstorrent
+        L = x.shape[1]
+        if len(x.shape) == 4:
+            chunk = tenstorrent.pair_row_tile(L)
+        else:
+            t = tenstorrent.SMALL_GRID_SEQ_TILE
+            chunk = t if (t and L > t) else 0
+        if chunk:
+            parts = ttnn.chunk(x, -(-L // chunk), dim=1)
+            return ttnn.concat([self._ffn(p) for p in parts], dim=1)
+        return self._ffn(x)
 
 
 class Block(Module):
