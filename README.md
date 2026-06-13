@@ -55,14 +55,14 @@ Every command names its model with `--model`:
 
 - **`boltz2`** — folds complexes of proteins, DNA, RNA, and ligands and predicts binding affinity. Needs an MSA for each protein chain.
 - **`esmfold2`** / **`esmfold2-fast`** — fold a single protein sequence on-device, no MSA required (`esmfold2-fast` is the lighter, faster checkpoint):
-- **`protenix-v2`** — AlphaFold3-family folder (Pairformer trunk + atom diffusion, the [Protenix-v2](https://github.com/bytedance/Protenix) reproduction). Folds a protein on-device; an MSA is optional but strongly recommended (single-sequence ≈9 Å vs ≈2 Å CA-RMSD with an MSA on our test target):
+- **`protenix-v2`** — folds a single protein with an optional MSA (an AlphaFold3-family model, the [Protenix](https://github.com/bytedance/Protenix) reproduction; an MSA is recommended for best accuracy):
 
 ```bash
 tt-bio predict seq.fasta --model esmfold2-fast --fast
 tt-bio predict seq.fasta --model protenix-v2 --use_msa_server   # or fold single-sequence with no MSA flag
 ```
 
-ESMFold2 and Protenix-v2 are protein-only, so the ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only**. Both can use an MSA: pass `--use_msa_server` (or a precomputed a3m via the input file / `--msa_db_path`); with no MSA source they fold single-sequence. The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, the MSA flags, and the multi-card / multi-machine flags — work for every model. Protenix-v2 loads its weights from the Hugging Face mirror on first use (override with `$PROTENIX_CKPT`).
+ESMFold2 and Protenix-v2 are protein-only, so the ligand, affinity, potential, constraint, template, and energy options below apply to **Boltz-2 only**. Both can use an MSA: pass `--use_msa_server` (or a precomputed a3m via the input file / `--msa_db_path`); with no MSA source they fold single-sequence. The shared options — `--fast`, `--recycling_steps`, `--sampling_steps`, `--diffusion_samples`, `--output_format`, the MSA flags, and the multi-card / multi-machine flags — work for every model. Each model downloads its weights automatically on first use.
 
 Boltz-2 needs an MSA (multiple sequence alignment) for each protein chain.
 `--use_msa_server` sends sequences to the ColabFold MSA API and downloads the resulting alignments (online MSA).
@@ -297,7 +297,7 @@ Options apply to every model unless tagged **(Boltz-2)**.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model` | `boltz2` | `boltz2`, `esmfold2`, `esmfold2-fast` (single-sequence ESMFold2), or `protenix-v2` (single-sequence AlphaFold3-family folder) |
+| `--model` | `boltz2` | `boltz2`, `esmfold2`, `esmfold2-fast` (single-sequence ESMFold2), or `protenix-v2` (AlphaFold3-family folder) |
 | `--out_dir` | `./` | Output directory |
 | `--cache` | `~/.boltz` | **(Boltz-2)** model cache directory; ESMFold2 uses the Hugging Face cache |
 | `--accelerator` | `tenstorrent` | **(Boltz-2)** `tenstorrent`, `cpu`, or `gpu`; ESMFold2 always runs on Tenstorrent |
@@ -503,6 +503,13 @@ If you use this code or the models in your research, please cite the following p
   url = {https://biohub.ai/papers/esm_protein.pdf},
   note = {Preprint; ESMC / ESMFold2}
 }
+
+@misc{protenix2025,
+  author = {{ByteDance AML AI4Science Team}},
+  title = {Protenix: An AlphaFold3 Reproduction for Biomolecular Structure Prediction},
+  year = {2025},
+  url = {https://github.com/bytedance/Protenix}
+}
 ```
 
 In addition if you use the automatic MSA generation, please cite:
@@ -518,4 +525,4 @@ In addition if you use the automatic MSA generation, please cite:
 
 ## License
 
-tt-bio is released under the MIT License (see [`LICENSE`](LICENSE)). It bundles third-party ESMFold2 host-side reference code under `tt_bio/_vendor/`: the `esm` input/output pipeline (MIT, © Chan Zuckerberg Biohub) and the HuggingFace ESMFold2 model definition (Apache-2.0, © The HuggingFace team and Chan Zuckerberg Biohub). See [`NOTICE`](NOTICE) for sources, versions, and modifications.
+tt-bio is released under the MIT License (see [`LICENSE`](LICENSE)) and is built on the MIT-licensed Boltz-2 / Boltz-1 code. It bundles third-party code, each under its upstream license: the ESMFold2 host-side reference under `tt_bio/_vendor/` (the `esm` pipeline, MIT, © Chan Zuckerberg Biohub; and the HuggingFace ESMFold2 model definition, Apache-2.0) and the BoltzGen binder-design source under `tt_bio/boltzgen/` (MIT, © Hannes Stärk). Protenix-v2 is an independent ttnn reimplementation — no upstream code is vendored — and its weights download from ByteDance's Hugging Face mirror under Apache-2.0. See [`NOTICE`](NOTICE) for sources, versions, and modifications.
