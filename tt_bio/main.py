@@ -108,37 +108,34 @@ from tt_bio.runtime import (
 )
 from tt_bio.worker import run_worker_loop
 
-ARTIFACT_BASE_URL = "https://storage.googleapis.com/tt-boltz-artifacts"
-URLS = {
-    "mols": f"{ARTIFACT_BASE_URL}/mols.tar",
-    "conf": f"{ARTIFACT_BASE_URL}/boltz2_conf.ckpt",
-    "aff": f"{ARTIFACT_BASE_URL}/boltz2_aff.ckpt",
-}
+# Model weights and data live on the Hugging Face Hub and are fetched with
+# huggingface_hub — the single download path shared by every tt-bio model.
+BOLTZ2_REPO = "moritztng/boltz-2"            # Boltz-2 weights + molecules (MIT)
+PROTENIX_REPO = "TMF001/protenix-v2-weights"  # Protenix-v2 weights (Apache-2.0)
 
 
-def download(url: str, dest: Path) -> None:
-    """Download a required artifact if it is missing locally."""
-    if dest.exists():
-        return
-    click.echo(f"Downloading {dest.name}")
-    try:
-        urllib.request.urlretrieve(url, dest)
-    except Exception as e:
-        raise RuntimeError(f"Failed to download {dest.name} from {url}") from e
+def hf_artifact(repo_id: str, filename: str, dest_dir: Path) -> Path:
+    """Fetch one file from a Hugging Face repo into dest_dir on first use and
+    reuse the local copy thereafter. Used by every tt-bio model (Boltz-2,
+    BoltzGen, Protenix-v2) so there is one artifact-download path."""
+    dest = dest_dir / filename
+    if not dest.exists():
+        from huggingface_hub import hf_hub_download
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        click.echo(f"Downloading {filename}")
+        hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(dest_dir))
+    return dest
 
 
 def download_all(cache: Path) -> None:
-    """Download all required model files and molecules."""
-    tar_path = cache / "mols.tar"
-    if not tar_path.exists():
-        click.echo(f"Downloading {tar_path.name}")
-        urllib.request.urlretrieve(URLS["mols"], tar_path)
+    """Fetch the Boltz-2 checkpoints and molecule library (Hugging Face, MIT)."""
+    tar_path = hf_artifact(BOLTZ2_REPO, "mols.tar", cache)
     if not (cache / "mols").exists():
-        click.echo(f"Extracting {tar_path.name}")
+        click.echo("Extracting mols.tar")
         with tarfile.open(tar_path) as tar:
             tar.extractall(cache)
-    download(URLS["conf"], cache / "boltz2_conf.ckpt")
-    download(URLS["aff"], cache / "boltz2_aff.ckpt")
+    hf_artifact(BOLTZ2_REPO, "boltz2_conf.ckpt", cache)
+    hf_artifact(BOLTZ2_REPO, "boltz2_aff.ckpt", cache)
 
 
 def compute_msa(seqs: dict[str, str], target_id: str, msa_dir: Path, url: str, strategy: str,
@@ -1589,15 +1586,9 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         # the same 1.9 GB file into one cache dir, corrupting/racing it (workers
         # fail with FileNotFoundError). Mirrors Boltz-2's parent-side download_all.
         # Skipped in --controller mode: remote workers fetch on their own hosts.
-        if model == "protenix-v2" and not controller:
+        if model == "protenix-v2" and not controller and not os.environ.get("PROTENIX_CKPT"):
             ckpt_cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
-            ckpt_cache.mkdir(parents=True, exist_ok=True)
-            ckpt = os.environ.get("PROTENIX_CKPT") or str(ckpt_cache / "protenix-v2.pt")
-            if not Path(ckpt).exists():
-                click.echo("Downloading protenix-v2.pt")
-                from huggingface_hub import hf_hub_download
-                hf_hub_download(repo_id="TMF001/protenix-v2-weights",
-                               filename="protenix-v2.pt", local_dir=str(ckpt_cache))
+            hf_artifact(PROTENIX_REPO, "protenix-v2.pt", ckpt_cache)
         if controller:
             _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
                                     struct_dir=struct_dir, model=model, debug=debug, log=log, run_id=run_id)

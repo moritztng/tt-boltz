@@ -65,14 +65,11 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
     # Protenix-v2: resolve the v2 checkpoint. Prefer $PROTENIX_CKPT, then the worker
     # cache, then download from the Hugging Face weights mirror on first use.
     if cfg.get("model") == "protenix-v2":
-        cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
-        ckpt = os.environ.get("PROTENIX_CKPT") or str(cache / "protenix-v2.pt")
-        if not Path(ckpt).exists():
-            from huggingface_hub import hf_hub_download
+        from tt_bio.main import PROTENIX_REPO, hf_artifact
 
-            ckpt = hf_hub_download(repo_id="TMF001/protenix-v2-weights",
-                                   filename="protenix-v2.pt", local_dir=str(cache))
-        cfg["protenix_ckpt"] = ckpt
+        cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
+        cfg["protenix_ckpt"] = os.environ.get("PROTENIX_CKPT") or str(
+            hf_artifact(PROTENIX_REPO, "protenix-v2.pt", cache))
         return
     # ESMFold2 loads its weights from HF on the first fold and needs no Boltz-2
     # checkpoints / molecule library — only a writable MSA dir.

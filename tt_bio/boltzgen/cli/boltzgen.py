@@ -156,16 +156,17 @@ assert all(
 
 
 ### Model checkpoints and other artifacts ####
-# All BoltzGen weights + mols are mirrored on the same GCP bucket as the
-# tt-bio core artifacts and fetched directly over HTTPS.
-BOLTZGEN_ARTIFACTS_URL = "https://storage.googleapis.com/tt-boltz-artifacts/boltzgen"
+# BoltzGen weights + molecules are hosted on the Hugging Face Hub and fetched
+# with huggingface_hub, unified with the rest of tt-bio. Spec form
+# `huggingface:<repo_id>:<filename>`, resolved by get_artifact_path.
+BOLTZGEN_REPO = "moritztng/boltzgen"
 ARTIFACTS: dict[str, tuple[str, str]] = {
-    "design-diverse":   (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_diverse.ckpt",   "model"),
-    "design-adherence": (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_adherence.ckpt", "model"),
-    "inverse-fold":     (f"{BOLTZGEN_ARTIFACTS_URL}/boltzgen1_ifold.ckpt",     "model"),
-    "folding":          (f"{BOLTZGEN_ARTIFACTS_URL}/boltz2_conf_final.ckpt",   "model"),
-    "affinity":         (f"{BOLTZGEN_ARTIFACTS_URL}/boltz2_aff.ckpt",          "model"),
-    "moldir":           (f"{BOLTZGEN_ARTIFACTS_URL}/mols.zip",                 "dataset"),
+    "design-diverse":   (f"huggingface:{BOLTZGEN_REPO}:boltzgen1_diverse.ckpt",   "model"),
+    "design-adherence": (f"huggingface:{BOLTZGEN_REPO}:boltzgen1_adherence.ckpt", "model"),
+    "inverse-fold":     (f"huggingface:{BOLTZGEN_REPO}:boltzgen1_ifold.ckpt",     "model"),
+    "folding":          (f"huggingface:{BOLTZGEN_REPO}:boltz2_conf_final.ckpt",   "model"),
+    "affinity":         (f"huggingface:{BOLTZGEN_REPO}:boltz2_aff.ckpt",          "model"),
+    "moldir":           (f"huggingface:{BOLTZGEN_REPO}:mols.zip",                 "dataset"),
 }
 
 
@@ -1728,19 +1729,31 @@ def get_artifact_path(
 ) -> Path:
     """Resolve an artifact spec to a local file path.
 
-    Two accepted forms:
-      * ``http(s)://...``  — fetched once via ``urllib`` into the local cache
-        (default ``~/.boltz/boltzgen/``; override with ``--cache``). Used by
-        the GCP-hosted defaults in ``ARTIFACTS``.
+    Three accepted forms (cache defaults to ``~/.boltz/boltzgen/``; override
+    with ``--cache``):
+      * ``huggingface:<repo_id>:<filename>`` — fetched once from the Hugging
+        Face Hub. Used by the ``ARTIFACTS`` defaults (the tt-bio weight repos).
+      * ``http(s)://...``  — fetched once via ``urllib``.
       * Anything else — treated as a local file path.
     """
-    if artifact.startswith(("http://", "https://")):
+    cache = args.cache if args.cache is not None else (Path.home() / ".boltz" / "boltzgen")
+    force = bool(getattr(args, "force_download", False))
+    if artifact.startswith("huggingface:"):
+        from huggingface_hub import hf_hub_download
+
+        _, repo_id, filename = artifact.split(":", 2)
+        cache.mkdir(parents=True, exist_ok=True)
+        result = cache / filename
+        if force or not result.exists():
+            print(f"Downloading {artifact} → {result}")
+            hf_hub_download(repo_id=repo_id, filename=filename,
+                            local_dir=str(cache), force_download=force)
+    elif artifact.startswith(("http://", "https://")):
         import urllib.request
 
-        cache = args.cache if args.cache is not None else (Path.home() / ".boltz" / "boltzgen")
         cache.mkdir(parents=True, exist_ok=True)
         result = cache / artifact.rsplit("/", 1)[-1]
-        if args.force_download or not result.exists():
+        if force or not result.exists():
             print(f"Downloading {artifact} → {result}")
             urllib.request.urlretrieve(artifact, result)
     else:
