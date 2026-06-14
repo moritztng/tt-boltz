@@ -1343,17 +1343,21 @@ _NA_HEADER_TYPES = {"rna": "rna", "rnasequence": "rna", "dna": "dna", "dnasequen
 
 def _read_bio_chains(path):
     """Like _read_protein_chains but modality-aware: returns [(chain_id, sequence, msa_spec,
-    mol_type)] for protein / rna / dna entries (Protenix complexes). FASTA type field and YAML
-    entry key select the modality; protein keeps MSA, nucleic-acid chains are single-sequence
-    (msa_spec=None). Ligand/ccd/smiles records are skipped here (handled separately)."""
+    mol_type)] for protein / rna / dna / ligand entries (Protenix complexes). FASTA type field
+    and YAML entry key select the modality; protein keeps MSA, nucleic-acid and ligand chains
+    are single-sequence (msa_spec=None). For ligands the `sequence` carries the spec the
+    featurizer expects: 'CCD_<code>' for a CCD code or a raw SMILES string."""
     suffix = path.suffix.lower()
     chains: list[tuple[str, str, str | None, str]] = []
     if suffix in (".fa", ".fas", ".fasta"):
         cid, buf, msa, mt = None, [], None, "protein"
         def flush():
             if cid and buf:
+                seq = "".join(buf)
+                seq = ("CCD_" + seq.upper()) if mt == "_ccd" else seq   # ccd code -> CCD_ spec
+                mtype = "ligand" if mt in ("_ccd", "ligand") else mt
                 for c in cid.split(","):
-                    chains.append((c.strip() or chr(65 + len(chains)), "".join(buf), msa, mt))
+                    chains.append((c.strip() or chr(65 + len(chains)), seq, msa, mtype))
         for line in path.read_text().splitlines():
             line = line.strip()
             if line.startswith(">"):
@@ -1366,8 +1370,11 @@ def _read_bio_chains(path):
                     msa = m if m and m.lower() != "empty" else None
                 elif typ in _NA_HEADER_TYPES:
                     cid, buf, mt, msa = parts[0].strip(), [], _NA_HEADER_TYPES[typ], None
+                elif typ in ("ccd", "ion", "smiles", "ligand"):
+                    cid, buf, msa = parts[0].strip(), [], None
+                    mt = "_ccd" if typ in ("ccd", "ion") else "ligand"
                 else:
-                    cid, buf = None, []           # ligand/ccd/smiles handled elsewhere
+                    cid, buf = None, []
             elif line and cid is not None:
                 buf.append(line)
         flush()
@@ -1388,6 +1395,14 @@ def _read_bio_chains(path):
                            else str(ids).split(","))
                 for c in id_list:
                     chains.append((c.strip(), sub["sequence"], m, mt))
+            lig = entry.get("ligand")                       # {ccd: CODE} or {smiles: STR}
+            if isinstance(lig, dict) and (lig.get("ccd") or lig.get("smiles")):
+                spec = ("CCD_" + str(lig["ccd"]).upper()) if lig.get("ccd") else str(lig["smiles"])
+                ids = lig.get("id", "L")
+                id_list = ([str(x) for x in ids] if isinstance(ids, (list, tuple))
+                           else str(ids).split(","))
+                for c in id_list:
+                    chains.append((c.strip(), spec, None, "ligand"))
     else:
         raise click.ClickException(f"Unsupported input for protenix-v2: {path.name}")
     return chains

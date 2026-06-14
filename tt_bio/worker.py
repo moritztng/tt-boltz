@@ -345,8 +345,10 @@ class _WorkerState:
             import numpy as np
             np.savez(out.with_suffix(".pae.npz"), pae=conf["pae"].numpy(), pde=conf["pde"].numpy())
         metrics = {
-            "plddt": round(conf["plddt"], 4), "n_residues": sum(len(c[1]) for c in chains),
-            "n_chains": len(chains), "msa": any(a for _, a, _ in chain_specs),
+            "plddt": round(conf["plddt"], 4),
+            "n_residues": sum(len(cseq) for _c, cseq, _s, mt in chains if mt != "ligand"),
+            "n_chains": len(chains), "n_tokens": int(feats["restype"].shape[0]),
+            "msa": any(a for _, a, _ in chain_specs),
             "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
         }
         return metrics, None, {"record": types.SimpleNamespace(affinity=False)}
