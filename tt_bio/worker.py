@@ -73,6 +73,8 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
             ckpt = hf_hub_download(repo_id="TMF001/protenix-v2-weights",
                                    filename="protenix-v2.pt", local_dir=str(cache))
         cfg["protenix_ckpt"] = ckpt
+        from tt_bio.main import download_mols           # CCD templates for nucleic acids / ligands
+        cfg["mol_dir"] = str(download_mols(cache))
         return
     # ESMFold2 loads its weights from HF on the first fold and needs no Boltz-2
     # checkpoints / molecule library — only a writable MSA dir.
@@ -296,22 +298,22 @@ class _WorkerState:
         import types
 
         from tt_bio.esmfold2 import report_progress
-        from tt_bio.main import (_generate_esmfold2_a3m, _read_protein_chains,
+        from tt_bio.main import (_generate_esmfold2_a3m, _read_bio_chains,
                                  _resolve_a3m_text, _write_protenix_structure)
         from tt_bio.protenix_data import build_complex_features
 
-        chains = _read_protein_chains(path)
+        chains = _read_bio_chains(path)
         if not chains:
-            raise RuntimeError("no protein sequences")
+            raise RuntimeError("no protein/nucleic-acid sequences")
         msa_dir = Path(cfg["msa_dir"])
 
         report_progress("msa")
-        # search any uncached chain (batched into one MSA call), then resolve each chain's a3m
+        # search any uncached protein chain (batched into one MSA call); NA chains are single-seq
         want_msa = cfg.get("use_msa_server") or cfg.get("msa_db_path")
         need = {}
-        for _cid, cseq, spec in chains:
+        for _cid, cseq, spec, mt in chains:
             have_spec = bool(spec and Path(spec).expanduser().exists())
-            if want_msa and not have_spec:
+            if mt == "protein" and want_msa and not have_spec:
                 h = hashlib.sha256(cseq.encode()).hexdigest()[:16]
                 if not (msa_dir / f"{h}.a3m").exists():
                     need[h] = cseq
@@ -321,10 +323,11 @@ class _WorkerState:
                 cfg.get("use_envdb", False), cfg.get("msa_server_url"),
                 cfg.get("msa_pairing_strategy"), cfg.get("msa_server_username"),
                 cfg.get("msa_server_password"), cfg.get("api_key_value"))
-        chain_a3m = [(cseq, _resolve_a3m_text(spec, cseq, msa_dir)) for _cid, cseq, spec in chains]
+        chain_specs = [(cseq, _resolve_a3m_text(spec, cseq, msa_dir) if mt == "protein" else None, mt)
+                       for _cid, cseq, spec, mt in chains]
 
         report_progress("prep")
-        feats = build_complex_features(chain_a3m)
+        feats = build_complex_features(chain_specs, mol_dir=cfg.get("mol_dir"))
 
         def _pfn(stage, step, total):
             report_progress("diffusion" if stage == "trunk" else stage)
@@ -343,7 +346,7 @@ class _WorkerState:
             np.savez(out.with_suffix(".pae.npz"), pae=conf["pae"].numpy(), pde=conf["pde"].numpy())
         metrics = {
             "plddt": round(conf["plddt"], 4), "n_residues": sum(len(c[1]) for c in chains),
-            "n_chains": len(chains), "msa": any(a for _, a in chain_a3m),
+            "n_chains": len(chains), "msa": any(a for _, a, _ in chain_specs),
             "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
         }
         return metrics, None, {"record": types.SimpleNamespace(affinity=False)}

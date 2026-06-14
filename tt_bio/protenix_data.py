@@ -155,48 +155,59 @@ def build_protein_features(sequence: str, a3m: str | None = None) -> dict:
     return build_complex_features([(sequence, a3m)])
 
 
-def build_complex_features(chains: list) -> dict:
-    """Multi-chain protein complex -> model-ready input_feature_dict.
+def build_complex_features(chains: list, mol_dir: str | None = None) -> dict:
+    """Multi-chain biomolecular complex -> model-ready input_feature_dict.
 
-    chains: list of (sequence, a3m_or_None). Identical sequences share an entity_id and get
-    distinct sym_ids (homomer copies); each chain gets its own asym_id. Token/atom features
-    are the per-chain protein features concatenated with global token indexing; residue_index
+    chains: list of (sequence, a3m_or_None[, mol_type]); mol_type is "protein" (default),
+    "rna" or "dna". Identical (mol_type, sequence) pairs share an entity_id and get distinct
+    sym_ids (homomer copies); each chain gets its own asym_id. Token/atom features are the
+    per-chain features concatenated with global token indexing (protein atoms from bundled
+    CCD conformers, nucleic-acid atoms from the CCD `mols` rdkit templates); residue_index
     restarts per chain (so the relative-position encoding sees chain breaks), token_index is
     global. The MSA is assembled BLOCK-DIAGONALLY (each chain's alignment over its own columns,
     gap elsewhere) on top of a shared query row -- the standard unpaired multi-chain assembly;
-    the model (tt_bio.protenix) regenerates relp / d_lm / v_lm / mask_trunked from asym/entity/
-    sym/residue/token indices. token_bonds = 0 (no inter-chain covalent bonds for plain complexes)."""
+    NA chains contribute only the query row (single-sequence). The model (tt_bio.protenix)
+    regenerates relp / d_lm / v_lm / mask_trunked from asym/entity/sym/residue/token indices.
+    token_bonds = 0 (no inter-chain covalent bonds for plain polymer complexes)."""
+    norm = [(e[0], e[1], e[2] if len(e) > 2 else "protein") for e in chains]
     conformers = load_ref_conformers()
-    N_tot = sum(len(s) for s, _ in chains)
-    entity_of = {}                                   # unique sequence -> entity_id
+    na_codes = {c for seq, _, mt in norm if mt != "protein" for c in _na_res_codes(seq, mt)}
+    mols = {}
+    if na_codes:
+        from .data.mol import load_molecules
+        mols = load_molecules(str(mol_dir or _default_mol_dir()), sorted(na_codes))
+    N_tot = sum(len(seq) for seq, _, _ in norm)
+    entity_of = {}                                   # (mol_type, sequence) -> entity_id
     sym_counter = {}                                 # entity_id -> next copy index
     restype, asym, entity, sym, resid = [], [], [], [], []
     atom_feats = []                                  # per-chain atom-feature dicts
     tok_off = 0
-    per_chain_msa = []                               # (start_col, n_tok, msa_feats|None, aatype)
-    for ci, (seq, a3m) in enumerate(chains):
-        aatype = aatype_from_sequence(seq)
-        n = aatype.shape[0]
-        eid = entity_of.setdefault(seq, len(entity_of))
+    per_chain_msa = []                               # (start_col, n_tok, raw_msa|None, restype_idx)
+    for ci, (seq, a3m, mt) in enumerate(norm):
+        rt_idx = seq_to_restype(seq, mt)                      # 32-class indices (0..30)
+        n = rt_idx.shape[0]
+        eid = entity_of.setdefault((mt, seq), len(entity_of))
         sid = sym_counter.get(eid, 0); sym_counter[eid] = sid + 1
-        rt = torch.nn.functional.one_hot(aatype.clamp(max=RESTYPE_DIM - 1), RESTYPE_DIM).float()
-        restype.append(rt)
+        restype.append(torch.nn.functional.one_hot(rt_idx.clamp(max=RESTYPE_DIM - 1), RESTYPE_DIM).float())
         asym.append(torch.full((n,), ci, dtype=torch.long))
         entity.append(torch.full((n,), eid, dtype=torch.long))
         sym.append(torch.full((n,), sid, dtype=torch.long))
         resid.append(torch.arange(1, n + 1, dtype=torch.long))
-        af = protein_atom_features(aatype, conformers)        # local token indices 0..n-1
+        if mt == "protein":
+            af = protein_atom_features(rt_idx, conformers)    # local token indices 0..n-1
+        else:
+            af = na_atom_features(_na_res_codes(seq, mt), mols)
         af["atom_to_token_idx"] = af["atom_to_token_idx"] + tok_off
         af["ref_space_uid"] = af["ref_space_uid"] + tok_off
         atom_feats.append(af)
-        raw = _parse_a3m_to_msa(a3m, seq) if a3m else None    # (tokens, raw deletions) | None
-        per_chain_msa.append((tok_off, n, raw, aatype))
+        raw = _parse_a3m_to_msa(a3m, seq) if (mt == "protein" and a3m) else None
+        per_chain_msa.append((tok_off, n, raw, rt_idx))
         tok_off += n
 
     # block-diagonal MSA assembled from RAW counts (shared query row 0; each chain's extra rows
     # over its own columns, gap elsewhere), then transformed once via _msa_to_features.
     GAP = MSA_GAP_IDX
-    query = torch.cat([a for _, _, _, a in per_chain_msa]).clamp(max=20)  # query restypes (row 0)
+    query = torch.cat([a for _, _, _, a in per_chain_msa])  # query restypes (row 0), 0..30
     msa_rows, del_rows = [query], [torch.zeros(N_tot)]
     for start, n, raw, aatype in per_chain_msa:
         if raw is None:
@@ -264,19 +275,98 @@ def protein_atom_features(aatype: torch.Tensor, conformers: dict) -> dict:
             padded = (nm + "    ")[:4]
             name_chars.append([ord(c) - 32 for c in padded])
         ref_pos.append(conf)
-    ref_pos = torch.cat(ref_pos, 0)
-    N = ref_pos.shape[0]
+    return _assemble_atom_features(torch.cat(ref_pos, 0), elem_idx, ref_charge, ref_mask,
+                                   a2t, ruid, tokatom, disto_rep, name_chars)
+
+
+def _assemble_atom_features(ref_pos, elem_idx, ref_charge, ref_mask, a2t, ruid,
+                            tokatom, disto_rep, name_chars) -> dict:
+    """Pack per-atom lists into the model-ready atom feature tensors (shared by every
+    modality's atom-feature builder). elem_idx = atomic_number - 1 (one_hot over 128);
+    name_chars = per-atom [4] of ord(c)-32; the rest are 1:1 per-atom annotations."""
+    from .data import const
+    F = torch.nn.functional
     return {
         "ref_pos": ref_pos,
-        "ref_element": torch.nn.functional.one_hot(torch.tensor(elem_idx), const.num_elements).float(),
+        "ref_element": F.one_hot(torch.tensor(elem_idx), const.num_elements).float(),
         "ref_charge": torch.tensor(ref_charge),
-        "ref_atom_name_chars": torch.nn.functional.one_hot(torch.tensor(name_chars), 64).float(),
+        "ref_atom_name_chars": F.one_hot(torch.tensor(name_chars), 64).float(),
         "ref_mask": torch.tensor(ref_mask),
         "atom_to_token_idx": torch.tensor(a2t, dtype=torch.long),
         "ref_space_uid": torch.tensor(ruid, dtype=torch.long),
         "atom_to_tokatom_idx": torch.tensor(tokatom, dtype=torch.long),
         "distogram_rep_atom_mask": torch.tensor(disto_rep),
     }
+
+
+# Nucleic-acid residue tokenization (v2 STD_RESIDUES: RNA 21-25, DNA 26-30; N/DN = unknown).
+_RNA_LETTER_IDX = {"A": 21, "G": 22, "C": 23, "U": 24}
+_DNA_LETTER_IDX = {"A": 26, "G": 27, "C": 28, "T": 29}
+_NA_PURINES = {"A", "G", "DA", "DG"}
+_NA_PYRIMIDINES = {"C", "U", "DC", "DT"}
+
+
+def seq_to_restype(seq: str, mol_type: str = "protein") -> torch.Tensor:
+    """One-letter sequence -> 32-class restype indices for the given modality
+    (protein 0-20, RNA 21-25, DNA 26-30); unknown letters map to the modality's UNK."""
+    if mol_type == "protein":
+        return aatype_from_sequence(seq)
+    table, unk = (_RNA_LETTER_IDX, 25) if mol_type == "rna" else (_DNA_LETTER_IDX, 30)
+    return torch.tensor([table.get(c.upper(), unk) for c in seq], dtype=torch.long)
+
+
+def _na_res_codes(seq: str, mol_type: str) -> list:
+    """Per-residue CCD codes for a nucleic-acid sequence (RNA: A/G/C/U/N; DNA: DA/.../DN)."""
+    if mol_type == "rna":
+        return [c.upper() if c.upper() in ("A", "G", "C", "U") else "N" for c in seq]
+    return [("D" + c.upper()) if c.upper() in ("A", "G", "C", "T") else "DN" for c in seq]
+
+
+def na_atom_features(res_codes: list, mols: dict) -> dict:
+    """Atom-level features for one nucleic-acid chain (one CCD code per residue token).
+
+    Mirrors protein_atom_features but sources heavy atoms (name / element / charge /
+    reference-conformer coords) from the CCD rdkit Mol -- whose heavy-atom order matches
+    the v2 reference RES_ATOMS_DICT exactly (validated). The 5'-terminal phosphate oxygen
+    OP3 is kept only on the first residue and dropped from the rest (the reference's chain
+    convention, analogous to protein OXT). Distogram rep atom: C4 for purines, C2 for
+    pyrimidines, C1' for unknown (N/DN), per AF3 SI 4.4."""
+    ref_pos, elem_idx, ref_charge, ref_mask = [], [], [], []
+    a2t, ruid, tokatom, disto_rep, name_chars = [], [], [], [], []
+    for t, code in enumerate(res_codes):
+        mol = mols[code]
+        conf = mol.GetConformer()
+        disto = "C4" if code in _NA_PURINES else "C2" if code in _NA_PYRIMIDINES else "C1'"
+        k = 0
+        for a in mol.GetAtoms():
+            if a.GetAtomicNum() <= 1:                     # skip hydrogens (heavy atoms only)
+                continue
+            nm = a.GetProp("name")
+            if nm == "OP3" and t > 0:                     # free 5'-phosphate O only on first residue
+                k += 1                                    # OP3 still occupies CCD slot 0 (atom_to_tokatom_idx)
+                continue
+            p = conf.GetAtomPosition(a.GetIdx())
+            ref_pos.append([p.x, p.y, p.z])
+            elem_idx.append(a.GetAtomicNum() - 1)
+            ref_charge.append(float(a.GetFormalCharge()))
+            ref_mask.append(1.0)
+            a2t.append(t); ruid.append(t); tokatom.append(k)
+            disto_rep.append(1.0 if nm == disto else 0.0)
+            name_chars.append([ord(c) - 32 for c in (nm + "    ")[:4]])
+            k += 1
+    return _assemble_atom_features(torch.tensor(ref_pos, dtype=torch.float32), elem_idx,
+                                   ref_charge, ref_mask, a2t, ruid, tokatom, disto_rep, name_chars)
+
+
+def _default_mol_dir() -> str:
+    """Best-effort location of the bundled CCD `mols` directory (CLI/worker pass mol_dir
+    explicitly; this only backstops tests run from a checkout)."""
+    import os
+    for p in ("~/.boltz/mols", "~/.cache/tt_bio/mols"):
+        ep = os.path.expanduser(p)
+        if os.path.exists(ep):
+            return ep
+    return os.path.expanduser("~/.boltz/mols")
 
 
 def protein_token_features(aatype: torch.Tensor) -> dict:

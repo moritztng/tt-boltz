@@ -127,8 +127,9 @@ def download(url: str, dest: Path) -> None:
         raise RuntimeError(f"Failed to download {dest.name} from {url}") from e
 
 
-def download_all(cache: Path) -> None:
-    """Download all required model files and molecules."""
+def download_mols(cache: Path) -> Path:
+    """Ensure the CCD molecule library is present under cache/mols; return its path.
+    Used by Boltz-2 (ligands/affinity) and Protenix-v2 (nucleic-acid / ligand templates)."""
     tar_path = cache / "mols.tar"
     if not tar_path.exists():
         click.echo(f"Downloading {tar_path.name}")
@@ -137,6 +138,12 @@ def download_all(cache: Path) -> None:
         click.echo(f"Extracting {tar_path.name}")
         with tarfile.open(tar_path) as tar:
             tar.extractall(cache)
+    return cache / "mols"
+
+
+def download_all(cache: Path) -> None:
+    """Download all required model files and molecules."""
+    download_mols(cache)
     download(URLS["conf"], cache / "boltz2_conf.ckpt")
     download(URLS["aff"], cache / "boltz2_aff.ckpt")
 
@@ -1328,6 +1335,61 @@ def _read_protein_chains(path):
                     chains.append((c.strip(), prot["sequence"], m))
     else:
         raise click.ClickException(f"Unsupported input for esmfold2: {path.name}")
+    return chains
+
+
+_NA_HEADER_TYPES = {"rna": "rna", "rnasequence": "rna", "dna": "dna", "dnasequence": "dna"}
+
+
+def _read_bio_chains(path):
+    """Like _read_protein_chains but modality-aware: returns [(chain_id, sequence, msa_spec,
+    mol_type)] for protein / rna / dna entries (Protenix complexes). FASTA type field and YAML
+    entry key select the modality; protein keeps MSA, nucleic-acid chains are single-sequence
+    (msa_spec=None). Ligand/ccd/smiles records are skipped here (handled separately)."""
+    suffix = path.suffix.lower()
+    chains: list[tuple[str, str, str | None, str]] = []
+    if suffix in (".fa", ".fas", ".fasta"):
+        cid, buf, msa, mt = None, [], None, "protein"
+        def flush():
+            if cid and buf:
+                for c in cid.split(","):
+                    chains.append((c.strip() or chr(65 + len(chains)), "".join(buf), msa, mt))
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(">"):
+                flush()
+                parts = line[1:].split("|")
+                typ = parts[1].strip().lower() if len(parts) > 1 else "protein"
+                if typ in ("", "protein"):
+                    cid, buf, mt = parts[0].strip(), [], "protein"
+                    m = parts[2].strip() if len(parts) > 2 else ""
+                    msa = m if m and m.lower() != "empty" else None
+                elif typ in _NA_HEADER_TYPES:
+                    cid, buf, mt, msa = parts[0].strip(), [], _NA_HEADER_TYPES[typ], None
+                else:
+                    cid, buf = None, []           # ligand/ccd/smiles handled elsewhere
+            elif line and cid is not None:
+                buf.append(line)
+        flush()
+    elif suffix in (".yml", ".yaml"):
+        import yaml
+        doc = yaml.safe_load(path.read_text()) or {}
+        for entry in doc.get("sequences", []):
+            if not isinstance(entry, dict):
+                continue
+            for key, mt in (("protein", "protein"), ("rna", "rna"), ("dna", "dna")):
+                sub = entry.get(key)
+                if not (sub and sub.get("sequence")):
+                    continue
+                m = sub.get("msa") if mt == "protein" else None
+                m = str(m) if m and str(m).lower() not in ("", "empty") else None
+                ids = sub.get("id", "A")
+                id_list = ([str(x) for x in ids] if isinstance(ids, (list, tuple))
+                           else str(ids).split(","))
+                for c in id_list:
+                    chains.append((c.strip(), sub["sequence"], m, mt))
+    else:
+        raise click.ClickException(f"Unsupported input for protenix-v2: {path.name}")
     return chains
 
 
