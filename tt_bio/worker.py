@@ -65,16 +65,12 @@ def _ensure_local_artifacts(cfg: dict[str, Any]) -> None:
     # Protenix-v2: resolve the v2 checkpoint. Prefer $PROTENIX_CKPT, then the worker
     # cache, then download from the Hugging Face weights mirror on first use.
     if cfg.get("model") == "protenix-v2":
-        cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
-        ckpt = os.environ.get("PROTENIX_CKPT") or str(cache / "protenix-v2.pt")
-        if not Path(ckpt).exists():
-            from huggingface_hub import hf_hub_download
+        from tt_bio.main import PROTENIX_REPO, download_mols, hf_artifact
 
-            ckpt = hf_hub_download(repo_id="TMF001/protenix-v2-weights",
-                                   filename="protenix-v2.pt", local_dir=str(cache))
-        cfg["protenix_ckpt"] = ckpt
-        from tt_bio.main import download_mols           # CCD templates for nucleic acids / ligands
-        cfg["mol_dir"] = str(download_mols(cache))
+        cfg["msa_dir"] = _resolve_msa_dir(cfg.get("msa_dir"), cache)
+        cfg["protenix_ckpt"] = os.environ.get("PROTENIX_CKPT") or str(
+            hf_artifact(PROTENIX_REPO, "protenix-v2.pt", cache))
+        cfg["mol_dir"] = str(download_mols(cache))     # CCD templates for nucleic acids / ligands
         return
     # ESMFold2 loads its weights from HF on the first fold and needs no Boltz-2
     # checkpoints / molecule library — only a writable MSA dir.
@@ -110,17 +106,25 @@ class _WorkerState:
         self.accelerator = accelerator
         self.run_id: str | None = None
         self.config_hash: str | None = None
+        self.model_id: str | None = None   # the loaded model — reported to the
+                                           # scheduler so it can keep this worker
+                                           # on the same model (affinity).
         self.model = None
         self.aff_model = None
         self.prepare = None
-        self.pfn = None  # progress callback (set per run), shared by both models
+        self.pfn = None  # progress callback (rebound per run)
+        self._ccd = self._tokenizer = self._featurizer = self._mol_dir = None  # Boltz-2, cached
         if accelerator == "gpu" and torch.cuda.is_available():
             self.torch_device = torch.device("cuda:0")
         else:
             self.torch_device = torch.device("cpu")
 
-    def configured_for(self, run_id: str, cfg: dict[str, Any]) -> bool:
-        return self.run_id == run_id and self.config_hash == _hash_run_config(cfg)
+    def configured_for(self, cfg: dict[str, Any]) -> bool:
+        # Residency is keyed on the model setup only, NOT the run id: the loaded
+        # weights are run-independent, so a resident model serves jobs from any
+        # run/user of the same model with no reload. Per-run bits (output/MSA
+        # paths, progress) are refreshed cheaply in bind_run().
+        return self.model is not None and self.config_hash == _hash_run_config(cfg)
 
     def reset(self) -> None:
         self.model = None
@@ -129,6 +133,8 @@ class _WorkerState:
         self.pfn = None
         self.run_id = None
         self.config_hash = None
+        self.model_id = None
+        self._ccd = self._tokenizer = self._featurizer = self._mol_dir = None
         gc.collect()
         if self.accelerator == "tenstorrent":
             try:
@@ -138,70 +144,62 @@ class _WorkerState:
             except Exception:
                 pass
 
-    def load(self, run_id: str, cfg: dict[str, Any]) -> None:
+    def load_model(self, cfg: dict[str, Any]) -> None:
+        """Load the heavy model weights onto the device. Keyed on the model
+        config (see configured_for), so it runs once per model, not once per run."""
         if self.accelerator == "tenstorrent":
             from tt_bio.tenstorrent import set_fast_mode
 
             set_fast_mode(cfg.get("fast", False))
 
-        # ESMFold2 family: load + patch the ttnn model (no tokenizer/featurizer;
-        # chains are read straight from the input in predict_one). Symmetric to
-        # the Boltz-2 load below — same _WorkerState, same scheduler/worker loop.
-        if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
+        model_id = cfg.get("model", "boltz2")
+        if model_id in ("esmfold2", "esmfold2-fast"):
             from tt_bio.esmfold2_runtime import load_ttnn_esmfold2
 
-            repo = "biohub/ESMFold2-Fast" if cfg["model"] == "esmfold2-fast" else "biohub/ESMFold2"
+            repo = "biohub/ESMFold2-Fast" if model_id == "esmfold2-fast" else "biohub/ESMFold2"
             self.model = load_ttnn_esmfold2(esmfold2_repo=repo, fast=cfg.get("fast", False))
             self.model._esmc.preload()
-            self.prepare = None
-            self.run_id = run_id
-            self.config_hash = _hash_run_config(cfg)
-            return
-
-        # Protenix-v2 family: load the ttnn model (no Boltz-2 tokenizer/featurizer;
-        # sequences are featurized in predict_one via tt_bio.protenix_data). Symmetric
-        # to the ESMFold2 branch above.
-        if cfg.get("model") == "protenix-v2":
+        elif model_id == "protenix-v2":
             from tt_bio.protenix import Protenix
 
             self.model = Protenix.load_from_checkpoint(cfg["protenix_ckpt"])
-            self.prepare = None
-            self.run_id = run_id
-            self.config_hash = _hash_run_config(cfg)
-            return
+        else:
+            from tt_bio.boltz2 import Boltz2
+            from tt_bio.data.featurizer import Boltz2Featurizer
+            from tt_bio.data.mol import load_canonicals
+            from tt_bio.data.tokenize import Boltz2Tokenizer
 
-        from tt_bio.boltz2 import Boltz2
-        from tt_bio.data.featurizer import Boltz2Featurizer
-        from tt_bio.data.mol import load_canonicals
-        from tt_bio.data.tokenize import Boltz2Tokenizer
-        from tt_bio.main import prepare_features
-
-        tokenizer, featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
-        ccd = load_canonicals(Path(cfg["mol_dir"]))
-        self.prepare = partial(
-            prepare_features,
-            ccd=ccd,
-            mol_dir=Path(cfg["mol_dir"]),
-            msa_dir=Path(cfg["msa_dir"]),
-            tokenizer=tokenizer,
-            featurizer=featurizer,
-            use_msa=cfg["use_msa_server"],
-            msa_url=cfg["msa_server_url"],
-            msa_strategy=cfg["msa_pairing_strategy"],
-            msa_user=cfg["msa_server_username"],
-            msa_pass=cfg["msa_server_password"],
-            api_key=cfg["api_key_value"],
-            max_msa=cfg["max_msa_seqs"],
-            msa_db_path=cfg.get("msa_db_path"),
-            use_envdb=cfg.get("use_envdb", False),
-        )
-        self.model = (
-            Boltz2.load_from_checkpoint(cfg["conf_ckpt"], **cfg["conf_kwargs"])
-            .eval()
-            .to(self.torch_device)
-        )
-        self.run_id = run_id
+            self._tokenizer, self._featurizer = Boltz2Tokenizer(), Boltz2Featurizer()
+            self._mol_dir = Path(cfg["mol_dir"])
+            self._ccd = load_canonicals(self._mol_dir)
+            self.model = (
+                Boltz2.load_from_checkpoint(cfg["conf_ckpt"], **cfg["conf_kwargs"])
+                .eval()
+                .to(self.torch_device)
+            )
         self.config_hash = _hash_run_config(cfg)
+        self.model_id = model_id
+
+    def bind_run(self, run_id: str, cfg: dict[str, Any]) -> None:
+        """Cheap per-run rebinding so a resident model serves a new run/user
+        correctly: point Boltz-2's featurizer at this run's MSA/output dirs.
+        ESMFold2 / Protenix read those straight from cfg in predict_one."""
+        self.run_id = run_id
+        if self.model_id == "boltz2":
+            from tt_bio.main import prepare_features
+
+            self.prepare = partial(
+                prepare_features,
+                ccd=self._ccd, mol_dir=self._mol_dir, msa_dir=Path(cfg["msa_dir"]),
+                tokenizer=self._tokenizer, featurizer=self._featurizer,
+                use_msa=cfg["use_msa_server"], msa_url=cfg["msa_server_url"],
+                msa_strategy=cfg["msa_pairing_strategy"], msa_user=cfg["msa_server_username"],
+                msa_pass=cfg["msa_server_password"], api_key=cfg["api_key_value"],
+                max_msa=cfg["max_msa_seqs"], msa_db_path=cfg.get("msa_db_path"),
+                use_envdb=cfg.get("use_envdb", False),
+            )
+        else:
+            self.prepare = None
 
     def predict_one(self, path: Path, cfg: dict[str, Any]):
         if cfg.get("model") == "protenix-v2":
@@ -458,6 +456,9 @@ def run_worker_loop(
             # fleet self-healing — a worker reconnects on its own when the
             # controller comes back, with no manual restart.
             try:
+                # Tell the scheduler which model we already have resident so it
+                # can keep us on it (affinity) and avoid a reload.
+                worker_info["model"] = state.model_id
                 lease = client.lease(worker_info, batch_size=1)
             except Exception:
                 time.sleep(idle_poll)
@@ -482,29 +483,34 @@ def run_worker_loop(
 
             _ensure_local_artifacts(cfg)
 
-            if not state.configured_for(run_id, cfg):
-                state.reset()
-                try:
-                    emit(run_id, "loading")
-                    state.load(run_id, cfg)
-                    from tt_bio.progress import make_progress_fn
-
-                    pfn = make_progress_fn(
-                        HttpProgressQueue(client, run_id, worker_id),
-                        worker_info["device_id"], worker_id, meta,
-                    )
-                    state.pfn = pfn
-                    if cfg.get("model", "boltz2") in ("esmfold2", "esmfold2-fast"):
-                        from tt_bio import esmfold2 as _E
-
-                        _E.set_progress(pfn)  # trunk/diffusion per-step bars
-                    else:
-                        state.model.progress_fn = pfn
-                except Exception as exc:
-                    traceback.print_exc()
-                    _complete_failure(client, run_id, worker_id, meta, jobs, str(exc)[:200])
+            try:
+                # Reload weights only when the model actually changes — a resident
+                # model is reused across runs/users of the same model.
+                if not state.configured_for(cfg):
                     state.reset()
-                    continue
+                    emit(run_id, "loading")
+                    state.load_model(cfg)
+                # Per-run rebinding (cheap) every job: output/MSA paths + a fresh
+                # progress callback aimed at this run.
+                state.bind_run(run_id, cfg)
+                from tt_bio.progress import make_progress_fn
+
+                pfn = make_progress_fn(
+                    HttpProgressQueue(client, run_id, worker_id),
+                    worker_info["device_id"], worker_id, meta,
+                )
+                state.pfn = pfn
+                if cfg.get("model", "boltz2") == "boltz2":
+                    state.model.progress_fn = pfn
+                else:
+                    from tt_bio import esmfold2 as _E
+
+                    _E.set_progress(pfn)  # esmfold2 + protenix report via this module
+            except Exception as exc:
+                traceback.print_exc()
+                _complete_failure(client, run_id, worker_id, meta, jobs, str(exc)[:200])
+                state.reset()
+                continue
 
             for job in jobs:
                 _execute_job(state, job, cfg, run_id, client, worker_id, meta)

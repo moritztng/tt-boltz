@@ -88,6 +88,7 @@ class ControllerStore:
                     result_dir TEXT NOT NULL,
                     status TEXT NOT NULL,
                     owner TEXT,
+                    model TEXT,
                     config_json TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -127,7 +128,8 @@ class ControllerStore:
             )
             # Migrate pre-existing tables that lack newer columns.
             for stmt in ("ALTER TABLE jobs ADD COLUMN stage TEXT",
-                         "ALTER TABLE runs ADD COLUMN owner TEXT"):
+                         "ALTER TABLE runs ADD COLUMN owner TEXT",
+                         "ALTER TABLE runs ADD COLUMN model TEXT"):
                 try:
                     conn.execute(stmt)
                 except sqlite3.OperationalError:
@@ -142,8 +144,8 @@ class ControllerStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO runs
-                    (run_id, data, out_dir, result_dir, status, owner, config_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_id, data, out_dir, result_dir, status, owner, model, config_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -152,6 +154,7 @@ class ControllerStore:
                     payload["result_dir"],
                     "running",
                     payload.get("owner"),  # opaque fairness key (hash of the user's session, never the secret)
+                    config.get("model"),   # which model these jobs need — drives worker model-affinity
                     json.dumps(config),
                     now,
                     now,
@@ -184,6 +187,7 @@ class ControllerStore:
     def lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         worker = payload["worker"]
         worker_id = worker["worker_id"]
+        warm_model = worker.get("model")  # model this worker already has resident
         batch_size = max(1, int(payload.get("batch_size") or 1))
         now = time.time()
         lease_until = now + LEASE_SECONDS
@@ -203,7 +207,7 @@ class ControllerStore:
             # expired), oldest first.
             rows = conn.execute(
                 """
-                SELECT j.run_id, j.job_id, j.name, j.input_b64, j.updated_at, r.owner, r.config_json
+                SELECT j.run_id, j.job_id, j.name, j.input_b64, j.updated_at, r.owner, r.model, r.config_json
                 FROM jobs j
                 JOIN runs r ON r.run_id = j.run_id
                 WHERE r.status = 'running'
@@ -214,12 +218,18 @@ class ControllerStore:
             ).fetchall()
             if not rows:
                 return {"jobs": []}
-            # Give this freed device to the owner using the fewest devices right
-            # now (ties → oldest job). One user alone is the only owner, so they
-            # fill the whole cluster; the moment a second user has work, they're
-            # balanced in as devices turn over — no device ever sits idle while
-            # any job is waiting.
-            chosen = min(rows, key=lambda row: (load.get(row["owner"], 0), row["updated_at"], row["job_id"]))
+            # Pick by, in order: (1) fairness — the owner using the fewest devices
+            # right now; (2) model affinity — among equally-underserved owners,
+            # prefer a job whose model this worker already has loaded, so it
+            # doesn't reload; (3) oldest. So one user alone fills the cluster, many
+            # users get a fair share, and each device tends to stay on one model
+            # (reloading only when its model has no waiting work). Work-conserving
+            # throughout — a device never idles while any job waits.
+            def rank(row):
+                return (load.get(row["owner"], 0),
+                        0 if row["model"] == warm_model else 1,
+                        row["updated_at"], row["job_id"])
+            chosen = min(rows, key=rank)
             run_id = chosen["run_id"]
             config_json = chosen["config_json"]
             picked = [row for row in rows if row["run_id"] == run_id][:batch_size]

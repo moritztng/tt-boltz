@@ -42,15 +42,29 @@ def _window_q(x, N, NP, nq=32):
     return ttnn.to_layout(ttnn.reshape(x, (NP // nq, nq, x.shape[-1])), ttnn.TILE_LAYOUT)
 
 
+_WIN_KV_IDX = {}  # (NP,nq,nk) -> precomputed (1, nb*nk) uint32 gather index (device tensor)
+
+
 def _window_kv(x, N, NP, nq=32, nk=128, pad_left=48):
     """Window the key/value axis into overlapping local blocks: (N,C)|(1,N,C) -> (NP//nq, nk, C)
-    with a left pad of (nk-nq)/2. Shared windowing for the local atom-pair attention."""
+    with a left pad of (nk-nq)/2. A SINGLE ttnn.embedding gather (window i, key j <- padded row
+    i*nq+j). Replaces an nb-element ttnn.slice loop + nb-way ttnn.concat that DEADLOCKS the device
+    at large nb (e.g. Wormhole, seq>~64 atoms): nb slices + concat -> ~2*nb dispatched ops that
+    never complete. Same gather the AtomTransformer KV-windowing uses; bit-identical semantics."""
     x = ttnn.reshape(x, (1, N, x.shape[-1])) if len(x.shape) == 2 else x
     C = x.shape[-1]; nb = NP // nq; Lp = pad_left + NP + nk
     x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
     x = ttnn.pad(x, [[0, 0], [pad_left, Lp - pad_left - N], [0, 0]], 0.0)
-    bl = [ttnn.slice(x, [0, i * nq, 0], [1, i * nq + nk, C]) for i in range(nb)]
-    return ttnn.to_layout(ttnn.reshape(ttnn.concat(bl, 0), (nb, nk, C)), ttnn.TILE_LAYOUT)
+    x = ttnn.reshape(x, (Lp, C))                                   # gather table (Lp, C)
+    idx = _WIN_KV_IDX.get((NP, nq, nk))
+    if idx is None:
+        ii = (torch.arange(nb).reshape(nb, 1) * nq + torch.arange(nk).reshape(1, nk)).reshape(1, nb * nk)
+        idx = ttnn.from_torch(ii.to(torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
+                              device=get_device(), dtype=ttnn.uint32)
+        _WIN_KV_IDX[(NP, nq, nk)] = idx
+    x = ttnn.embedding(idx, x, layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    x = ttnn.reshape(x, (nb, nk, C))                               # (nb, nk, C)
+    return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
 
 
 class _KeyedWeights:

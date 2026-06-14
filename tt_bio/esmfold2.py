@@ -407,7 +407,7 @@ class TransitionLayer(Module):
         self.b_w = self.torch_to_tt("b_proj.weight")
         self.out_w = self.torch_to_tt("out_proj.weight")
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def _body(self, x: ttnn.Tensor) -> ttnn.Tensor:
         ck = self.compute_kernel_config
         lin = self._lin
         xn = ttnn.layer_norm(x, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck)
@@ -419,6 +419,25 @@ class TransitionLayer(Module):
         out = lin(gated, self.out_w)
         ttnn.deallocate(gated)
         return out
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        # On the pair tensor z [B,L,L,c] the a/b projections are ~1 GiB at L=1024,
+        # which (with the 6B LM resident through the fold) OOMs the 12 GB/chip
+        # Wormhole DRAM. The transition is row-independent over dim=1 (per-position
+        # LayerNorm + matmuls + pointwise gate), so tiling is bit-exact. A pair
+        # input (4D, transient ~ rows*L) uses the area-bounded tile; a single
+        # input (3D, per-token) uses the fixed row tile. Single pass on Blackhole.
+        from tt_bio import tenstorrent
+        L = x.shape[1]
+        if len(x.shape) == 4:
+            chunk = tenstorrent.pair_row_tile(L)
+        else:
+            t = tenstorrent.SMALL_GRID_SEQ_TILE
+            chunk = t if (t and L > t) else 0
+        if chunk:
+            parts = ttnn.chunk(x, -(-L // chunk), dim=1)
+            return ttnn.concat([self._body(p) for p in parts], dim=1)
+        return self._body(x)
 
 
 class DiffusionConditioningModel(Module):
@@ -986,19 +1005,34 @@ class OuterProductMean(Module):
         self.W = self.torch_to_tt("W.weight")
         self.Wout = self.torch_to_tt("Wout.weight"); self.Wout_b = self.torch_to_tt("Wout.bias", transform=_ROW)
 
+    def _rows(self, a_blk, b2, recip_blk, L, M):  # a_blk [B,Bl,M,32] -> [B,Bl,L,256]
+        ck = self.compute_kernel_config
+        B, Bl = a_blk.shape[0], a_blk.shape[1]
+        a2 = ttnn.reshape(ttnn.permute(a_blk, (0, 1, 3, 2)), (B, Bl * 32, M))   # [B,Bl*32,M]
+        prod = ttnn.matmul(a2, b2, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,Bl*32,L*32]
+        prod = ttnn.permute(ttnn.reshape(prod, (B, Bl, 32, L, 32)), (0, 1, 3, 2, 4))  # [B,Bl,L,32,32]
+        outer = ttnn.reshape(prod, (B, Bl, L, 1024))
+        out = self._lin(outer, self.Wout, self.Wout_b)  # [B,Bl,L,256]
+        return ttnn.multiply(out, recip_blk)
+
     def __call__(self, m, recip_nvalid):  # m [B,L,M,128]; recip_nvalid [B,L,L,1]
         ck = self.compute_kernel_config
-        lin = self._lin
         B, L, M = m.shape[0], m.shape[1], m.shape[2]
-        x = lin(ttnn.layer_norm(m, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck), self.W)
+        x = self._lin(ttnn.layer_norm(m, weight=self.norm_w, bias=self.norm_b, epsilon=1e-5, compute_kernel_config=ck), self.W)
         a, b = ttnn.chunk(x, 2, dim=-1)  # [B,L,M,32]
-        a2 = ttnn.reshape(ttnn.permute(a, (0, 1, 3, 2)), (B, L * 32, M))   # [B,L*32,M]
         b2 = ttnn.reshape(ttnn.permute(b, (0, 2, 1, 3)), (B, M, L * 32))   # [B,M,L*32]
-        prod = ttnn.matmul(a2, b2, compute_kernel_config=ck, dtype=_DTYPE, core_grid=CORE_GRID_MAIN)  # [B,L*32,L*32]
-        prod = ttnn.permute(ttnn.reshape(prod, (B, L, 32, L, 32)), (0, 1, 3, 2, 4))  # [B,L,L,32,32]
-        outer = ttnn.reshape(prod, (B, L, L, 1024))
-        out = lin(outer, self.Wout, self.Wout_b)  # [B,L,L,256]
-        return ttnn.multiply(out, recip_nvalid)
+        # The a2@b2 product is [B,L*32,L*32] (~2 GiB at L=1024), which OOMs the
+        # 12 GB/chip Wormhole DRAM. Output row i depends only on a[i] and b, so
+        # tiling over the i (row) dim is bit-exact. Pair op -> area-bounded tile
+        # (transient ~ rows*L). Single pass on Blackhole.
+        from tt_bio import tenstorrent
+        chunk = tenstorrent.pair_row_tile(L)
+        if chunk:
+            outs = [self._rows(a[:, s:min(s + chunk, L), :, :], b2,
+                               recip_nvalid[:, s:min(s + chunk, L), :, :], L, M)
+                    for s in range(0, L, chunk)]
+            return ttnn.concat(outs, dim=1)
+        return self._rows(a, b2, recip_nvalid, L, M)
 
 
 class MSAPairWeightedAveraging(Module):

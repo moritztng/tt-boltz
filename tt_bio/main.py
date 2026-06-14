@@ -108,44 +108,41 @@ from tt_bio.runtime import (
 )
 from tt_bio.worker import run_worker_loop
 
-ARTIFACT_BASE_URL = "https://storage.googleapis.com/tt-boltz-artifacts"
-URLS = {
-    "mols": f"{ARTIFACT_BASE_URL}/mols.tar",
-    "conf": f"{ARTIFACT_BASE_URL}/boltz2_conf.ckpt",
-    "aff": f"{ARTIFACT_BASE_URL}/boltz2_aff.ckpt",
-}
+# Model weights and data live on the Hugging Face Hub and are fetched with
+# huggingface_hub — the single download path shared by every tt-bio model.
+BOLTZ2_REPO = "moritztng/boltz-2"            # Boltz-2 weights + molecules (MIT)
+PROTENIX_REPO = "TMF001/protenix-v2-weights"  # Protenix-v2 weights (Apache-2.0)
 
 
-def download(url: str, dest: Path) -> None:
-    """Download a required artifact if it is missing locally."""
-    if dest.exists():
-        return
-    click.echo(f"Downloading {dest.name}")
-    try:
-        urllib.request.urlretrieve(url, dest)
-    except Exception as e:
-        raise RuntimeError(f"Failed to download {dest.name} from {url}") from e
+def hf_artifact(repo_id: str, filename: str, dest_dir: Path) -> Path:
+    """Fetch one file from a Hugging Face repo into dest_dir on first use and
+    reuse the local copy thereafter. Used by every tt-bio model (Boltz-2,
+    BoltzGen, Protenix-v2) so there is one artifact-download path."""
+    dest = dest_dir / filename
+    if not dest.exists():
+        from huggingface_hub import hf_hub_download
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        click.echo(f"Downloading {filename}")
+        hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(dest_dir))
+    return dest
 
 
 def download_mols(cache: Path) -> Path:
     """Ensure the CCD molecule library is present under cache/mols; return its path.
     Used by Boltz-2 (ligands/affinity) and Protenix-v2 (nucleic-acid / ligand templates)."""
-    tar_path = cache / "mols.tar"
-    if not tar_path.exists():
-        click.echo(f"Downloading {tar_path.name}")
-        urllib.request.urlretrieve(URLS["mols"], tar_path)
+    tar_path = hf_artifact(BOLTZ2_REPO, "mols.tar", cache)
     if not (cache / "mols").exists():
-        click.echo(f"Extracting {tar_path.name}")
+        click.echo("Extracting mols.tar")
         with tarfile.open(tar_path) as tar:
             tar.extractall(cache)
     return cache / "mols"
 
 
 def download_all(cache: Path) -> None:
-    """Download all required model files and molecules."""
+    """Fetch the Boltz-2 checkpoints and molecule library (Hugging Face, MIT)."""
     download_mols(cache)
-    download(URLS["conf"], cache / "boltz2_conf.ckpt")
-    download(URLS["aff"], cache / "boltz2_aff.ckpt")
+    hf_artifact(BOLTZ2_REPO, "boltz2_conf.ckpt", cache)
+    hf_artifact(BOLTZ2_REPO, "boltz2_aff.ckpt", cache)
 
 
 def compute_msa(seqs: dict[str, str], target_id: str, msa_dir: Path, url: str, strategy: str,
@@ -410,10 +407,15 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
                 f.write(f">{name}\n{seq}\n")
         a3m_out = tmp / "a3m"
         a3m_out.mkdir(exist_ok=True)
+        # Honor the per-worker thread cap (set by _spawn_worker_processes as
+        # OMP_NUM_THREADS = cores // workers) so many concurrent MSAs across a
+        # fleet share each host's cores instead of oversubscribing them. A
+        # plain single-run CLI leaves the env unset and gets all cores.
+        threads = int(os.environ.get("OMP_NUM_THREADS") or os.cpu_count() or 1)
         cmd_base = [
             colabfold_bin, str(fasta), db_path, str(a3m_out),
             "--use-env", "1" if use_env else "0", "--use-templates", "0",
-            "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1),
+            "--db-load-mode", "2", "--threads", str(threads),
         ]
         if len(seqs) > 1:
             cmd_base += ["--pair-mode", "unpaired_paired", "--pairing_strategy", strategy_val]
@@ -836,6 +838,14 @@ def _local_workers(accelerator: str, num_devices: int, device_ids: str | None, m
 def _spawn_worker_processes(controller_url: str, workers: list, debug: bool) -> list:
     """Spawn one process per worker slot, each connected to the controller."""
     ctx = mp.get_context("spawn")
+    # Cap per-worker host threads. Each worker's torch/OMP/BLAS pools otherwise
+    # default to ALL cores, so N co-resident workers spawn N*cores threads that
+    # thrash the CPU and collapse throughput on the host-side work (featurization,
+    # output, layout conversion) -- the multi-card slowdown. Size to cores/workers;
+    # an operator-set value wins. Spawned children inherit these at import.
+    cap = max(1, (os.cpu_count() or 1) // max(1, len(workers)))
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, str(cap))
     procs = []
     for worker in workers:
         proc = ctx.Process(
@@ -1627,6 +1637,16 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
                       ("--write_embeddings", write_embeddings), ("--checkpoint", bool(checkpoint))]:
             if on:
                 click.secho(f"Note: --model {model} is protein-only; ignoring {n}", fg="yellow")
+        # ESMFold2's ESMC-6B language model is ~12.8 GB resident in normal precision
+        # and does not fit a Wormhole chip's ~12 GB DRAM (OOM at every length). The
+        # --fast block-fp8 path halves it to ~6.4 GB and, with the grid-aware FFN
+        # tiling, folds the full L<=1024 range. So on Wormhole ESMFold2 runs fast-only.
+        if use_tt and model in ("esmfold2", "esmfold2-fast") and not fast:
+            from tt_bio.tenstorrent import is_wormhole
+            if is_wormhole():
+                fast = True
+                click.secho("Note: --model {} runs in --fast mode on Wormhole (normal "
+                            "precision needs >12 GB DRAM/chip); enabling --fast.".format(model), fg="yellow")
         if model == "esmfold2-fast" and (use_msa_server or msa_db_path):
             click.echo()
             click.secho("Note: --model esmfold2-fast has no MSA encoder; folding single-sequence "
@@ -1663,6 +1683,14 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
                        "jobs": job_payloads(jobs), "config": worker_cfg, "owner": owner}
+        # Pre-fetch the Protenix-v2 checkpoint ONCE in the parent before fanning
+        # out: otherwise N local workers all see it missing and race to download
+        # the same 1.9 GB file into one cache dir, corrupting/racing it (workers
+        # fail with FileNotFoundError). Mirrors Boltz-2's parent-side download_all.
+        # Skipped in --controller mode: remote workers fetch on their own hosts.
+        if model == "protenix-v2" and not controller and not os.environ.get("PROTENIX_CKPT"):
+            ckpt_cache = Path(os.environ.get("BOLTZ_CACHE", str(Path("~/.boltz").expanduser())))
+            hf_artifact(PROTENIX_REPO, "protenix-v2.pt", ckpt_cache)
         if controller:
             _dispatch_to_controller(controller, run_payload, total=len(jobs), results_path=results_path,
                                     struct_dir=struct_dir, model=model, debug=debug, log=log, run_id=run_id)
