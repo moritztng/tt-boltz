@@ -435,7 +435,12 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
         for name in seqs:
             src = a3m_out / f"{name}.a3m"
             if src.exists():
-                shutil.copy2(src, msa_dir / f"{name}.a3m")
+                # Publish atomically (write-then-rename) so a concurrent reader
+                # never sees a half-written, empty a3m.
+                dst = msa_dir / f"{name}.a3m"
+                tmp_dst = msa_dir / f".{name}.a3m.{os.getpid()}.tmp"
+                shutil.copy2(src, tmp_dst)
+                os.replace(tmp_dst, dst)
             else:
                 click.echo(f"  warning: no A3M for {name}")
     finally:
@@ -479,17 +484,37 @@ def prepare_features(path, ccd, mol_dir, msa_dir, tokenizer, featurizer,
             chain.msa_id = -1
 
     if to_gen:
-        if msa_db_path:
-            compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path,
-                                use_env=use_envdb, pairing_strategy=msa_strategy)
-        elif use_msa:
-            compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
-        else:
-            raise RuntimeError(
-                "Missing MSAs. Use one of:\n"
-                "  1) Online:  --use_msa_server\n"
-                "  2) Offline: tt-bio msa  (then rerun predict)"
-            )
+        # Serialize MSA generation per sequence across all workers sharing this
+        # msa_dir: each sequence is searched once and reused, never redundantly
+        # re-searched in parallel (which both wasted CPU and raced on the shared
+        # a3m file). Locks are taken in sorted-hash order so concurrent
+        # multi-chain targets can't deadlock.
+        locks = []
+        try:
+            for h in sorted(to_gen):
+                lf = open(msa_dir / f".{h}.lock", "w")
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                locks.append(lf)
+            # Re-check under the locks: another worker may have produced some of
+            # these while we waited, so only generate what is still missing.
+            to_gen = {h: s for h, s in to_gen.items()
+                      if not (msa_dir / f"{h}.a3m").exists()
+                      and not (msa_dir / f"{h}.csv").exists()}
+            if to_gen and msa_db_path:
+                compute_msa_offline(to_gen, record.id, msa_dir, msa_db_path,
+                                    use_env=use_envdb, pairing_strategy=msa_strategy)
+            elif to_gen and use_msa:
+                compute_msa(to_gen, record.id, msa_dir, msa_url, msa_strategy, msa_user, msa_pass, api_key)
+            elif to_gen:
+                raise RuntimeError(
+                    "Missing MSAs. Use one of:\n"
+                    "  1) Online:  --use_msa_server\n"
+                    "  2) Offline: tt-bio msa  (then rerun predict)"
+                )
+        finally:
+            for lf in locks:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
         for chain in record.chains:
             if isinstance(chain.msa_id, str) and not Path(chain.msa_id).exists():
                 a3m = Path(chain.msa_id).with_suffix(".a3m")
