@@ -400,10 +400,15 @@ def compute_msa_offline(seqs: dict[str, str], target_id: str, msa_dir: Path,
                 f.write(f">{name}\n{seq}\n")
         a3m_out = tmp / "a3m"
         a3m_out.mkdir(exist_ok=True)
+        # Honor the per-worker thread cap (set by _spawn_worker_processes as
+        # OMP_NUM_THREADS = cores // workers) so many concurrent MSAs across a
+        # fleet share each host's cores instead of oversubscribing them. A
+        # plain single-run CLI leaves the env unset and gets all cores.
+        threads = int(os.environ.get("OMP_NUM_THREADS") or os.cpu_count() or 1)
         cmd_base = [
             colabfold_bin, str(fasta), db_path, str(a3m_out),
             "--use-env", "1" if use_env else "0", "--use-templates", "0",
-            "--db-load-mode", "2", "--threads", str(os.cpu_count() or 1),
+            "--db-load-mode", "2", "--threads", str(threads),
         ]
         if len(seqs) > 1:
             cmd_base += ["--pair-mode", "unpaired_paired", "--pairing_strategy", strategy_val]
