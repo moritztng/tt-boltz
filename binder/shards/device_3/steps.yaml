@@ -1,0 +1,13 @@
+steps:
+- name: design
+  config_file: config/design.yaml
+- name: inverse_folding
+  config_file: config/inverse_folding.yaml
+- name: folding
+  config_file: config/folding.yaml
+- name: design_folding
+  config_file: config/design_folding.yaml
+- name: analysis
+  config_file: config/analysis.yaml
+- name: filtering
+  config_file: config/filtering.yaml

@@ -1,0 +1,3 @@
+steps:
+- name: filtering
+  config_file: config/filtering.yaml

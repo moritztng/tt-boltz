@@ -1,0 +1,85 @@
+_target_: tt_boltz.boltzgen.task.predict.predict.Predict
+data:
+  _target_: tt_boltz.boltzgen.task.predict.data_from_generated.FromGeneratedDataModule
+  cfg:
+    _target_: tt_boltz.boltzgen.task.predict.data_from_generated.DataConfig
+    tokenizer:
+      _target_: tt_boltz.boltzgen.data.tokenizer.Tokenizer
+      atomize_modified_residues: false
+    featurizer:
+      _target_: tt_boltz.boltzgen.data.featurizer.Featurizer
+    suffix: .cif
+    suffix_metadata: .npz
+    suffix_native: _native.cif
+    moldir: /home/ttuser/.boltz/boltzgen/mols.zip
+    samples_per_target: 1000000000
+    design: true
+    backbone_only: true
+    atom14: false
+    max_seqs: 1
+    inverse_fold: true
+    batch_size: 1
+    num_workers: 1
+    num_targets: 1000000000
+    design_mask_override: null
+    multiplicity: 1
+  fail_if_no_designs: true
+  design_dir: out_binder/intermediate_designs
+  output_dir: ${output}
+  skip_existing: false
+  skip_existing_kind: inverse_fold
+writer:
+  _target_: tt_boltz.boltzgen.task.predict.writer.DesignWriter
+  output_dir: ${output}
+  res_atoms_only: false
+  atom14: ${data.cfg.atom14}
+  inverse_fold: ${data.cfg.inverse_fold}
+  write_native: false
+trainer:
+  devices: 1
+name: if_full
+output: out_binder/intermediate_designs_inverse_folded
+checkpoint: /home/ttuser/.boltz/boltzgen/boltzgen1_ifold.ckpt
+recycling_steps: 3
+sampling_steps: 200
+diffusion_samples: 1
+override:
+  masker_args:
+    mask: true
+    mask_backbone: false
+  validators: null
+  diffusion_process_args:
+    sigma_min: 0.0004
+    sigma_max: 160.0
+    sigma_data: 16.0
+    rho: 7
+    P_mean: -1.2
+    P_std: 1.5
+    gamma_0: 0.8
+    gamma_min: 1.0
+    noise_scale: 1.0
+    step_scale: 1.0
+    mse_rotational_alignment: true
+    coordinate_augmentation: true
+    alignment_reverse_diff: true
+    synchronize_sigmas: false
+  inverse_fold_args:
+    atom_s: 128
+    atom_z: 16
+    token_s: 384
+    token_z: 128
+    node_dim: 128
+    pair_dim: 128
+    hidden_dim: 128
+    dropout: 0.1
+    softmax_dropout: 0.2
+    num_encoder_layers: 6
+    transformation_scale_factor: 1.0
+    inverse_fold_noise: 0.2
+    topk: 30
+    num_heads: 4
+    num_decoder_layers: 3
+    autoregressive: true
+    enable_input_embedder: true
+    inverse_fold_restriction: []
+  use_kernels: false

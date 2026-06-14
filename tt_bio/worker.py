@@ -329,15 +329,20 @@ class _WorkerState:
         def _pfn(stage, step, total):
             report_progress("diffusion" if stage == "trunk" else stage)
 
-        coords, plddt = self.model.fold(
+        coords, conf = self.model.fold(
             feats, n_step=cfg["sampling_steps"], n_sample=cfg["diffusion_samples"],
             seed=cfg.get("seed") or 0, progress_fn=_pfn, return_confidence=True,
             n_cycles=cfg.get("recycling_steps"),
         )
         out = Path(cfg["struct_dir"]) / f"{path.stem}.{cfg['output_format']}"
-        _write_protenix_structure(coords[0], feats, None, out, cfg["output_format"])
+        # per-atom pLDDT (0-1) -> B-factors (0-100), matching the AF/Boltz confidence convention
+        _write_protenix_structure(coords[0], feats, None, out, cfg["output_format"],
+                                  b_factors=conf["plddt_atom"] * 100.0)
+        if cfg.get("write_pae"):                       # token-token PAE matrix (Angstrom)
+            import numpy as np
+            np.savez(out.with_suffix(".pae.npz"), pae=conf["pae"].numpy(), pde=conf["pde"].numpy())
         metrics = {
-            "plddt": round(float(plddt), 4), "n_residues": sum(len(c[1]) for c in chains),
+            "plddt": round(conf["plddt"], 4), "n_residues": sum(len(c[1]) for c in chains),
             "n_chains": len(chains), "msa": any(a for _, a in chain_a3m),
             "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
         }

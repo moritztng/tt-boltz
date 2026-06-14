@@ -619,8 +619,11 @@ class ConfidenceHead:
     def _bias(self, k):
         return self._w[k].float() if k in self._w else 0.0
 
-    def plddt(self, s_inputs, s_trunk, z_trunk, coords, feats):
-        """Returns mean pLDDT in [0,1]. All inputs host tensors; coords (N_atom,3)."""
+    def confidence(self, s_inputs, s_trunk, z_trunk, coords, feats):
+        """Full confidence forward -> dict with per-atom pLDDT, mean pLDDT, and the token-token
+        PAE / PDE matrices (Angstrom). All inputs host tensors; coords (N_atom,3). Recipe
+        validated vs the real v2 reference (pae/pde PCC 1.0, plddt ~0.93;
+        scripts/protenix_confidence_parity.py)."""
         import torch
         import torch.nn.functional as F
         N = s_trunk.shape[0]
@@ -633,15 +636,30 @@ class ConfidenceHead:
         oh = ((d.unsqueeze(-1) >= self._g("lower_bins")) & (d.unsqueeze(-1) < self._g("upper_bins"))).float()
         z = z + F.linear(oh, self._g("linear_no_bias_d.weight")) + F.linear(d.unsqueeze(-1), self._g("linear_no_bias_d_wo_onehot.weight"))
         T = lambda x: ttnn.from_torch(x.float(), layout=ttnn.TILE_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
-        so, _ = self.pf(T(s_t.unsqueeze(0)), T(z.unsqueeze(0)))
+        so, zo = self.pf(T(s_t.unsqueeze(0)), T(z.unsqueeze(0)))
         s_single = torch.Tensor(ttnn.to_torch(so)).float().reshape(N, 384)
+        zf = torch.Tensor(ttnn.to_torch(zo)).float().reshape(N, N, -1)
+
+        def _expected(logits, max_a=32.0):     # softmax over distance bins -> expected value (A)
+            nb = logits.shape[-1]
+            centers = (torch.arange(nb, dtype=torch.float32) + 0.5) * (max_a / nb)
+            return (torch.softmax(logits, -1) * centers).sum(-1)
+
+        pae = _expected(F.linear(F.layer_norm(zf, (256,)) * self._g("pae_ln.weight") + self._bias("pae_ln.bias"),
+                                 self._g("linear_no_bias_pae.weight")))                     # (N,N)
+        pde = _expected(F.linear(F.layer_norm(zf + zf.transpose(0, 1), (256,)) * self._g("pde_ln.weight") + self._bias("pde_ln.bias"),
+                                 self._g("linear_no_bias_pde.weight")))                     # (N,N)
         a2t = feats["atom_to_token_idx"].long(); a2ta = feats["atom_to_tokatom_idx"].long()
         a = s_single[a2t]
         aln = F.layer_norm(a, (384,)) * self._g("plddt_ln.weight") + self._bias("plddt_ln.bias")
         logits = torch.einsum("nc,ncb->nb", aln, self._g("plddt_weight")[a2ta])  # (N_atom, n_bins)
-        nbins = logits.shape[-1]
-        centers = (torch.arange(nbins, dtype=torch.float32) + 0.5) / nbins   # pLDDT in [0,1]
-        return float((torch.softmax(logits, -1) * centers).sum(-1).mean())
+        nb = logits.shape[-1]
+        plddt_atom = (torch.softmax(logits, -1) * ((torch.arange(nb, dtype=torch.float32) + 0.5) / nb)).sum(-1)
+        return {"plddt": float(plddt_atom.mean()), "plddt_atom": plddt_atom, "pae": pae, "pde": pde}
+
+    def plddt(self, s_inputs, s_trunk, z_trunk, coords, feats):
+        """Mean pLDDT in [0,1] (back-compat thin wrapper over confidence())."""
+        return self.confidence(s_inputs, s_trunk, z_trunk, coords, feats)["plddt"]
 
 
 class Protenix:
@@ -870,8 +888,8 @@ class Protenix:
             coords.append(edm_sample(self.diffusion, cond, N, n_step=n_step, seed=sd_seed)[0])
         coords = torch.stack(coords, 0)
         if return_confidence:
-            plddt = self.confidence_head.plddt(s_inputs, s_trunk, z_trunk, coords[0], feats)
-            return coords, plddt
+            conf = self.confidence_head.confidence(s_inputs, s_trunk, z_trunk, coords[0], feats)
+            return coords, conf
         return coords
 
 

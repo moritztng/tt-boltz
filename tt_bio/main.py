@@ -1350,13 +1350,14 @@ def _resolve_a3m_text(msa_spec, sequence, msa_dir):
     return None
 
 
-def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
+def _write_protenix_structure(coords, feats, aatype, outpath, output_format, b_factors=None):
     """Write a Protenix-v2 prediction (coords + atom metadata) as PDB/mmCIF via biotite.
 
     Reconstructed entirely from the feature dict so it is modality- and chain-agnostic
     (proteins, complexes, nucleic acids, ligands): atom name from ref_atom_name_chars,
     element from ref_element, chain letter from asym_id, residue number from residue_index,
-    residue name from restype. `aatype` is accepted for back-compat but unused."""
+    residue name from restype. `aatype` is accepted for back-compat but unused. `b_factors`
+    (per-atom, e.g. pLDDT*100) is written to the B-factor column when given."""
     import biotite.structure as struc
     import biotite.structure.io.pdb as _pdb
     import biotite.structure.io.pdbx as _pdbx
@@ -1376,7 +1377,8 @@ def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
     arr = struc.AtomArray(coords.shape[0])
     arr.coord = coords.numpy().astype("float32")
     arr.add_annotation("occupancy", float); arr.occupancy[:] = 1.0
-    arr.add_annotation("b_factor", float); arr.b_factor[:] = 0.0
+    arr.add_annotation("b_factor", float)
+    arr.b_factor[:] = b_factors.numpy().astype("float32") if b_factors is not None else 0.0
     for i in range(coords.shape[0]):
         t = a2t[i]
         arr.chain_id[i] = chr(ord("A") + int(asym[t]) % 26)
@@ -1570,6 +1572,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+            "write_pae": write_pae,
         }
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
