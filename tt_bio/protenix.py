@@ -837,7 +837,8 @@ class Protenix:
              return_confidence=False, n_cycles=None):
         """Run the full pipeline. feats: model-ready tensor dict. n_cycles = trunk recycling
         iterations (default 10, protenix-v2's spec; fewer trades accuracy for speed). Returns
-        coords (n_sample, N, 3) host tensor; if return_confidence, returns (coords, mean_pLDDT)."""
+        coords (n_sample, N, 3) host tensor; if return_confidence, returns (coords, conf) where
+        conf is the dict {plddt (mean, float), plddt_atom (N_atom,), pae (N,N), pde (N,N)}."""
         import torch
         fi = self._atom_feat_inputs(feats)
         N, NT, nb, nq, nk = fi["N"], fi["NT"], fi["nb"], fi["nq"], fi["nk"]
