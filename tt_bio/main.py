@@ -1445,8 +1445,16 @@ def _write_protenix_structure(coords, feats, aatype, outpath, output_format, b_f
     a2t = feats["atom_to_token_idx"].tolist()
     znum = (feats["ref_element"].argmax(-1) + 1).tolist()
     z2sym = {z: s for s, z in const.element_to_atomic_num.items()}
-    resname = restype_to_resname(feats["restype"].argmax(-1))          # per-token 3-letter name
+    rt = feats["restype"].argmax(-1)
+    resname = restype_to_resname(rt)                                  # per-token 3-letter name
     asym = feats["asym_id"].tolist(); resid = feats["residue_index"].tolist()
+    rt = rt.tolist()
+    # ligand atom-tokens are restype UNK(20) with a single atom in the token (no standard
+    # residue is single-atom) -> write them as HETATM "LIG" rather than a polymer "UNK".
+    tok_atom_count = [0] * len(rt)
+    for t in a2t:
+        tok_atom_count[t] += 1
+    is_lig_tok = [rt[t] == 20 and tok_atom_count[t] == 1 for t in range(len(rt))]
     # decode 4-char atom names from the one-hot ref_atom_name_chars (idx -> chr(idx+32))
     name_idx = feats["ref_atom_name_chars"].argmax(-1).tolist()        # (N_atom, 4)
     names = ["".join(chr(c + 32) for c in chars).strip() for chars in name_idx]
@@ -1460,9 +1468,10 @@ def _write_protenix_structure(coords, feats, aatype, outpath, output_format, b_f
         t = a2t[i]
         arr.chain_id[i] = chr(ord("A") + int(asym[t]) % 26)
         arr.res_id[i] = int(resid[t])
-        arr.res_name[i] = resname[t]
+        arr.res_name[i] = "LIG" if is_lig_tok[t] else resname[t]
         arr.atom_name[i] = names[i]
         arr.element[i] = z2sym.get(int(znum[i]), "C")
+        arr.hetero[i] = is_lig_tok[t]
     outpath = Path(outpath)
     if output_format == "pdb":
         pf = _pdb.PDBFile(); pf.set_structure(arr); pf.write(str(outpath))
