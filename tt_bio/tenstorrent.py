@@ -922,8 +922,15 @@ class Transition(Module):
         # reference W=1024, c=128; scale the row-chunk so memory stays bounded for wider pair
         # channels / longer sequences -- but only shrink when actually needed (so c=128 and
         # Protenix-v2's c=256 at W<=512 keep the full chunk; only large W reduces it). No
-        # Boltz-2 regression (c=128, W<=1024 -> factor 1.0).
+        # Boltz-2 regression (c=128, W<=1024 -> factor 1.0). On a small grid (Wormhole, ~55%
+        # of Blackhole's L1) the c=128 per-chunk CB still fits (Boltz-2/esmfold2 fold to 1024),
+        # but a WIDER channel overflows L1 (Protenix-v2 c=256 clashed at W=512). So shrink the
+        # budget ONLY in proportion to the channel's excess over 128: c=256 -> half (h_chunk
+        # 16->8, fits), c<=128 -> UNCHANGED (no Boltz-2/esmfold2 regression). Blackhole keeps
+        # the full budget for every channel (no small-grid path).
         _ref = 1024 * 128
+        if _IS_SMALL_GRID:
+            _ref = _ref * 128 // max(128, x.shape[-1])
         transition_h_chunk_size = max(1, int(transition_h_chunk_size * min(1.0, _ref / (W * x.shape[-1]))))
         transition_w_chunking_threshold = (
             SEQ_LEN_MORE_CHUNKING
