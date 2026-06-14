@@ -1352,36 +1352,36 @@ def _resolve_a3m_text(msa_spec, sequence, msa_dir):
 
 def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
     """Write a Protenix-v2 prediction (coords + atom metadata) as PDB/mmCIF via biotite.
-    Reconstructs atom names/residues from tt_bio.data.const.ref_atoms (+ C-terminal OXT)."""
+
+    Reconstructed entirely from the feature dict so it is modality- and chain-agnostic
+    (proteins, complexes, nucleic acids, ligands): atom name from ref_atom_name_chars,
+    element from ref_element, chain letter from asym_id, residue number from residue_index,
+    residue name from restype. `aatype` is accepted for back-compat but unused."""
     import biotite.structure as struc
     import biotite.structure.io.pdb as _pdb
     import biotite.structure.io.pdbx as _pdbx
 
     from tt_bio.data import const
-    from tt_bio.protenix_data import RESTYPE_ORDER
+    from tt_bio.protenix_data import restype_to_resname
 
-    l2r = {v: k for k, v in const.prot_token_to_letter.items()}
     a2t = feats["atom_to_token_idx"].tolist()
     znum = (feats["ref_element"].argmax(-1) + 1).tolist()
-    z2sym = {1: "H", 6: "C", 7: "N", 8: "O", 16: "S"}
-    n_tok = int(max(a2t)) + 1
-    names = []
-    for t in range(n_tok):
-        res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
-        atoms = list(const.ref_atoms[res])
-        if t == n_tok - 1:
-            atoms = atoms + ["OXT"]
-        names.extend(atoms)
+    z2sym = {z: s for s, z in const.element_to_atomic_num.items()}
+    resname = restype_to_resname(feats["restype"].argmax(-1))          # per-token 3-letter name
+    asym = feats["asym_id"].tolist(); resid = feats["residue_index"].tolist()
+    # decode 4-char atom names from the one-hot ref_atom_name_chars (idx -> chr(idx+32))
+    name_idx = feats["ref_atom_name_chars"].argmax(-1).tolist()        # (N_atom, 4)
+    names = ["".join(chr(c + 32) for c in chars).strip() for chars in name_idx]
+
     arr = struc.AtomArray(coords.shape[0])
     arr.coord = coords.numpy().astype("float32")
     arr.add_annotation("occupancy", float); arr.occupancy[:] = 1.0
     arr.add_annotation("b_factor", float); arr.b_factor[:] = 0.0
     for i in range(coords.shape[0]):
         t = a2t[i]
-        res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
-        arr.chain_id[i] = "A"
-        arr.res_id[i] = t + 1
-        arr.res_name[i] = res
+        arr.chain_id[i] = chr(ord("A") + int(asym[t]) % 26)
+        arr.res_id[i] = int(resid[t])
+        arr.res_name[i] = resname[t]
         arr.atom_name[i] = names[i]
         arr.element[i] = z2sym.get(int(znum[i]), "C")
     outpath = Path(outpath)

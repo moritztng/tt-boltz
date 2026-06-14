@@ -38,6 +38,29 @@ def aatype_from_sequence(seq: str) -> torch.Tensor:
     return torch.tensor([_AA1_TO_IDX.get(c.upper(), 20) for c in seq], dtype=torch.long)
 
 
+# protenix STD_RESIDUES_WITH_GAP token names beyond protein: RNA 21-25, DNA 26-30, gap 31
+_RNA_NAMES = ["A", "G", "C", "U", "N"]
+_DNA_NAMES = ["DA", "DG", "DC", "DT", "DN"]
+
+
+def restype_to_resname(idx: torch.Tensor) -> list:
+    """Per-token restype index -> CCD residue name (protein 3-letter / RNA / DNA / UNK).
+    Modality-agnostic; used by the structure writer to label residues for any entity type."""
+    from .data import const
+    l2r = {v: k for k, v in const.prot_token_to_letter.items()}
+    out = []
+    for i in idx.tolist():
+        if i < 20:
+            out.append(l2r[RESTYPE_ORDER[i]])
+        elif i < 26:
+            out.append("UNK" if i == 20 else _RNA_NAMES[i - 21])
+        elif i < 31:
+            out.append(_DNA_NAMES[i - 26])
+        else:
+            out.append("UNK")
+    return out
+
+
 def load_ref_conformers() -> dict:
     """Bundled standard-residue reference conformers (CCD ideal coordinates, in
     const.ref_atoms order). {3-letter resname: (n_atom, 3) tensor}."""
@@ -72,15 +95,11 @@ def _parse_a3m(a3m: str) -> list[str]:
     return seqs
 
 
-def protein_msa_features(a3m: str, query: str) -> dict | None:
-    """Build protenix MSA features from an a3m aligned to `query`.
-
-    a3m convention: query is row 0; uppercase = match columns, lowercase = insertions
-    (deletions relative to the query), '-' = gap. Per protenix
-    (data/msa/msa_featurizer.py): profile = per-column token frequency over 32 classes
-    (incl. gap), deletion_value = arctan(deletions/3)*2/pi, has_deletion = clip(deletions,0,1),
-    deletion_mean = raw column-mean deletions. Returns None if the a3m is not aligned to this
-    exact query (caller falls back to single-sequence)."""
+def _parse_a3m_to_msa(a3m: str, query: str):
+    """a3m aligned to `query` -> (msa_tokens (M,n) long, raw_deletions (M,n) float), deduped
+    (query is row 0). Returns None if the a3m query isn't aligned to this exact sequence.
+    a3m convention: uppercase = match columns, lowercase = insertions (deletions relative to
+    the query), '-' = gap."""
     rows = _parse_a3m(a3m)
     if not rows:
         return None
@@ -106,8 +125,14 @@ def protein_msa_features(a3m: str, query: str) -> dict | None:
         if len(toks) != n_tok:
             continue
         msa.append(toks); delmat.append(dels)
-    M = torch.tensor(msa, dtype=torch.long)
-    DM = torch.tensor(delmat, dtype=torch.float32)
+    return torch.tensor(msa, dtype=torch.long), torch.tensor(delmat, dtype=torch.float32)
+
+
+def _msa_to_features(M: torch.Tensor, DM: torch.Tensor) -> dict:
+    """MSA tokens (M,N) + RAW deletion counts (M,N) -> protenix MSA features. Per protenix
+    (data/msa/msa_featurizer.py): profile = per-column token frequency over 32 classes (incl.
+    gap), deletion_value = arctan(deletions/3)*2/pi, has_deletion = clip(deletions,0,1),
+    deletion_mean = raw column-mean deletions. Single source for the single- and multi-chain paths."""
     profile = torch.stack([(M == k).float().mean(0) for k in range(RESTYPE_DIM)], dim=-1)
     return {
         "msa": M,
@@ -118,20 +143,84 @@ def protein_msa_features(a3m: str, query: str) -> dict | None:
     }
 
 
+def protein_msa_features(a3m: str, query: str) -> dict | None:
+    """Single-chain protenix MSA features from an a3m aligned to `query` (None if unaligned)."""
+    raw = _parse_a3m_to_msa(a3m, query)
+    return _msa_to_features(*raw) if raw is not None else None
+
+
 def build_protein_features(sequence: str, a3m: str | None = None) -> dict:
-    """Full model-ready input_feature_dict for a single protein chain from a one-letter
-    sequence. Combines token + atom features (bundled reference conformers). If `a3m` is
-    given (an alignment whose query matches `sequence`), the single-sequence MSA features
-    are replaced with the real MSA features; otherwise it folds single-sequence. The model
-    (tt_bio.protenix.Protenix.fold) regenerates relp / d_lm / v_lm / mask_trunked internally,
-    so this is everything fold needs."""
-    aatype = aatype_from_sequence(sequence)
-    feats = protein_token_features(aatype)
-    feats.update(protein_atom_features(aatype, load_ref_conformers()))
-    if a3m:
-        msa_feats = protein_msa_features(a3m, sequence)
-        if msa_feats is not None:
-            feats.update(msa_feats)
+    """Single protein chain -> model-ready input_feature_dict. Thin wrapper over
+    build_complex_features for the common one-chain case (back-compatible)."""
+    return build_complex_features([(sequence, a3m)])
+
+
+def build_complex_features(chains: list) -> dict:
+    """Multi-chain protein complex -> model-ready input_feature_dict.
+
+    chains: list of (sequence, a3m_or_None). Identical sequences share an entity_id and get
+    distinct sym_ids (homomer copies); each chain gets its own asym_id. Token/atom features
+    are the per-chain protein features concatenated with global token indexing; residue_index
+    restarts per chain (so the relative-position encoding sees chain breaks), token_index is
+    global. The MSA is assembled BLOCK-DIAGONALLY (each chain's alignment over its own columns,
+    gap elsewhere) on top of a shared query row -- the standard unpaired multi-chain assembly;
+    the model (tt_bio.protenix) regenerates relp / d_lm / v_lm / mask_trunked from asym/entity/
+    sym/residue/token indices. token_bonds = 0 (no inter-chain covalent bonds for plain complexes)."""
+    conformers = load_ref_conformers()
+    N_tot = sum(len(s) for s, _ in chains)
+    entity_of = {}                                   # unique sequence -> entity_id
+    sym_counter = {}                                 # entity_id -> next copy index
+    restype, asym, entity, sym, resid = [], [], [], [], []
+    atom_feats = []                                  # per-chain atom-feature dicts
+    tok_off = 0
+    per_chain_msa = []                               # (start_col, n_tok, msa_feats|None, aatype)
+    for ci, (seq, a3m) in enumerate(chains):
+        aatype = aatype_from_sequence(seq)
+        n = aatype.shape[0]
+        eid = entity_of.setdefault(seq, len(entity_of))
+        sid = sym_counter.get(eid, 0); sym_counter[eid] = sid + 1
+        rt = torch.nn.functional.one_hot(aatype.clamp(max=RESTYPE_DIM - 1), RESTYPE_DIM).float()
+        restype.append(rt)
+        asym.append(torch.full((n,), ci, dtype=torch.long))
+        entity.append(torch.full((n,), eid, dtype=torch.long))
+        sym.append(torch.full((n,), sid, dtype=torch.long))
+        resid.append(torch.arange(1, n + 1, dtype=torch.long))
+        af = protein_atom_features(aatype, conformers)        # local token indices 0..n-1
+        af["atom_to_token_idx"] = af["atom_to_token_idx"] + tok_off
+        af["ref_space_uid"] = af["ref_space_uid"] + tok_off
+        atom_feats.append(af)
+        raw = _parse_a3m_to_msa(a3m, seq) if a3m else None    # (tokens, raw deletions) | None
+        per_chain_msa.append((tok_off, n, raw, aatype))
+        tok_off += n
+
+    # block-diagonal MSA assembled from RAW counts (shared query row 0; each chain's extra rows
+    # over its own columns, gap elsewhere), then transformed once via _msa_to_features.
+    GAP = MSA_GAP_IDX
+    query = torch.cat([a for _, _, _, a in per_chain_msa]).clamp(max=20)  # query restypes (row 0)
+    msa_rows, del_rows = [query], [torch.zeros(N_tot)]
+    for start, n, raw, aatype in per_chain_msa:
+        if raw is None:
+            continue
+        M, DM = raw
+        for r in range(1, M.shape[0]):                        # skip the chain's own query (row 0)
+            row = torch.full((N_tot,), GAP, dtype=torch.long); row[start:start + n] = M[r]
+            drow = torch.zeros(N_tot); drow[start:start + n] = DM[r]
+            msa_rows.append(row); del_rows.append(drow)
+    msa_feats = _msa_to_features(torch.stack(msa_rows, 0), torch.stack(del_rows, 0))
+
+    feats = {
+        "restype": torch.cat(restype, 0),
+        "token_bonds": torch.zeros(N_tot, N_tot),
+        "asym_id": torch.cat(asym, 0),
+        "entity_id": torch.cat(entity, 0),
+        "sym_id": torch.cat(sym, 0),
+        "residue_index": torch.cat(resid, 0),
+        "token_index": torch.arange(0, N_tot, dtype=torch.long),
+        **msa_feats,
+    }
+    # concat atom features across chains (atom_to_token_idx / ref_space_uid already offset)
+    for k in atom_feats[0]:
+        feats[k] = torch.cat([af[k] for af in atom_feats], 0)
     return feats
 
 

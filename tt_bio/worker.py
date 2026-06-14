@@ -287,43 +287,44 @@ class _WorkerState:
         return metrics, None, feats
 
     def _predict_protenix_one(self, path: Path, cfg: dict[str, Any]):
-        """Protenix-v2 protein fold: sequence -> (optional MSA) -> on-device fold -> structure.
-
-        Rides the same MSA stage as ESMFold2/Boltz-2: any chain whose {seq_hash}.a3m is not
-        cached is searched into the shared msa_dir, then resolved and featurized. Protenix-v2's
-        MSA module consumes one chain's alignment; multi-chain inputs are concatenated and
-        folded single-sequence (no inter-chain MSA pairing)."""
+        """Protenix-v2 protein fold: sequence(s) -> (optional per-chain MSA) -> on-device fold
+        -> structure. Rides the same MSA stage as ESMFold2/Boltz-2: each chain whose
+        {seq_hash}.a3m is not cached is searched into the shared msa_dir, resolved, and
+        featurized. Multi-chain inputs fold as a true complex (per-chain asym/entity/sym +
+        block-diagonal MSA via build_complex_features)."""
         import hashlib
         import types
 
         from tt_bio.esmfold2 import report_progress
         from tt_bio.main import (_generate_esmfold2_a3m, _read_protein_chains,
                                  _resolve_a3m_text, _write_protenix_structure)
-        from tt_bio.protenix_data import aatype_from_sequence, build_protein_features
+        from tt_bio.protenix_data import build_complex_features
 
         chains = _read_protein_chains(path)
         if not chains:
             raise RuntimeError("no protein sequences")
         msa_dir = Path(cfg["msa_dir"])
-        seq = "".join(c[1] for c in chains)
 
         report_progress("msa")
-        a3m = None
-        if len(chains) == 1:
-            _cid, cseq, spec = chains[0]
+        # search any uncached chain (batched into one MSA call), then resolve each chain's a3m
+        want_msa = cfg.get("use_msa_server") or cfg.get("msa_db_path")
+        need = {}
+        for _cid, cseq, spec in chains:
             have_spec = bool(spec and Path(spec).expanduser().exists())
-            if (cfg.get("use_msa_server") or cfg.get("msa_db_path")) and not have_spec:
+            if want_msa and not have_spec:
                 h = hashlib.sha256(cseq.encode()).hexdigest()[:16]
                 if not (msa_dir / f"{h}.a3m").exists():
-                    _generate_esmfold2_a3m(
-                        {h: cseq}, path.stem, msa_dir, cfg.get("msa_db_path"),
-                        cfg.get("use_envdb", False), cfg.get("msa_server_url"),
-                        cfg.get("msa_pairing_strategy"), cfg.get("msa_server_username"),
-                        cfg.get("msa_server_password"), cfg.get("api_key_value"))
-            a3m = _resolve_a3m_text(spec, cseq, msa_dir)
+                    need[h] = cseq
+        if need:
+            _generate_esmfold2_a3m(
+                need, path.stem, msa_dir, cfg.get("msa_db_path"),
+                cfg.get("use_envdb", False), cfg.get("msa_server_url"),
+                cfg.get("msa_pairing_strategy"), cfg.get("msa_server_username"),
+                cfg.get("msa_server_password"), cfg.get("api_key_value"))
+        chain_a3m = [(cseq, _resolve_a3m_text(spec, cseq, msa_dir)) for _cid, cseq, spec in chains]
 
         report_progress("prep")
-        feats = build_protein_features(seq, a3m=a3m)
+        feats = build_complex_features(chain_a3m)
 
         def _pfn(stage, step, total):
             report_progress("diffusion" if stage == "trunk" else stage)
@@ -334,10 +335,11 @@ class _WorkerState:
             n_cycles=cfg.get("recycling_steps"),
         )
         out = Path(cfg["struct_dir"]) / f"{path.stem}.{cfg['output_format']}"
-        _write_protenix_structure(coords[0], feats, aatype_from_sequence(seq), out, cfg["output_format"])
+        _write_protenix_structure(coords[0], feats, None, out, cfg["output_format"])
         metrics = {
-            "plddt": round(float(plddt), 4), "n_residues": len(seq), "n_chains": len(chains),
-            "msa": a3m is not None, "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
+            "plddt": round(float(plddt), 4), "n_residues": sum(len(c[1]) for c in chains),
+            "n_chains": len(chains), "msa": any(a for _, a in chain_a3m),
+            "n_atoms": int(coords.shape[1]), "samples": cfg["diffusion_samples"],
         }
         return metrics, None, {"record": types.SimpleNamespace(affinity=False)}
 
