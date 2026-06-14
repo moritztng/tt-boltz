@@ -826,6 +826,14 @@ def _local_workers(accelerator: str, num_devices: int, device_ids: str | None, m
 def _spawn_worker_processes(controller_url: str, workers: list, debug: bool) -> list:
     """Spawn one process per worker slot, each connected to the controller."""
     ctx = mp.get_context("spawn")
+    # Cap per-worker host threads. Each worker's torch/OMP/BLAS pools otherwise
+    # default to ALL cores, so N co-resident workers spawn N*cores threads that
+    # thrash the CPU and collapse throughput on the host-side work (featurization,
+    # output, layout conversion) -- the multi-card slowdown. Size to cores/workers;
+    # an operator-set value wins. Spawned children inherit these at import.
+    cap = max(1, (os.cpu_count() or 1) // max(1, len(workers)))
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, str(cap))
     procs = []
     for worker in workers:
         proc = ctx.Process(
