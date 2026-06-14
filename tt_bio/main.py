@@ -1480,6 +1480,9 @@ def _generate_esmfold2_a3m(seqs, target_id, msa_dir, msa_db_path, use_envdb,
 @click.option("--seed", default=None, type=int)
 @click.option("--use_msa_server", is_flag=True, help="Generate MSAs via ColabFold API (requires internet)")
 @click.option("--msa_db_path", default=None, type=click.Path(exists=True), help="Local ColabFold DB for offline MSA (default: auto-detect ~/.boltz/msa_db)")
+@click.option("--msa_dir", "msa_dir_opt", default=None, type=click.Path(),
+              help="MSA cache directory (default: <out_dir>/msa). Point at a persistent shared "
+                   "path to reuse {seq_hash}.a3m across runs and hosts (never re-search a sequence).")
 @click.option("--use_envdb", is_flag=True, help="Also search ColabFold environmental database (requires envdb)")
 @click.option("--msa_server_url", default="https://api.colabfold.com")
 @click.option("--msa_pairing_strategy", default="greedy")
@@ -1520,7 +1523,7 @@ def _generate_esmfold2_a3m(seqs, target_id, msa_dir, msa_db_path, use_envdb,
                    "ligand / affinity options apply to boltz2 only).")
 def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, sampling_steps,
             diffusion_samples, max_parallel_samples, step_scale, output_format, override,
-            seed, use_msa_server, msa_db_path, use_envdb, msa_server_url, msa_pairing_strategy,
+            seed, use_msa_server, msa_db_path, msa_dir_opt, use_envdb, msa_server_url, msa_pairing_strategy,
             msa_server_username, msa_server_password, api_key_value, use_potentials,
             method, max_msa_seqs, subsample_msa, num_subsampled_msa, no_kernels, trace,
             write_pae, write_pde, write_embeddings, affinity_mw_correction,
@@ -1591,7 +1594,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
         data = Path(data).expanduser()
         out_dir_path = Path(out_dir).expanduser()
         out = out_dir_path / f"boltz_results_{data.stem}"
-        msa_dir = out_dir_path / "msa"
+        msa_dir = Path(msa_dir_opt).expanduser() if msa_dir_opt else out_dir_path / "msa"
         struct_dir = out / "structures"
         msa_dir.mkdir(parents=True, exist_ok=True)
         struct_dir.mkdir(parents=True, exist_ok=True)
@@ -1670,7 +1673,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
     data = Path(data).expanduser()
     out_dir_path = Path(out_dir).expanduser()
     out = out_dir_path / f"boltz_results_{data.stem}"
-    msa_dir = out_dir_path / "msa"
+    msa_dir = Path(msa_dir_opt).expanduser() if msa_dir_opt else out_dir_path / "msa"
     struct_dir = out / "structures"
     msa_dir.mkdir(parents=True, exist_ok=True)
     struct_dir.mkdir(parents=True, exist_ok=True)
