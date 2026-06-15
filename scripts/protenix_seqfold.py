@@ -18,9 +18,9 @@ dev = get_device()
 ckc = ttnn.init_device_compute_kernel_config(dev.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
                                              fp32_dest_acc_en=True, packer_l1_acc=True)
 model = Protenix.load_from_checkpoint(CKPT, compute_kernel_config=ckc, device=dev)
-coords, plddt = model.fold(feats, n_step=N_STEP, n_sample=1, seed=0, return_confidence=True)
+coords, conf = model.fold(feats, n_step=N_STEP, n_sample=1, seed=0, return_confidence=True)
 x = coords[0]
 rg = float((x - x.mean(0)).pow(2).sum(-1).mean().sqrt())
 print('SEQFOLD seq_len=%d n_atoms=%d finite=%s Rg=%.2f plddt=%.4f' % (
-    len(SEQ), x.shape[0], bool(torch.isfinite(coords).all()), rg, plddt), flush=True)
+    len(SEQ), x.shape[0], bool(torch.isfinite(coords).all()), rg, conf['plddt']), flush=True)
 print('SEQFOLD_DONE', flush=True)

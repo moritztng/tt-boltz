@@ -127,13 +127,20 @@ def hf_artifact(repo_id: str, filename: str, dest_dir: Path) -> Path:
     return dest
 
 
-def download_all(cache: Path) -> None:
-    """Fetch the Boltz-2 checkpoints and molecule library (Hugging Face, MIT)."""
+def download_mols(cache: Path) -> Path:
+    """Ensure the CCD molecule library is present under cache/mols; return its path.
+    Used by Boltz-2 (ligands/affinity) and Protenix-v2 (nucleic-acid / ligand templates)."""
     tar_path = hf_artifact(BOLTZ2_REPO, "mols.tar", cache)
     if not (cache / "mols").exists():
         click.echo("Extracting mols.tar")
         with tarfile.open(tar_path) as tar:
             tar.extractall(cache)
+    return cache / "mols"
+
+
+def download_all(cache: Path) -> None:
+    """Fetch the Boltz-2 checkpoints and molecule library (Hugging Face, MIT)."""
+    download_mols(cache)
     hf_artifact(BOLTZ2_REPO, "boltz2_conf.ckpt", cache)
     hf_artifact(BOLTZ2_REPO, "boltz2_aff.ckpt", cache)
 
@@ -1366,6 +1373,76 @@ def _read_protein_chains(path):
     return chains
 
 
+_NA_HEADER_TYPES = {"rna": "rna", "rnasequence": "rna", "dna": "dna", "dnasequence": "dna"}
+
+
+def _read_bio_chains(path):
+    """Like _read_protein_chains but modality-aware: returns [(chain_id, sequence, msa_spec,
+    mol_type)] for protein / rna / dna / ligand entries (Protenix complexes). FASTA type field
+    and YAML entry key select the modality; protein keeps MSA, nucleic-acid and ligand chains
+    are single-sequence (msa_spec=None). For ligands the `sequence` carries the spec the
+    featurizer expects: 'CCD_<code>' for a CCD code or a raw SMILES string."""
+    suffix = path.suffix.lower()
+    chains: list[tuple[str, str, str | None, str]] = []
+    if suffix in (".fa", ".fas", ".fasta"):
+        cid, buf, msa, mt = None, [], None, "protein"
+        def flush():
+            if cid and buf:
+                seq = "".join(buf)
+                seq = ("CCD_" + seq.upper()) if mt == "_ccd" else seq   # ccd code -> CCD_ spec
+                mtype = "ligand" if mt in ("_ccd", "ligand") else mt
+                for c in cid.split(","):
+                    chains.append((c.strip() or chr(65 + len(chains)), seq, msa, mtype))
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(">"):
+                flush()
+                parts = line[1:].split("|")
+                typ = parts[1].strip().lower() if len(parts) > 1 else "protein"
+                if typ in ("", "protein"):
+                    cid, buf, mt = parts[0].strip(), [], "protein"
+                    m = parts[2].strip() if len(parts) > 2 else ""
+                    msa = m if m and m.lower() != "empty" else None
+                elif typ in _NA_HEADER_TYPES:
+                    cid, buf, mt, msa = parts[0].strip(), [], _NA_HEADER_TYPES[typ], None
+                elif typ in ("ccd", "ion", "smiles", "ligand"):
+                    cid, buf, msa = parts[0].strip(), [], None
+                    mt = "_ccd" if typ in ("ccd", "ion") else "ligand"
+                else:
+                    cid, buf = None, []
+            elif line and cid is not None:
+                buf.append(line)
+        flush()
+    elif suffix in (".yml", ".yaml"):
+        import yaml
+        doc = yaml.safe_load(path.read_text()) or {}
+        for entry in doc.get("sequences", []):
+            if not isinstance(entry, dict):
+                continue
+            for key, mt in (("protein", "protein"), ("rna", "rna"), ("dna", "dna")):
+                sub = entry.get(key)
+                if not (sub and sub.get("sequence")):
+                    continue
+                m = sub.get("msa") if mt == "protein" else None
+                m = str(m) if m and str(m).lower() not in ("", "empty") else None
+                ids = sub.get("id", "A")
+                id_list = ([str(x) for x in ids] if isinstance(ids, (list, tuple))
+                           else str(ids).split(","))
+                for c in id_list:
+                    chains.append((c.strip(), sub["sequence"], m, mt))
+            lig = entry.get("ligand")                       # {ccd: CODE} or {smiles: STR}
+            if isinstance(lig, dict) and (lig.get("ccd") or lig.get("smiles")):
+                spec = ("CCD_" + str(lig["ccd"]).upper()) if lig.get("ccd") else str(lig["smiles"])
+                ids = lig.get("id", "L")
+                id_list = ([str(x) for x in ids] if isinstance(ids, (list, tuple))
+                           else str(ids).split(","))
+                for c in id_list:
+                    chains.append((c.strip(), spec, None, "ligand"))
+    else:
+        raise click.ClickException(f"Unsupported input for protenix-v2: {path.name}")
+    return chains
+
+
 def _resolve_a3m_text(msa_spec, sequence, msa_dir):
     """Return a3m text for a chain, or None for single-sequence folding. Tries an explicit
     a3m path (``msa_spec``), then the shared ``{sha256(seq)[:16]}.a3m`` cache in ``msa_dir``
@@ -1385,40 +1462,51 @@ def _resolve_a3m_text(msa_spec, sequence, msa_dir):
     return None
 
 
-def _write_protenix_structure(coords, feats, aatype, outpath, output_format):
+def _write_protenix_structure(coords, feats, aatype, outpath, output_format, b_factors=None):
     """Write a Protenix-v2 prediction (coords + atom metadata) as PDB/mmCIF via biotite.
-    Reconstructs atom names/residues from tt_bio.data.const.ref_atoms (+ C-terminal OXT)."""
+
+    Reconstructed entirely from the feature dict so it is modality- and chain-agnostic
+    (proteins, complexes, nucleic acids, ligands): atom name from ref_atom_name_chars,
+    element from ref_element, chain letter from asym_id, residue number from residue_index,
+    residue name from restype. `aatype` is accepted for back-compat but unused. `b_factors`
+    (per-atom, e.g. pLDDT*100) is written to the B-factor column when given."""
     import biotite.structure as struc
     import biotite.structure.io.pdb as _pdb
     import biotite.structure.io.pdbx as _pdbx
 
     from tt_bio.data import const
-    from tt_bio.protenix_data import RESTYPE_ORDER
+    from tt_bio.protenix_data import restype_to_resname
 
-    l2r = {v: k for k, v in const.prot_token_to_letter.items()}
     a2t = feats["atom_to_token_idx"].tolist()
     znum = (feats["ref_element"].argmax(-1) + 1).tolist()
-    z2sym = {1: "H", 6: "C", 7: "N", 8: "O", 16: "S"}
-    n_tok = int(max(a2t)) + 1
-    names = []
-    for t in range(n_tok):
-        res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
-        atoms = list(const.ref_atoms[res])
-        if t == n_tok - 1:
-            atoms = atoms + ["OXT"]
-        names.extend(atoms)
+    z2sym = {z: s for s, z in const.element_to_atomic_num.items()}
+    rt = feats["restype"].argmax(-1)
+    resname = restype_to_resname(rt)                                  # per-token 3-letter name
+    asym = feats["asym_id"].tolist(); resid = feats["residue_index"].tolist()
+    rt = rt.tolist()
+    # ligand atom-tokens are restype UNK(20) with a single atom in the token (no standard
+    # residue is single-atom) -> write them as HETATM "LIG" rather than a polymer "UNK".
+    tok_atom_count = [0] * len(rt)
+    for t in a2t:
+        tok_atom_count[t] += 1
+    is_lig_tok = [rt[t] == 20 and tok_atom_count[t] == 1 for t in range(len(rt))]
+    # decode 4-char atom names from the one-hot ref_atom_name_chars (idx -> chr(idx+32))
+    name_idx = feats["ref_atom_name_chars"].argmax(-1).tolist()        # (N_atom, 4)
+    names = ["".join(chr(c + 32) for c in chars).strip() for chars in name_idx]
+
     arr = struc.AtomArray(coords.shape[0])
     arr.coord = coords.numpy().astype("float32")
     arr.add_annotation("occupancy", float); arr.occupancy[:] = 1.0
-    arr.add_annotation("b_factor", float); arr.b_factor[:] = 0.0
+    arr.add_annotation("b_factor", float)
+    arr.b_factor[:] = b_factors.numpy().astype("float32") if b_factors is not None else 0.0
     for i in range(coords.shape[0]):
         t = a2t[i]
-        res = l2r[RESTYPE_ORDER[int(aatype[t])]] if int(aatype[t]) < 20 else "UNK"
-        arr.chain_id[i] = "A"
-        arr.res_id[i] = t + 1
-        arr.res_name[i] = res
+        arr.chain_id[i] = chr(ord("A") + int(asym[t]) % 26)
+        arr.res_id[i] = int(resid[t])
+        arr.res_name[i] = "LIG" if is_lig_tok[t] else resname[t]
         arr.atom_name[i] = names[i]
         arr.element[i] = z2sym.get(int(znum[i]), "C")
+        arr.hetero[i] = is_lig_tok[t]
     outpath = Path(outpath)
     if output_format == "pdb":
         pf = _pdb.PDBFile(); pf.set_structure(arr); pf.write(str(outpath))
@@ -1618,6 +1706,7 @@ def predict(data, out_dir, cache, checkpoint, accelerator, recycling_steps, samp
             "msa_server_url": msa_server_url, "msa_pairing_strategy": msa_pairing_strategy,
             "msa_server_username": msa_server_username, "msa_server_password": msa_server_password,
             "api_key_value": api_key_value, "max_msa_seqs": max_msa_seqs,
+            "write_pae": write_pae,
         }
         results_path = out / "results.json"
         run_payload = {"data": str(data), "out_dir": str(out_dir_path), "result_dir": str(out),
