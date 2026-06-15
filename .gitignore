@@ -13,6 +13,8 @@ env/
 
 # Project outputs
 boltz_results_*/
+binder/
+out_binder/
 eval_data/
 generated/
 msa/
